@@ -88,7 +88,7 @@ class BiBoConfig(PretrainedConfig):
         num_experts_per_tok=2,
         num_experts=None,
         router_temperature=1.3,
-        bias_update_factor=1e-3,
+        bias_update_factor=1e-2,
         bias_update_threshold=100_000, # amount of tokens(bs*seq) to update bias 
         router_noise=0.5,
         router_type="mlp", # mlp or conv
