@@ -88,7 +88,8 @@ class BiBoConfig(PretrainedConfig):
         num_experts_per_tok=2,
         num_experts=None,
         router_temperature=1.3,
-        bias_update_factor=1e-4,
+        bias_update_factor=1e-3,
+        bias_update_threshold=100_000, # amount of tokens(bs*seq) to update bias 
         router_noise=0.5,
         router_type="mlp", # mlp or conv
         kernel_size=3,
@@ -128,6 +129,7 @@ class BiBoConfig(PretrainedConfig):
         self.num_experts = num_experts if num_experts is not None else (num_routed_experts + num_shared_experts)
         self.router_temperature = router_temperature
         self.bias_update_factor = bias_update_factor
+        self.bias_update_threshold=bias_update_threshold
         self.router_noise = router_noise
         self.router_type=router_type
         self.kernel_size = kernel_size

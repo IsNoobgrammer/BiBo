@@ -222,7 +222,16 @@ class BiBoMLP(nn.Module):
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
-class CausalConv1D(nn.Module):
+
+class BiBoIdentityExpert(nn.Module):
+    """Identity/Residual Expert to increase combinatrics (hack) """
+    def __init__(self, config: BiBoConfig, *args, **kwargs): 
+        super().__init__()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+
+class BiBoCausalConv1D(nn.Module):
     """
     Implements a 1D causal convolutional expert block for the BiBo-MoE architecture.
 
@@ -374,148 +383,176 @@ class BiBoMoERouter(nn.Module):
 
 
 
+
+
 class BiBoMoELayer(nn.Module):
-    """BiBo Mixture of Experts Layer with Convolutional Shared Expert"""
+    """
+    Mixture of Experts (MoE) layer for the BiBo model.
+    Args:
+        config (BiBoConfig): Configuration object containing MoE parameters including:
+            - hidden_size: Dimension of hidden representations
+            - num_routed_experts: Number of experts to route between
+            - num_experts_per_tok: Number of experts each token is routed to (top-k)
+            - bias_update_factor: Learning rate for router bias updates
+            - bias_update_threshold: Threshold for triggering bias updates
+            - num_shared_experts: Number of shared experts (typically 1 Conv expert)
+    
+    Attributes:
+        hidden_size (int): Dimension of hidden representations
+        num_routed_experts (int): Number of experts to route between
+        num_experts_per_tok (int): Number of experts each token is routed to (top-k)
+        bias_update_factor (float): Learning rate for router bias updates
+        bias_update_threshold (float): Threshold for triggering bias updates
+        routed_experts (nn.ModuleList): List of routed expert modules (MLPs + Identity)
+        shared_experts_list (nn.ModuleList): List of shared expert modules (typically Conv)
+        gate (BiBoMoERouter): Router module that determines token-to-expert assignment
+    """
     def __init__(self, config: BiBoConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_routed_experts = config.num_routed_experts
         self.num_experts_per_tok = config.num_experts_per_tok
-        self.bias_update_factor = config.bias_update_factor # For bias update logic
+        self.bias_update_factor = config.bias_update_factor 
+        self.bias_update_threshold = config.bias_update_threshold
 
-        # --- Routed Experts ---
+        # Initialize token counter and accumulated TPE for threshold-based bias updates
+        self.register_buffer("tokens_processed", torch.tensor(0, dtype=torch.long))
+        self.register_buffer("accumulated_tpe", torch.zeros(config.num_routed_experts, dtype=torch.float))
+        
         self.routed_experts = nn.ModuleList()
-        num_mlp_routed = config.num_routed_experts - 1 # Account for Identity expert
+        num_mlp_routed = config.num_routed_experts - 1 # - 1 for identity expert 
+                                                       # (we can more likely add min(1,top_k%4) as identity expert to increase combinatrics ) 
         if num_mlp_routed < 0:
             raise ValueError("num_routed_experts must be at least 1 (for IdentityExpert)")
         for _ in range(num_mlp_routed):
-            self.routed_experts.append(MLPExpert(config))
-        # Add the Identity expert at the end
-        self.routed_experts.append(IdentityExpert(config))
+            self.routed_experts.append(BiBoMLP(config,is_expert=True))
+        self.routed_experts.append(BiBoIdentityExpert(config))
         if len(self.routed_experts) != config.num_routed_experts:
             raise ValueError(f"Mismatch: Created {len(self.routed_experts)} routed experts, expected {config.num_routed_experts}")
 
-        # --- Shared Experts ---
+
         self.shared_experts_list = nn.ModuleList()
         if config.num_shared_experts is not None and config.num_shared_experts > 0:
              if config.num_shared_experts != 1:
                  warnings.warn(f"BiBoMoELayer configured for 1 shared Conv expert, but got num_shared_experts={config.num_shared_experts}. Using 1 Conv expert.", UserWarning)
-             # Instantiate the single convolutional shared expert
-             self.shared_experts_list.append(ModifiedConvolutionalExpert(config))
+             self.shared_experts_list.append(BiBoCausalConv1D(config))
         elif config.num_shared_experts is None:
              warnings.warn("num_shared_experts is None, assuming 0 shared experts.", UserWarning)
-        # No warning if num_shared_experts is explicitly 0
-
-        # --- Router ---
         self.gate = BiBoMoERouter(config)
 
 
-    @torch.no_grad() # Bias update should not require gradients
+    @torch.no_grad() # bias update based on heuristic ; no grads needed 
+                     # can also be used like async(i.e even when its inside a step and can skip a step if we want)     
     def update_bias(self, tokens_per_expert: torch.Tensor):
         """
         Updates the router's learnable bias based on token distribution.
         Aims to balance load by increasing bias for under-utilized experts
         and decreasing bias for over-utilized experts.
+        
+        Args:
+            tokens_per_expert (torch.Tensor): Count of tokens routed to each expert
+                in the current batch
+                
+        Notes:
+            - Increases bias for under-utilized experts (below mean token count)
+            - Decreases bias for over-utilized experts (above mean token count)
+            - Uses sign of deviation from mean to determine update direction
+            - Update magnitude controlled by bias_update_factor
+            - No gradients are computed for this update (torch.no_grad)
         """
-        # Check if bias exists and update factor is positive
         if not hasattr(self.gate, 'bias') or self.bias_update_factor <= 0:
             return
 
-        tpe = tokens_per_expert.detach().float() # Ensure float and detach
+        """
+        Heuristic based load balancing
+        """
 
-        # Calculate deviation from the mean number of tokens per expert
-        # Avoid division by zero if num_routed_experts is 0 (shouldn't happen with checks)
+        tpe = tokens_per_expert.detach().float() 
         if self.num_routed_experts > 0:
              mean_tpe = tpe.mean()
-             deviation = mean_tpe - tpe # Positive if below mean, negative if above
+             deviation = mean_tpe - tpe 
         else:
-             deviation = torch.zeros_like(tpe) # No deviation if no experts
+             deviation = torch.zeros_like(tpe) 
 
         # Update bias: add_(factor * sign(deviation))
         # bias increases if deviation > 0 (expert under-utilized)
         # bias decreases if deviation < 0 (expert over-utilized)
-        update_amount = self.bias_update_factor * deviation.sign()
-        self.gate.bias.add_(update_amount)
-        # Optional: Clamp bias to prevent extreme values?
-        # self.gate.bias.data.clamp_(-max_bias_value, max_bias_value)
+        self.gate.bias.add_(self.bias_update_factor * deviation.sign())
 
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """ MoE forward pass including routing, expert computation, and combination. """
         bsz, seq_len, hidden_dim = hidden_states.shape
-        num_tokens = bsz * seq_len
-        flat_hidden = hidden_states.view(num_tokens, -1) # [num_tokens, hidden_dim]
+        
+        # Get routing decisions from the router
+        top_k_indices, top_k_weights = self.gate(hidden_states) # noqa: The router already handles the proper reshaping internally
+        # top_k_indices: [bsz, seq_len, top_k], top_k_weights: [bsz, seq_len, top_k]
 
-        # 1. Get routing decisions (indices and weights)
-        top_k_indices, top_k_weights = self.gate(hidden_states)
-        # top_k_indices: [num_tokens, top_k], top_k_weights: [num_tokens, top_k]
 
-        # 2. Calculate Tokens Per Expert (TPE) for bias update (training only)
+        """
+        global context to update heuristic
+        """
+
         tokens_per_expert = None
         if self.training and hasattr(self.gate, 'bias') and self.bias_update_factor > 0:
-            # Bincount needs non-negative indices
-            tpe = torch.bincount(top_k_indices.view(-1), minlength=self.num_routed_experts)
-            tokens_per_expert = tpe # Store for bias update later
+            current_tpe = torch.bincount(
+                rearrange(top_k_indices, 'b s k -> (b s k)'), 
+                minlength=self.num_routed_experts
+            )
+            
+            batch_tokens = bsz * seq_len
+            self.tokens_processed += batch_tokens
+            self.accumulated_tpe += current_tpe.float()
+            
+            if self.tokens_processed >= self.bias_update_threshold:
+                # Use accumulated TPE for bias update
+                tokens_per_expert = self.accumulated_tpe.clone()
+                
+                # Reset buffer
+                self.tokens_processed.zero_()
+                self.accumulated_tpe.zero_()
 
-        # 3. Dispatch tokens to experts and compute routed output
-        final_routed = torch.zeros_like(flat_hidden) # Initialize output buffer
 
-        # Flatten indices and weights for easier processing
-        flat_expert_indices = top_k_indices.view(-1) # [num_tokens * top_k]
-        flat_weights = top_k_weights.view(-1)       # [num_tokens * top_k]
+        flat_hidden = rearrange(hidden_states, 'b s h -> (b s) h') 
+        final_routed = torch.zeros_like(flat_hidden) 
+        flat_expert_indices = rearrange(top_k_indices, 'b s k -> (b s k)')
+        flat_weights = rearrange(top_k_weights, 'b s k -> (b s k)')
 
-        # Create token indices corresponding to the flattened expert indices
-        # Each token appears top_k times in this list
         flat_token_indices = torch.arange(
-            num_tokens, device=hidden_states.device
-        ).repeat_interleave(self.num_experts_per_tok) # [num_tokens * top_k]
+            bsz * seq_len, device=hidden_states.device
+        ).repeat_interleave(self.num_experts_per_tok)
 
-        # Iterate through each expert to process its assigned tokens
         for i, expert in enumerate(self.routed_experts):
             # Find which entries in flat_expert_indices correspond to the current expert (i)
             mask = (flat_expert_indices == i)
 
-            if mask.any(): # If any tokens are routed to this expert
-                # Get the indices of the tokens routed to this expert
-                tokens_idx_for_expert = flat_token_indices[mask] # Indices into the original num_tokens dimension
+            if mask.any(): # if any token
+                # Get the indices 
+                tokens_idx_for_expert = flat_token_indices[mask]
+                weights_for_expert = flat_weights[mask].unsqueeze(1)
 
-                # Get the corresponding weights
-                weights_for_expert = flat_weights[mask].unsqueeze(1) # [num_tokens_for_this_expert, 1]
-
-                # Optimization: Process unique tokens only once if top_k > 1
+                # Optimization: Process unique tokens
                 unique_tokens, inverse_indices = torch.unique(tokens_idx_for_expert, return_inverse=True)
-
-                # Select the unique input hidden states for these tokens
-                inputs_for_expert = flat_hidden[unique_tokens] # [num_unique_tokens, hidden_dim]
-
-                # Compute expert output for unique tokens
-                outputs_for_expert_unique = expert(inputs_for_expert) # [num_unique_tokens, hidden_dim]
-
-                # Expand the unique outputs back to match the original number of routed tokens
-                # using the inverse_indices from torch.unique
-                outputs_for_expert = outputs_for_expert_unique[inverse_indices] # [num_tokens_for_this_expert, hidden_dim]
-
-                # Weight the expert output
+                inputs_for_expert = flat_hidden[unique_tokens]
+                outputs_for_expert_unique = expert(inputs_for_expert)
+                outputs_for_expert = outputs_for_expert_unique[inverse_indices]
                 weighted_output = outputs_for_expert * weights_for_expert
 
-                # Add the weighted output to the final result using scatter_add_
-                # This efficiently adds contributions for the same token routed to multiple experts
-                final_routed.scatter_add_(0, tokens_idx_for_expert.unsqueeze(1).expand(-1, hidden_dim), weighted_output)
+                final_routed.scatter_add_(
+                    0, 
+                    tokens_idx_for_expert.unsqueeze(1).expand(-1, hidden_dim), 
+                    weighted_output
+                )
 
-        # Reshape routed output back to original shape
-        final_routed = final_routed.view(bsz, seq_len, hidden_dim)
-
-        # 4. Compute shared expert output (if configured)
-        shared_combined = torch.zeros_like(hidden_states) # Default if no shared experts
+        final_routed = rearrange(final_routed, '(b s) h -> b s h', b=bsz)
+        shared_combined = torch.zeros_like(hidden_states) 
         if self.shared_experts_list:
-            # Assuming only one shared expert (the Conv one) as per design
             shared_combined = self.shared_experts_list[0](hidden_states)
-
-        # 5. Combine routed and shared outputs
         final_output = final_routed + shared_combined
 
-        # 6. Update router bias (after forward pass, using TPE calculated earlier)
+
         if tokens_per_expert is not None:
             self.update_bias(tokens_per_expert)
 
         return final_output
+
+
