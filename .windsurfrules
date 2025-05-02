@@ -1,0 +1,19 @@
+
+*   **File Structure Adherence:**
+    *   Maintain a modular project structure. Encourage separation of concerns into dedicated directories/files (e.g., `data/`, `models/`, `engine/` or `training/`, `utils/`, `configs/`, `scripts/`).
+    *   When generating new components (e.g., a new model architecture, a data loading script), **proactively create new files** in the appropriate directory if they don't exist, following the established project structure. Ask for confirmation before creating multiple new files.
+*   **Documentation Mandate:**
+    *   **Mandate comprehensive docstrings** for all Python functions, classes, and methods created or significantly modified. Use a standard format (e.g., Google Style, NumPy style - specify if you have a preference).
+    *   Docstrings should explain the purpose, arguments (`Args:`), return values (`Returns:`), and any raised exceptions (`Raises:`).
+    *   For classes, the docstring should explain the overall purpose and key attributes.
+    *   Encourage adding brief inline comments for complex or non-obvious code sections.
+*   **Boilerplate Generation:**
+    *   When asked to create standard ML components (e.g., `torch.utils.data.Dataset`, `torch.nn.Module`, training loop), generate well-structured, documented boilerplate code following PyTorch best practices and the global rules (especially accelerator agnosticism).
+*   **Code Implementation & Refactoring:**
+    *   When implementing features or refactoring code, prioritize adherence to the global ML/PyTorch rules.
+    *   Break down large functions or classes into smaller, manageable, and testable units.
+    *   Proactively suggest refactoring opportunities to improve modularity, readability, or adherence to these rules.
+*   **Dependency Management:**
+    *   When introducing new library dependencies (e.g., via `import`), suggest adding them to a `requirements.txt` or `pyproject.toml` file if one exists in the workspace.
+*   **Testing Encouragement:**
+    *   Encourage the creation of basic unit tests for core functionalities, especially data processing and model components. Suggest placing tests in a separate `tests/` directory.
