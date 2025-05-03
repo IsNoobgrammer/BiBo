@@ -26,6 +26,7 @@ from transformers.modeling_outputs import (
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 from configuration_bibo import BiBoConfig
+from transformers.cache_utils import Cache,DynamicCache, SlidingWindowCache, StaticCache
 
 logger = logging.get_logger(__name__)
 
@@ -38,11 +39,11 @@ logger = logging.get_logger(__name__)
 
 # BiBoRMSNorm adopted from Qwen3RMSNorm
 class BiBoRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
+    def __init__(self, hidden_size, eps=1e-5):
         """
         Args:
             hidden_size (int): Size of the last dimension of the input tensor.
-            eps (float, optional): A value added to the denominator for numerical stability. Default: 1e-6.
+            eps (float, optional): A value added to the denominator for numerical stability. Default: 1e-5.
 
         Input shape:
             hidden_states: (batch_size, ..., hidden_size)
@@ -191,7 +192,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     q_embed = (q * cos) + (_rotate_half(q) * sin)
     k_embed = (k * cos) + (_rotate_half(k) * sin)
     return q_embed, k_embed
-
 
 
 class BiBoMLP(nn.Module):
@@ -383,8 +383,6 @@ class BiBoMoERouter(nn.Module):
 
 
 
-
-
 class BiBoMoELayer(nn.Module):
     """
     Mixture of Experts (MoE) layer for the BiBo model.
@@ -556,3 +554,184 @@ class BiBoMoELayer(nn.Module):
         return final_output
 
 
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    Repeat key/value heads for GQA.
+    Args:
+        hidden_states: (batch, num_key_value_heads, seq_len, head_dim)
+        n_rep: number of repetitions (num_query_heads // num_key_value_heads)
+    Returns:
+        (batch, num_query_heads, seq_len, head_dim)
+    """
+    batch, num_key_value_heads, seq_len, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, seq_len, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, seq_len, head_dim)
+
+
+
+class BiBoAttention(nn.Module):
+    """
+    Multi-Layer KV Sharing + Grouped Query Attention (MLKV-GQA) for BiBo model.
+
+    This module supports:
+    1. Grouped Query Attention (GQA): Multiple Q heads, fewer K/V heads per layer
+    2. Multi-layer KV sharing (MLKV): Only one set of K/V projections for every group of layers, controlled by config.num_layer_kv_sharing
+
+    Args:
+        config (BiBoConfig): Model configuration
+        layer_idx (int): Index of this layer in the stack
+        use_sliding_window (bool, optional): Whether this layer should use sliding window attention.
+    """
+    def __init__(self, config: BiBoConfig, layer_idx: int, use_sliding_window: Optional[bool] = False):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.layer_idx = layer_idx
+        # self.num_layer_kv_sharing = config.num_layer_kv_sharing
+
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size} and `num_heads`: {self.num_heads})."
+            )
+        if self.num_heads % self.num_key_value_heads != 0:
+            raise ValueError(
+                f"num_attention_heads ({self.num_heads}) must be divisible by num_key_value_heads ({self.num_key_value_heads})"
+            )
+
+        # Configure sliding window attention if enabled
+        self.sliding_window = config.sliding_window if use_sliding_window else None
+        # sliding_window_stride can be set in config for strided window attention
+        self.attention_dropout = config.attention_dropout
+
+
+
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+
+        # rope
+        self.rotary_emb = BiBoRotaryEmbedding(
+            self.head_dim,
+            max_position_embeddings=self.max_position_embeddings,
+            base=config.rope_theta,
+        )
+
+        # Norms
+        if config.layer_norm_type == "rms":
+            self.q_norm = BiBoRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = BiBoRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        elif config.layer_norm_type == "dyt":
+            self.q_norm = BiBoDyTNorm(self.head_dim)
+            self.k_norm = BiBoDyTNorm(self.head_dim)
+        elif config.layer_norm_type == "erf":
+            self.q_norm = BiBoErfNorm(self.head_dim)
+            self.k_norm = BiBoErfNorm(self.head_dim)
+        else:
+            raise ValueError(f"Unknown layer_norm_type: {config.layer_norm_type}")
+
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    
+    
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_value is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        
+        batch_size, q_len, _, _ = query_states.shape
+        
+        if self.sliding_window is not None and False:
+            stride = getattr(self.config, 'sliding_window_stride', None)
+            attn_output = self.eager_sliding_window_attention(
+                query_states, 
+                key_states, 
+                value_states, 
+                attention_mask,
+                self.sliding_window,
+                stride
+            )
+        else:
+            attn_output = self.eager_standard_attention(
+                query_states, 
+                key_states, 
+                value_states, 
+                attention_mask
+            )
+        
+        
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(batch_size, q_len, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+        
+        return attn_output, None, past_key_value
+    
+    def eager_sliding_window_attention():
+        pass
+    
+    
+    def eager_standard_attention(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+
+    ) -> torch.Tensor:
+        """
+        Compute standard attention.
+        
+        Args:
+            query_states: (batch_size, num_heads, q_len, head_dim)
+            key_states: (batch_size, num_heads, kv_len, head_dim)
+            value_states: (batch_size, num_heads, kv_len, head_dim)
+            attention_mask: Optional attention mask
+            
+        Returns:
+            torch.Tensor: Output tensor after applying standard attention
+        """
+
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+        
+        return attn_output
+
+
+
+
+        

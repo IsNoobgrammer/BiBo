@@ -11,43 +11,7 @@ class BiBoConfig(PretrainedConfig):
     Configuration class for the BiBo model inherited from PretrainedConfig.
 
     Args:
-        vocab_size (int): Vocabulary size.
-        hidden_size (int): Hidden state dimension.
-        intermediate_size (int): MLP hidden state dimension.
-        num_hidden_layers (int): Number of transformer layers.
-        num_attention_heads (int): Number of attention heads.
-        num_key_value_heads (int): Number of key/value heads for GQA/MQA.
-        hidden_act (str): Activation function.
-        max_position_embeddings (int): Max sequence length.
-        initializer_range (float): Weight initialization range.
-        rms_norm_eps (float): RMSNorm epsilon.
-        rms_norm_type (str): Type of normalization to use ("rms", "dyt", "erf").
-        use_cache (bool): Use cache for decoding.
-        pad_token_id (int): Padding token id.
-        bos_token_id (int): Beginning of sentence token id.
-        eos_token_id (int): End of sentence token id.
-        tie_word_embeddings (bool): Tie input/output embeddings.
-        rope_theta (float): RoPE base period.
-        rope_scaling (dict): RoPE scaling config.
-        attention_dropout (float): Attention dropout.
-        use_sliding_window (bool): Use sliding window attention.
-        sliding_window (int): Sliding window size.
-        max_window_layers (int): Number of layers using SWA.
-        attention_bias (bool): Use bias in attention projections.
-        mlp_only_layers (list): Indices of layers using dense MLP (first and last by default).
-        decoder_sparse_step (int): Frequency of MoE layers.
-        moe_intermediate_size (int): MoE expert hidden dim.
-        num_routed_experts (int): Number of routed experts.
-        num_shared_experts (int): Number of shared experts.
-        num_experts_per_tok (int): Number of experts per token.
-        num_experts (int): Total number of experts (routed + shared).
-        router_temperature (float): Router temperature.
-        bias_update_factor (float): Router bias update factor.
-        router_noise (float): Router noise.
-        kernel_size (int): MoE kernel size.
-        norm_topk_prob (bool): Normalize topk probabilities.
-        output_router_logits (bool): Output router logits and aux loss.
-        router_aux_loss_coef (float): Router aux loss coefficient.
+
     """
     model_type = "bibo"
 
@@ -55,7 +19,7 @@ class BiBoConfig(PretrainedConfig):
         self,
         vocab_size=128000,
         hidden_size=1536,
-        intermediate_size=4104, #2nd ramanujan hardy number 1729,4104 .. etc
+        intermediate_size=4104, #2nd ramanujan hardy number 1729,4104 .. etc  generally this is dense mlp dim
         # """
         # 4104 = 16³ + 2³ (16 cubed + 2 cubed) = 4096 + 8
         # 4104 = 15³ + 9³ (15 cubed + 9 cubed) = 3375 + 729
@@ -63,10 +27,12 @@ class BiBoConfig(PretrainedConfig):
         num_hidden_layers=8,
         num_attention_heads=12,
         num_key_value_heads=2,
+        num_layer_kv_sharing=2, # multi-layer kv-proj sharing
+        num_meta_tokens=8,  # help do meta-learning ; will be trained unsupervised
         hidden_act="silu",
         max_position_embeddings=32768,
         initializer_range=0.02,
-        rms_norm_eps=1e-6,
+        rms_norm_eps=1e-5,
         layer_norm_type="rms", # options are "dyt","rms","erf"
         use_cache=True,
         pad_token_id=None,
@@ -76,8 +42,8 @@ class BiBoConfig(PretrainedConfig):
         rope_theta=1000000.0,
         rope_scaling=None,
         attention_dropout=0.0,
-        use_sliding_window=False,
-        sliding_window=32768,
+        use_sliding_window=True,
+        sliding_window=512,
         max_window_layers=None,
         attention_bias=False,
         mlp_only_layers=None,
@@ -104,6 +70,8 @@ class BiBoConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
+        self.num_layer_kv_sharing = num_layer_kv_sharing
+        self.num_meta_tokens = num_meta_tokens
         self.hidden_act = hidden_act
         self.max_position_embeddings = max_position_embeddings
         self.initializer_range = initializer_range
