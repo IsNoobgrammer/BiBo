@@ -701,9 +701,74 @@ class BiBoAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
         
         return attn_output, None, past_key_value
-    
-    def eager_sliding_window_attention(self):
-        pass
+
+    def eager_sliding_window_attention(
+            self,
+            query_states: torch.Tensor,
+            key_states: torch.Tensor,
+            value_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor],
+            window_size: int,
+            stride: Optional[int] = None
+    ) -> torch.Tensor:
+        """
+        Sliding window attention to limit attention to a fixed window size.
+        For each query position, it can only attend to key positions within a window
+        centered around the query position, while still respecting causal masking.
+
+        Args:
+            query_states: Query tensor of shape [batch_size, num_heads, seq_len, head_dim]
+            key_states: Key tensor of shape [batch_size, num_heads, seq_len, head_dim]
+            value_states: Value tensor of shape [batch_size, num_heads, seq_len, head_dim]
+            attention_mask: Optional mask tensor
+            window_size: Size of the attention window
+            stride: Optional stride for the window (unused in this implementation)
+
+        Returns:
+            Attention output tensor
+        """
+        batch_size, num_heads, q_len, head_dim = query_states.shape
+        kv_len = key_states.shape[-2]
+
+        # Compute attention scores
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        # Create sliding window causal mask
+        # Each query position i can attend to positions [max(0, i-window_size+1), i]
+        window_mask = torch.ones((q_len, kv_len), device=query_states.device, dtype=torch.bool)
+
+        # Apply window constraint: each position can only attend to window_size tokens before it
+        for i in range(q_len):
+            # Start position of the window (respect sequence boundaries)
+            start = max(0, i - window_size + 1)
+            # Mask out positions before the window
+            if start > 0:
+                window_mask[i, :start] = False
+            # Causal masking: mask out future positions
+            if i + 1 < kv_len:
+                window_mask[i, i + 1:] = False
+
+        # Reshape for broadcasting
+        window_mask = window_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, q_len, kv_len)
+
+        # Apply sliding window mask
+        attn_weights = attn_weights.masked_fill(~window_mask, float('-inf'))
+
+        # Apply additional attention mask if provided
+        if attention_mask is not None:
+            # Ensure attention_mask is properly sized for the key sequence length
+            causal_mask = attention_mask[:, :, :q_len, :kv_len]
+            attn_weights = attn_weights + causal_mask
+
+        # Compute attention probabilities
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+        # Apply dropout
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+
+        # Compute output
+        attn_output = torch.matmul(attn_weights, value_states)
+        return attn_output
     
     
     def eager_standard_attention(
@@ -729,6 +794,7 @@ class BiBoAttention(nn.Module):
 
 
         kv_len = key_states.shape[-2]
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         if self.use_ssmax:
             log_n = torch.log(torch.clamp(torch.tensor(kv_len, device=query_states.device, dtype=self.ssmax_scale.dtype), min=2.0))
             # min=2.0 since log(1) = 0 and negative for <1
@@ -738,11 +804,9 @@ class BiBoAttention(nn.Module):
             # SSMax Ratio: exp(C * z_i) / exp(C * z_k) = exp(C * z_i - C * z_k) = exp(C * (z_i - z_k)) = (exp(z_i - z_k))^C
             # C is scaling factor i.e s*log(seq_len) ; 
             # in a gist: a learnable, seq-len adaptive temperature applied per head to control attention sharpness, preventing fading in long contexts.
+            s_scaled = self.s.view(1, self.num_heads, 1, 1) * log_n
 
-
-
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        attn_weights = attn_weights * s_scaled
+            attn_weights = attn_weights * s_scaled
 
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
@@ -752,8 +816,3 @@ class BiBoAttention(nn.Module):
         attn_output = torch.matmul(attn_weights, value_states)
         
         return attn_output
-
-
-
-
-        
