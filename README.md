@@ -22,7 +22,7 @@
         *   If we designate 1 expert as shared (always active) and route among the remaining 31, selecting 5 (`k=5`), the routed combinations become C(31, 5). The token is processed by these 5 + the 1 shared expert.
         *   Now, if we add 2 *parameter-free* identity experts to the pool of *selectable* experts (making the pool size 31 routed + 2 identity = 33), and still select 5 (`k=5`), the number of possible combinations for the routed part jumps to C(33, 5). The token is still processed by the selected 5 (which could include identity experts) + the 1 shared expert.
     *   This combinatorial explosion allows the model to learn much richer functions and specialize pathways more effectively, mitigating potential representational bottlenecks from using fewer, or shared, experts.
-*   **Reference:** [OLMoE talks why it not took Shared Expert](https://arxiv.org/html/2409.02060v1#S4.F6) (Illustrates the concept of dynamic computation/conditional routing).
+*   **Reference:** [OLMoE talks why it not took Shared Expert](https://arxiv.org/html/2409.02060v1#S4.F6).
 
 ### 3. Convolution-Based Router
 
@@ -57,8 +57,8 @@
 TODO: 
 - MLA
 - Better RoPE/NoPE ?? VO-RoPE etc.. ref: https://kexue.fm/archives/10862 
-- MLKV (Multi layer kv/proj and cache sharing) ref: x/zedzed
-- Meta-tokens (giving model a scratc-pad and allowing it to learn implicitly in unsupervised manner)
+- MLKV (Multi layer kv/proj and cache sharing) ref: https://t.co/AmoqdyLiod
+- Meta-tokens (giving model some latent tokens and allowing it to learn implicitly in unsupervised manner (meta-learning) )
 - KAN also as a routable expert in FFN ?? 
 - Any other innovation : thing is low compute req. or very high perf. imrpov and compatibilty with current framework
 
@@ -73,7 +73,7 @@ TODO:
 
 इंसान को केवल कर्म का ही अधिकार है, उसके फल के बारे में चिंता करने का नहीं। इसलिए तुम कर्मों के फल की चिंता मत कर और कर्म से विमुख मत हो
 
-Lets make India a frontier in AI ; via key innovation in arch thus reducing compute requirements and model's inherent capability
+Lets make India a frontier in AI ; Can be done via key innovation in arch thus reducing compute requirements and increasing model's inherent capability
 
 ## License
 
