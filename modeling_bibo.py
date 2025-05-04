@@ -1,6 +1,7 @@
 """
 
 PyTorch BiBo model
+Apache 2.0 License
 
 - adi-kmt
 
@@ -596,13 +597,12 @@ class BiBoAttention(nn.Module):
         self.head_dim = self.hidden_size // self.num_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.layer_idx = layer_idx
+        self.use_ssmax=config.use_ssmax
         # self.num_layer_kv_sharing = config.num_layer_kv_sharing
 
 
-        ## SSMax init
-        self.s = nn.Parameter(torch.ones(self.num_heads), requires_grad=True)
-        # Initialize s to 1 as per the paper
-        nn.init.constant_(self.s, 1.0)
+        if self.use_ssmax:
+            self.ssmax_scale = nn.Parameter(torch.full((1, self.num_heads, 1, 1), 1.0) , requires_grad=True)
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -728,15 +728,20 @@ class BiBoAttention(nn.Module):
         """
 
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
         kv_len = key_states.shape[-2]
+        if self.use_ssmax:
+            log_n = torch.log(torch.clamp(torch.tensor(kv_len, device=query_states.device, dtype=self.ssmax_scale.dtype), min=2.0))
+            # min=2.0 since log(1) = 0 and negative for <1
+            query_states = query_states * self.ssmax_scale * log_n
+            
+            # Standard Softmax Ratio: exp(z_i) / exp(z_k) = exp(z_i - z_k)
+            # SSMax Ratio: exp(C * z_i) / exp(C * z_k) = exp(C * z_i - C * z_k) = exp(C * (z_i - z_k)) = (exp(z_i - z_k))^C
+            # C is scaling factor i.e s*log(seq_len) ; 
+            # in a gist: a learnable, seq-len adaptive temperature applied per head to control attention sharpness, preventing fading in long contexts.
 
-        # SSMax: Compute log(n) where n is the sequence length (kv_len)
-        log_n = torch.log(torch.tensor(kv_len, dtype=attn_weights.dtype, device=attn_weights.device))
 
-        # SSMax: Scale attention scores with s * log(n) for each head
-        s_scaled = self.s.view(1, self.num_heads, 1, 1) * log_n
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         attn_weights = attn_weights * s_scaled
 
         if attention_mask is not None:

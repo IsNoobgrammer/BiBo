@@ -35,11 +35,12 @@ class BiBoConfig(PretrainedConfig):
         rms_norm_eps=1e-5,
         layer_norm_type="rms", # options are "dyt","rms","erf"
         use_cache=True,
+        use_ssmax=True, # scaling softmax to longer seq by scaling attn_weights 
         pad_token_id=None,
         bos_token_id=0,
         eos_token_id=0,
         tie_word_embeddings=True,
-        rope_theta=1000000.0,
+        rope_theta=10000.0,
         rope_scaling=None,
         attention_dropout=0.0,
         use_sliding_window=True,
