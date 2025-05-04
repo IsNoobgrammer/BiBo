@@ -587,6 +587,7 @@ class BiBoAttention(nn.Module):
         layer_idx (int): Index of this layer in the stack
         use_sliding_window (bool, optional): Whether this layer should use sliding window attention.
     """
+
     def __init__(self, config: BiBoConfig, layer_idx: int, use_sliding_window: Optional[bool] = False):
         super().__init__()
         self.config = config
@@ -742,8 +743,7 @@ class BiBoAttention(nn.Module):
 
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        attn_weights = attn_weights * s_scaled
-
+        
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask

@@ -62,7 +62,6 @@ class BiBoConfig(PretrainedConfig):
         kernel_size=3,
         norm_topk_prob=False,
         output_router_logits=False,
-        conv_router=False,  # router will also be a causal conv1d with same kernel as shared expert 
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -79,6 +78,7 @@ class BiBoConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.layer_norm_type = layer_norm_type
         self.use_cache = use_cache
+        self.use_ssmax=use_ssmax
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
@@ -155,7 +155,7 @@ class BiBoConfig(PretrainedConfig):
         for idx in self.mlp_only_layers:
             if not (0 <= idx < self.num_hidden_layers):
                 raise ValueError(f"mlp_only_layers index {idx} is out of range for {self.num_hidden_layers} layers")
-        rope_config_validation(self)
+        # rope_config_validation(self)
 
 
 if __name__ == "__main__":

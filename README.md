@@ -46,10 +46,17 @@
 
 ### 6. Scalable Softmax (SSMax)
 
-*   **Goal:** Improve attention mechanism stability and performance, especially for very long sequences.
-*   **Mechanism:** Implements SSMax (`use_ssmax=True`), a modification to the standard softmax function used in attention. It involves scaling the attention weights before the softmax operation, aiming to prevent attention scores from becoming too concentrated or too diffuse over long contexts. In a gist: a learnable, seq-len adaptive temperature applied per head to control attention sharpness, preventing fading in long contexts.
 
-*   **Reference:** [lol a single guy ; cooking fire](https://arxiv.org/abs/2501.19399)
+*   **Goal:** Improve attention mechanism stability and performance, especially for very long sequences, by preventing attention scores from becoming overly diffuse ("fading") or overly concentrated.
+*   **Mechanism:** Implements SSMax (`use_ssmax=True`), a modification to the standard softmax function used in attention.
+    *   **Core Idea:** It scales the attention weights *before* the softmax operation based on the sequence length (`k_len`).
+    *   **Scaling Factor:** The scaling factor `C` is calculated as `s * log(k_len)`, where `s` is a learnable parameter (`ssmax_scale`) per head, and `log(k_len)` adapts the scaling to the sequence length (clamped at a minimum length of 2 to avoid issues with log(1) or log(<1)).
+    *   **Effect:** This scaling effectively acts as a learnable, sequence-length-adaptive temperature applied *before* the softmax. Comparing the ratio of two softmax probabilities:
+        *   Standard Softmax Ratio: `exp(z_i) / exp(z_k) = exp(z_i - z_k)`
+        *   SSMax Ratio: `exp(C * z_i) / exp(C * z_k) = exp(C * (z_i - z_k)) = (exp(z_i - z_k))^C`
+        The scaling factor `C` exponentiates the standard ratio, allowing the model to learn how sharply the attention should focus based on the context length.
+    *   **Benefit:** Helps maintain meaningful attention distributions over longer sequences where standard softmax might struggle.
+*   **Reference:** [https://arxiv.org/abs/2501.19399](https://arxiv.org/abs/2501.19399)
 
 
 
@@ -62,6 +69,9 @@ TODO:
 - KAN also as a routable expert in FFN ?? 
 - Any other innovation : thing is low compute req. or very high perf. imrpov and compatibilty with current framework
 
+- To be QK-norm or not to be ? (ref: https://arxiv.org/pdf/2501.18795 ; says qk-norm loses long-context but will it scale with ssmax ?? )
+
+
 
 
 # Awknokewledhement 
@@ -73,7 +83,32 @@ TODO:
 
 इंसान को केवल कर्म का ही अधिकार है, उसके फल के बारे में चिंता करने का नहीं। इसलिए तुम कर्मों के फल की चिंता मत कर और कर्म से विमुख मत हो
 
-Lets make India a frontier in AI ; Can be done via key innovation in arch thus reducing compute requirements and increasing model's inherent capability
+
+**Our Nation**
+
+| Language  | Name for India        |
+| :-------- | :-------------------- |
+| Assamese  | ভাৰত (Bhārôt)         |
+| Bengali   | ভারত (Bhārôt)         |
+| Boro/Bodo | भारत (Bharot)         |
+| Dogri     | भारत (Bhārat)         |
+| English   | India                 |
+| Gujarati  | ભારત (Bhārat)         |
+| Hindi     | भारत (Bhārat)         |
+| Kannada   | ಭಾರತ (Bhārata)        |
+| Kashmiri  | भारत, हिन्दोस्तान (Bhārata, Hindōstān) |
+| Konkani   | भारत (Bhārat)         |
+| Maithili  | भारत (Bhārat)         |
+| Malayalam | ഭാരതം (Bhāratam)      |
+| Marathi   | भारत (Bhārat)         |
+| Nepali    | भारत (Bhārat)         |
+| Oriya     | ଭାରତ (Bhārata)        |
+| Punjabi   | ਭਾਰਤ (Bhārat)         |
+| Sanskrit  | भारतम् (Bhāratam)     |
+| Santali   | ᱥᱤᱧᱚᱛ/ᱵᱷᱚᱨᱳᱛᱵᱳᱨᱥᱚ (Siñôt/Bhôrotborsô) |
+| Sindhi    | ڀارت (Bharatu)        |
+| Telugu    | భారతదేశం (Bhāratadēśam) |
+| Urdu      | بھارَت (Bhārat)        |
 
 ## License
 
