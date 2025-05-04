@@ -7,6 +7,7 @@ PyTorch BiBo model
 """
 
 import math
+import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -597,6 +598,12 @@ class BiBoAttention(nn.Module):
         self.layer_idx = layer_idx
         # self.num_layer_kv_sharing = config.num_layer_kv_sharing
 
+
+        ## SSMax init
+        self.s = nn.Parameter(torch.ones(self.num_heads), requires_grad=True)
+        # Initialize s to 1 as per the paper
+        nn.init.constant_(self.s, 1.0)
+
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size} and `num_heads`: {self.num_heads})."
@@ -695,7 +702,7 @@ class BiBoAttention(nn.Module):
         
         return attn_output, None, past_key_value
     
-    def eager_sliding_window_attention():
+    def eager_sliding_window_attention(self):
         pass
     
     
@@ -722,6 +729,16 @@ class BiBoAttention(nn.Module):
 
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        kv_len = key_states.shape[-2]
+
+        # SSMax: Compute log(n) where n is the sequence length (kv_len)
+        log_n = torch.log(torch.tensor(kv_len, dtype=attn_weights.dtype, device=attn_weights.device))
+
+        # SSMax: Scale attention scores with s * log(n) for each head
+        s_scaled = self.s.view(1, self.num_heads, 1, 1) * log_n
+        attn_weights = attn_weights * s_scaled
+
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
