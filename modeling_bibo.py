@@ -729,6 +729,7 @@ class BiBoAttention(nn.Module):
 
 
         kv_len = key_states.shape[-2]
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         if self.use_ssmax:
             log_n = torch.log(torch.clamp(torch.tensor(kv_len, device=query_states.device, dtype=self.ssmax_scale.dtype), min=2.0))
             # min=2.0 since log(1) = 0 and negative for <1
@@ -738,11 +739,9 @@ class BiBoAttention(nn.Module):
             # SSMax Ratio: exp(C * z_i) / exp(C * z_k) = exp(C * z_i - C * z_k) = exp(C * (z_i - z_k)) = (exp(z_i - z_k))^C
             # C is scaling factor i.e s*log(seq_len) ; 
             # in a gist: a learnable, seq-len adaptive temperature applied per head to control attention sharpness, preventing fading in long contexts.
+            s_scaled = self.s.view(1, self.num_heads, 1, 1) * log_n
 
-
-
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        attn_weights = attn_weights * s_scaled
+            attn_weights = attn_weights * s_scaled
 
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
@@ -752,8 +751,3 @@ class BiBoAttention(nn.Module):
         attn_output = torch.matmul(attn_weights, value_states)
         
         return attn_output
-
-
-
-
-        
