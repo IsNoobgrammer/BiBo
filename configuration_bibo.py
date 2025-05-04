@@ -104,6 +104,8 @@ class BiBoConfig(PretrainedConfig):
         self.kernel_size = kernel_size
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
+        self.conv_router = conv_router
+        self.use_ssmax = use_ssmax
         if mlp_only_layers is None:
             self.mlp_only_layers = [0, num_hidden_layers - 1]
         else:
