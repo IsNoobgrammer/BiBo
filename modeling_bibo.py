@@ -16,7 +16,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
-from einops import rearrange
+from einops import rearrange, einsum
 
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (
@@ -704,71 +704,143 @@ class BiBoAttention(nn.Module):
 
     def eager_sliding_window_attention(
             self,
-            query_states: torch.Tensor,
-            key_states: torch.Tensor,
-            value_states: torch.Tensor,
-            attention_mask: Optional[torch.Tensor],
+            query_states: torch.Tensor,  # (b, h, q_len, d)
+            key_states: torch.Tensor,  # (b, h, kv_len, d)
+            value_states: torch.Tensor,  # (b, h, kv_len, d)
+            attention_mask: Optional[torch.Tensor],  # (b, 1, q_len, kv_len) additive
             window_size: int,
             stride: Optional[int] = None
     ) -> torch.Tensor:
-        """
-        Sliding window attention to limit attention to a fixed window size.
-        For each query position, it can only attend to key positions within a window
-        centered around the query position, while still respecting causal masking.
+            """
+            Efficient sliding window attention using tensor unfolding and einops,
+            matching the logic of the provided loop-based implementation.
 
-        Args:
-            query_states: Query tensor of shape [batch_size, num_heads, seq_len, head_dim]
-            key_states: Key tensor of shape [batch_size, num_heads, seq_len, head_dim]
-            value_states: Value tensor of shape [batch_size, num_heads, seq_len, head_dim]
-            attention_mask: Optional mask tensor
-            window_size: Size of the attention window
-            stride: Optional stride for the window (unused in this implementation)
+            Args:
+                query_states: Query tensor [batch_size, num_heads, q_len, head_dim]
+                key_states: Key tensor [batch_size, num_heads, kv_len, head_dim]
+                value_states: Value tensor [batch_size, num_heads, kv_len, head_dim]
+                attention_mask: Optional additive mask tensor (-inf for masked)
+                                Shape [batch_size, 1, q_len, kv_len].
+                window_size: Size of the attention window.
 
-        Returns:
-            Attention output tensor
-        """
-        batch_size, num_heads, q_len, head_dim = query_states.shape
-        kv_len = key_states.shape[-2]
+            Returns:
+                Attention output tensor [batch_size, num_heads, q_len, head_dim]
+            """
+            batch_size, num_heads, q_len, head_dim = query_states.shape
+            kv_len = key_states.shape[-2]
+            # Ensure kv_len matches query_states if expected by causal window logic
+            # assert q_len == kv_len, "This specific unfold logic assumes q_len == kv_len for simplicity"
 
-        # Compute attention scores
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            # --- 1. Pad Key and Value tensors (Left Padding) ---
+            # Pad by window_size - 1 on the left of the sequence dimension (dim 2)
+            kv_padding_size = max(0, window_size - 1)
+            # Pad format: (pad_left, pad_right) for last dim, then second-to-last, etc.
+            # We pad dim 2 (sequence length): (pad_seq_left, pad_seq_right)
+            kv_padding = (0, 0, kv_padding_size, 0) # (pad_dim3_l, pad_d3_r, pad_dim2_l, pad_d2_r)
 
-        # Create sliding window causal mask
-        # Each query position i can attend to positions [max(0, i-window_size+1), i]
-        window_mask = torch.ones((q_len, kv_len), device=query_states.device, dtype=torch.bool)
+            padded_key_states = F.pad(key_states, kv_padding)
+            padded_value_states = F.pad(value_states, kv_padding)
+            # Padded shape: [b, h, kv_len + window_size - 1, d]
 
-        # Apply window constraint: each position can only attend to window_size tokens before it
-        for i in range(q_len):
-            # Start position of the window (respect sequence boundaries)
-            start = max(0, i - window_size + 1)
-            # Mask out positions before the window
-            if start > 0:
-                window_mask[i, :start] = False
-            # Causal masking: mask out future positions
-            if i + 1 < kv_len:
-                window_mask[i, i + 1:] = False
+            # --- 2. Unfold Padded Key/Value tensors ---
+            # Create sliding windows of size `window_size` along dim 2 with step 1
+            unfolded_key = padded_key_states.unfold(dimension=2, size=window_size, step=1)
+            unfolded_value = padded_value_states.unfold(dimension=2, size=window_size, step=1)
+            # Shape after unfold: [b, h, num_windows, d, w]
+            # num_windows = (kv_len + window_size - 1) - window_size + 1 = kv_len
+            # If q_len == kv_len, then num_windows == q_len
 
-        # Reshape for broadcasting
-        window_mask = window_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, q_len, kv_len)
+            # Handle potential mismatch if q_len != kv_len (unlikely for standard SWA)
+            num_windows = unfolded_key.shape[2]
+            if num_windows != q_len:
+                 print(f"Warning: q_len ({q_len}) != kv_len ({num_windows}). Check logic if this is intended. Taking first {q_len} windows.")
+                 unfolded_key = unfolded_key[:, :, :q_len, :, :]
+                 unfolded_value = unfolded_value[:, :, :q_len, :, :]
 
-        # Apply sliding window mask
-        attn_weights = attn_weights.masked_fill(~window_mask, float('-inf'))
+            # --- 3. Rearrange with einops ---
+            # Rearrange to [b, h, q_len, window_size, head_dim] for matmul convenience
+            unfolded_key = rearrange(unfolded_key, 'b h q d w -> b h q w d')
+            unfolded_value = rearrange(unfolded_value, 'b h q d w -> b h q w d')
 
-        # Apply additional attention mask if provided
-        if attention_mask is not None:
-            # Ensure attention_mask is properly sized for the key sequence length
-            causal_mask = attention_mask[:, :, :q_len, :kv_len]
-            attn_weights = attn_weights + causal_mask
+            # --- 4. Compute Attention Scores within Windows ---
+            # Scale query beforehand as in the loop version
+            # query_scaled = query_states * (self.head_dim ** -0.5) # Option 1: Scale Q
+            # attn_scores_windowed = einsum(query_scaled, unfolded_key, 'b h q d, b h q w d -> b h q w')
 
-        # Compute attention probabilities
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            # Option 2: Scale scores after matmul (more common)
+            scale_factor = self.head_dim ** -0.5
+            attn_scores_windowed = einsum(query_states, unfolded_key, 'b h q d, b h q w d -> b h q w') * scale_factor
+            # Shape: [b, h, q, w]
 
-        # Apply dropout
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+            # --- 5. Apply Masking ---
+            # a) Mask attention to padded key positions introduced by F.pad
+            # Calculate original key indices corresponding to each window position
+            relative_indices = torch.arange(window_size, device=query_states.device) # (w,)
+            query_indices = torch.arange(q_len, device=query_states.device).unsqueeze(1) # (q, 1)
+            # For query i, window position k, the key index in the padded tensor is i+k.
+            # The original key index is (i+k) - kv_padding_size
+            # More directly: original key index = query_idx - (window_size - 1) + window_relative_idx
+            original_key_indices = query_indices - kv_padding_size + relative_indices # Shape (q, w)
+            # Mask if the original key index is negative (came from padding)
+            padding_mask_window = (original_key_indices < 0) # Shape (q, w) boolean
 
-        # Compute output
-        attn_output = torch.matmul(attn_weights, value_states)
-        return attn_output
+            # Apply this padding mask (additive -inf)
+            attn_scores_windowed = attn_scores_windowed.masked_fill(
+                padding_mask_window.unsqueeze(0).unsqueeze(0), # Expand to (1, 1, q, w)
+                float('-inf')
+            )
+
+            # b) Apply the external attention_mask if provided
+            # This requires selecting the mask values corresponding to the keys in each window.
+            # Replicating the loop version's logic by constructing the windowed mask.
+            if attention_mask is not None:
+                # Input mask shape: (b, 1, q, k), additive (-inf where masked)
+                # Output needed: (b, h, q, w) mask values corresponding to windowed keys
+                windowed_attention_mask = torch.zeros_like(attn_scores_windowed) # Start with 0 (no mask)
+
+                # Ensure mask has correct dimensions for slicing
+                mask_for_loop = attention_mask
+                if mask_for_loop.shape[2] != q_len or mask_for_loop.shape[3] != kv_len:
+                     mask_for_loop = mask_for_loop[:,:,:q_len, :kv_len] # Adjust slice if needed
+
+                for i in range(q_len):
+                     # Determine the slice of keys in the *original* sequence for query i's window
+                     k_start = max(0, i - window_size + 1)
+                     k_end = i + 1 # exclusive end index
+
+                     # Extract the relevant slice from the original attention_mask
+                     # Mask for query i, attending to keys k_start to k_end-1
+                     # Shape: (b, 1, 1, actual_window_len)
+                     mask_slice = mask_for_loop[:, :, i:i+1, k_start:k_end]
+
+                     # Pad the mask slice on the left if the window was truncated at the start
+                     actual_window_len = k_end - k_start
+                     left_padding_needed = window_size - actual_window_len
+                     # Pad format (left, right) for the last dimension. Pad with 0 for additive mask.
+                     padded_mask_slice = F.pad(mask_slice, (left_padding_needed, 0), value=0.0)
+
+                     # Assign to the correct position in the windowed mask tensor
+                     # Squeeze the query dim (dim 2) from the slice before assigning
+                     windowed_attention_mask[:, :, i, :] = padded_mask_slice.squeeze(2)
+
+                # Add the constructed windowed mask to the scores
+                attn_scores_windowed = attn_scores_windowed + windowed_attention_mask
+
+            # --- 6. Compute Attention Probabilities ---
+            # Softmax is applied over the window dimension (-1)
+            attn_weights = F.softmax(attn_scores_windowed, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            # Shape: [b, h, q, w]
+
+            # Apply dropout (as in the loop version)
+            attn_weights = F.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+
+            # --- 7. Compute Output using einsum ---
+            # Weighted sum of the unfolded values based on the attention weights
+            # weights[b,h,q,w] * values[b,h,q,w,d] -> output[b,h,q,d]
+            attn_output = einsum(attn_weights, unfolded_value, 'b h q w, b h q w d -> b h q d')
+            # Final shape: [batch_size, num_heads, q_len, head_dim]
+
+            return attn_output
     
     
     def eager_standard_attention(
