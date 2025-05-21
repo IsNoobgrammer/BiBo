@@ -15,16 +15,37 @@
 ### 2. Dynamic Compute and Enhanced Pathways in FFN
 
 *   **Goal:** Allow the model to dynamically allocate computational resources per token based on complexity *and* significantly increase the number of potential processing pathways within the FFN layers, enhancing representational power without proportional parameter increase.
-*   **Mechanism:** This is achieved by including identity/residual experts alongside the standard routed experts (`num_routed_experts`).
-    *   **Dynamic Compute:** The router can choose an identity expert for a token. This acts as a passthrough (residual connection), effectively skipping the heavy computation of a standard expert FFN for that token, saving computational resources on tokens deemed "simpler".
-    *   **Increased Combinatorics:** Crucially, these identity experts are treated as selectable options by the router alongside the routed experts. This dramatically increases the total number of expert combinations a token might be processed by.
-        *   *Example:* Consider an MoE with 32 experts where the router selects the top 6 (`k=6`). The number of combinations is C(32, 6).
-        *   If we designate 1 expert as shared (always active) and route among the remaining 31, selecting 5 (`k=5`), the routed combinations become C(31, 5). The token is processed by these 5 + the 1 shared expert.
-        *   Now, if we add 2 *parameter-free* identity experts to the pool of *selectable* experts (making the pool size 31 routed + 2 identity = 33), and still select 5 (`k=5`), the number of possible combinations for the routed part jumps to C(33, 5). The token is still processed by the selected 5 (which could include identity experts) + the 1 shared expert.
-    *   This combinatorial explosion allows the model to learn much richer functions and specialize pathways more effectively, mitigating potential representational bottlenecks from using fewer, or shared, experts.
-*   **Reference:** [OLMoE talks why it not took Shared Expert](https://arxiv.org/html/2409.02060v1#S4.F6).
+*   **Mechanism:** The expert pool now includes:
+    - **(n-4) MLP Experts:** Standard, parameterized MLPs.
+    - **Identity/Residual Expert:** Passes input unchanged (enables residual/skip routing).
+    - **Zero Expert:** Outputs zeros, implemented as `x * 0` for robust device/dtype/sharding propagation.
+    - **Noise Expert:** Adds Gaussian noise (std=0.5) to input for stochastic routing/regularization.  
+      ⚠️ **Highly experimental**: Not recommended for production or official validation. Intended only for private/ablation testing.
+    - **ReLU² Expert:** Applies `relu(x)^2` nonlinearity.
+    - **Order:** All are selectable by the router; shared expert is always active.
+*   **Dynamic Compute:** The router can select any of these experts per token, including skipping computation (identity/zero) or adding noise for regularization.
+*   **Increased Combinatorics:** These diverse options enable a combinatorial explosion of token pathways, improving specialization and efficiency.
+*   **Device/Distributed Safety:** All experts are implemented to be device/dtype/sharding-agnostic for maximal compatibility.
+*   **References:**
+    *   [OLMoE: Why not Shared Expert?](https://arxiv.org/html/2409.02060v1#S4.F6)
+    *   [MoE++ Residual experts](https://arxiv.org/abs/2410.07348)
+    *   [DeepSeek-V2/V3 MoE scaling rationale](https://kexue.fm/archives/10945#%E6%AF%94%E4%BE%8B%E5%9B%A0%E5%AD%90)
 
-### 3. Convolution-Based Router
+### 3. MoE Configuration and Shared Expert Scaling
+
+*   **Shared Expert Scaling (`moe_shared_scaling`):**
+    - To balance the routed and shared expert outputs, a scaling factor λ is applied to the shared expert output.
+    - If left at the default (`1.0`), λ is automatically estimated at runtime using a statistical simulation (see [DeepSeek-V2/V3, Muon](https://kexue.fm/archives/10945#%E6%AF%94%E4%BE%8B%E5%9B%A0%E5%AD%90)) based on your MoE config (`num_routed_experts`, `num_experts_per_tok`, `num_shared_experts`).
+    - The chosen λ is printed at model init for transparency and can be overridden manually.
+    - This ensures routed/shared outputs have comparable norms, improving training stability and expert utilization.
+*   **Expert Pool Example:**
+    - With `num_routed_experts=16`, you get 12 MLPs, 1 identity, 1 zero, 1 noise, 1 relu² expert (all routed), plus 1 shared convolution expert.
+*   **Robustness:**
+    - All experts propagate device, dtype, and sharding correctly.
+    - Zero expert uses `x * 0` pattern for full compatibility.
+    - Noise expert uses `torch.no_grad` .
+
+### 4. Convolution-Based Router
 
 *   **Goal:** Improve router decisions by incorporating local context, rather than relying solely on the current token's features.
 *   **Mechanism:** Offers an optional causal 1D convolution-based router (`router_type="conv"`). This router uses a kernel (`kernel_size`) to consider a local window of preceding token representations when calculating routing scores. This allows the router to make more informed decisions based on the immediate history.
@@ -37,9 +58,7 @@
 *   **Reference:** Conceptual alignment with ideas discussed in [https://x.com/ZeyuanAllenZhu/status/1918684280001089619](https://x.com/ZeyuanAllenZhu/status/1918684280001089619)
 
 ### 5. Activation-Based Normalization
-
-*   **Goal:** Approximate standard normalization layers (like RMSNorm) with a faster alternative.
-*   **Mechanism:** Replaces traditional normalization with scaled activation functions (`layer_norm_type="dyt"` or `"erf"`). Based on research suggesting normalization layers behave similarly to scaled activations, this approach uses functions like Tanh and Erf to achieve normalization effects. This method is computationally cheaper (~50% faster than RMSNorm) as it avoids calculating variance and can be applied pointwise.
+*   **SCRAPED (Doesn't provide what it claims)**
 *   **References:**
     *   [Tanh proposed](https://arxiv.org/abs/2503.10622)
     *   [Proof of why?](https://arxiv.org/abs/2503.21708) (Theoretical basis)
@@ -60,18 +79,29 @@
 
 
 
-
-TODO: 
-- MLA
-- Better RoPE/NoPE ?? VO-RoPE etc.. ref: https://kexue.fm/archives/10862 
-- MLKV (Multi layer kv/proj and cache sharing) ref: https://t.co/AmoqdyLiod
-- Meta-tokens (giving model some latent tokens and allowing it to learn implicitly in unsupervised manner (meta-learning) )
-- KAN also as a routable expert in FFN ?? 
-- Any other innovation : thing is low compute req. or very high perf. imrpov and compatibilty with current framework
-
-- To be QK-norm or not to be ? (ref: https://arxiv.org/pdf/2501.18795 ; says qk-norm loses long-context but will it scale with ssmax ?? )
+*   [ ] **MLA (Multi-Latent Attention):** Explore attention mechanisms like those in DeepSeek-V2. (Ref: [DeepSeek-V2 Paper](https://arxiv.org/abs/2404.19753))
+*   [ ] **Advanced Positional Embeddings:** Investigate alternatives like VO-RoPE or NoPE. (Ref: [kexue.fm Blog Post](https://kexue.fm/archives/10862))
+*   [ ] **MLKV (Multi-Layer Key/Value Sharing):** Implement sharing of KV projections/caches across layers. (Ref: [Twitter/X Link](https://t.co/AmoqdyLiod))
+*   [ ] **Meta-Tokens:** Experiment with adding latent tokens for unsupervised meta-learning.
+*   [ ] **KAN as Routable Expert:** Consider integrating Kolmogorov-Arnold Networks (KAN) as an option within the MoE FFN layers.
+*   [ ] **Wavelet-like RoPE**
+*   [ ] **QK-Normalization:** Evaluate the trade-offs of QK-Norm, especially its interaction with SSMax for long-context performance. (Ref: [arxiv:2501.18795](https://arxiv.org/pdf/2501.18795))
+*   [ ] **Other Innovations:** Seek low-compute, high-performance improvements compatible with the current framework.
 
 
+
+
+
+### Pretraining-Tips
+
+- Add CoTs with self-correction like ds-r1 in pretrain corpus ; helps model self-correct without RL (ref: https://physics.allen-zhu.com/part-2-grade-school-math/part-2-2)
+- Use more hidden_layers than hidden_dims ; for same param (depth is better than width) (ref: https://physics.allen-zhu.com/part-2-grade-school-math/part-2-1)
+* add intruct tuned data to pretrain (should be diverse and generalizd) (else not so much perf. improvements) (ref: https://physics.allen-zhu.com/part-3-knowledge/part-3-1) 
+* * i.e add qa in pretrain data along with its biography ; results shows it learns from qa then bio and then generalizes on oout of distribution(ood) bio and then ood qa
+* * it implies that in pretrain ; we should teach the model how to use its knowledege ; can't just train on corpus of internet slop ; need structed data ;  i think even comprehension and answering would help. if factual include popular data for more pronounced effect
+* At min can train till int8(tpu go brr)/fp8 ;  (ref: https://physics.allen-zhu.com/part-3-knowledge/part-3-3)
+* Pretrain data quality matters **alot** ; if anyhow can't filter then use some keytags to differentiate text ; i.e use wikipideia.org before starting a text sample  (ref: https://arxiv.org/abs/2404.05405)
+* for data to params ; i thinks its more in the ratio of 32 bits per params and considering tokenizer's avg. compression as 2bits/token then for 7b it would be 112B pure/clean/knowledgeable deta (depends only on full param size on activated ; for moe its kind 0.95% capacity of dense of same total param (but i think that moe should have more capacity due to token's combinatrics of path to follow)  )
 
 
 # Awknokewledhement 

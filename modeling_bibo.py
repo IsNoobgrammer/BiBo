@@ -3,7 +3,7 @@
 PyTorch BiBo model
 Apache 2.0 License
 
-- adi-kmt
+- BiBo authors
 
 """
 
@@ -36,8 +36,8 @@ logger = logging.get_logger(__name__)
 
 # for norm we have 3 type of norm
 # Rms-Norm(arxiv: https://arxiv.org/abs/1910.07467 ),
-# Dynamic-tanh(DyT) (arxiv: https://arxiv.org/abs/2503.10622 ) 
-# Dynamic-Erf (Proposed by us; since our little experiments it to show more closeness to RMS)
+
+
 
 # BiBoRMSNorm adopted from Qwen3RMSNorm
 class BiBoRMSNorm(nn.Module):
@@ -66,65 +66,6 @@ class BiBoRMSNorm(nn.Module):
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-
-
-# BiBoDyTNorm adopted from https://github.com/jiachenzhu/DyT/blob/main/dynamic_tanh.py
-class BiBoDyTNorm(nn.Module):
-    """
-    A PyTorch module implementing a dynamic Tanh activation with learnable scaling (alpha), weight, and bias parameters.
-
-    Args:
-        hidden_size (int): Size of the hidden dimension to normalize.
-        alpha_init_value (float, optional): Initial value for the learnable alpha parameter. Default is 0.69.
-
-    The forward pass applies a scaled Tanh activation followed by an affine transformation.
-    """
-    def __init__(self, hidden_size, alpha_init_value=0.69):
-        super().__init__()
-        self.normalized_shape = hidden_size
-        self.alpha_init_value = alpha_init_value
-        # self.channels_last = channels_last # position of hidden_states ## refer to dyt they dont use bais for llm (llama)
-
-        self.alpha = nn.Parameter(torch.ones(1) * alpha_init_value)
-        self.weight = nn.Parameter(torch.ones(self.normalized_shape))
-        # self.bias = nn.Parameter(torch.zeros(self.normalized_shape))
-
-    def forward(self, x):
-        return self.weight * torch.tanh(self.alpha * x)
-
-    def extra_repr(self):
-        return f"normalized_shape={self.normalized_shape}, alpha_init_value={self.alpha_init_value}, channels_last={self.channels_last}"
-
-
-# proposed better alternative to dyt 
-class BiBoErfNorm(nn.Module):
-    """
-    Applies a parameterized Error Function (erf) element-wise:
-        f(x) = weight * erf(alpha * x)
-    """
-    def __init__(self, hidden_size, alpha_init_value=1.0):
-        """
-        Args:
-            hidden_size (int): The size of the last dimension of the input tensor.
-            alpha_init_value (float): Initial value for the scalar 'alpha' parameter.
-        """
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.alpha_init_value = alpha_init_value
-
-        self.alpha = nn.Parameter(torch.tensor(alpha_init_value))
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        # self.bias = nn.Parameter(torch.zeros(hidden_size)) # Optional bias
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Applies the parameterized erf function."""
-
-        # if hasattr(self, 'bias'):
-        #     output = output + self.bias
-        return self.weight * torch.erf(self.alpha * x)
-
-    def extra_repr(self):
-        return f"hidden_size={self.hidden_size}, alpha_init_value={self.alpha_init_value}"
 
 
 
@@ -232,6 +173,39 @@ class BiBoIdentityExpert(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x
 
+class BiBoReLUExpert(nn.Module):
+    """ReLU^2 Activated Expert"""
+    def __init__(self, config: BiBoConfig, *args, **kwargs): 
+        super().__init__()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.relu(x).square()
+
+class BiBoZeroExpert(nn.Module):
+    """
+    Returns input multiplied by a constant zero tensor (same shape, dtype, device, sharding as input).
+    This ensures all distributed/sharding properties are preserved.
+    """
+    def __init__(self, config: BiBoConfig, *args, **kwargs):
+        super().__init__()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        zero = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        return x * zero
+
+class BiBoNoiseExpert(nn.Module):
+    """
+    Adds Gaussian noise (std=0.5) to input. Noise is generated with torch.no_grad to avoid affecting gradients.
+    """
+    def __init__(self, config: BiBoConfig, std: float = 0.5, *args, **kwargs):
+        super().__init__()
+        self.std = std
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if True: # use while in inference also ; lmao
+            with torch.no_grad():
+                noise = torch.randn_like(x) * self.std
+            return x + noise
+        
+
+
 
 class BiBoCausalConv1D(nn.Module):
     """
@@ -332,6 +306,7 @@ class BiBoMoERouter(nn.Module):
         self.router_type = config.router_type
         self.kernel_size = config.kernel_size
         self.causal_padding = self.kernel_size - 1  # For causal convolution
+        self.router_lambda = getattr(config, 'router_lambda', 1.0)
 
         self.bias = nn.Parameter(torch.zeros(self.num_routed_experts))        
         if self.router_type == "mlp":
@@ -340,6 +315,7 @@ class BiBoMoERouter(nn.Module):
             self.gate_conv = nn.Conv1d(config.hidden_size, self.num_routed_experts, self.kernel_size, padding=0, bias=False)
         else:
             raise ValueError(f"Unknown router type: {self.router_type}. Expected 'mlp' or 'conv'.")
+
 
     def forward(self, hidden_states: torch.Tensor):
         """
@@ -372,15 +348,20 @@ class BiBoMoERouter(nn.Module):
             router_logits = router_logits + noise.detach()  
 
         router_logits = router_logits + self.bias
-        if self.temperature != 1.0:
-            router_logits = router_logits / self.temperature
+        # Paper: z = lambda * (z - mean) / std ref: https://arxiv.org/abs/2406.06563
+        mean = router_logits.mean(dim=1, keepdim=True)
+        std = router_logits.std(dim=1, keepdim=True) + 1e-6
+        router_logits_norm = (router_logits - mean) / std
+        router_logits_scaled = self.router_lambda * router_logits_norm
 
-        routing_weights = F.softmax(router_logits, dim=1)
+        routing_weights = F.softmax(router_logits_scaled, dim=1)
         top_k_weights, top_k_indices = torch.topk(routing_weights, self.top_k, dim=-1)
         norm_weights = top_k_weights / (top_k_weights.sum(dim=-1, keepdim=True) + 1e-6)
         top_k_indices = rearrange(top_k_indices, '(b s) k -> b s k', b=batch_size)
         norm_weights = rearrange(norm_weights, '(b s) k -> b s k', b=batch_size)
         return top_k_indices.long(), norm_weights.to(hidden_states.dtype)
+        # Note: temperature is not applied since scaling is now controlled by router_lambda
+
 
 
 
@@ -414,30 +395,33 @@ class BiBoMoELayer(nn.Module):
         self.num_experts_per_tok = config.num_experts_per_tok
         self.bias_update_factor = config.bias_update_factor 
         self.bias_update_threshold = config.bias_update_threshold
+        self.moe_shared_scaling = getattr(config, 'moe_shared_scaling', 1.0)
 
         # Initialize token counter and accumulated TPE for threshold-based bias updates
         self.register_buffer("tokens_processed", torch.tensor(0, dtype=torch.long))
         self.register_buffer("accumulated_tpe", torch.zeros(config.num_routed_experts, dtype=torch.float))
         
         self.routed_experts = nn.ModuleList()
-        num_mlp_routed = config.num_routed_experts - 1 # - 1 for identity expert 
-                                                       # (we can more likely add min(1,top_k%4) as identity expert to increase combinatrics ) 
-        if num_mlp_routed < 0:
-            raise ValueError("num_routed_experts must be at least 1 (for IdentityExpert)")
-        for _ in range(num_mlp_routed):
-            self.routed_experts.append(BiBoMLP(config,is_expert=True))
+        n = config.num_routed_experts
+        if n < 5:
+            raise ValueError("num_routed_experts must be at least 5 (MLPs + identity + zero + noise + relu)")
+        # (n - 4) MLP experts
+        for _ in range(n - 4):
+            self.routed_experts.append(BiBoMLP(config, is_expert=True))
+        # 1 identity/residual expert
         self.routed_experts.append(BiBoIdentityExpert(config))
-        if len(self.routed_experts) != config.num_routed_experts:
-            raise ValueError(f"Mismatch: Created {len(self.routed_experts)} routed experts, expected {config.num_routed_experts}")
-
+        # 1 zero expert
+        self.routed_experts.append(BiBoZeroExpert(config))
+        # 1 noise expert
+        self.routed_experts.append(BiBoNoiseExpert(config))
+        # 1 relu^2 expert
+        self.routed_experts.append(BiBoReLUExpert(config))
+        if len(self.routed_experts) != n:
+            raise ValueError(f"Mismatch: Created {len(self.routed_experts)} routed experts, expected {n}")
 
         self.shared_experts_list = nn.ModuleList()
-        if config.num_shared_experts is not None and config.num_shared_experts > 0:
-             if config.num_shared_experts != 1:
-                 warnings.warn(f"BiBoMoELayer configured for 1 shared Conv expert, but got num_shared_experts={config.num_shared_experts}. Using 1 Conv expert.", UserWarning)
-             self.shared_experts_list.append(BiBoCausalConv1D(config))
-        elif config.num_shared_experts is None:
-             warnings.warn("num_shared_experts is None, assuming 0 shared experts.", UserWarning)
+        # Always create 1 shared conv expert
+        self.shared_experts_list.append(BiBoCausalConv1D(config))
         self.gate = BiBoMoERouter(config)
 
 
@@ -547,8 +531,8 @@ class BiBoMoELayer(nn.Module):
         shared_combined = torch.zeros_like(hidden_states) 
         if self.shared_experts_list:
             shared_combined = self.shared_experts_list[0](hidden_states)
-        final_output = final_routed + shared_combined
-
+        # Scale shared expert output to balance routed/shared expert norms ref: https://kexue.fm/archives/10945#%E6%AF%94%E4%BE%8B%E5%9B%A0%E5%AD%90
+        final_output = final_routed + (getattr(self, 'moe_shared_scaling', 1.0) * shared_combined)
 
         if tokens_per_expert is not None:
             self.update_bias(tokens_per_expert)
@@ -633,18 +617,11 @@ class BiBoAttention(nn.Module):
             base=config.rope_theta,
         )
 
-        # Norms
-        if config.layer_norm_type == "rms":
-            self.q_norm = BiBoRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.k_norm = BiBoRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        elif config.layer_norm_type == "dyt":
-            self.q_norm = BiBoDyTNorm(self.head_dim)
-            self.k_norm = BiBoDyTNorm(self.head_dim)
-        elif config.layer_norm_type == "erf":
-            self.q_norm = BiBoErfNorm(self.head_dim)
-            self.k_norm = BiBoErfNorm(self.head_dim)
-        else:
-            raise ValueError(f"Unknown layer_norm_type: {config.layer_norm_type}")
+        # Norms - Only RMSNorm is supported
+        if config.layer_norm_type != "rms":
+            raise ValueError("Only 'rms' layer_norm_type is supported. Please set layer_norm_type='rms' in config.")
+        self.q_norm = BiBoRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = BiBoRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
 
     def forward(
@@ -743,7 +720,6 @@ class BiBoAttention(nn.Module):
 
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask

@@ -9,11 +9,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modeling_bibo import (
     BiBoRMSNorm,
-    BiBoDyTNorm,
     BiBoarctanNorm,
     BiBoAlgebraicSigmoid,
-    BiBoSoftSign,
-    BiBoErf
+    BiBoSoftSign
 )
 
 class NormStabilityTester:
@@ -25,11 +23,9 @@ class NormStabilityTester:
         # Initialize all norm layers
         self.norm_layers = {
             "RMSNorm": BiBoRMSNorm(hidden_size),
-            "DyTNorm": BiBoDyTNorm(hidden_size),
             "ArctanNorm": BiBoarctanNorm(hidden_size),
             "AlgebraicSigmoid": BiBoAlgebraicSigmoid(hidden_size),
-            "SoftSign": BiBoSoftSign(hidden_size),
-            "Erf": BiBoErf(hidden_size)
+            "SoftSign": BiBoSoftSign(hidden_size)
         }
     
     def test_extreme_values(self):

@@ -13,11 +13,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modeling_bibo import (
     BiBoRMSNorm,
-    BiBoDyTNorm,
     BiBoarctanNorm,
     BiBoAlgebraicSigmoid,
-    BiBoSoftSign,
-    BiBoErf
+    BiBoSoftSign
 )
 
 class NormProfiler:
@@ -56,11 +54,9 @@ class NormProfiler:
         """Initialize all norm layers with the given hidden size"""
         return {
             "RMSNorm": BiBoRMSNorm(hidden_size),
-            "DyTNorm": BiBoDyTNorm(hidden_size),
             "ArctanNorm": BiBoarctanNorm(hidden_size),
             "AlgebraicSigmoid": BiBoAlgebraicSigmoid(hidden_size),
-            "SoftSign": BiBoSoftSign(hidden_size),
-            "Erf": BiBoErf(hidden_size)
+            "SoftSign": BiBoSoftSign(hidden_size)
         }
     
     def _generate_random_input(self, batch_size, seq_len, hidden_size, seed, magnitude=1.0):
@@ -76,7 +72,7 @@ class NormProfiler:
         print("\nProfiling execution time extensively...")
         
         # Initialize detailed timing results
-        for layer_name in ["RMSNorm", "DyTNorm", "ArctanNorm", "AlgebraicSigmoid", "SoftSign", "Erf"]:
+        for layer_name in ["RMSNorm", "ArctanNorm", "AlgebraicSigmoid", "SoftSign"]:
             self.detailed_timing[layer_name] = []
         
         # Test across all combinations of sizes
@@ -184,7 +180,7 @@ class NormProfiler:
         operation_times["RMSNorm_multiply"] = (end_time - start_time) / runs * 1000
         
         # Profile activation-based norms
-        for name in ["DyTNorm", "ArctanNorm", "AlgebraicSigmoid", "SoftSign", "Erf"]:
+        for name in ["ArctanNorm", "AlgebraicSigmoid", "SoftSign"]:
             layer = norm_layers[name]
             
             # Measure alpha scaling
@@ -197,12 +193,7 @@ class NormProfiler:
             # Measure activation function
             scaled_input = layer.alpha * input_tensor
             
-            if name == "DyTNorm":
-                start_time = time.time()
-                for _ in range(runs):
-                    _ = torch.tanh(scaled_input)
-                end_time = time.time()
-            elif name == "ArctanNorm":
+            if name == "ArctanNorm":
                 start_time = time.time()
                 for _ in range(runs):
                     _ = torch.arctan(scaled_input)
@@ -217,25 +208,16 @@ class NormProfiler:
                 for _ in range(runs):
                     _ = scaled_input / (1.0 + torch.abs(scaled_input))
                 end_time = time.time()
-            elif name == "Erf":
-                start_time = time.time()
-                for _ in range(runs):
-                    _ = torch.erf(scaled_input)
-                end_time = time.time()
             
             operation_times[f"{name}_activation"] = (end_time - start_time) / runs * 1000
             
             # Measure weight multiplication
-            if name == "DyTNorm":
-                activated = torch.tanh(scaled_input)
-            elif name == "ArctanNorm":
+            if name == "ArctanNorm":
                 activated = torch.arctan(scaled_input)
             elif name == "AlgebraicSigmoid":
                 activated = scaled_input / torch.sqrt(1.0 + scaled_input**2 + 1e-6)
             elif name == "SoftSign":
                 activated = scaled_input / (1.0 + torch.abs(scaled_input))
-            elif name == "Erf":
-                activated = torch.erf(scaled_input)
                 
             start_time = time.time()
             for _ in range(runs):

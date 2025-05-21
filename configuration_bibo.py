@@ -33,7 +33,7 @@ class BiBoConfig(PretrainedConfig):
         max_position_embeddings=32768,
         initializer_range=0.02,
         rms_norm_eps=1e-5,
-        layer_norm_type="rms", # options are "dyt","rms","erf"
+        layer_norm_type="rms", # options are "rms" (RMS Normalization)
         use_cache=True,
         use_ssmax=True, # scaling softmax to longer seq by scaling attn_weights 
         pad_token_id=None,
@@ -50,16 +50,19 @@ class BiBoConfig(PretrainedConfig):
         mlp_only_layers=None,
         decoder_sparse_step=1,
         moe_intermediate_size=512,
-        num_routed_experts=8,
+        num_routed_experts=16,
         num_shared_experts=1,
-        num_experts_per_tok=2,
+        num_experts_per_tok=6,
         num_experts=None,
-        router_temperature=1.3,
+        router_temperature=1.3, # no need for temp. explicitly ; now its calculated implicitly based on logits.
         bias_update_factor=1e-2,
         bias_update_threshold=100_000, # amount of tokens(bs*seq) to update bias 
         router_noise=0.5,
         router_type="mlp", # mlp or conv
         kernel_size=3,
+        router_lambda=1.0, # Scaling for router logits before softmax (see Skywork-MoE paper, eq. 6)
+        moe_shared_scaling=1.0, # Scaling for shared expert output in MoE block (see DeepSeek-V2/V3, Muon)
+
         norm_topk_prob=False,
         output_router_logits=False,
         **kwargs,
@@ -104,12 +107,48 @@ class BiBoConfig(PretrainedConfig):
         self.kernel_size = kernel_size
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
+        self.router_lambda = router_lambda
+
+        # --- Auto-estimate scaling factor for shared expert if left as 1.0 ---
+        self.moe_shared_scaling = moe_shared_scaling
+        if moe_shared_scaling == 1.0:
+            try:
+                import numpy as np
+                def sigmoid(x):
+                    return 1 / (1 + np.exp(-x))
+                def softmax(x):
+                    p = np.exp(x)
+                    return p / p.sum()
+                n = self.num_routed_experts
+                k = self.num_experts_per_tok
+                s = getattr(self, 'num_shared_experts', 1) or 1
+                act = 'softmax' # TODO: expose as config if needed
+                renorm = False  # TODO: expose as config if needed
+                factors = []
+                for _ in range(10000):
+                    logits = np.random.randn(n - s)
+                    p = np.sort(eval(act)(logits))[::-1][:k - s]
+                    if renorm:
+                        p /= p.sum()
+                    factors.append(s**0.5 / (np.sum(p**2)**0.5))
+                approx_lambda = float(np.mean(factors))
+                approx_lambda_rounded = round(approx_lambda, 2)
+                self.moe_shared_scaling = approx_lambda_rounded
+                print(f"[BiBoConfig] Auto-set moe_shared_scaling to {approx_lambda_rounded:.2f} for routable experts={n}, top_k={k}, shared_expert={s}")
+            except Exception as e:
+                print(f"[BiBoConfig] Could not auto-set moe_shared_scaling: {e}")
+        if self.rope_scaling is None:
+            self.rope_scaling = {"type": "linear", "factor": 1.0}
+        self.rope_scaling = rope_config_validation(self.rope_scaling)
+        
+        # Validate layer_norm_type
+        if self.layer_norm_type != "rms":
+            raise ValueError(f"Only 'rms' layer_norm_type is supported. Got: {self.layer_norm_type}")
+            
         if mlp_only_layers is None:
             self.mlp_only_layers = [0, num_hidden_layers - 1]
         else:
             self.mlp_only_layers = mlp_only_layers
-
-        
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -136,8 +175,8 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError("rms_norm_eps must be positive")
         if self.initializer_range <= 0.0:
             raise ValueError("initializer_range must be positive")
-        if self.layer_norm_type not in ("rms", "dyt", "erf"):
-            raise ValueError(f"rms_norm_type must be one of 'rms', 'dyt', or 'erf', got '{self.layer_norm_type}'")
+        if self.layer_norm_type != "rms":
+            raise ValueError(f"Only 'rms' layer_norm_type is supported. Got: '{self.layer_norm_type}'")
         if self.sliding_window is not None and self.sliding_window <= 0:
             raise ValueError("sliding_window must be positive if specified")
         if self.moe_intermediate_size <= 0:
