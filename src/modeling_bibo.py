@@ -605,6 +605,11 @@ class BiBoAttention(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.layer_idx = layer_idx
         self.use_ssmax=config.use_ssmax
+        self.attention_type = getattr(config, "attention_type", "softmax")
+        if self.attention_type == "sliding_window":
+            use_sliding_window = True
+        self.linear_attention_feature_map = getattr(config, "linear_attention_feature_map", "elu")
+        self.linear_attention_eps = getattr(config, "linear_attention_eps", 1e-6)
         # self.num_layer_kv_sharing = config.num_layer_kv_sharing
 
 
@@ -631,6 +636,12 @@ class BiBoAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        if self.attention_type in {"gdn", "kda"}:
+            self.delta_beta_proj = nn.Linear(self.hidden_size, self.num_heads, bias=True)
+        if self.attention_type == "gdn":
+            self.delta_gate_proj = nn.Linear(self.hidden_size, self.num_heads, bias=True)
+        elif self.attention_type == "kda":
+            self.delta_gate_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=True)
 
         # rope
         self.rotary_emb = BiBoRotaryEmbedding(
@@ -667,7 +678,8 @@ class BiBoAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_value is not None:
+        recurrent_attention_types = {"linear", "gdn", "kda"}
+        if past_key_value is not None and self.attention_type not in recurrent_attention_types:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
@@ -677,7 +689,15 @@ class BiBoAttention(nn.Module):
         
         batch_size, num_heads, q_len, head_dim = query_states.shape
         
-        if self.sliding_window is not None and False:
+        if self.attention_type in {"linear", "gdn", "kda"}:
+            attn_output = self.eager_recurrent_attention(
+                hidden_states,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+            )
+        elif self.sliding_window is not None:
             stride = getattr(self.config, 'sliding_window_stride', None)
             attn_output = self.eager_sliding_window_attention(
                 query_states, 
@@ -701,9 +721,137 @@ class BiBoAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
         
         return attn_output, None, past_key_value
+
+    def _apply_ssmax_query_scaling(self, query_states: torch.Tensor, kv_len: int) -> torch.Tensor:
+        if not self.use_ssmax:
+            return query_states
+        log_n = torch.log(
+            torch.clamp(
+                torch.tensor(kv_len, device=query_states.device, dtype=self.ssmax_scale.dtype),
+                min=2.0,
+            )
+        )
+        return query_states * self.ssmax_scale * log_n
     
-    def eager_sliding_window_attention(self):
-        pass
+    def eager_sliding_window_attention(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        sliding_window: int,
+        stride: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Compute causal sliding-window attention in eager PyTorch.
+
+        The attention mask supplied by the model still applies. This method adds
+        a local causal window over the key axis, allowing each query to see at
+        most ``sliding_window`` recent keys.
+        """
+        del stride  # Reserved for future strided-window experiments.
+
+        kv_len = key_states.shape[-2]
+        q_len = query_states.shape[-2]
+        query_states = self._apply_ssmax_query_scaling(query_states, kv_len)
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        query_positions = torch.arange(kv_len - q_len, kv_len, device=query_states.device)
+        key_positions = torch.arange(kv_len, device=query_states.device)
+        window_mask = key_positions.unsqueeze(0) < (query_positions.unsqueeze(1) - sliding_window + 1)
+        attn_weights = attn_weights.masked_fill(window_mask.view(1, 1, q_len, kv_len), torch.finfo(attn_weights.dtype).min)
+
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, :kv_len]
+            attn_weights = attn_weights + causal_mask
+
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        return torch.matmul(attn_weights, value_states)
+
+    def _linear_feature_map(self, states: torch.Tensor) -> torch.Tensor:
+        if self.linear_attention_feature_map == "relu":
+            return F.relu(states) + self.linear_attention_eps
+        return F.elu(states) + 1.0 + self.linear_attention_eps
+
+    def _source_token_mask(
+        self,
+        attention_mask: Optional[torch.Tensor],
+        batch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if attention_mask is None:
+            return None
+        mask_slice = attention_mask[:, :, -1, :seq_len]
+        min_value = torch.finfo(mask_slice.dtype).min
+        source_mask = (mask_slice > min_value / 2).to(dtype)
+        return source_mask.view(batch_size, 1, seq_len, 1)
+
+    def eager_recurrent_attention(
+        self,
+        hidden_states: torch.Tensor,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Reference recurrent attention family used for linear/GDN/KDA experiments.
+
+        Shapes use the same head layout as softmax attention:
+            query/key/value: (batch, heads, seq, head_dim)
+            recurrent state: (batch, heads, key_dim, value_dim)
+        """
+        batch_size, num_heads, seq_len, _ = query_states.shape
+        q = self._linear_feature_map(query_states)
+        k = self._linear_feature_map(key_states)
+        v = value_states
+
+        token_mask = self._source_token_mask(attention_mask, batch_size, seq_len, q.dtype)
+        if token_mask is not None:
+            k = k * token_mask
+            v = v * token_mask
+
+        if self.attention_type == "linear":
+            kv_state = torch.cumsum(
+                torch.einsum("bhtd,bhte->bhtde", k, v.to(k.dtype)),
+                dim=2,
+            )
+            k_state = torch.cumsum(k, dim=2)
+            numerator = torch.einsum("bhtd,bhtde->bhte", q, kv_state)
+            denominator = torch.einsum("bhtd,bhtd->bht", q, k_state).unsqueeze(-1)
+            return (numerator / denominator.clamp_min(self.linear_attention_eps)).to(value_states.dtype)
+
+        beta = torch.sigmoid(self.delta_beta_proj(hidden_states))
+        beta = rearrange(beta, "b t h -> b h t")
+
+        if self.attention_type == "kda":
+            gate = torch.sigmoid(self.delta_gate_proj(hidden_states))
+            gate = rearrange(gate, "b t (h d) -> b h t d", h=num_heads)
+        else:
+            gate = torch.sigmoid(self.delta_gate_proj(hidden_states))
+            gate = rearrange(gate, "b t h -> b h t")
+
+        state = query_states.new_zeros(batch_size, num_heads, self.head_dim, self.head_dim)
+        outputs = []
+        for idx in range(seq_len):
+            k_t = k[:, :, idx, :]
+            v_t = v[:, :, idx, :]
+            q_t = q[:, :, idx, :]
+
+            if self.attention_type == "kda":
+                state = state * gate[:, :, idx, :].unsqueeze(-1)
+            else:
+                state = state * gate[:, :, idx].unsqueeze(-1).unsqueeze(-1)
+
+            old_v = torch.einsum("bhd,bhde->bhe", k_t, state)
+            error = v_t - old_v
+            delta = torch.einsum("bhd,bhe->bhde", k_t, error)
+            state = state + beta[:, :, idx].unsqueeze(-1).unsqueeze(-1) * delta
+            outputs.append(torch.einsum("bhd,bhde->bhe", q_t, state))
+
+        return torch.stack(outputs, dim=2).to(value_states.dtype)
     
     
     def eager_standard_attention(
@@ -730,9 +878,7 @@ class BiBoAttention(nn.Module):
 
         kv_len = key_states.shape[-2]
         if self.use_ssmax:
-            log_n = torch.log(torch.clamp(torch.tensor(kv_len, device=query_states.device, dtype=self.ssmax_scale.dtype), min=2.0))
-            # min=2.0 since log(1) = 0 and negative for <1
-            query_states = query_states * self.ssmax_scale * log_n
+            query_states = self._apply_ssmax_query_scaling(query_states, kv_len)
             
             # Standard Softmax Ratio: exp(z_i) / exp(z_k) = exp(z_i - z_k)
             # SSMax Ratio: exp(C * z_i) / exp(C * z_k) = exp(C * z_i - C * z_k) = exp(C * (z_i - z_k)) = (exp(z_i - z_k))^C
