@@ -43,6 +43,9 @@ class BiBoConfig(PretrainedConfig):
         rope_theta=10000.0,
         rope_scaling=None,
         attention_dropout=0.0,
+        attention_type="softmax",
+        linear_attention_feature_map="elu",
+        linear_attention_eps=1e-6,
         use_sliding_window=True,
         sliding_window=512,
         max_window_layers=None,
@@ -89,6 +92,9 @@ class BiBoConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
         self.attention_dropout = attention_dropout
+        self.attention_type = attention_type
+        self.linear_attention_feature_map = linear_attention_feature_map
+        self.linear_attention_eps = linear_attention_eps
         self.use_sliding_window = use_sliding_window
         self.sliding_window = sliding_window
         self.max_window_layers = max_window_layers if max_window_layers is not None else num_hidden_layers
@@ -171,6 +177,14 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError("vocab_size must be positive")
         if self.attention_dropout < 0.0 or self.attention_dropout > 1.0:
             raise ValueError("attention_dropout must be between 0.0 and 1.0")
+        if self.attention_type not in {"softmax", "sliding_window", "linear", "gdn", "kda"}:
+            raise ValueError(
+                "attention_type must be one of: 'softmax', 'sliding_window', 'linear', 'gdn', 'kda'"
+            )
+        if self.linear_attention_feature_map not in {"elu", "relu"}:
+            raise ValueError("linear_attention_feature_map must be one of: 'elu', 'relu'")
+        if self.linear_attention_eps <= 0.0:
+            raise ValueError("linear_attention_eps must be positive")
         if self.rms_norm_eps <= 0.0:
             raise ValueError("rms_norm_eps must be positive")
         if self.initializer_range <= 0.0:
