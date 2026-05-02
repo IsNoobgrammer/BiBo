@@ -11,10 +11,10 @@ reviews:
     enabled: true
     
   # Review profile - controls depth and focus
-  profile: chill # Options: chill, assertive, or custom
+  profile: assertive # Changed to assertive for stricter ML/research code review
   
   # Request changes workflow
-  request_changes_workflow: false
+  request_changes_workflow: true  # Enable to block merges on critical issues
   
   # High level summary
   high_level_summary: true
@@ -30,14 +30,17 @@ reviews:
   
   # Path filters - focus on important files
   path_filters:
-    - "!**/*.md"  # Skip markdown files
+    - "!**/*.md"  # Skip markdown files (except CODERABBIT_SETUP.md)
     - "!**/logs/**"  # Skip log files
     - "!**/__pycache__/**"  # Skip Python cache
-    - "!**/legacy/**"  # Skip legacy code
+    - "!**/legacy/**"  # Skip legacy code (archived experiments)
+    - "!**/*.log"  # Skip log files
+    - "!**/.git/**"  # Skip git internals
+    - "!**/events.out.tfevents.*"  # Skip TensorBoard logs
   
   # Auto-approve settings
   auto_approve:
-    enabled: false  # Set to true if you want auto-approval for certain conditions
+    enabled: false  # Manual review required for research code
     
 # Chat settings
 chat:
@@ -63,26 +66,123 @@ tools:
 
 # Knowledge base - help CodeRabbit understand your project
 knowledge_base:
-  - "This is a PyTorch-based MoE (Mixture of Experts) transformer model"
-  - "The project implements BiBo architecture with multiple attention mechanisms"
-  - "Key components: BiBoAttention, BiBoConfig, MoE layers"
-  - "Attention types supported: softmax, sliding_window, linear, gdn, kda"
-  - "Uses einops for tensor operations"
-  - "Testing framework: pytest"
+  # === Project Overview ===
+  - "BiBo: A PyTorch-based Mixture of Experts (MoE) transformer model for research"
+  - "Goal: Compare BiBo hypothesis against Qwen3/Qwen3MoE baselines"
+  - "Target hardware: TPU v5e-8 (Kaggle), RTX 3050 Laptop (local)"
+  - "Framework: PyTorch with torch-xla for TPU compilation"
+  
+  # === Architecture Components ===
+  - "BiBoConfig: Configuration class with feature toggles for all experimental features"
+  - "BiBoAttention: Multi-head attention with GQA, MLKV sharing, and multiple attention variants"
+  - "BiBoMoELayer: MoE layer with routed experts (MLP/Identity/Zero/Noise/ReLU) + shared Conv expert"
+  - "BiBoMoERouter: Router with MLP or Conv-based routing, learnable bias, and heuristic load balancing"
+  - "Attention types: softmax (standard), sliding_window, linear, gdn (Gated Delta Network), kda (Key-Delta Attention)"
+  
+  # === Baseline Models ===
+  - "baseline/qwen3: Standard dense transformer (Qwen3 architecture)"
+  - "baseline/qwen3moe: Sparse MoE transformer (Qwen3MoE architecture)"
+  - "Baselines are reference implementations for comparison"
+  
+  # === Key Features & Toggles ===
+  - "CRITICAL: Every new feature MUST have a config toggle (e.g., use_ssmax, use_sliding_window, attention_type)"
+  - "use_ssmax: Scaled Softmax for longer sequences (learnable per-head scaling)"
+  - "attention_type: Toggle between softmax/sliding_window/linear/gdn/kda"
+  - "router_type: Toggle between mlp/conv routing"
+  - "num_routed_experts: Number of routable experts (includes MLP + special experts)"
+  - "num_shared_experts: Number of shared experts (typically 1 Conv expert)"
+  - "moe_shared_scaling: Auto-computed scaling factor for shared expert output"
+  
+  # === Compilation & XLA Requirements ===
+  - "Code must be torch.compile() compatible (avoid Python control flow in forward passes)"
+  - "Code must be torch-xla compatible for TPU execution"
+  - "Avoid dynamic shapes where possible (use static shapes or padding)"
+  - "Use torch.jit.script annotations for complex operations if needed"
+  - "Prefer torch operations over numpy/Python loops in forward passes"
+  
+  # === Testing & Validation ===
+  - "tests/: Comprehensive test suite with pytest"
+  - "tests/conftest.py: Transformers stub for dependency-free testing"
+  - "tests/test_attention_variants.py: Tests for all attention mechanisms"
+  - "All attention variants must pass: finite outputs, gradients, causality, shape contracts"
+  
+  # === Code Quality Standards ===
+  - "Use einops for readable tensor operations (rearrange, repeat, reduce)"
+  - "RMSNorm only (no LayerNorm) - enforced in config validation"
+  - "Type hints required for all function signatures"
+  - "Docstrings required for all classes and non-trivial functions"
+  - "Config validation in __init__ to catch errors early"
 
 # Early access features
 early_access: true
 
 # Tone of reviews
 tone_instructions: |
-  - Be constructive and helpful
-  - Focus on correctness, performance, and best practices
-  - Highlight potential bugs and security issues
-  - Suggest improvements for code clarity
-  - Be specific with examples when suggesting changes
-  - For ML/PyTorch code, pay attention to:
-    * Tensor shape mismatches
-    * Gradient flow issues
-    * Memory efficiency
-    * Numerical stability
-    * Device placement (CPU/GPU/TPU)
+  You are reviewing ML research code for a PyTorch MoE transformer targeting TPU compilation.
+  
+  **Critical Review Areas:**
+  
+  1. **Feature Toggles (MANDATORY)**:
+     - Every new feature MUST have a config parameter with a default value
+     - Config parameter MUST be validated in BiBoConfig.__init__
+     - Feature MUST be conditionally enabled based on config flag
+     - Example: if adding "use_flash_attention", add config param, validation, and conditional logic
+  
+  2. **Compilation Compatibility**:
+     - Flag any Python control flow in forward() methods (if/for/while on non-tensor conditions)
+     - Flag dynamic tensor shapes (use .size() instead of .shape where possible)
+     - Flag numpy operations in forward passes (use torch equivalents)
+     - Flag in-place operations that break autograd (use functional equivalents)
+     - Suggest torch.jit.script or static shapes for complex operations
+  
+  3. **Tensor Operations**:
+     - Verify tensor shape comments match actual shapes
+     - Check for shape mismatches in matmul/einsum operations
+     - Verify broadcasting behavior is intentional
+     - Check device placement (all tensors on same device)
+     - Flag unnecessary .to() or .cuda() calls (use device-agnostic code)
+  
+  4. **Numerical Stability**:
+     - Check for division by zero (use clamp_min or add epsilon)
+     - Check for log(0) or sqrt(negative) (add epsilon or clamp)
+     - Verify softmax is computed in float32 then cast back
+     - Check for overflow in exp() operations (use log-sum-exp trick)
+  
+  5. **Memory Efficiency**:
+     - Flag unnecessary tensor copies (.clone() without reason)
+     - Flag large intermediate tensors that could be computed in-place
+     - Check for gradient checkpointing opportunities in long sequences
+     - Verify attention masks are not materialized unnecessarily
+  
+  6. **Gradient Flow**:
+     - Flag .detach() calls that might break gradients unintentionally
+     - Check for operations that don't propagate gradients (e.g., .item(), .numpy())
+     - Verify torch.no_grad() is only used for inference/bias updates
+  
+  7. **Baseline Compatibility**:
+     - Changes to src/ should not break baseline/ reference implementations
+     - Baseline models (Qwen3, Qwen3MoE) are read-only references
+     - New features should be BiBo-specific, not backported to baselines
+  
+  8. **Testing Requirements**:
+     - New attention mechanisms MUST have tests in test_attention_variants.py
+     - Tests MUST verify: finite outputs, finite gradients, causality, shape contracts
+     - New config parameters MUST have validation tests
+     - MoE routing changes MUST have load balancing tests
+  
+  9. **Documentation**:
+     - Config parameters MUST be documented in BiBoConfig docstring
+     - Complex operations MUST have shape comments (e.g., # [batch, heads, seq, dim])
+     - Non-obvious design decisions MUST have inline comments explaining "why"
+  
+  10. **Performance**:
+      - Flag O(n²) operations that could be O(n) with cumsum/scan
+      - Suggest einsum over multiple matmuls for clarity and speed
+      - Check for redundant computations (e.g., computing same value in loop)
+  
+  **Review Style**:
+  - Be direct and specific with examples
+  - Cite line numbers and suggest exact fixes
+  - Explain "why" for non-obvious issues
+  - Prioritize correctness > performance > style
+  - For research code, explain tradeoffs rather than demanding changes
