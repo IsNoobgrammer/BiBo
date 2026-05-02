@@ -1,0 +1,88 @@
+# CodeRabbit Configuration for BiBo Repository
+# Documentation: https://docs.coderabbit.ai/guides/configure-coderabbit
+
+# Language settings
+language: en-US
+
+# Review settings
+reviews:
+  # Enable automatic reviews on PR creation
+  auto_review:
+    enabled: true
+    
+  # Review profile - controls depth and focus
+  profile: chill # Options: chill, assertive, or custom
+  
+  # Request changes workflow
+  request_changes_workflow: false
+  
+  # High level summary
+  high_level_summary: true
+  
+  # Poem in review (fun feature)
+  poem: true
+  
+  # Review status
+  review_status: true
+  
+  # Collapse walkthrough
+  collapse_walkthrough: false
+  
+  # Path filters - focus on important files
+  path_filters:
+    - "!**/*.md"  # Skip markdown files
+    - "!**/logs/**"  # Skip log files
+    - "!**/__pycache__/**"  # Skip Python cache
+    - "!**/legacy/**"  # Skip legacy code
+  
+  # Auto-approve settings
+  auto_approve:
+    enabled: false  # Set to true if you want auto-approval for certain conditions
+    
+# Chat settings
+chat:
+  auto_reply: true
+
+# Tools to enable
+tools:
+  # Static analysis
+  ruff:
+    enabled: true  # Python linter (faster than flake8)
+  
+  # Security scanning
+  bandit:
+    enabled: true  # Python security linter
+  
+  # Type checking
+  mypy:
+    enabled: true  # Python type checker
+    
+  # Complexity analysis
+  mccabe:
+    enabled: true
+
+# Knowledge base - help CodeRabbit understand your project
+knowledge_base:
+  - "This is a PyTorch-based MoE (Mixture of Experts) transformer model"
+  - "The project implements BiBo architecture with multiple attention mechanisms"
+  - "Key components: BiBoAttention, BiBoConfig, MoE layers"
+  - "Attention types supported: softmax, sliding_window, linear, gdn, kda"
+  - "Uses einops for tensor operations"
+  - "Testing framework: pytest"
+
+# Early access features
+early_access: true
+
+# Tone of reviews
+tone_instructions: |
+  - Be constructive and helpful
+  - Focus on correctness, performance, and best practices
+  - Highlight potential bugs and security issues
+  - Suggest improvements for code clarity
+  - Be specific with examples when suggesting changes
+  - For ML/PyTorch code, pay attention to:
+    * Tensor shape mismatches
+    * Gradient flow issues
+    * Memory efficiency
+    * Numerical stability
+    * Device placement (CPU/GPU/TPU)
