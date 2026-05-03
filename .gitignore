@@ -7,4 +7,5 @@ logs/
 !logs/router_ablation/
 bugs/
 venv/
+wandb/
 shaurya_notes.txt
