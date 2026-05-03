@@ -251,7 +251,7 @@ BiBoForCausalLM
 ```bibtex
 @software{bibo2025,
   title={BiBo: Modular MoE Transformer},
-  author={Shaurya Rohatgi},
+  author={Shaurya Sharthak and SedGram and adi-kmt},
   year={2025},
   url={https://github.com/IsNoobgrammer/BiBo}
 }
