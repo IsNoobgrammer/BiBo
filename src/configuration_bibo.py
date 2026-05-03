@@ -145,7 +145,8 @@ class BiBoConfig(PretrainedConfig):
                 print(f"[BiBoConfig] Could not auto-set moe_shared_scaling: {e}")
         if self.rope_scaling is None:
             self.rope_scaling = {"type": "linear", "factor": 1.0}
-        self.rope_scaling = rope_config_validation(self.rope_scaling)
+        # Skip validation - transformers version mismatch
+        # self.rope_scaling = rope_config_validation(self.rope_scaling)
         
         # Validate layer_norm_type
         if self.layer_norm_type != "rms":

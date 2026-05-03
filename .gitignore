@@ -4,3 +4,5 @@ __pycache__/
 .aim/
 .kiro/
 logs/
+bugs/
+venv/

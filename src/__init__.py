@@ -1,25 +1,22 @@
-"""
-BiBo: Biased Bounded MoE Language Model
-
-A compact, efficient MoE architecture with:
-- Multi-layer KV sharing for reduced memory
-- Adaptive router with bias-based load balancing
-- Diverse expert types (MLP, Conv, Identity, Noise, ReLU, Zero)
-- Scaling Softmax (SSMax) for long-context attention
-"""
-
+"""BiBo model package"""
 from .configuration_bibo import BiBoConfig
-from .modeling_bibo import (
+from .modeling import (
+    BiBoPreTrainedModel,
     BiBoModel,
     BiBoForCausalLM,
-    BiBoPreTrainedModel,
+    BiBoAttention,
+    BiBoMLP,
+    BiBoMoELayer,
+    BiBoRMSNorm,
 )
 
-__version__ = "0.1.0"
-
 __all__ = [
-    "BiBoConfig",
-    "BiBoModel",
-    "BiBoForCausalLM",
-    "BiBoPreTrainedModel",
+    'BiBoConfig',
+    'BiBoPreTrainedModel',
+    'BiBoModel',
+    'BiBoForCausalLM',
+    'BiBoAttention',
+    'BiBoMLP',
+    'BiBoMoELayer',
+    'BiBoRMSNorm',
 ]
