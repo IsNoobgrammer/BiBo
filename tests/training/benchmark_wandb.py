@@ -229,9 +229,9 @@ def main():
     save_dir.mkdir(parents=True, exist_ok=True)
     
     # Hyperparameters
-    num_steps = 500
+    num_steps = 600
     batch_size = 8
-    lr = 3e-2  # High LR
+    lr = 5e-3  # High LR
     warmup_steps = 50
     weight_decay = 0.01
     use_compile = False  # torch.compile disabled
