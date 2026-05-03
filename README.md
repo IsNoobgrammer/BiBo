@@ -36,7 +36,7 @@
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/BiBo.git
+git clone https://github.com/IsNoobgrammer/BiBo.git
 cd BiBo
 pip install -r requirements.txt
 ```
