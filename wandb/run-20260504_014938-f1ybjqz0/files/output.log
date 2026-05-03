@@ -1,0 +1,61 @@
+
+✓ wandb initialized: https://wandb.ai/ablations-tinycompany-ai/bibo-benchmark/runs/f1ybjqz0
+
+================================================================================
+BENCHMARKING BIBO
+================================================================================
+
+======================================================================
+Benchmarking BiBo
+======================================================================
+  Optimizer: AdamW (lr=0.0003, wd=0.01, betas=(0.9, 0.95))
+  Scheduler: Cosine with warmup (20 steps)
+  Total steps: 200
+======================================================================
+[transformers] `use_return_dict` is deprecated! Use `return_dict` instead!
+
+  Step  10: loss=8.6043, lr=1.50e-04, fwd=843ms, bwd=2128ms
+  Step  20: loss=8.5578, lr=3.00e-04, fwd=2061ms, bwd=3666ms
+  Step  30: loss=8.5308, lr=2.98e-04, fwd=1383ms, bwd=2335ms
+  Step  40: loss=8.4622, lr=2.91e-04, fwd=1595ms, bwd=3334ms
+  Step  50: loss=8.4810, lr=2.80e-04, fwd=1382ms, bwd=3634ms
+  Step  60: loss=8.3557, lr=2.65e-04, fwd=841ms, bwd=2381ms
+  Step  70: loss=7.8407, lr=2.46e-04, fwd=1632ms, bwd=3305ms
+  Step  80: loss=7.7960, lr=2.25e-04, fwd=952ms, bwd=2162ms
+  Step  90: loss=7.7859, lr=2.01e-04, fwd=802ms, bwd=2155ms
+  Step 100: loss=7.6591, lr=1.76e-04, fwd=1686ms, bwd=3475ms
+  Step 110: loss=7.6290, lr=1.50e-04, fwd=931ms, bwd=2592ms
+  Step 120: loss=7.7189, lr=1.24e-04, fwd=1758ms, bwd=3936ms
+  Step 130: loss=6.9212, lr=9.87e-05, fwd=1012ms, bwd=2535ms
+  Step 140: loss=7.1729, lr=7.50e-05, fwd=1045ms, bwd=2257ms
+  Step 150: loss=6.9207, lr=5.36e-05, fwd=1657ms, bwd=3208ms
+  Step 160: loss=6.8617, lr=3.51e-05, fwd=1211ms, bwd=3198ms
+  Step 170: loss=7.0221, lr=3.00e-05, fwd=1265ms, bwd=2719ms
+  Step 180: loss=6.9080, lr=3.00e-05, fwd=1196ms, bwd=2810ms
+  Step 190: loss=6.4439, lr=3.00e-05, fwd=1723ms, bwd=2504ms
+  Step 200: loss=6.4432, lr=3.00e-05, fwd=1195ms, bwd=2462ms
+
+================================================================================
+BENCHMARKING QWEN3MOE
+================================================================================
+
+======================================================================
+Benchmarking Qwen3MoE
+======================================================================
+  Optimizer: AdamW (lr=0.0003, wd=0.01, betas=(0.9, 0.95))
+  Scheduler: Cosine with warmup (20 steps)
+  Total steps: 200
+======================================================================
+
+  Step  10: loss=8.6047, lr=1.50e-04, fwd=881ms, bwd=2619ms
+  Step  20: loss=8.5171, lr=3.00e-04, fwd=1555ms, bwd=3998ms
+  Step  30: loss=8.4503, lr=2.98e-04, fwd=1887ms, bwd=5424ms
+  Step  40: loss=8.5000, lr=2.91e-04, fwd=1383ms, bwd=4100ms
+  Step  50: loss=8.4241, lr=2.80e-04, fwd=664ms, bwd=1841ms
+  Step  60: loss=8.4782, lr=2.65e-04, fwd=501ms, bwd=1623ms
+  Step  70: loss=8.2449, lr=2.46e-04, fwd=1042ms, bwd=2755ms
+  Step  80: loss=8.3284, lr=2.25e-04, fwd=904ms, bwd=2580ms
+  Step  90: loss=8.1640, lr=2.01e-04, fwd=1109ms, bwd=2862ms
+  Step 100: loss=8.1626, lr=1.76e-04, fwd=660ms, bwd=2266ms
+  Step 110: loss=8.1165, lr=1.50e-04, fwd=715ms, bwd=2229ms
+  Step 120: loss=8.2167, lr=1.24e-04, fwd=654ms, bwd=2315ms

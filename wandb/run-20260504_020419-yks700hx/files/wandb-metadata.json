@@ -1,0 +1,28 @@
+{
+  "os":  "Windows-11-10.0.26200-SP0",
+  "python":  "CPython 3.12.5",
+  "startedAt":  "2026-05-03T20:34:19.286162Z",
+  "program":  "C:\\Users\\shaur\\OneDrive\\Documents\\BiBo\\tests\\training\\benchmark_wandb.py",
+  "codePath":  "tests\\training\\benchmark_wandb.py",
+  "codePathLocal":  "tests\\training\\benchmark_wandb.py",
+  "git":  {
+    "remote":  "https://github.com/IsNoobgrammer/BiBo.git",
+    "commit":  "4b59acf08fb7912bd3e103a643ff2244afeff7a0"
+  },
+  "email":  "shaurya.sharthak.work@gmail.com",
+  "root":  "C:\\Users\\shaur\\OneDrive\\Documents\\BiBo",
+  "host":  "SedGram",
+  "executable":  "C:\\Users\\shaur\\OneDrive\\Documents\\BiBo\\venv\\Scripts\\python.exe",
+  "cpu_count":  8,
+  "cpu_count_logical":  12,
+  "disk":  {
+    "/":  {
+      "total":  "403370405888",
+      "used":  "364759330816"
+    }
+  },
+  "memory":  {
+    "total":  "16870006784"
+  },
+  "writerId":  "s5dpllrc8w2zsatun2ocbqarhu1bgvdm"
+}

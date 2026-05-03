@@ -4,5 +4,7 @@ __pycache__/
 .aim/
 .kiro/
 logs/
+!logs/router_ablation/
 bugs/
 venv/
+shaurya_notes.txt

@@ -1,0 +1,70 @@
+_wandb:
+    value:
+        cli_version: 0.26.1
+        e:
+            s5dpllrc8w2zsatun2ocbqarhu1bgvdm:
+                codePath: tests\training\benchmark_wandb.py
+                codePathLocal: tests\training\benchmark_wandb.py
+                cpu_count: 8
+                cpu_count_logical: 12
+                disk:
+                    /:
+                        total: "403370405888"
+                        used: "364759330816"
+                email: shaurya.sharthak.work@gmail.com
+                executable: C:\Users\shaur\OneDrive\Documents\BiBo\venv\Scripts\python.exe
+                git:
+                    commit: 4b59acf08fb7912bd3e103a643ff2244afeff7a0
+                    remote: https://github.com/IsNoobgrammer/BiBo.git
+                host: SedGram
+                memory:
+                    total: "16870006784"
+                os: Windows-11-10.0.26200-SP0
+                program: C:\Users\shaur\OneDrive\Documents\BiBo\tests\training\benchmark_wandb.py
+                python: CPython 3.12.5
+                root: C:\Users\shaur\OneDrive\Documents\BiBo
+                startedAt: "2026-05-03T20:34:19.286162Z"
+                writerId: s5dpllrc8w2zsatun2ocbqarhu1bgvdm
+        m: []
+        python_version: 3.12.5
+        t:
+            "1":
+                - 1
+                - 11
+                - 49
+            "2":
+                - 1
+                - 11
+                - 49
+            "3":
+                - 13
+                - 16
+            "4": 3.12.5
+            "5": 0.26.1
+            "6": 5.7.0
+            "8":
+                - 3
+            "12": 0.26.1
+            "13": windows-amd64
+batch_size:
+    value: 8
+bibo_experts:
+    value: 8
+bibo_params:
+    value: 62404784
+device:
+    value: cpu
+lr:
+    value: 0.03
+num_steps:
+    value: 500
+qwen_experts:
+    value: 6
+qwen_params:
+    value: 64933888
+use_compile:
+    value: false
+warmup_steps:
+    value: 50
+weight_decay:
+    value: 0.01
