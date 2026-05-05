@@ -154,9 +154,11 @@ config = BiBoConfig(
     residual_mixer_type="dynamic_causal_conv",  # "none", "causal_conv", or "dynamic_causal_conv"
     residual_conv_kernel_size=4,
     residual_conv_init=0.95,
+    residual_history_include_input=False,       # Keep depth history to layer outputs by default
 
     # mHC-style parallel residual streams
     residual_num_streams=2,             # 1 disables multi-stream residuals
+    residual_stream_mode="delay_line",  # "independent" or "delay_line"
     residual_stream_gate_type="token",  # "scalar" or "token"
     residual_stream_init="copy",        # "copy" or "zero"
     residual_stream_read_init=0.99,
@@ -173,6 +175,13 @@ Residual gates keep the identity path intact and only scale the branch write:
 ```python
 x = residual + gate * branch_output
 ```
+
+For a clean mHC-style run, keep `residual_gate_type="none"` and use
+`residual_num_streams > 1`; enabling both is supported, but branch gates and
+stream write gates compose and should be logged as a combined experiment.
+Set `residual_stream_mode="delay_line"` to make stream index causal over depth:
+stream 0 is newest, stream 1 is one layer old, and each layer performs a learned
+read followed by a deterministic shift write.
 
 After a forward pass, inspect flow statistics:
 

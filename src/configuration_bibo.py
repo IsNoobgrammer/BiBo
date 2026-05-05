@@ -70,7 +70,9 @@ class BiBoConfig(PretrainedConfig):
         residual_mixer_type="none", # none, causal_conv, or dynamic_causal_conv
         residual_conv_kernel_size=4, # Depth-causal residual states: previous kernel_size-1 + current
         residual_conv_init=0.95, # Initial weight on the current layer output
+        residual_history_include_input=False, # Include embeddings as the first depth residual state
         residual_num_streams=1, # mHC-style parallel residual streams; 1 disables
+        residual_stream_mode="independent", # independent or delay_line
         residual_stream_gate_type="token", # scalar or token
         residual_stream_init="copy", # copy or zero
         residual_stream_read_init=0.99, # Initial read mass on stream 0
@@ -129,7 +131,9 @@ class BiBoConfig(PretrainedConfig):
         self.residual_mixer_type = residual_mixer_type
         self.residual_conv_kernel_size = residual_conv_kernel_size
         self.residual_conv_init = residual_conv_init
+        self.residual_history_include_input = residual_history_include_input
         self.residual_num_streams = residual_num_streams
+        self.residual_stream_mode = residual_stream_mode
         self.residual_stream_gate_type = residual_stream_gate_type
         self.residual_stream_init = residual_stream_init
         self.residual_stream_read_init = residual_stream_read_init
@@ -236,8 +240,12 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError("residual_conv_kernel_size must be greater than 1")
         if not (0.0 < self.residual_conv_init < 1.0):
             raise ValueError("residual_conv_init must be between 0 and 1")
+        if not isinstance(self.residual_history_include_input, bool):
+            raise ValueError("residual_history_include_input must be a boolean")
         if self.residual_num_streams < 1:
             raise ValueError("residual_num_streams must be at least 1")
+        if self.residual_stream_mode not in {"independent", "delay_line"}:
+            raise ValueError("residual_stream_mode must be one of: 'independent', 'delay_line'")
         if self.residual_stream_gate_type not in {"scalar", "token"}:
             raise ValueError("residual_stream_gate_type must be one of: 'scalar', 'token'")
         if self.residual_stream_init not in {"copy", "zero"}:
@@ -246,6 +254,16 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError("residual_stream_read_init must be between 0 and 1")
         if not (0.0 < self.residual_stream_write_init < 1.0):
             raise ValueError("residual_stream_write_init must be between 0 and 1")
+        if (
+            self.residual_num_streams > 1
+            and self.residual_stream_mode == "independent"
+            and self.residual_gate_type != "none"
+        ):
+            logger.warning_once(
+                "Both residual branch gates and multi-stream write gates are enabled. "
+                "This is valid, but their effects compose; use residual_gate_type='none' "
+                "for cleaner mHC-style stream-gate attribution."
+            )
         for idx in self.mlp_only_layers:
             if not (0 <= idx < self.num_hidden_layers):
                 raise ValueError(f"mlp_only_layers index {idx} is out of range for {self.num_hidden_layers} layers")

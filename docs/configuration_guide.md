@@ -260,7 +260,7 @@ small fully causal depth convolution:
 
 ```python
 current = layer(hidden_states)
-hidden_states = causal_depth_conv(previous_states + [current])
+hidden_states = causal_depth_conv(previous_layer_states + [current])
 ```
 
 This convolution is over **layer depth**, not over sequence tokens. It can only read
@@ -287,6 +287,15 @@ The mixer exposes `current_weight`, `previous_mass`, and `num_states` through:
 model.model.residual_mixer_stats()
 ```
 
+### `residual_history_include_input`
+
+**Default:** `False`
+
+Whether to seed the depth residual history with the embedding output before layer 0.
+By default the mixer history contains only decoder layer outputs, so layer 0 sees only
+its own current output. Set this to `True` if you explicitly want the embedding state
+to be part of the early residual-depth window.
+
 ---
 
 ### `residual_num_streams`
@@ -302,6 +311,36 @@ read_state = gated_read(streams)
 layer_output = decoder_layer(read_state)
 streams = gated_write(streams, layer_output - read_state)
 ```
+
+The model performs one stream read before each layer and one final read after the
+last write for the output state. It does not re-read after every intermediate write.
+
+For cleaner attribution, use `residual_gate_type="none"` when experimenting with
+multi-stream residuals. Enabling branch residual gates and stream gates together is
+valid, but their effective scaling composes.
+
+### `residual_stream_mode`
+
+**Default:** `"independent"`
+
+**Options:** `"independent"`, `"delay_line"`
+
+- **independent:** Free mHC-style streams. Each layer writes its update into all
+  streams through learned write gates.
+- **delay_line:** Stream index is a causal depth axis. Stream 0 stores the newest
+  layer state, stream 1 stores the previous layer state, and so on. Reads are
+  learned, but writes are deterministic shifts:
+
+```python
+read_state = gated_read([x_t, x_t_minus_1, x_t_minus_2])
+new_state = decoder_layer(read_state)
+streams = [new_state, x_t, x_t_minus_1]
+```
+
+In delay-line mode, auxiliary streams start at zero regardless of
+`residual_stream_init`, because there is no older layer state at layer 0.
+This is the cleanest setting when you want the stream gate to act as a learned
+causal depth kernel.
 
 ### `residual_stream_gate_type`
 
