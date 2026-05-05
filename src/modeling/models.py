@@ -20,7 +20,7 @@ from transformers.utils import logging
 from src.configuration_bibo import BiBoConfig
 from .norm import BiBoRMSNorm
 from .embed import BiBoRotaryEmbedding
-from .layers import BiBoDecoderLayer
+from .layers import BiBoDecoderLayer, BiBoMultiStreamResidual
 
 logger = logging.get_logger(__name__)
 
@@ -111,6 +111,9 @@ class BiBoModel(BiBoPreTrainedModel):
         self.layers = nn.ModuleList(
             [BiBoDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
+        self.residual_stream_mixers = nn.ModuleList(
+            [BiBoMultiStreamResidual(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
         self.norm = BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = BiBoRotaryEmbedding(
             config.hidden_size // config.num_attention_heads,
@@ -125,6 +128,41 @@ class BiBoModel(BiBoPreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.embed_tokens = value
+
+    def residual_gate_stats(self) -> dict:
+        stats = {}
+        for layer in self.layers:
+            stats.update(layer.residual_gate_stats())
+        return stats
+
+    def residual_mixer_stats(self) -> dict:
+        stats = {}
+        for layer in self.layers:
+            stats.update(layer.residual_mixer_stats())
+        return stats
+
+    def residual_stream_stats(self) -> dict:
+        stats = {}
+        for mixer in self.residual_stream_mixers:
+            stats.update(mixer.stats())
+        return stats
+
+    def _init_residual_streams(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.config.residual_num_streams <= 1:
+            return None
+
+        main_stream = hidden_states.unsqueeze(2)
+        if self.config.residual_stream_init == "copy":
+            return main_stream.expand(-1, -1, self.config.residual_num_streams, -1).clone()
+
+        aux_shape = (
+            hidden_states.shape[0],
+            hidden_states.shape[1],
+            self.config.residual_num_streams - 1,
+            hidden_states.shape[2],
+        )
+        aux_streams = hidden_states.new_zeros(aux_shape)
+        return torch.cat([main_stream, aux_streams], dim=2)
 
     def forward(
         self,
@@ -185,6 +223,7 @@ class BiBoModel(BiBoPreTrainedModel):
         )
 
         hidden_states = inputs_embeds
+        residual_streams = self._init_residual_streams(hidden_states)
 
         # Position embeddings
         position_embeddings = self.rotary_emb(hidden_states, cache_position)
@@ -193,10 +232,21 @@ class BiBoModel(BiBoPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
+        residual_history = None
+        if self.config.residual_mixer_type != "none":
+            residual_history = [hidden_states]
+            max_residual_history = self.config.residual_conv_kernel_size - 1
 
-        for decoder_layer in self.layers:
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            read_state = hidden_states
+            if residual_streams is not None:
+                read_state = self.residual_stream_mixers[layer_idx].read(residual_streams)
+                hidden_states = read_state
+
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+
+            residual_history_arg = tuple(residual_history) if residual_history is not None else None
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -208,6 +258,7 @@ class BiBoModel(BiBoPreTrainedModel):
                     cache_position,
                     output_attentions,
                     False,
+                    residual_history_arg,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -218,9 +269,23 @@ class BiBoModel(BiBoPreTrainedModel):
                     cache_position=cache_position,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
+                    residual_history=residual_history_arg,
                 )
 
             hidden_states = layer_outputs[0]
+
+            if residual_streams is not None:
+                layer_update = hidden_states - read_state
+                residual_streams = self.residual_stream_mixers[layer_idx].write(
+                    residual_streams,
+                    layer_update,
+                )
+                hidden_states = self.residual_stream_mixers[layer_idx].read(residual_streams)
+
+            if residual_history is not None:
+                residual_history.append(hidden_states)
+                if len(residual_history) > max_residual_history:
+                    residual_history = residual_history[-max_residual_history:]
 
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]

@@ -7,6 +7,9 @@ from .modeling import (
     BiBoAttention,
     BiBoMLP,
     BiBoMoELayer,
+    BiBoResidualGate,
+    BiBoCausalResidualConv,
+    BiBoMultiStreamResidual,
     BiBoRMSNorm,
 )
 
@@ -18,5 +21,8 @@ __all__ = [
     'BiBoAttention',
     'BiBoMLP',
     'BiBoMoELayer',
+    'BiBoResidualGate',
+    'BiBoCausalResidualConv',
+    'BiBoMultiStreamResidual',
     'BiBoRMSNorm',
 ]

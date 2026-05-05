@@ -24,6 +24,7 @@
 - **SSMax attention**: Learnable per-head scaling for long context
 - **Sliding window attention**: Optional local attention windows
 - **RoPE**: Rotary position embeddings with configurable base
+- **Residual write gates**: Optional mHC-inspired gates for attention and MLP/MoE residual updates
 
 ### Training Features
 
@@ -144,11 +145,46 @@ config = BiBoConfig(
     use_sliding_window=True,
     sliding_window=512,
     max_window_layers=4,
+
+    # Residual flow gates
+    residual_gate_type="token",  # "none", "scalar", "token", or "channel"
+    residual_gate_init=0.95,     # Start close to standard residual behavior
+
+    # Causal residual-state mixer over model depth
+    residual_mixer_type="dynamic_causal_conv",  # "none", "causal_conv", or "dynamic_causal_conv"
+    residual_conv_kernel_size=4,
+    residual_conv_init=0.95,
+
+    # mHC-style parallel residual streams
+    residual_num_streams=2,             # 1 disables multi-stream residuals
+    residual_stream_gate_type="token",  # "scalar" or "token"
+    residual_stream_init="copy",        # "copy" or "zero"
+    residual_stream_read_init=0.99,
+    residual_stream_write_init=0.99,
     
     # Position embeddings
     max_position_embeddings=32768,
     rope_theta=10000.0,
 )
+```
+
+Residual gates keep the identity path intact and only scale the branch write:
+
+```python
+x = residual + gate * branch_output
+```
+
+After a forward pass, inspect flow statistics:
+
+```python
+stats = model.model.residual_gate_stats()
+print(stats["layer_0/attn/mean"], stats["layer_0/mlp/mean"])
+
+depth_stats = model.model.residual_mixer_stats()
+print(depth_stats["layer_1/residual_conv/current_weight"])
+
+stream_stats = model.model.residual_stream_stats()
+print(stream_stats["layer_0/streams/read_main"])
 ```
 
 ## Testing

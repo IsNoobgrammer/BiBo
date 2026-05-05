@@ -65,6 +65,16 @@ class BiBoConfig(PretrainedConfig):
         kernel_size=3,
         router_lambda=1.0, # Scaling for router logits before softmax (see Skywork-MoE paper, eq. 6)
         moe_shared_scaling=1.0, # Scaling for shared expert output in MoE block (see DeepSeek-V2/V3, Muon)
+        residual_gate_type="none", # none, scalar, token, or channel
+        residual_gate_init=0.95, # Initial residual write strength; 0.95 keeps baseline behavior
+        residual_mixer_type="none", # none, causal_conv, or dynamic_causal_conv
+        residual_conv_kernel_size=4, # Depth-causal residual states: previous kernel_size-1 + current
+        residual_conv_init=0.95, # Initial weight on the current layer output
+        residual_num_streams=1, # mHC-style parallel residual streams; 1 disables
+        residual_stream_gate_type="token", # scalar or token
+        residual_stream_init="copy", # copy or zero
+        residual_stream_read_init=0.99, # Initial read mass on stream 0
+        residual_stream_write_init=0.99, # Initial write gate on stream 0
 
         norm_topk_prob=False,
         output_router_logits=False,
@@ -114,6 +124,16 @@ class BiBoConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.router_lambda = router_lambda
+        self.residual_gate_type = residual_gate_type
+        self.residual_gate_init = residual_gate_init
+        self.residual_mixer_type = residual_mixer_type
+        self.residual_conv_kernel_size = residual_conv_kernel_size
+        self.residual_conv_init = residual_conv_init
+        self.residual_num_streams = residual_num_streams
+        self.residual_stream_gate_type = residual_stream_gate_type
+        self.residual_stream_init = residual_stream_init
+        self.residual_stream_read_init = residual_stream_read_init
+        self.residual_stream_write_init = residual_stream_write_init
 
         # --- Auto-estimate scaling factor for shared expert if left as 1.0 ---
         self.moe_shared_scaling = moe_shared_scaling
@@ -206,6 +226,26 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError("router_noise must be non-negative")
         if self.num_experts_per_tok > self.num_experts:
             raise ValueError("num_experts_per_tok cannot exceed total number of experts")
+        if self.residual_gate_type not in {"none", "scalar", "token", "channel"}:
+            raise ValueError("residual_gate_type must be one of: 'none', 'scalar', 'token', 'channel'")
+        if not (0.0 < self.residual_gate_init < 1.0):
+            raise ValueError("residual_gate_init must be between 0 and 1")
+        if self.residual_mixer_type not in {"none", "causal_conv", "dynamic_causal_conv"}:
+            raise ValueError("residual_mixer_type must be one of: 'none', 'causal_conv', 'dynamic_causal_conv'")
+        if self.residual_conv_kernel_size <= 1:
+            raise ValueError("residual_conv_kernel_size must be greater than 1")
+        if not (0.0 < self.residual_conv_init < 1.0):
+            raise ValueError("residual_conv_init must be between 0 and 1")
+        if self.residual_num_streams < 1:
+            raise ValueError("residual_num_streams must be at least 1")
+        if self.residual_stream_gate_type not in {"scalar", "token"}:
+            raise ValueError("residual_stream_gate_type must be one of: 'scalar', 'token'")
+        if self.residual_stream_init not in {"copy", "zero"}:
+            raise ValueError("residual_stream_init must be one of: 'copy', 'zero'")
+        if not (0.0 < self.residual_stream_read_init < 1.0):
+            raise ValueError("residual_stream_read_init must be between 0 and 1")
+        if not (0.0 < self.residual_stream_write_init < 1.0):
+            raise ValueError("residual_stream_write_init must be between 0 and 1")
         for idx in self.mlp_only_layers:
             if not (0 <= idx < self.num_hidden_layers):
                 raise ValueError(f"mlp_only_layers index {idx} is out of range for {self.num_hidden_layers} layers")

@@ -208,6 +208,136 @@ self.gate_conv = nn.Conv1d(config.hidden_size, self.num_routed_experts,
 
 ---
 
+### `residual_gate_type`
+
+**Default:** `"none"`
+
+**Options:** `"none"`, `"scalar"`, `"token"`, `"channel"`
+
+**What it does:**
+Adds optional mHC-inspired write gates around the attention and MLP/MoE residual branches:
+
+```python
+hidden_states = residual + gate * branch_output
+```
+
+The identity stream is never gated, so the model can always preserve normal residual flow.
+
+**Gate shapes:**
+- **none:** Standard residual add
+- **scalar:** One learned value per branch/layer
+- **token:** One value per token, shape `[batch, seq, 1]`
+- **channel:** One value per token/channel, shape `[batch, seq, hidden_size]`
+
+**Tuning guidance:**
+- Start with `"token"` for residual-flow diagnostics.
+- Use `"scalar"` for a very cheap stability experiment.
+- Use `"channel"` only if you can afford extra parameters and want more expressive control.
+
+### `residual_gate_init`
+
+**Default:** `0.95`
+
+Initial gate value. Values close to `1.0` preserve baseline Transformer behavior at initialization.
+The gate modules expose `mean`, `open_frac`, and `closed_frac` through:
+
+```python
+model.model.residual_gate_stats()
+```
+
+---
+
+### `residual_mixer_type`
+
+**Default:** `"none"`
+
+**Options:** `"none"`, `"causal_conv"`, `"dynamic_causal_conv"`
+
+**What it does:**
+Adds an attention-residual-style mixer over residual states from previous model depths.
+The `"causal_conv"` option replaces softmax attention over all previous layers with a
+small fully causal depth convolution:
+
+```python
+current = layer(hidden_states)
+hidden_states = causal_depth_conv(previous_states + [current])
+```
+
+This convolution is over **layer depth**, not over sequence tokens. It can only read
+previous residual states and the current layer output, so token-level causality is
+preserved. `"causal_conv"` uses one learned depth kernel per layer. `"dynamic_causal_conv"`
+uses the current token state to produce token-conditioned depth kernels.
+
+### `residual_conv_kernel_size`
+
+**Default:** `4`
+
+Number of depth states in the causal residual convolution window. The model keeps
+`kernel_size - 1` previous residual states plus the current layer output.
+
+### `residual_conv_init`
+
+**Default:** `0.95`
+
+Initial weight on the current layer output. The remaining mass is distributed across
+older residual states, keeping initialization close to normal Transformer flow.
+The mixer exposes `current_weight`, `previous_mass`, and `num_states` through:
+
+```python
+model.model.residual_mixer_stats()
+```
+
+---
+
+### `residual_num_streams`
+
+**Default:** `1`
+
+Number of mHC-style parallel residual streams. `1` disables multi-stream residuals.
+When enabled, each layer reads a gated mixture of streams, runs the normal decoder
+layer, then writes that layer's update back into the streams.
+
+```python
+read_state = gated_read(streams)
+layer_output = decoder_layer(read_state)
+streams = gated_write(streams, layer_output - read_state)
+```
+
+### `residual_stream_gate_type`
+
+**Default:** `"token"`
+
+**Options:** `"scalar"`, `"token"`
+
+- **scalar:** One read/write gate per layer and stream.
+- **token:** Per-token read/write gates over streams.
+
+### `residual_stream_init`
+
+**Default:** `"copy"`
+
+**Options:** `"copy"`, `"zero"`
+
+- **copy:** Every stream starts from the embedding state. This preserves the first
+  layer read even when the initial read gate is not exactly one-hot.
+- **zero:** Stream 0 starts from embeddings and auxiliary streams start at zero.
+
+### `residual_stream_read_init` / `residual_stream_write_init`
+
+**Default:** `0.99`
+
+Initial read mass and write gate value for stream 0. The remaining read mass is
+spread across auxiliary streams. These should stay close to `1.0` for baseline-like
+initialization.
+
+Inspect stream routing after a forward pass:
+
+```python
+model.model.residual_stream_stats()
+```
+
+---
+
 ## MoE Architecture
 
 ### `bias_update_threshold`
