@@ -181,14 +181,15 @@ class BiBoMultiStreamResidual(nn.Module):
     """
     mHC-style parallel residual streams with learned read/write gates.
 
-    The model reads a gated mixture of streams before a layer, runs the normal
-    decoder block, then writes the layer delta back into the streams. This keeps
-    attention/MoE modules unchanged while giving each layer token-wise control
-    over which residual lanes are useful.
+    In independent mode, the model reads a gated mixture of streams before a
+    layer, runs the normal decoder block, then writes the layer delta back into
+    the streams. In delay-line mode, stream index is a causal depth axis: stream
+    0 holds the newest layer state and writes shift older states right.
     """
     def __init__(self, config: BiBoConfig, layer_idx: int):
         super().__init__()
         self.num_streams = config.residual_num_streams
+        self.stream_mode = config.residual_stream_mode
         self.gate_type = config.residual_stream_gate_type
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
@@ -200,15 +201,21 @@ class BiBoMultiStreamResidual(nn.Module):
             self.write_bias = None
         else:
             read_probs = _stream_probs(self.num_streams, config.residual_stream_read_init)
-            write_probs = _stream_probs(self.num_streams, config.residual_stream_write_init)
             if self.gate_type == "scalar":
                 self.read_weight = None
-                self.write_weight = None
             else:
                 self.read_weight = nn.Parameter(torch.zeros(self.num_streams, self.hidden_size))
-                self.write_weight = nn.Parameter(torch.zeros(self.num_streams, self.hidden_size))
             self.read_bias = nn.Parameter(torch.log(read_probs))
-            self.write_bias = nn.Parameter(torch.tensor([_logit(float(p)) for p in write_probs]))
+            if self.stream_mode == "delay_line":
+                self.write_weight = None
+                self.write_bias = None
+            else:
+                write_probs = _stream_probs(self.num_streams, config.residual_stream_write_init)
+                if self.gate_type == "scalar":
+                    self.write_weight = None
+                else:
+                    self.write_weight = nn.Parameter(torch.zeros(self.num_streams, self.hidden_size))
+                self.write_bias = nn.Parameter(torch.tensor([_logit(float(p)) for p in write_probs]))
 
         self.register_buffer("last_read_main", torch.tensor(float("nan")), persistent=False)
         self.register_buffer("last_read_entropy", torch.tensor(float("nan")), persistent=False)
@@ -239,6 +246,14 @@ class BiBoMultiStreamResidual(nn.Module):
     def write(self, streams: torch.Tensor, update: torch.Tensor) -> torch.Tensor:
         if self.num_streams <= 1:
             return streams + update.unsqueeze(2)
+
+        if self.stream_mode == "delay_line":
+            shifted_streams = torch.cat([update.unsqueeze(2), streams[:, :, :-1, :]], dim=2)
+            if not torch.jit.is_scripting():
+                with torch.no_grad():
+                    self.last_write_main.fill_(1.0)
+                    self.last_write_aux.fill_(0.0)
+            return shifted_streams
 
         if self.gate_type == "scalar":
             logits = self.write_bias.view(1, 1, self.num_streams)

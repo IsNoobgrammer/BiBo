@@ -152,6 +152,16 @@ class BiBoModel(BiBoPreTrainedModel):
             return None
 
         main_stream = hidden_states.unsqueeze(2)
+        if self.config.residual_stream_mode == "delay_line":
+            delay_shape = (
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+                self.config.residual_num_streams - 1,
+                hidden_states.shape[2],
+            )
+            delay_streams = hidden_states.new_zeros(delay_shape)
+            return torch.cat([main_stream, delay_streams], dim=2)
+
         if self.config.residual_stream_init == "copy":
             return main_stream.expand(-1, -1, self.config.residual_num_streams, -1).clone()
 
@@ -234,7 +244,7 @@ class BiBoModel(BiBoPreTrainedModel):
         next_decoder_cache = None
         residual_history = None
         if self.config.residual_mixer_type != "none":
-            residual_history = [hidden_states]
+            residual_history = [hidden_states] if self.config.residual_history_include_input else []
             max_residual_history = self.config.residual_conv_kernel_size - 1
 
         for layer_idx, decoder_layer in enumerate(self.layers):
@@ -275,12 +285,15 @@ class BiBoModel(BiBoPreTrainedModel):
             hidden_states = layer_outputs[0]
 
             if residual_streams is not None:
-                layer_update = hidden_states - read_state
+                layer_update = (
+                    hidden_states
+                    if self.config.residual_stream_mode == "delay_line"
+                    else hidden_states - read_state
+                )
                 residual_streams = self.residual_stream_mixers[layer_idx].write(
                     residual_streams,
                     layer_update,
                 )
-                hidden_states = self.residual_stream_mixers[layer_idx].read(residual_streams)
 
             if residual_history is not None:
                 residual_history.append(hidden_states)
@@ -292,6 +305,9 @@ class BiBoModel(BiBoPreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+
+        if residual_streams is not None:
+            hidden_states = self.residual_stream_mixers[-1].read(residual_streams)
 
         hidden_states = self.norm(hidden_states)
 
