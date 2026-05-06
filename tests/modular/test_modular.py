@@ -3,6 +3,7 @@ import sys
 sys.path.insert(0, '.')
 import torch
 import pytest
+from transformers.generation import GenerationMixin
 from src.configuration_bibo import BiBoConfig
 from src.modeling.models import BiBoModel, BiBoForCausalLM
 from src.modeling.attn import BiBoAttention
@@ -65,6 +66,12 @@ def test_causal_lm(cfg):
     labels = torch.randint(0, cfg.vocab_size, (2, 8))
     out = model(input_ids, labels=labels)
     print(f"✓ CausalLM loss: {out.loss.item():.4f}")
+
+def test_causal_lm_supports_generation_mixin(cfg):
+    """Causal LM should keep HF generate support on modern Transformers."""
+    model = BiBoForCausalLM(cfg)
+
+    assert isinstance(model, GenerationMixin)
 
 def test_forward_backward(cfg):
     """Test forward + backward"""
