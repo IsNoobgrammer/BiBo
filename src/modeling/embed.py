@@ -1,7 +1,6 @@
 """Positional embeddings - Qwen3MoE compatible."""
 import torch
 from torch import nn
-from transformers.utils.generic import maybe_autocast
 
 __all__ = ["BiBoRotaryEmbedding", "apply_rotary_pos_emb", "rotate_half", "_rotate_half"]
 
@@ -87,7 +86,7 @@ class BiBoRotaryEmbedding(nn.Module):
         position_ids_expanded = position_ids[:, None, :].to(device=x.device, dtype=torch.float)
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
-        with maybe_autocast(device_type=device_type, enabled=False):
+        with torch.autocast(device_type=device_type, enabled=False):
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
             cos = emb.cos() * self.attention_scaling

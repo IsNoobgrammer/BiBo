@@ -82,11 +82,12 @@ def test_rotary_embedding_uses_tensor_cache_positions():
     positions = torch.tensor([3, 5])
 
     cos, sin = rotary(x, positions)
+    expected_cos, expected_sin = rotary(x, seq_len=6)
 
-    torch.testing.assert_close(cos[0], rotary.cos_cached[3])
-    torch.testing.assert_close(cos[1], rotary.cos_cached[5])
-    torch.testing.assert_close(sin[0], rotary.sin_cached[3])
-    torch.testing.assert_close(sin[1], rotary.sin_cached[5])
+    torch.testing.assert_close(cos[0], expected_cos[3])
+    torch.testing.assert_close(cos[1], expected_cos[5])
+    torch.testing.assert_close(sin[0], expected_sin[3])
+    torch.testing.assert_close(sin[1], expected_sin[5])
 
 def test_softmax_cache_matches_full_forward():
     """Incremental cached decode should match full-prefix logits for softmax attention."""
