@@ -97,8 +97,8 @@ def validate_experimental_config(config: Any) -> None:
         raise ValueError(
             "exp.residual_mixer_type must be one of: 'none', 'causal_conv', 'dynamic_causal_conv'"
         )
-    if config.residual_conv_kernel_size <= 1:
-        raise ValueError("exp.residual_conv_kernel_size must be greater than 1")
+    if config.residual_conv_kernel_size <= 0:
+        raise ValueError("exp.residual_conv_kernel_size must be at least 1")
     if not (0.0 < config.residual_conv_init < 1.0):
         raise ValueError("exp.residual_conv_init must be between 0 and 1")
     if not isinstance(config.residual_history_include_input, bool):

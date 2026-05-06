@@ -298,7 +298,9 @@ class BiBoModel(BiBoPreTrainedModel):
 
             if residual_history is not None:
                 residual_history.append(hidden_states)
-                if len(residual_history) > max_residual_history:
+                if max_residual_history == 0:
+                    residual_history = []
+                elif len(residual_history) > max_residual_history:
                     residual_history = residual_history[-max_residual_history:]
 
             if use_cache:

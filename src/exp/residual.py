@@ -117,10 +117,15 @@ class BiBoCausalResidualConv(nn.Module):
             self.dynamic_weight = None
             self.dynamic_bias = None
         else:
-            previous_mass = 1.0 - config.residual_conv_init
-            previous_prob = previous_mass / (self.kernel_size - 1)
-            probs = torch.full((self.kernel_size,), previous_prob, dtype=torch.float32)
-            probs[-1] = config.residual_conv_init
+            if self.kernel_size < 1:
+                raise ValueError("residual_conv_kernel_size must be at least 1")
+            if self.kernel_size == 1:
+                probs = torch.ones((1,), dtype=torch.float32)
+            else:
+                previous_mass = 1.0 - config.residual_conv_init
+                previous_prob = previous_mass / (self.kernel_size - 1)
+                probs = torch.full((self.kernel_size,), previous_prob, dtype=torch.float32)
+                probs[-1] = config.residual_conv_init
             if self.mixer_type == "causal_conv":
                 self.kernel_logits = nn.Parameter(torch.log(probs))
                 self.dynamic_weight = None
@@ -143,7 +148,8 @@ class BiBoCausalResidualConv(nn.Module):
             return current_state
 
         history = tuple(residual_history or ())
-        states = history[-(self.kernel_size - 1):] + (current_state,)
+        history_window = self.kernel_size - 1
+        states = (current_state,) if history_window == 0 else history[-history_window:] + (current_state,)
         num_states = len(states)
         if self.mixer_type == "causal_conv":
             logits = self.kernel_logits[-num_states:]

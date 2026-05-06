@@ -122,7 +122,7 @@ def test_residual_gate_starts_near_identity():
 
     out = gate(x, branch)
     assert out.shape == branch.shape
-    assert torch.allclose(out.mean(), torch.tensor(0.95), atol=1e-5)
+    assert torch.allclose(out.mean(), out.new_tensor(0.95), atol=1e-5)
     assert gate.stats()["attn/mean"] == pytest.approx(0.95, abs=1e-5)
 
 def test_residual_gates_work_in_model_and_receive_gradients():
@@ -175,11 +175,35 @@ def test_causal_residual_conv_starts_near_current_state():
 
     mixed = mixer(current, (previous, previous))
     assert mixed.shape == current.shape
-    assert torch.allclose(mixed.mean(), torch.tensor(0.9), atol=1e-5)
+    assert torch.allclose(mixed.mean(), mixed.new_tensor(0.9), atol=1e-5)
     stats = mixer.stats()
     assert stats["layer_0/residual_conv/current_weight"] == pytest.approx(0.9, abs=1e-5)
     assert stats["layer_0/residual_conv/previous_mass"] == pytest.approx(0.1, abs=1e-5)
     assert stats["layer_0/residual_conv/num_states"] == 3
+
+def test_causal_residual_conv_kernel_size_one_is_current_only():
+    """A one-state residual conv window should reduce to the current layer output."""
+    for mixer_type in ["causal_conv", "dynamic_causal_conv"]:
+        cfg = BiBoConfig(
+            hidden_size=64,
+            num_attention_heads=4,
+            num_routed_experts=8,
+            exp={
+                "residual_mixer_type": mixer_type,
+                "residual_conv_kernel_size": 1,
+            },
+        )
+        mixer = BiBoCausalResidualConv(cfg, layer_idx=0)
+        current = torch.randn(2, 8, cfg.hidden_size)
+        previous = torch.randn_like(current)
+
+        mixed = mixer(current, (previous, previous))
+        stats = mixer.stats()
+
+        torch.testing.assert_close(mixed, current)
+        assert stats["layer_0/residual_conv/current_weight"] == pytest.approx(1.0, abs=1e-5)
+        assert stats["layer_0/residual_conv/previous_mass"] == pytest.approx(0.0, abs=1e-5)
+        assert stats["layer_0/residual_conv/num_states"] == 1
 
 def test_causal_residual_conv_works_in_model_and_receives_gradients():
     """Model should train causal depth-conv residual mixer parameters."""
@@ -214,6 +238,37 @@ def test_causal_residual_conv_works_in_model_and_receives_gradients():
     assert stats["layer_2/residual_conv/num_states"] == 3
     assert model.model.layers[0].residual_mixer.kernel_logits.grad is not None
     assert model.model.layers[1].residual_mixer.kernel_logits.grad is not None
+
+def test_residual_conv_kernel_size_one_works_in_model():
+    """A current-only depth mixer should not retain residual history in the model loop."""
+    cfg = BiBoConfig(
+        vocab_size=100,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        exp={
+            "residual_mixer_type": "causal_conv",
+            "residual_conv_kernel_size": 1,
+        },
+    )
+    model = BiBoForCausalLM(cfg)
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
+    labels = torch.randint(0, cfg.vocab_size, (2, 8))
+
+    out = model(input_ids, labels=labels)
+    out.loss.backward()
+    stats = model.model.residual_mixer_stats()
+
+    assert torch.isfinite(out.loss)
+    assert stats["layer_0/residual_conv/num_states"] == 1
+    assert stats["layer_1/residual_conv/num_states"] == 1
+    assert stats["layer_0/residual_conv/current_weight"] == pytest.approx(1.0, abs=1e-5)
+    assert model.model.layers[0].residual_mixer.kernel_logits.grad is not None
 
 def test_dynamic_causal_residual_conv_works_in_model_and_receives_gradients():
     """Dynamic depth conv should learn token-conditioned residual-depth reads."""
@@ -315,7 +370,7 @@ def test_multistream_residual_prefers_main_stream_at_init():
     stats = mixer.stats()
 
     assert read.shape == (2, 8, cfg.hidden_size)
-    assert torch.allclose(read.mean(), torch.tensor(0.9), atol=1e-5)
+    assert torch.allclose(read.mean(), read.new_tensor(0.9), atol=1e-5)
     assert stats["layer_0/streams/read_main"] == pytest.approx(0.9, abs=1e-5)
     assert stats["layer_0/streams/write_main"] == pytest.approx(0.8, abs=1e-5)
 

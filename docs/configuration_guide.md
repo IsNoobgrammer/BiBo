@@ -407,7 +407,9 @@ uses the current token state to produce token-conditioned depth kernels.
 **Default:** `4`
 
 Number of depth states in the causal residual convolution window. The model keeps
-`kernel_size - 1` previous residual states plus the current layer output.
+`kernel_size - 1` previous residual states plus the current layer output. Use `1`
+for a current-only window that reduces to normal layer output while still exercising
+the same mixer path.
 
 ### `exp.residual_conv_init`
 
@@ -909,6 +911,25 @@ rope_scaling = {"type": "dynamic", "factor": 2.0}
 | `kernel_size` | 3 | config:68 | Conv router kernel size | 3-7 (odd) |
 | `moe_shared_scaling` | 1.0 (auto) | config:70 | Shared expert output scaling | 0.3-1.5 |
 | `rope_scaling` | {"type": "linear", "factor": 1.0} | config:154 | Position embedding scaling | factor: 1.0-4.0 |
+| `exp.attention_type` | "softmax" | exp | Experimental attention kernel | "softmax", "sliding_window", "linear", "gdn", "kda" |
+| `exp.use_ssmax` | False | exp | Sequence-length-aware softmax scaling | True/False |
+| `exp.use_sliding_window` | False | exp | Apply sliding-window attention to early layers | True/False |
+| `exp.sliding_window` | 512 | exp | Local attention window size | 128-4096 |
+| `exp.max_window_layers` | num_hidden_layers | exp | Layers using sliding-window attention | 0-num_hidden_layers |
+| `exp.linear_attention_feature_map` | "elu" | exp | Recurrent attention feature map | "elu" or "relu" |
+| `exp.linear_attention_eps` | 1e-6 | exp | Recurrent attention numerical epsilon | 1e-8 to 1e-4 |
+| `exp.residual_gate_type` | "none" | exp | Attention/MLP residual branch write gate | "none", "scalar", "token", "channel" |
+| `exp.residual_gate_init` | 0.95 | exp | Initial residual branch gate openness | 0.5-0.99 |
+| `exp.residual_mixer_type` | "none" | exp | Depth residual-state mixer | "none", "causal_conv", "dynamic_causal_conv" |
+| `exp.residual_conv_kernel_size` | 4 | exp | Residual-depth window size | 1-8 |
+| `exp.residual_conv_init` | 0.95 | exp | Initial current-state mass in depth mixer | 0.5-0.99 |
+| `exp.residual_history_include_input` | False | exp | Include embeddings in depth history | True/False |
+| `exp.residual_num_streams` | 1 | exp | mHC parallel residual stream count | 1-4 |
+| `exp.residual_stream_mode` | "independent" | exp | Stream write semantics | "independent", "delay_line" |
+| `exp.residual_stream_gate_type` | "token" | exp | Stream read/write gate granularity | "scalar" or "token" |
+| `exp.residual_stream_init` | "copy" | exp | Auxiliary stream initialization | "copy" or "zero" |
+| `exp.residual_stream_read_init` | 0.99 | exp | Initial read mass on stream 0 | 0.5-0.999 |
+| `exp.residual_stream_write_init` | 0.99 | exp | Initial independent-mode write gate on stream 0 | 0.5-0.999 |
 
 ---
 
