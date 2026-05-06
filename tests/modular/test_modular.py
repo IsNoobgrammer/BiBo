@@ -7,7 +7,7 @@ from src.configuration_bibo import BiBoConfig
 from src.modeling.models import BiBoModel, BiBoForCausalLM
 from src.modeling.attn import BiBoAttention
 from src.modeling.ffn import BiBoMLP, BiBoMoELayer
-from src.modeling.layers import BiBoCausalResidualConv, BiBoMultiStreamResidual, BiBoResidualGate
+from src.exp.residual import BiBoCausalResidualConv, BiBoMultiStreamResidual, BiBoResidualGate
 
 @pytest.fixture
 def cfg():
@@ -81,14 +81,40 @@ def test_forward_backward(cfg):
     total_params = sum(1 for _ in model.parameters())
     print(f"✓ Backward: {has_grads}/{total_params} params have grads")
 
+def test_experimental_config_serializes_under_exp():
+    """Experimental knobs should stay out of the top-level serialized config."""
+    cfg = BiBoConfig(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_routed_experts=8,
+        exp={
+            "use_ssmax": True,
+            "attention_type": "linear",
+            "residual_num_streams": 2,
+            "residual_stream_mode": "delay_line",
+        },
+    )
+    serialized = cfg.to_dict()
+
+    assert cfg.use_ssmax is True
+    assert cfg.attention_type == "linear"
+    assert serialized["exp"]["use_ssmax"] is True
+    assert serialized["exp"]["attention_type"] == "linear"
+    assert serialized["exp"]["residual_stream_mode"] == "delay_line"
+    assert "use_ssmax" not in serialized
+    assert "attention_type" not in serialized
+    assert "residual_num_streams" not in serialized
+
 def test_residual_gate_starts_near_identity():
     """Residual write gate should preserve baseline flow at init."""
     cfg = BiBoConfig(
         hidden_size=64,
         num_attention_heads=4,
         num_routed_experts=8,
-        residual_gate_type="token",
-        residual_gate_init=0.95,
+        exp={
+            "residual_gate_type": "token",
+            "residual_gate_init": 0.95,
+        },
     )
     gate = BiBoResidualGate(cfg, "attn")
     x = torch.randn(2, 8, cfg.hidden_size)
@@ -111,9 +137,10 @@ def test_residual_gates_work_in_model_and_receive_gradients():
         num_routed_experts=8,
         num_experts_per_tok=2,
         moe_intermediate_size=32,
-        use_sliding_window=False,
-        residual_gate_type="token",
-        residual_gate_init=0.95,
+        exp={
+            "residual_gate_type": "token",
+            "residual_gate_init": 0.95,
+        },
     )
     model = BiBoForCausalLM(cfg)
     input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
@@ -136,9 +163,11 @@ def test_causal_residual_conv_starts_near_current_state():
         hidden_size=64,
         num_attention_heads=4,
         num_routed_experts=8,
-        residual_mixer_type="causal_conv",
-        residual_conv_kernel_size=3,
-        residual_conv_init=0.9,
+        exp={
+            "residual_mixer_type": "causal_conv",
+            "residual_conv_kernel_size": 3,
+            "residual_conv_init": 0.9,
+        },
     )
     mixer = BiBoCausalResidualConv(cfg, layer_idx=0)
     current = torch.ones(2, 8, cfg.hidden_size)
@@ -164,10 +193,11 @@ def test_causal_residual_conv_works_in_model_and_receives_gradients():
         num_routed_experts=8,
         num_experts_per_tok=2,
         moe_intermediate_size=32,
-        use_sliding_window=False,
-        residual_mixer_type="causal_conv",
-        residual_conv_kernel_size=3,
-        residual_conv_init=0.9,
+        exp={
+            "residual_mixer_type": "causal_conv",
+            "residual_conv_kernel_size": 3,
+            "residual_conv_init": 0.9,
+        },
     )
     model = BiBoForCausalLM(cfg)
     input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
@@ -197,10 +227,11 @@ def test_dynamic_causal_residual_conv_works_in_model_and_receives_gradients():
         num_routed_experts=8,
         num_experts_per_tok=2,
         moe_intermediate_size=32,
-        use_sliding_window=False,
-        residual_mixer_type="dynamic_causal_conv",
-        residual_conv_kernel_size=3,
-        residual_conv_init=0.9,
+        exp={
+            "residual_mixer_type": "dynamic_causal_conv",
+            "residual_conv_kernel_size": 3,
+            "residual_conv_init": 0.9,
+        },
     )
     model = BiBoForCausalLM(cfg)
     input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
@@ -228,9 +259,10 @@ def test_residual_history_can_include_input_when_requested():
         num_routed_experts=8,
         num_experts_per_tok=2,
         moe_intermediate_size=32,
-        use_sliding_window=False,
-        residual_mixer_type="causal_conv",
-        residual_conv_kernel_size=3,
+        exp={
+            "residual_mixer_type": "causal_conv",
+            "residual_conv_kernel_size": 3,
+        },
     )
     input_ids = torch.randint(0, 100, (2, 8))
 
@@ -239,7 +271,15 @@ def test_residual_history_can_include_input_when_requested():
     default_stats = default_model.model.residual_mixer_stats()
 
     include_input_model = BiBoForCausalLM(
-        BiBoConfig(**base_kwargs, residual_history_include_input=True)
+        BiBoConfig(
+            **{
+                **base_kwargs,
+                "exp": {
+                    **base_kwargs["exp"],
+                    "residual_history_include_input": True,
+                },
+            }
+        )
     )
     include_input_model(input_ids)
     include_input_stats = include_input_model.model.residual_mixer_stats()
@@ -255,10 +295,12 @@ def test_multistream_residual_prefers_main_stream_at_init():
         hidden_size=64,
         num_attention_heads=4,
         num_routed_experts=8,
-        residual_num_streams=3,
-        residual_stream_gate_type="token",
-        residual_stream_read_init=0.9,
-        residual_stream_write_init=0.8,
+        exp={
+            "residual_num_streams": 3,
+            "residual_stream_gate_type": "token",
+            "residual_stream_read_init": 0.9,
+            "residual_stream_write_init": 0.8,
+        },
     )
     mixer = BiBoMultiStreamResidual(cfg, layer_idx=0)
     streams = torch.stack([
@@ -289,11 +331,12 @@ def test_multistream_residual_works_in_model_and_receives_gradients():
         num_routed_experts=8,
         num_experts_per_tok=2,
         moe_intermediate_size=32,
-        use_sliding_window=False,
-        residual_num_streams=2,
-        residual_stream_gate_type="token",
-        residual_stream_read_init=0.99,
-        residual_stream_write_init=0.99,
+        exp={
+            "residual_num_streams": 2,
+            "residual_stream_gate_type": "token",
+            "residual_stream_read_init": 0.99,
+            "residual_stream_write_init": 0.99,
+        },
     )
     model = BiBoForCausalLM(cfg)
     input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
@@ -322,9 +365,10 @@ def test_multistream_model_reads_once_per_layer_plus_final_read():
         num_routed_experts=8,
         num_experts_per_tok=2,
         moe_intermediate_size=32,
-        use_sliding_window=False,
-        residual_num_streams=2,
-        residual_stream_gate_type="scalar",
+        exp={
+            "residual_num_streams": 2,
+            "residual_stream_gate_type": "scalar",
+        },
     )
     model = BiBoForCausalLM(cfg)
 
@@ -349,10 +393,12 @@ def test_delay_line_residual_shifts_states_and_reads_depth_axis():
         hidden_size=64,
         num_attention_heads=4,
         num_routed_experts=8,
-        residual_num_streams=3,
-        residual_stream_mode="delay_line",
-        residual_stream_gate_type="scalar",
-        residual_stream_read_init=0.8,
+        exp={
+            "residual_num_streams": 3,
+            "residual_stream_mode": "delay_line",
+            "residual_stream_gate_type": "scalar",
+            "residual_stream_read_init": 0.8,
+        },
     )
     mixer = BiBoMultiStreamResidual(cfg, layer_idx=0)
     streams = torch.stack([
@@ -387,11 +433,12 @@ def test_delay_line_residual_works_in_model_and_receives_gradients():
         num_routed_experts=8,
         num_experts_per_tok=2,
         moe_intermediate_size=32,
-        use_sliding_window=False,
-        residual_num_streams=3,
-        residual_stream_mode="delay_line",
-        residual_stream_gate_type="token",
-        residual_stream_read_init=0.9,
+        exp={
+            "residual_num_streams": 3,
+            "residual_stream_mode": "delay_line",
+            "residual_stream_gate_type": "token",
+            "residual_stream_read_init": 0.9,
+        },
     )
     model = BiBoForCausalLM(cfg)
     input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
@@ -421,12 +468,13 @@ def test_residual_experiments_can_be_combined():
         num_routed_experts=8,
         num_experts_per_tok=2,
         moe_intermediate_size=32,
-        use_sliding_window=False,
-        residual_gate_type="token",
-        residual_mixer_type="dynamic_causal_conv",
-        residual_conv_kernel_size=3,
-        residual_num_streams=2,
-        residual_stream_gate_type="token",
+        exp={
+            "residual_gate_type": "token",
+            "residual_mixer_type": "dynamic_causal_conv",
+            "residual_conv_kernel_size": 3,
+            "residual_num_streams": 2,
+            "residual_stream_gate_type": "token",
+        },
     )
     model = BiBoForCausalLM(cfg)
     input_ids = torch.randint(0, cfg.vocab_size, (2, 8))

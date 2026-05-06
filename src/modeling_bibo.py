@@ -8,13 +8,11 @@ Structure:
     modeling/
     ├── norm.py              # BiBoRMSNorm
     ├── embed.py             # BiBoRotaryEmbedding, apply_rotary_pos_emb
-    ├── attn/                # Attention mechanisms
+    ├── attn/                # Stable attention shell and standard attention
     │   ├── base.py          # BiBoAttention (main class)
     │   ├── standard.py      # Standard softmax attention
-    │   ├── sliding.py       # Sliding window attention
-    │   ├── recurrent.py     # Linear/GDN/KDA attention
-    │   ├── ssmax.py         # SSMax scaling
     │   └── utils.py         # repeat_kv
+    ├── ../exp/              # Experimental attention + residual modules
     ├── ffn/                 # Feed-forward networks
     │   ├── mlp.py           # BiBoMLP (standard MLP)
     │   ├── experts.py       # Special experts (Identity/ReLU/Zero/Noise/Conv)
@@ -40,10 +38,8 @@ from src.modeling.attn import (
     BiBoAttention,
     repeat_kv,
     eager_standard_attention,
-    eager_sliding_window_attention,
-    eager_recurrent_attention,
-    apply_ssmax_query_scaling,
 )
+from src.exp.attn import eager_sliding_window_attention, eager_recurrent_attention, apply_ssmax_query_scaling
 from src.modeling.ffn import (
     BiBoMLP,
     BiBoIdentityExpert,

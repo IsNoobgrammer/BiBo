@@ -8,6 +8,12 @@ from modeling_bibo import BiBoAttention, apply_rotary_pos_emb, repeat_kv
 
 
 def make_config(attention_type="softmax", **overrides):
+    exp = {
+        "attention_type": attention_type,
+        "sliding_window": overrides.pop("sliding_window", 3),
+        "use_ssmax": overrides.pop("use_ssmax", False),
+        "linear_attention_feature_map": overrides.pop("linear_attention_feature_map", "elu"),
+    }
     kwargs = dict(
         vocab_size=128,
         hidden_size=32,
@@ -18,10 +24,8 @@ def make_config(attention_type="softmax", **overrides):
         num_key_value_heads=2,
         num_routed_experts=8,
         num_experts_per_tok=2,
-        attention_type=attention_type,
-        sliding_window=3,
-        use_ssmax=False,
         moe_shared_scaling=2.0,
+        exp=exp,
     )
     kwargs.update(overrides)
     return BiBoConfig(**kwargs)

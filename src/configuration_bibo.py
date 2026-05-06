@@ -1,6 +1,11 @@
 from transformers import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
+from src.exp.configuration import (
+    EXPERIMENTAL_CONFIG_KEYS,
+    apply_experimental_config,
+    pop_legacy_experimental_kwargs,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -35,7 +40,6 @@ class BiBoConfig(PretrainedConfig):
         rms_norm_eps=1e-5,
         layer_norm_type="rms", # options are "rms" (RMS Normalization)
         use_cache=True,
-        use_ssmax=True, # scaling softmax to longer seq by scaling attn_weights 
         pad_token_id=None,
         bos_token_id=0,
         eos_token_id=0,
@@ -43,12 +47,6 @@ class BiBoConfig(PretrainedConfig):
         rope_theta=10000.0,
         rope_scaling=None,
         attention_dropout=0.0,
-        attention_type="softmax",
-        linear_attention_feature_map="elu",
-        linear_attention_eps=1e-6,
-        use_sliding_window=True,
-        sliding_window=512,
-        max_window_layers=None,
         attention_bias=False,
         mlp_only_layers=None,
         decoder_sparse_step=1,
@@ -65,23 +63,12 @@ class BiBoConfig(PretrainedConfig):
         kernel_size=3,
         router_lambda=1.0, # Confidence control: scaling for router logits (Skywork-MoE) - controls entropy/decisiveness
         moe_shared_scaling=1.0, # Scaling for shared expert output in MoE block (see DeepSeek-V2/V3, Muon)
-        residual_gate_type="none", # none, scalar, token, or channel
-        residual_gate_init=0.95, # Initial residual write strength; 0.95 keeps baseline behavior
-        residual_mixer_type="none", # none, causal_conv, or dynamic_causal_conv
-        residual_conv_kernel_size=4, # Depth-causal residual states: previous kernel_size-1 + current
-        residual_conv_init=0.95, # Initial weight on the current layer output
-        residual_history_include_input=False, # Include embeddings as the first depth residual state
-        residual_num_streams=1, # mHC-style parallel residual streams; 1 disables
-        residual_stream_mode="independent", # independent or delay_line
-        residual_stream_gate_type="token", # scalar or token
-        residual_stream_init="copy", # copy or zero
-        residual_stream_read_init=0.99, # Initial read mass on stream 0
-        residual_stream_write_init=0.99, # Initial write gate on stream 0
-
+        exp=None,
         norm_topk_prob=False,
         output_router_logits=False,
         **kwargs,
     ):
+        legacy_exp = pop_legacy_experimental_kwargs(kwargs)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -96,7 +83,6 @@ class BiBoConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.layer_norm_type = layer_norm_type
         self.use_cache = use_cache
-        self.use_ssmax=use_ssmax
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
@@ -104,12 +90,6 @@ class BiBoConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
         self.attention_dropout = attention_dropout
-        self.attention_type = attention_type
-        self.linear_attention_feature_map = linear_attention_feature_map
-        self.linear_attention_eps = linear_attention_eps
-        self.use_sliding_window = use_sliding_window
-        self.sliding_window = sliding_window
-        self.max_window_layers = max_window_layers if max_window_layers is not None else num_hidden_layers
         self.attention_bias = attention_bias
         self.decoder_sparse_step = decoder_sparse_step
         self.moe_intermediate_size = moe_intermediate_size
@@ -126,18 +106,7 @@ class BiBoConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.router_lambda = router_lambda
-        self.residual_gate_type = residual_gate_type
-        self.residual_gate_init = residual_gate_init
-        self.residual_mixer_type = residual_mixer_type
-        self.residual_conv_kernel_size = residual_conv_kernel_size
-        self.residual_conv_init = residual_conv_init
-        self.residual_history_include_input = residual_history_include_input
-        self.residual_num_streams = residual_num_streams
-        self.residual_stream_mode = residual_stream_mode
-        self.residual_stream_gate_type = residual_stream_gate_type
-        self.residual_stream_init = residual_stream_init
-        self.residual_stream_read_init = residual_stream_read_init
-        self.residual_stream_write_init = residual_stream_write_init
+        apply_experimental_config(self, exp, legacy_exp, num_hidden_layers=num_hidden_layers)
 
         # --- Auto-estimate scaling factor for shared expert if left as 1.0 ---
         self.moe_shared_scaling = moe_shared_scaling
@@ -202,22 +171,12 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError("vocab_size must be positive")
         if self.attention_dropout < 0.0 or self.attention_dropout > 1.0:
             raise ValueError("attention_dropout must be between 0.0 and 1.0")
-        if self.attention_type not in {"softmax", "sliding_window", "linear", "gdn", "kda"}:
-            raise ValueError(
-                "attention_type must be one of: 'softmax', 'sliding_window', 'linear', 'gdn', 'kda'"
-            )
-        if self.linear_attention_feature_map not in {"elu", "relu"}:
-            raise ValueError("linear_attention_feature_map must be one of: 'elu', 'relu'")
-        if self.linear_attention_eps <= 0.0:
-            raise ValueError("linear_attention_eps must be positive")
         if self.rms_norm_eps <= 0.0:
             raise ValueError("rms_norm_eps must be positive")
         if self.initializer_range <= 0.0:
             raise ValueError("initializer_range must be positive")
         if self.layer_norm_type != "rms":
             raise ValueError(f"Only 'rms' layer_norm_type is supported. Got: '{self.layer_norm_type}'")
-        if self.sliding_window is not None and self.sliding_window <= 0:
-            raise ValueError("sliding_window must be positive if specified")
         if self.moe_intermediate_size <= 0:
             raise ValueError("moe_intermediate_size must be positive")
         if self.kernel_size <= 0:
@@ -230,44 +189,17 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError("router_noise must be non-negative")
         if self.num_experts_per_tok > self.num_experts:
             raise ValueError("num_experts_per_tok cannot exceed total number of experts")
-        if self.residual_gate_type not in {"none", "scalar", "token", "channel"}:
-            raise ValueError("residual_gate_type must be one of: 'none', 'scalar', 'token', 'channel'")
-        if not (0.0 < self.residual_gate_init < 1.0):
-            raise ValueError("residual_gate_init must be between 0 and 1")
-        if self.residual_mixer_type not in {"none", "causal_conv", "dynamic_causal_conv"}:
-            raise ValueError("residual_mixer_type must be one of: 'none', 'causal_conv', 'dynamic_causal_conv'")
-        if self.residual_conv_kernel_size <= 1:
-            raise ValueError("residual_conv_kernel_size must be greater than 1")
-        if not (0.0 < self.residual_conv_init < 1.0):
-            raise ValueError("residual_conv_init must be between 0 and 1")
-        if not isinstance(self.residual_history_include_input, bool):
-            raise ValueError("residual_history_include_input must be a boolean")
-        if self.residual_num_streams < 1:
-            raise ValueError("residual_num_streams must be at least 1")
-        if self.residual_stream_mode not in {"independent", "delay_line"}:
-            raise ValueError("residual_stream_mode must be one of: 'independent', 'delay_line'")
-        if self.residual_stream_gate_type not in {"scalar", "token"}:
-            raise ValueError("residual_stream_gate_type must be one of: 'scalar', 'token'")
-        if self.residual_stream_init not in {"copy", "zero"}:
-            raise ValueError("residual_stream_init must be one of: 'copy', 'zero'")
-        if not (0.0 < self.residual_stream_read_init < 1.0):
-            raise ValueError("residual_stream_read_init must be between 0 and 1")
-        if not (0.0 < self.residual_stream_write_init < 1.0):
-            raise ValueError("residual_stream_write_init must be between 0 and 1")
-        if (
-            self.residual_num_streams > 1
-            and self.residual_stream_mode == "independent"
-            and self.residual_gate_type != "none"
-        ):
-            logger.warning_once(
-                "Both residual branch gates and multi-stream write gates are enabled. "
-                "This is valid, but their effects compose; use residual_gate_type='none' "
-                "for cleaner mHC-style stream-gate attribution."
-            )
         for idx in self.mlp_only_layers:
             if not (0 <= idx < self.num_hidden_layers):
                 raise ValueError(f"mlp_only_layers index {idx} is out of range for {self.num_hidden_layers} layers")
         # rope_config_validation(self)
+
+    def to_dict(self):
+        output = super().to_dict()
+        for key in EXPERIMENTAL_CONFIG_KEYS:
+            output.pop(key, None)
+        output["exp"] = dict(self.exp)
+        return output
 
 
 if __name__ == "__main__":

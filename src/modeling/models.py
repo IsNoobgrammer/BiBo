@@ -18,9 +18,10 @@ from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.utils import logging
 
 from src.configuration_bibo import BiBoConfig
+from src.exp.residual import BiBoMultiStreamResidual
 from .norm import BiBoRMSNorm
 from .embed import BiBoRotaryEmbedding
-from .layers import BiBoDecoderLayer, BiBoMultiStreamResidual
+from .layers import BiBoDecoderLayer
 
 logger = logging.get_logger(__name__)
 

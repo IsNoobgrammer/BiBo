@@ -291,7 +291,58 @@ self.gate_conv = nn.Conv1d(config.hidden_size, self.num_routed_experts,
 
 ---
 
-### `residual_gate_type`
+## Experimental Features
+
+Experimental attention and residual features are configured under `BiBoConfig(exp={...})`
+and implemented in `src/exp/`. The stable model config keeps the standard softmax
+attention and MoE architecture options at the top level.
+
+Example:
+
+```python
+config = BiBoConfig(
+    hidden_size=1536,
+    num_attention_heads=12,
+    exp={
+        "attention_type": "sliding_window",
+        "sliding_window": 512,
+        "use_ssmax": True,
+        "residual_stream_mode": "delay_line",
+        "residual_num_streams": 2,
+    },
+)
+```
+
+### `exp.attention_type`
+
+**Default:** `"softmax"`
+
+**Options:** `"softmax"`, `"sliding_window"`, `"linear"`, `"gdn"`, `"kda"`
+
+The non-standard attention paths live in `src/exp/attn/`. Use `"softmax"` for the
+normal attention path. Use the other values only for experiments:
+
+- **sliding_window:** Local causal attention with a fixed recent-token window.
+- **linear:** Causal linear attention with an ELU or ReLU feature map.
+- **gdn / kda:** Delta-style recurrent attention variants with learned gates.
+
+### `exp.use_ssmax`
+
+**Default:** `False`
+
+Enables experimental sequence-length-aware query scaling before softmax attention.
+
+### `exp.use_sliding_window` / `exp.sliding_window` / `exp.max_window_layers`
+
+Sliding-window controls for local causal attention. `exp.attention_type="sliding_window"`
+forces sliding-window attention; `exp.use_sliding_window=True` applies it to the first
+`exp.max_window_layers` decoder layers.
+
+### `exp.linear_attention_feature_map` / `exp.linear_attention_eps`
+
+Controls the recurrent linear/GDN/KDA attention feature map and numerical epsilon.
+
+### `exp.residual_gate_type`
 
 **Default:** `"none"`
 
@@ -317,7 +368,7 @@ The identity stream is never gated, so the model can always preserve normal resi
 - Use `"scalar"` for a very cheap stability experiment.
 - Use `"channel"` only if you can afford extra parameters and want more expressive control.
 
-### `residual_gate_init`
+### `exp.residual_gate_init`
 
 **Default:** `0.95`
 
@@ -330,7 +381,7 @@ model.model.residual_gate_stats()
 
 ---
 
-### `residual_mixer_type`
+### `exp.residual_mixer_type`
 
 **Default:** `"none"`
 
@@ -351,14 +402,14 @@ previous residual states and the current layer output, so token-level causality 
 preserved. `"causal_conv"` uses one learned depth kernel per layer. `"dynamic_causal_conv"`
 uses the current token state to produce token-conditioned depth kernels.
 
-### `residual_conv_kernel_size`
+### `exp.residual_conv_kernel_size`
 
 **Default:** `4`
 
 Number of depth states in the causal residual convolution window. The model keeps
 `kernel_size - 1` previous residual states plus the current layer output.
 
-### `residual_conv_init`
+### `exp.residual_conv_init`
 
 **Default:** `0.95`
 
@@ -370,7 +421,7 @@ The mixer exposes `current_weight`, `previous_mass`, and `num_states` through:
 model.model.residual_mixer_stats()
 ```
 
-### `residual_history_include_input`
+### `exp.residual_history_include_input`
 
 **Default:** `False`
 
@@ -381,7 +432,7 @@ to be part of the early residual-depth window.
 
 ---
 
-### `residual_num_streams`
+### `exp.residual_num_streams`
 
 **Default:** `1`
 
@@ -398,11 +449,11 @@ streams = gated_write(streams, layer_output - read_state)
 The model performs one stream read before each layer and one final read after the
 last write for the output state. It does not re-read after every intermediate write.
 
-For cleaner attribution, use `residual_gate_type="none"` when experimenting with
+For cleaner attribution, use `exp={"residual_gate_type": "none"}` when experimenting with
 multi-stream residuals. Enabling branch residual gates and stream gates together is
 valid, but their effective scaling composes.
 
-### `residual_stream_mode`
+### `exp.residual_stream_mode`
 
 **Default:** `"independent"`
 
@@ -421,11 +472,11 @@ streams = [new_state, x_t, x_t_minus_1]
 ```
 
 In delay-line mode, auxiliary streams start at zero regardless of
-`residual_stream_init`, because there is no older layer state at layer 0.
+`exp.residual_stream_init`, because there is no older layer state at layer 0.
 This is the cleanest setting when you want the stream gate to act as a learned
 causal depth kernel.
 
-### `residual_stream_gate_type`
+### `exp.residual_stream_gate_type`
 
 **Default:** `"token"`
 
@@ -434,7 +485,7 @@ causal depth kernel.
 - **scalar:** One read/write gate per layer and stream.
 - **token:** Per-token read/write gates over streams.
 
-### `residual_stream_init`
+### `exp.residual_stream_init`
 
 **Default:** `"copy"`
 
@@ -444,7 +495,7 @@ causal depth kernel.
   layer read even when the initial read gate is not exactly one-hot.
 - **zero:** Stream 0 starts from embeddings and auxiliary streams start at zero.
 
-### `residual_stream_read_init` / `residual_stream_write_init`
+### `exp.residual_stream_read_init` / `exp.residual_stream_write_init`
 
 **Default:** `0.99`
 
