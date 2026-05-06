@@ -17,6 +17,73 @@ Complete reference for all BiBo model configuration parameters with implementati
 
 ## Router Configuration
 
+### Two Independent Mechanisms
+
+The BiBo router uses **two independent mechanisms** that serve different purposes:
+
+#### 1. **Router Logit Normalization** (`router_lambda`) — Controls Confidence
+
+**Purpose:** Increase confidence in expert selection (low entropy in router logits)
+
+**What it does:** Makes the router more or less decisive when picking experts
+
+**Mechanism:** Normalizes and scales logits before softmax
+```python
+z̃ = λ · (z - μ) / σ
+g = softmax(z̃)
+```
+
+**Controls:**
+- ✓ Entropy of routing distribution (confidence)
+- ✓ Sharpness of expert selection (decisiveness)
+- ✗ Does NOT control which experts get selected
+- ✗ Does NOT control load balancing
+
+**Key insight:** Higher λ → lower entropy → more confident decisions
+
+---
+
+#### 2. **Bias Update Mechanism** (`bias_update_*`) — Controls Load Balancing
+
+**Purpose:** Ensure experts are selected evenly over the long run
+
+**What it does:** Adjusts router bias to favor under-utilized experts
+
+**Mechanism:** Tracks token counts per expert, updates bias periodically
+```python
+deviation = mean_tokens_per_expert - tokens_per_expert
+bias += factor × sign(deviation)
+```
+
+**Controls:**
+- ✓ Load distribution across experts (fairness)
+- ✓ Prevents expert collapse (some experts never used)
+- ✗ Does NOT control routing confidence/entropy
+- ✗ Does NOT control sharpness of decisions
+
+**Key insight:** Bias updates ensure all experts get used, regardless of routing confidence
+
+---
+
+### How They Work Together
+
+| Mechanism | What it controls | Analogy |
+|-----------|------------------|---------|
+| `router_lambda` | **HOW CONFIDENT** the router is | "How decisively should I pick?" |
+| `bias_update_*` | **WHICH EXPERTS** get selected over time | "Am I picking all experts fairly?" |
+
+**Example scenario:**
+- `router_lambda = 2.0` → Router is very confident (low entropy), picks experts decisively
+- `bias_update_factor = 1e-2` → If some experts are under-used, bias increases to make them more likely
+- **Result:** Confident routing + fair load distribution
+
+**They are independent:**
+- You can have high confidence (low entropy) AND balanced load
+- You can have low confidence (high entropy) AND imbalanced load
+- They solve different problems
+
+---
+
 ### `router_temperature`
 
 **Default:** `1.3`
@@ -68,7 +135,9 @@ This parameter is conceptually related to temperature in softmax, but the actual
 **Location:** `src/configuration_bibo.py:69`
 
 **What it does:**
-Scaling factor for normalized router logits before softmax. This is the **actual** parameter that controls routing sharpness in the current implementation.
+Scaling factor for normalized router logits before softmax. Controls **confidence/decisiveness** in expert selection by creating **low-entropy routing distributions**.
+
+**Purpose:** Increase confidence in expert selection (low entropy in router logits)
 
 **Implementation:**
 ```python
@@ -101,18 +170,27 @@ Where:
 - `z̃` = normalized and scaled logits
 - `g` = final routing weights
 
+**What this controls:**
+- **Entropy of routing distribution** (confidence in expert selection)
+- **Sharpness of expert selection** (how decisively the router picks experts)
+- **Separation between expert logits** (forces model to create clear preferences)
+
+**Does NOT control:**
+- Load balancing across experts (that's `bias_update_*` parameters)
+- Which experts get selected (that's learned through training)
+
 **Tuning guidance:**
 - **λ = 1.0:** Standard normalization, balanced routing
-- **λ = 1.5-2.0:** Sharper routing, stronger expert specialization
-- **λ = 0.5-0.8:** Softer routing, better load balancing
+- **λ = 1.5-2.0:** Sharper routing, stronger expert specialization, **lower entropy**
+- **λ = 0.5-0.8:** Softer routing, **higher entropy**, more exploration
 
 **Pros:**
-- Higher λ: Clearer expert differentiation, better specialization
-- Lower λ: More uniform expert usage, stable training
+- Higher λ: **Lower entropy** → clearer expert differentiation, more confident decisions, better specialization
+- Lower λ: **Higher entropy** → more uniform expert usage, stable training, more exploration
 
 **Cons:**
-- Higher λ: Risk of token dropping, load imbalance
-- Lower λ: Experts may not learn distinct specializations
+- Higher λ: Risk of token dropping, load imbalance (some experts never selected)
+- Lower λ: Experts may not learn distinct specializations, mushy routing decisions
 
 **Research Reference:**
 [Skywork-MoE: A Deep Dive into Training Techniques for Mixture-of-Experts Language Models](https://arxiv.org/abs/2406.06563)
@@ -120,9 +198,14 @@ Where:
 Section 4.1 "Gating Logit Normalization" - This technique prevents high-entropy gate distributions and improves expert diversification.
 
 **Key findings from Skywork-MoE:**
-- Without normalization: gate outputs become nearly uniform (high entropy)
-- With λ=1: Significant improvement in loss and token drop rate
-- With λ=2: Even sharper distributions, but λ=1 is sufficient for most cases
+- Without normalization: gate outputs become nearly uniform (**high entropy** = no confidence)
+- With λ=1: Significant improvement in loss and token drop rate (**lower entropy** = more confidence)
+- With λ=2: Even sharper distributions (**very low entropy** = very confident), but λ=1 is sufficient for most cases
+
+**Entropy interpretation:**
+- **High entropy** (λ < 1.0): Router is uncertain, spreads probability across many experts
+- **Low entropy** (λ > 1.0): Router is confident, concentrates probability on few experts
+- **Goal:** Low entropy = confident, decisive expert selection
 
 ---
 
@@ -217,7 +300,9 @@ self.gate_conv = nn.Conv1d(config.hidden_size, self.num_routed_experts,
 **Location:** `src/configuration_bibo.py:68`
 
 **What it does:**
-Number of tokens (batch_size × seq_len) to process before updating router bias for load balancing.
+Number of tokens (batch_size × seq_len) to process before updating router bias for **load balancing**.
+
+**Purpose:** Ensure experts are selected evenly over the long run (load balancing)
 
 **Implementation:**
 ```python
@@ -256,6 +341,24 @@ def update_bias(self, tokens_per_expert: torch.Tensor):
     self.gate.bias.add_(self.bias_update_factor * deviation.sign())
 ```
 
+**What this controls:**
+- **Load balancing** (ensuring all experts get used evenly)
+- **Expert utilization distribution** (prevents expert collapse)
+- **Long-term fairness** in expert selection
+
+**Does NOT control:**
+- Confidence/entropy of routing decisions (that's `router_lambda`)
+- Sharpness of expert selection (that's `router_lambda`)
+- Which expert is best for a given token (that's learned through training)
+
+**Key distinction from `router_lambda`:**
+- `router_lambda`: Controls **HOW CONFIDENT** the router is (entropy of logits)
+- `bias_update_*`: Controls **WHICH EXPERTS** get selected over time (load distribution)
+
+**Analogy:**
+- `router_lambda` = "How decisively should I pick?" (confidence)
+- `bias_update_*` = "Am I picking all experts fairly?" (fairness)
+
 **Tuning guidance:**
 - **100,000 (default):** Update every ~100k tokens
   - With batch_size=8, seq_len=2048: ~6 batches
@@ -289,7 +392,9 @@ batches_until_update = 100,000 / 32,768 ≈ 3 batches
 **Location:** `src/configuration_bibo.py:67`
 
 **What it does:**
-Step size for router bias updates. Controls how aggressively the bias is adjusted to balance load.
+Step size for router bias updates. Controls how aggressively the bias is adjusted to **balance load across experts**.
+
+**Purpose:** Control the speed of load balancing (works with `bias_update_threshold`)
 
 **Implementation:**
 ```python
@@ -301,6 +406,14 @@ self.gate.bias.add_(self.bias_update_factor * deviation.sign())
 - Computes deviation from mean load: `deviation = mean_tpe - tpe`
 - Updates bias by: `bias += factor × sign(deviation)`
 - Only the sign matters (not magnitude), so this is a fixed-step update
+
+**What this controls:**
+- **Speed of load balancing** (how fast under-utilized experts get boosted)
+- **Magnitude of bias adjustments** (step size per update)
+
+**Does NOT control:**
+- Confidence/entropy of routing decisions (that's `router_lambda`)
+- Frequency of updates (that's `bias_update_threshold`)
 
 **Tuning guidance:**
 - **1e-2 (default):** Moderate adjustment
@@ -336,6 +449,11 @@ bias_update_factor = 1e-2
 bias_update_threshold = 50_000
 bias_update_factor = 2e-2
 ```
+
+**Key distinction:**
+- This parameter affects **load distribution** (which experts get used)
+- It does NOT affect **routing confidence** (how decisively experts are selected)
+- For routing confidence, use `router_lambda`
 
 ---
 
@@ -549,15 +667,26 @@ rope_scaling = {"type": "dynamic", "factor": 2.0}
 
 ## Quick Reference Table
 
+### Router Mechanisms Summary
+
+| Mechanism | Parameters | Purpose | What it Controls |
+|-----------|-----------|---------|------------------|
+| **Logit Normalization** | `router_lambda` | Confidence in expert selection | Entropy of routing distribution (decisiveness) |
+| **Bias Updates** | `bias_update_threshold`, `bias_update_factor` | Load balancing | Which experts get selected over time (fairness) |
+
+**Key insight:** These are independent mechanisms that solve different problems.
+
+### All Parameters
+
 | Parameter | Default | Location | Purpose | Tuning Range |
 |-----------|---------|----------|---------|--------------|
+| `router_lambda` | 1.0 | config:69 | **Routing confidence (entropy control)** | 0.5-2.0 |
+| `bias_update_threshold` | 100,000 | config:68 | **Load balancing frequency** | 10k-500k |
+| `bias_update_factor` | 0.01 | config:67 | **Load balancing step size** | 1e-3 to 5e-2 |
 | `router_temperature` | 1.3 | config:68 | Legacy parameter (not actively used) | 0.8-2.0 |
-| `router_lambda` | 1.0 | config:69 | **Actual routing sharpness control** | 0.5-2.0 |
 | `router_noise` | 0.5 | config:68 | Exploration noise during training | 0.0-1.0 |
 | `router_type` | "mlp" | config:68 | Router architecture | "mlp" or "conv" |
 | `kernel_size` | 3 | config:68 | Conv router kernel size | 3-7 (odd) |
-| `bias_update_threshold` | 100,000 | config:68 | Tokens before bias update | 10k-500k |
-| `bias_update_factor` | 0.01 | config:67 | Bias update step size | 1e-3 to 5e-2 |
 | `moe_shared_scaling` | 1.0 (auto) | config:70 | Shared expert output scaling | 0.3-1.5 |
 | `rope_scaling` | {"type": "linear", "factor": 1.0} | config:154 | Position embedding scaling | factor: 1.0-4.0 |
 

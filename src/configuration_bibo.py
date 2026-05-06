@@ -57,13 +57,13 @@ class BiBoConfig(PretrainedConfig):
         num_shared_experts=1,
         num_experts_per_tok=6,
         num_experts=None,
-        router_temperature=1.3, # no need for temp. explicitly ; now its calculated implicitly based on logits.
-        bias_update_factor=1e-2,
-        bias_update_threshold=100_000, # amount of tokens(bs*seq) to update bias 
-        router_noise=0.5,
+        router_temperature=1.3, # Legacy parameter (not actively used; see router_lambda)
+        bias_update_factor=1e-2, # Step size for load balancing bias updates
+        bias_update_threshold=100_000, # Tokens before bias update (load balancing)
+        router_noise=0.1, # Exploration noise during training
         router_type="mlp", # mlp or conv
         kernel_size=3,
-        router_lambda=1.0, # Scaling for router logits before softmax (see Skywork-MoE paper, eq. 6)
+        router_lambda=1.0, # Confidence control: scaling for router logits (Skywork-MoE) - controls entropy/decisiveness
         moe_shared_scaling=1.0, # Scaling for shared expert output in MoE block (see DeepSeek-V2/V3, Muon)
 
         norm_topk_prob=False,

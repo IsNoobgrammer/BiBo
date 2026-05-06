@@ -27,11 +27,15 @@
 
 ### Training Features
 
-- **Adaptive router bias**: Automatic load balancing via threshold-based bias updates
+- **Router logit normalization (Skywork-MoE)**: `router_lambda` controls confidence in expert selection (low entropy routing)
+- **Adaptive router bias**: Automatic load balancing via threshold-based bias updates (ensures even expert utilization)
 - **Router noise**: Gumbel noise for exploration during training
-- **Router lambda**: Skywork-MoE style logit normalization
 - **Shared expert scaling**: DeepSeek-V2/V3 style shared expert weighting
 - **Gradient checkpointing**: Memory-efficient training for large models
+
+**Key distinction:**
+- `router_lambda`: Controls **confidence** (entropy) of expert selection
+- `bias_update_*`: Controls **load balancing** (which experts get used over time)
 
 ## Installation
 
@@ -133,10 +137,10 @@ config = BiBoConfig(
     
     # Router settings
     router_type="mlp",  # "mlp" or "conv"
-    router_temperature=1.3,
+    router_lambda=1.0,  # Confidence control (low entropy routing)
     router_noise=0.5,
-    router_lambda=1.0,
-    bias_update_factor=1e-2,
+    router_temperature=1.3,  # Legacy (not actively used)
+    bias_update_factor=1e-2,  # Load balancing step size
     bias_update_threshold=100_000,  # Tokens before bias update
     
     # Attention settings
