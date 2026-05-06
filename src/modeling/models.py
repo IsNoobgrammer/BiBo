@@ -207,6 +207,14 @@ class BiBoModel(BiBoPreTrainedModel):
             logger.warning_once("`use_cache=True` incompatible with gradient checkpointing. Setting `use_cache=False`")
             use_cache = False
 
+        if self.config.attention_type in {"linear", "gdn", "kda"} and use_cache:
+            logger.warning_once(
+                "`use_cache=True` is not supported for recurrent experimental attention types yet. "
+                "Setting `use_cache=False` to preserve full-prefix generation semantics."
+            )
+            use_cache = False
+            past_key_values = None
+
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 

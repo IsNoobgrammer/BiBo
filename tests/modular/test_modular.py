@@ -3,10 +3,12 @@ import sys
 sys.path.insert(0, '.')
 import torch
 import pytest
+from transformers.cache_utils import DynamicCache
 from transformers.generation import GenerationMixin
 from src.configuration_bibo import BiBoConfig
 from src.modeling.models import BiBoModel, BiBoForCausalLM
 from src.modeling.attn import BiBoAttention
+from src.modeling.embed import BiBoRotaryEmbedding
 from src.modeling.ffn import BiBoMLP, BiBoMoELayer
 from src.exp.residual import BiBoCausalResidualConv, BiBoMultiStreamResidual, BiBoResidualGate
 
@@ -72,6 +74,81 @@ def test_causal_lm_supports_generation_mixin(cfg):
     model = BiBoForCausalLM(cfg)
 
     assert isinstance(model, GenerationMixin)
+
+def test_rotary_embedding_uses_tensor_cache_positions():
+    """Cached decode should use absolute positions, not slice from position zero."""
+    rotary = BiBoRotaryEmbedding(dim=8, max_position_embeddings=16)
+    x = torch.randn(1, 2, 8)
+    positions = torch.tensor([3, 5])
+
+    cos, sin = rotary(x, positions)
+
+    torch.testing.assert_close(cos[0], rotary.cos_cached[3])
+    torch.testing.assert_close(cos[1], rotary.cos_cached[5])
+    torch.testing.assert_close(sin[0], rotary.sin_cached[3])
+    torch.testing.assert_close(sin[1], rotary.sin_cached[5])
+
+def test_softmax_cache_matches_full_forward():
+    """Incremental cached decode should match full-prefix logits for softmax attention."""
+    torch.manual_seed(0)
+    cfg = BiBoConfig(
+        vocab_size=100,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        moe_shared_scaling=2.0,
+        router_noise=0.0,
+    )
+    model = BiBoForCausalLM(cfg).eval()
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 6))
+    attention_mask = torch.ones_like(input_ids)
+
+    with torch.no_grad():
+        full = model(input_ids, attention_mask=attention_mask, use_cache=False).logits[:, -1]
+        cache = DynamicCache()
+        prefix = model(
+            input_ids[:, :-1],
+            attention_mask=attention_mask[:, :-1],
+            past_key_values=cache,
+            use_cache=True,
+        )
+        incremental = model(
+            input_ids[:, -1:],
+            attention_mask=attention_mask,
+            past_key_values=prefix.past_key_values,
+            use_cache=True,
+        ).logits[:, -1]
+
+    torch.testing.assert_close(incremental, full, atol=1e-5, rtol=1e-5)
+
+@pytest.mark.parametrize("attention_type", ["linear", "gdn", "kda"])
+def test_recurrent_attention_disables_unsupported_kv_cache(attention_type):
+    """Recurrent attention should not return an invalid KV cache."""
+    cfg = BiBoConfig(
+        vocab_size=100,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        moe_shared_scaling=2.0,
+        exp={"attention_type": attention_type},
+    )
+    model = BiBoForCausalLM(cfg).eval()
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 6))
+
+    with torch.no_grad():
+        out = model(input_ids, use_cache=True)
+
+    assert out.past_key_values is None
 
 def test_forward_backward(cfg):
     """Test forward + backward"""
