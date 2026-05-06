@@ -8,4 +8,5 @@ logs/
 bugs/
 venv/
 wandb/
-shaurya_notes.txt
+shaurya_notes.md
+pipeline/
