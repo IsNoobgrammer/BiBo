@@ -11,7 +11,7 @@ import torch
 import pytest
 from src.configuration_bibo import BiBoConfig
 from src.modeling.attn import BiBoAttention
-from src.modeling.attn.ssmax import apply_ssmax_query_scaling
+from src.exp.attn.ssmax import apply_ssmax_query_scaling
 
 
 class TestSSMaxInitialization:

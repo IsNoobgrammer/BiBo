@@ -3,10 +3,14 @@ import sys
 sys.path.insert(0, '.')
 import torch
 import pytest
+from transformers.cache_utils import DynamicCache
+from transformers.generation import GenerationMixin
 from src.configuration_bibo import BiBoConfig
 from src.modeling.models import BiBoModel, BiBoForCausalLM
 from src.modeling.attn import BiBoAttention
+from src.modeling.embed import BiBoRotaryEmbedding
 from src.modeling.ffn import BiBoMLP, BiBoMoELayer
+from src.exp.residual import BiBoCausalResidualConv, BiBoMultiStreamResidual, BiBoResidualGate
 
 @pytest.fixture
 def cfg():
@@ -50,8 +54,8 @@ def test_model(cfg):
     model = BiBoModel(cfg)
     input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
     out = model(input_ids)
+    assert out.last_hidden_state.shape == (2, 8, cfg.hidden_size)
     print(f"✓ Model: input {input_ids.shape} → hidden {out.last_hidden_state.shape}")
-    return model
 
 def test_causal_lm(cfg):
     """Test causal LM"""
@@ -64,6 +68,88 @@ def test_causal_lm(cfg):
     labels = torch.randint(0, cfg.vocab_size, (2, 8))
     out = model(input_ids, labels=labels)
     print(f"✓ CausalLM loss: {out.loss.item():.4f}")
+
+def test_causal_lm_supports_generation_mixin(cfg):
+    """Causal LM should keep HF generate support on modern Transformers."""
+    model = BiBoForCausalLM(cfg)
+
+    assert isinstance(model, GenerationMixin)
+
+def test_rotary_embedding_uses_tensor_cache_positions():
+    """Cached decode should use absolute positions, not slice from position zero."""
+    rotary = BiBoRotaryEmbedding(dim=8, max_position_embeddings=16)
+    x = torch.randn(1, 2, 8)
+    positions = torch.tensor([3, 5])
+
+    cos, sin = rotary(x, positions)
+    expected_cos, expected_sin = rotary(x, seq_len=6)
+
+    torch.testing.assert_close(cos[0], expected_cos[3])
+    torch.testing.assert_close(cos[1], expected_cos[5])
+    torch.testing.assert_close(sin[0], expected_sin[3])
+    torch.testing.assert_close(sin[1], expected_sin[5])
+
+def test_softmax_cache_matches_full_forward():
+    """Incremental cached decode should match full-prefix logits for softmax attention."""
+    torch.manual_seed(0)
+    cfg = BiBoConfig(
+        vocab_size=100,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        moe_shared_scaling=2.0,
+        router_noise=0.0,
+    )
+    model = BiBoForCausalLM(cfg).eval()
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 6))
+    attention_mask = torch.ones_like(input_ids)
+
+    with torch.no_grad():
+        full = model(input_ids, attention_mask=attention_mask, use_cache=False).logits[:, -1]
+        cache = DynamicCache()
+        prefix = model(
+            input_ids[:, :-1],
+            attention_mask=attention_mask[:, :-1],
+            past_key_values=cache,
+            use_cache=True,
+        )
+        incremental = model(
+            input_ids[:, -1:],
+            attention_mask=attention_mask,
+            past_key_values=prefix.past_key_values,
+            use_cache=True,
+        ).logits[:, -1]
+
+    torch.testing.assert_close(incremental, full, atol=1e-5, rtol=1e-5)
+
+@pytest.mark.parametrize("attention_type", ["linear", "gdn", "kda"])
+def test_recurrent_attention_disables_unsupported_kv_cache(attention_type):
+    """Recurrent attention should not return an invalid KV cache."""
+    cfg = BiBoConfig(
+        vocab_size=100,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        moe_shared_scaling=2.0,
+        exp={"attention_type": attention_type},
+    )
+    model = BiBoForCausalLM(cfg).eval()
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 6))
+
+    with torch.no_grad():
+        out = model(input_ids, use_cache=True)
+
+    assert out.past_key_values is None
 
 def test_forward_backward(cfg):
     """Test forward + backward"""
@@ -79,6 +165,487 @@ def test_forward_backward(cfg):
     has_grads = sum(1 for p in model.parameters() if p.grad is not None)
     total_params = sum(1 for _ in model.parameters())
     print(f"✓ Backward: {has_grads}/{total_params} params have grads")
+
+def test_experimental_config_serializes_under_exp():
+    """Experimental knobs should stay out of the top-level serialized config."""
+    cfg = BiBoConfig(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_routed_experts=8,
+        exp={
+            "use_ssmax": True,
+            "attention_type": "linear",
+            "residual_num_streams": 2,
+            "residual_stream_mode": "delay_line",
+        },
+    )
+    serialized = cfg.to_dict()
+
+    assert cfg.use_ssmax is True
+    assert cfg.attention_type == "linear"
+    assert serialized["exp"]["use_ssmax"] is True
+    assert serialized["exp"]["attention_type"] == "linear"
+    assert serialized["exp"]["residual_stream_mode"] == "delay_line"
+    assert "use_ssmax" not in serialized
+    assert "attention_type" not in serialized
+    assert "residual_num_streams" not in serialized
+
+def test_exp_config_takes_precedence_over_legacy_experimental_kwargs():
+    """Canonical exp values should win over old top-level experimental kwargs."""
+    cfg = BiBoConfig(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_routed_experts=8,
+        exp={
+            "use_ssmax": False,
+            "attention_type": "linear",
+        },
+        use_ssmax=True,
+        attention_type="gdn",
+    )
+
+    assert cfg.use_ssmax is False
+    assert cfg.attention_type == "linear"
+    assert cfg.exp["use_ssmax"] is False
+    assert cfg.exp["attention_type"] == "linear"
+
+def test_residual_gate_starts_near_identity():
+    """Residual write gate should preserve baseline flow at init."""
+    cfg = BiBoConfig(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_routed_experts=8,
+        exp={
+            "residual_gate_type": "token",
+            "residual_gate_init": 0.95,
+        },
+    )
+    gate = BiBoResidualGate(cfg, "attn")
+    x = torch.randn(2, 8, cfg.hidden_size)
+    branch = torch.ones_like(x)
+
+    out = gate(x, branch)
+    assert out.shape == branch.shape
+    assert torch.allclose(out.mean(), out.new_tensor(0.95), atol=1e-5)
+    assert gate.stats()["attn/mean"] == pytest.approx(0.95, abs=1e-5)
+
+def test_residual_gates_work_in_model_and_receive_gradients():
+    """Token gates should expose per-branch flow stats and train."""
+    cfg = BiBoConfig(
+        vocab_size=100,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        exp={
+            "residual_gate_type": "token",
+            "residual_gate_init": 0.95,
+        },
+    )
+    model = BiBoForCausalLM(cfg)
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
+    labels = torch.randint(0, cfg.vocab_size, (2, 8))
+
+    out = model(input_ids, labels=labels)
+    out.loss.backward()
+    stats = model.model.residual_gate_stats()
+
+    assert "layer_0/attn/mean" in stats
+    assert "layer_0/mlp/mean" in stats
+    assert stats["layer_0/attn/mean"] == pytest.approx(0.95, abs=1e-5)
+    assert stats["layer_0/mlp/mean"] == pytest.approx(0.95, abs=1e-5)
+    assert model.model.layers[0].attn_residual_gate.bias.grad is not None
+    assert model.model.layers[0].mlp_residual_gate.bias.grad is not None
+
+def test_causal_residual_conv_starts_near_current_state():
+    """Depth-causal residual conv should prefer the current layer at init."""
+    cfg = BiBoConfig(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_routed_experts=8,
+        exp={
+            "residual_mixer_type": "causal_conv",
+            "residual_conv_kernel_size": 3,
+            "residual_conv_init": 0.9,
+        },
+    )
+    mixer = BiBoCausalResidualConv(cfg, layer_idx=0)
+    current = torch.ones(2, 8, cfg.hidden_size)
+    previous = torch.zeros_like(current)
+
+    mixed = mixer(current, (previous, previous))
+    assert mixed.shape == current.shape
+    assert torch.allclose(mixed.mean(), mixed.new_tensor(0.9), atol=1e-5)
+    stats = mixer.stats()
+    assert stats["layer_0/residual_conv/current_weight"] == pytest.approx(0.9, abs=1e-5)
+    assert stats["layer_0/residual_conv/previous_mass"] == pytest.approx(0.1, abs=1e-5)
+    assert stats["layer_0/residual_conv/num_states"] == 3
+
+def test_causal_residual_conv_kernel_size_one_is_current_only():
+    """A one-state residual conv window should reduce to the current layer output."""
+    for mixer_type in ["causal_conv", "dynamic_causal_conv"]:
+        cfg = BiBoConfig(
+            hidden_size=64,
+            num_attention_heads=4,
+            num_routed_experts=8,
+            exp={
+                "residual_mixer_type": mixer_type,
+                "residual_conv_kernel_size": 1,
+            },
+        )
+        mixer = BiBoCausalResidualConv(cfg, layer_idx=0)
+        current = torch.randn(2, 8, cfg.hidden_size)
+        previous = torch.randn_like(current)
+
+        mixed = mixer(current, (previous, previous))
+        stats = mixer.stats()
+
+        torch.testing.assert_close(mixed, current)
+        assert stats["layer_0/residual_conv/current_weight"] == pytest.approx(1.0, abs=1e-5)
+        assert stats["layer_0/residual_conv/previous_mass"] == pytest.approx(0.0, abs=1e-5)
+        assert stats["layer_0/residual_conv/num_states"] == 1
+
+def test_causal_residual_conv_works_in_model_and_receives_gradients():
+    """Model should train causal depth-conv residual mixer parameters."""
+    cfg = BiBoConfig(
+        vocab_size=100,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        exp={
+            "residual_mixer_type": "causal_conv",
+            "residual_conv_kernel_size": 3,
+            "residual_conv_init": 0.9,
+        },
+    )
+    model = BiBoForCausalLM(cfg)
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
+    labels = torch.randint(0, cfg.vocab_size, (2, 8))
+
+    out = model(input_ids, labels=labels)
+    out.loss.backward()
+    stats = model.model.residual_mixer_stats()
+
+    assert "layer_0/residual_conv/current_weight" in stats
+    assert "layer_1/residual_conv/current_weight" in stats
+    assert stats["layer_0/residual_conv/num_states"] == 1
+    assert stats["layer_1/residual_conv/num_states"] == 2
+    assert stats["layer_2/residual_conv/num_states"] == 3
+    assert model.model.layers[0].residual_mixer.kernel_logits.grad is not None
+    assert model.model.layers[1].residual_mixer.kernel_logits.grad is not None
+
+def test_residual_conv_kernel_size_one_works_in_model():
+    """A current-only depth mixer should not retain residual history in the model loop."""
+    cfg = BiBoConfig(
+        vocab_size=100,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        exp={
+            "residual_mixer_type": "causal_conv",
+            "residual_conv_kernel_size": 1,
+        },
+    )
+    model = BiBoForCausalLM(cfg)
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
+    labels = torch.randint(0, cfg.vocab_size, (2, 8))
+
+    out = model(input_ids, labels=labels)
+    out.loss.backward()
+    stats = model.model.residual_mixer_stats()
+
+    assert torch.isfinite(out.loss)
+    assert stats["layer_0/residual_conv/num_states"] == 1
+    assert stats["layer_1/residual_conv/num_states"] == 1
+    assert stats["layer_0/residual_conv/current_weight"] == pytest.approx(1.0, abs=1e-5)
+    assert model.model.layers[0].residual_mixer.kernel_logits.grad is not None
+
+def test_dynamic_causal_residual_conv_works_in_model_and_receives_gradients():
+    """Dynamic depth conv should learn token-conditioned residual-depth reads."""
+    cfg = BiBoConfig(
+        vocab_size=100,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        exp={
+            "residual_mixer_type": "dynamic_causal_conv",
+            "residual_conv_kernel_size": 3,
+            "residual_conv_init": 0.9,
+        },
+    )
+    model = BiBoForCausalLM(cfg)
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
+    labels = torch.randint(0, cfg.vocab_size, (2, 8))
+
+    out = model(input_ids, labels=labels)
+    out.loss.backward()
+    stats = model.model.residual_mixer_stats()
+
+    assert stats["layer_0/residual_conv/num_states"] == 1
+    assert stats["layer_1/residual_conv/num_states"] == 2
+    assert stats["layer_2/residual_conv/num_states"] == 3
+    assert model.model.layers[0].residual_mixer.dynamic_weight.grad is not None
+    assert model.model.layers[0].residual_mixer.dynamic_bias.grad is not None
+
+def test_residual_history_can_include_input_when_requested():
+    """Depth residual history should exclude embeddings by default but keep the option."""
+    base_kwargs = dict(
+        vocab_size=100,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        exp={
+            "residual_mixer_type": "causal_conv",
+            "residual_conv_kernel_size": 3,
+        },
+    )
+    input_ids = torch.randint(0, 100, (2, 8))
+
+    default_model = BiBoForCausalLM(BiBoConfig(**base_kwargs))
+    default_model(input_ids)
+    default_stats = default_model.model.residual_mixer_stats()
+
+    include_input_model = BiBoForCausalLM(
+        BiBoConfig(
+            **{
+                **base_kwargs,
+                "exp": {
+                    **base_kwargs["exp"],
+                    "residual_history_include_input": True,
+                },
+            }
+        )
+    )
+    include_input_model(input_ids)
+    include_input_stats = include_input_model.model.residual_mixer_stats()
+
+    assert default_stats["layer_0/residual_conv/num_states"] == 1
+    assert default_stats["layer_1/residual_conv/num_states"] == 2
+    assert include_input_stats["layer_0/residual_conv/num_states"] == 2
+    assert include_input_stats["layer_1/residual_conv/num_states"] == 3
+
+def test_multistream_residual_prefers_main_stream_at_init():
+    """mHC-style residual streams should read/write mostly from stream 0 at init."""
+    cfg = BiBoConfig(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_routed_experts=8,
+        exp={
+            "residual_num_streams": 3,
+            "residual_stream_gate_type": "token",
+            "residual_stream_read_init": 0.9,
+            "residual_stream_write_init": 0.8,
+        },
+    )
+    mixer = BiBoMultiStreamResidual(cfg, layer_idx=0)
+    streams = torch.stack([
+        torch.ones(2, 8, cfg.hidden_size),
+        torch.zeros(2, 8, cfg.hidden_size),
+        torch.zeros(2, 8, cfg.hidden_size),
+    ], dim=2)
+    update = torch.ones(2, 8, cfg.hidden_size)
+
+    read = mixer.read(streams)
+    streams = mixer.write(streams, update)
+    stats = mixer.stats()
+
+    assert read.shape == (2, 8, cfg.hidden_size)
+    assert torch.allclose(read.mean(), read.new_tensor(0.9), atol=1e-5)
+    assert stats["layer_0/streams/read_main"] == pytest.approx(0.9, abs=1e-5)
+    assert stats["layer_0/streams/write_main"] == pytest.approx(0.8, abs=1e-5)
+
+def test_multistream_residual_works_in_model_and_receives_gradients():
+    """Full model should train stream read/write gate parameters."""
+    cfg = BiBoConfig(
+        vocab_size=100,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        exp={
+            "residual_num_streams": 2,
+            "residual_stream_gate_type": "token",
+            "residual_stream_read_init": 0.99,
+            "residual_stream_write_init": 0.99,
+        },
+    )
+    model = BiBoForCausalLM(cfg)
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
+    labels = torch.randint(0, cfg.vocab_size, (2, 8))
+
+    out = model(input_ids, labels=labels)
+    out.loss.backward()
+    stats = model.model.residual_stream_stats()
+
+    assert "layer_0/streams/read_main" in stats
+    assert "layer_1/streams/write_main" in stats
+    assert model.model.residual_stream_mixers[0].read_bias.grad is not None
+    assert model.model.residual_stream_mixers[0].write_bias.grad is not None
+    assert model.model.residual_stream_mixers[0].read_weight.grad is not None
+    assert model.model.residual_stream_mixers[0].write_weight.grad is not None
+
+def test_multistream_model_reads_once_per_layer_plus_final_read():
+    """Stream reads should not repeat after every write; only final output is re-read."""
+    cfg = BiBoConfig(
+        vocab_size=100,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        exp={
+            "residual_num_streams": 2,
+            "residual_stream_gate_type": "scalar",
+        },
+    )
+    model = BiBoForCausalLM(cfg)
+
+    for mixer in model.model.residual_stream_mixers:
+        mixer._test_read_calls = 0
+        original_read = mixer.read
+
+        def counted_read(streams, *, _mixer=mixer, _original_read=original_read):
+            _mixer._test_read_calls += 1
+            return _original_read(streams)
+
+        mixer.read = counted_read
+
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
+    model(input_ids)
+
+    assert [mixer._test_read_calls for mixer in model.model.residual_stream_mixers] == [1, 2]
+
+def test_delay_line_residual_shifts_states_and_reads_depth_axis():
+    """Delay-line streams should encode current, one-layer-old, two-layer-old states."""
+    cfg = BiBoConfig(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_routed_experts=8,
+        exp={
+            "residual_num_streams": 3,
+            "residual_stream_mode": "delay_line",
+            "residual_stream_gate_type": "scalar",
+            "residual_stream_read_init": 0.8,
+        },
+    )
+    mixer = BiBoMultiStreamResidual(cfg, layer_idx=0)
+    streams = torch.stack([
+        torch.ones(2, 8, cfg.hidden_size),
+        torch.full((2, 8, cfg.hidden_size), 2.0),
+        torch.full((2, 8, cfg.hidden_size), 3.0),
+    ], dim=2)
+    new_state = torch.full((2, 8, cfg.hidden_size), 10.0)
+
+    read = mixer.read(streams)
+    shifted = mixer.write(streams, new_state)
+    stats = mixer.stats()
+
+    assert read.shape == (2, 8, cfg.hidden_size)
+    assert read.mean().item() == pytest.approx(1.3, abs=1e-5)
+    assert torch.allclose(shifted[:, :, 0, :], new_state)
+    assert torch.allclose(shifted[:, :, 1, :], streams[:, :, 0, :])
+    assert torch.allclose(shifted[:, :, 2, :], streams[:, :, 1, :])
+    assert mixer.write_bias is None
+    assert stats["layer_0/streams/read_main"] == pytest.approx(0.8, abs=1e-5)
+    assert stats["layer_0/streams/write_main"] == pytest.approx(1.0, abs=1e-5)
+
+def test_delay_line_residual_works_in_model_and_receives_gradients():
+    """Delay-line mode should train only the causal depth read gates."""
+    cfg = BiBoConfig(
+        vocab_size=100,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        exp={
+            "residual_num_streams": 3,
+            "residual_stream_mode": "delay_line",
+            "residual_stream_gate_type": "token",
+            "residual_stream_read_init": 0.9,
+        },
+    )
+    model = BiBoForCausalLM(cfg)
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
+    labels = torch.randint(0, cfg.vocab_size, (2, 8))
+
+    out = model(input_ids, labels=labels)
+    out.loss.backward()
+    stats = model.model.residual_stream_stats()
+
+    assert torch.isfinite(out.loss)
+    assert "layer_0/streams/read_main" in stats
+    assert stats["layer_0/streams/write_main"] == pytest.approx(1.0, abs=1e-5)
+    assert model.model.residual_stream_mixers[0].read_bias.grad is not None
+    assert model.model.residual_stream_mixers[0].read_weight.grad is not None
+    assert model.model.residual_stream_mixers[0].write_bias is None
+    assert model.model.residual_stream_mixers[0].write_weight is None
+
+def test_residual_experiments_can_be_combined():
+    """Write gates, stream gates, and dynamic depth conv should compose."""
+    cfg = BiBoConfig(
+        vocab_size=100,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_routed_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        exp={
+            "residual_gate_type": "token",
+            "residual_mixer_type": "dynamic_causal_conv",
+            "residual_conv_kernel_size": 3,
+            "residual_num_streams": 2,
+            "residual_stream_gate_type": "token",
+        },
+    )
+    model = BiBoForCausalLM(cfg)
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 8))
+    labels = torch.randint(0, cfg.vocab_size, (2, 8))
+
+    out = model(input_ids, labels=labels)
+    out.loss.backward()
+
+    assert torch.isfinite(out.loss)
+    assert model.model.residual_gate_stats()
+    assert model.model.residual_mixer_stats()
+    assert model.model.residual_stream_stats()
 
 def count_params(model):
     """Count model params"""
@@ -97,7 +664,8 @@ if __name__ == "__main__":
     test_moe(cfg)
     print()
     
-    model = test_model(cfg)
+    test_model(cfg)
+    model = BiBoModel(cfg)
     count_params(model)
     print()
     

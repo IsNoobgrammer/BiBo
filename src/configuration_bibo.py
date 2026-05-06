@@ -1,6 +1,11 @@
 from transformers import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
+from src.exp.configuration import (
+    EXPERIMENTAL_CONFIG_KEYS,
+    apply_experimental_config,
+    pop_legacy_experimental_kwargs,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -35,7 +40,6 @@ class BiBoConfig(PretrainedConfig):
         rms_norm_eps=1e-5,
         layer_norm_type="rms", # options are "rms" (RMS Normalization)
         use_cache=True,
-        use_ssmax=True, # scaling softmax to longer seq by scaling attn_weights 
         pad_token_id=None,
         bos_token_id=0,
         eos_token_id=0,
@@ -43,12 +47,6 @@ class BiBoConfig(PretrainedConfig):
         rope_theta=10000.0,
         rope_scaling=None,
         attention_dropout=0.0,
-        attention_type="softmax",
-        linear_attention_feature_map="elu",
-        linear_attention_eps=1e-6,
-        use_sliding_window=True,
-        sliding_window=512,
-        max_window_layers=None,
         attention_bias=False,
         mlp_only_layers=None,
         decoder_sparse_step=1,
@@ -65,11 +63,12 @@ class BiBoConfig(PretrainedConfig):
         kernel_size=3,
         router_lambda=1.0, # Confidence control: scaling for router logits (Skywork-MoE) - controls entropy/decisiveness
         moe_shared_scaling=1.0, # Scaling for shared expert output in MoE block (see DeepSeek-V2/V3, Muon)
-
+        exp=None,
         norm_topk_prob=False,
         output_router_logits=False,
         **kwargs,
     ):
+        legacy_exp = pop_legacy_experimental_kwargs(kwargs)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -84,7 +83,6 @@ class BiBoConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.layer_norm_type = layer_norm_type
         self.use_cache = use_cache
-        self.use_ssmax=use_ssmax
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
@@ -92,12 +90,6 @@ class BiBoConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
         self.attention_dropout = attention_dropout
-        self.attention_type = attention_type
-        self.linear_attention_feature_map = linear_attention_feature_map
-        self.linear_attention_eps = linear_attention_eps
-        self.use_sliding_window = use_sliding_window
-        self.sliding_window = sliding_window
-        self.max_window_layers = max_window_layers if max_window_layers is not None else num_hidden_layers
         self.attention_bias = attention_bias
         self.decoder_sparse_step = decoder_sparse_step
         self.moe_intermediate_size = moe_intermediate_size
@@ -114,6 +106,7 @@ class BiBoConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.router_lambda = router_lambda
+        apply_experimental_config(self, exp, legacy_exp, num_hidden_layers=num_hidden_layers)
 
         # --- Auto-estimate scaling factor for shared expert if left as 1.0 ---
         self.moe_shared_scaling = moe_shared_scaling
@@ -178,22 +171,12 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError("vocab_size must be positive")
         if self.attention_dropout < 0.0 or self.attention_dropout > 1.0:
             raise ValueError("attention_dropout must be between 0.0 and 1.0")
-        if self.attention_type not in {"softmax", "sliding_window", "linear", "gdn", "kda"}:
-            raise ValueError(
-                "attention_type must be one of: 'softmax', 'sliding_window', 'linear', 'gdn', 'kda'"
-            )
-        if self.linear_attention_feature_map not in {"elu", "relu"}:
-            raise ValueError("linear_attention_feature_map must be one of: 'elu', 'relu'")
-        if self.linear_attention_eps <= 0.0:
-            raise ValueError("linear_attention_eps must be positive")
         if self.rms_norm_eps <= 0.0:
             raise ValueError("rms_norm_eps must be positive")
         if self.initializer_range <= 0.0:
             raise ValueError("initializer_range must be positive")
         if self.layer_norm_type != "rms":
             raise ValueError(f"Only 'rms' layer_norm_type is supported. Got: '{self.layer_norm_type}'")
-        if self.sliding_window is not None and self.sliding_window <= 0:
-            raise ValueError("sliding_window must be positive if specified")
         if self.moe_intermediate_size <= 0:
             raise ValueError("moe_intermediate_size must be positive")
         if self.kernel_size <= 0:
@@ -210,6 +193,13 @@ class BiBoConfig(PretrainedConfig):
             if not (0 <= idx < self.num_hidden_layers):
                 raise ValueError(f"mlp_only_layers index {idx} is out of range for {self.num_hidden_layers} layers")
         # rope_config_validation(self)
+
+    def to_dict(self):
+        output = super().to_dict()
+        for key in EXPERIMENTAL_CONFIG_KEYS:
+            output.pop(key, None)
+        output["exp"] = dict(self.exp)
+        return output
 
 
 if __name__ == "__main__":

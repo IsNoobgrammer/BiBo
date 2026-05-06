@@ -3,11 +3,14 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple
 from src.configuration_bibo import BiBoConfig
+from src.exp.residual import BiBoCausalResidualConv, BiBoResidualGate
 from .norm import BiBoRMSNorm
 from .attn import BiBoAttention
 from .ffn import BiBoMLP, BiBoMoELayer
 
-__all__ = ['BiBoDecoderLayer']
+__all__ = [
+    'BiBoDecoderLayer',
+]
 
 
 class BiBoDecoderLayer(nn.Module):
@@ -43,6 +46,9 @@ class BiBoDecoderLayer(nn.Module):
 
         self.input_layernorm = BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attn_residual_gate = BiBoResidualGate(config, "attn")
+        self.mlp_residual_gate = BiBoResidualGate(config, "mlp")
+        self.residual_mixer = BiBoCausalResidualConv(config, layer_idx)
 
     def forward(
         self,
@@ -53,6 +59,7 @@ class BiBoDecoderLayer(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        residual_history: Optional[Tuple[torch.Tensor, ...]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """
@@ -70,6 +77,7 @@ class BiBoDecoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        gate_input = hidden_states
 
         # Self attention
         attn_output, self_attn_weights, present_key_value = self.self_attn(
@@ -81,13 +89,15 @@ class BiBoDecoderLayer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
-        hidden_states = residual + attn_output
+        hidden_states = residual + self.attn_residual_gate(gate_input, attn_output)
 
         # FFN
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        gate_input = hidden_states
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states = residual + self.mlp_residual_gate(gate_input, hidden_states)
+        hidden_states = self.residual_mixer(hidden_states, residual_history)
 
         outputs = (hidden_states,)
         if output_attentions:
@@ -96,3 +106,16 @@ class BiBoDecoderLayer(nn.Module):
             outputs += (present_key_value,)
 
         return outputs
+
+    def residual_gate_stats(self) -> dict:
+        if self.attn_residual_gate.gate_type == "none":
+            return {}
+        stats = {}
+        for name, value in self.attn_residual_gate.stats().items():
+            stats[f"layer_{self.layer_idx}/{name}"] = value
+        for name, value in self.mlp_residual_gate.stats().items():
+            stats[f"layer_{self.layer_idx}/{name}"] = value
+        return stats
+
+    def residual_mixer_stats(self) -> dict:
+        return self.residual_mixer.stats()

@@ -6,6 +6,12 @@ import torch
 import pytest
 from src.modeling.attn.base import BiBoAttention
 from src.configuration_bibo import BiBoConfig
+
+pytest.importorskip(
+    "huggingface_hub.dataclasses",
+    reason="Qwen3MoE baseline requires newer huggingface_hub dataclasses support",
+)
+
 from baseline.qwen3moe.modeling import Qwen3MoeAttention
 from baseline.qwen3moe.config import Qwen3MoeConfig
 

@@ -9,9 +9,9 @@ from ..norm import BiBoRMSNorm
 from ..embed import BiBoRotaryEmbedding, apply_rotary_pos_emb
 from .utils import repeat_kv
 from .standard import eager_standard_attention
-from .sliding import eager_sliding_window_attention
-from .recurrent import eager_recurrent_attention
-from .ssmax import apply_ssmax_query_scaling
+from src.exp.attn.sliding import eager_sliding_window_attention
+from src.exp.attn.recurrent import eager_recurrent_attention
+from src.exp.attn.ssmax import apply_ssmax_query_scaling
 
 __all__ = ['BiBoAttention']
 

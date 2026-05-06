@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 from typing import Optional
-from .ssmax import apply_ssmax_query_scaling
+from src.exp.attn.ssmax import apply_ssmax_query_scaling
 
 __all__ = ['eager_standard_attention']
 

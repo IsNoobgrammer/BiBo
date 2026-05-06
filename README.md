@@ -4,9 +4,9 @@
 
 - **RMSNorm**: Layer normalization
 - **RoPE**: Rotary position embeddings
-- **SSMax**: Scaling softmax for long context attention
 - **MoE**: Mixture of experts with flexible routing (MLP or Conv)
 - **Diverse experts**: MLP, Identity, Zero, Noise, ReLU, Causal Conv1D
+- **Experimental package**: Optional SSMax, sliding/recurrent attention, residual gates, and mHC streams under `src/exp/`
 
 ## Features
 
@@ -21,9 +21,9 @@
   - Noise expert (regularization)
   - ReLU expert (simple non-linearity)
   - Shared causal Conv1D expert
-- **SSMax attention**: Learnable per-head scaling for long context
-- **Sliding window attention**: Optional local attention windows
+- **Experimental attention**: Optional SSMax, sliding-window, linear, GDN, and KDA variants
 - **RoPE**: Rotary position embeddings with configurable base
+- **Experimental residual flow**: Optional mHC-inspired gates, depth conv, and delay-line streams
 
 ### Training Features
 
@@ -61,7 +61,6 @@ config = BiBoConfig(
     num_attention_heads=8,
     num_routed_experts=8,
     num_experts_per_tok=4,
-    use_ssmax=True,
 )
 
 # Create model
@@ -143,16 +142,63 @@ config = BiBoConfig(
     bias_update_factor=1e-2,  # Load balancing step size
     bias_update_threshold=100_000,  # Tokens before bias update
     
-    # Attention settings
-    use_ssmax=True,
-    use_sliding_window=True,
-    sliding_window=512,
-    max_window_layers=4,
-    
     # Position embeddings
     max_position_embeddings=32768,
     rope_theta=10000.0,
+
+    # Experimental features live under exp and in src/exp/
+    exp={
+        # Attention experiments
+        "use_ssmax": True,
+        "use_sliding_window": True,
+        "sliding_window": 512,
+        "max_window_layers": 4,
+
+        # Residual flow gates
+        "residual_gate_type": "token",
+        "residual_gate_init": 0.95,
+
+        # Causal residual-state mixer over model depth
+        "residual_mixer_type": "dynamic_causal_conv",
+        "residual_conv_kernel_size": 4,
+        "residual_conv_init": 0.95,
+        "residual_history_include_input": False,
+
+        # mHC-style parallel residual streams
+        "residual_num_streams": 2,
+        "residual_stream_mode": "delay_line",
+        "residual_stream_gate_type": "token",
+        "residual_stream_init": "copy",
+        "residual_stream_read_init": 0.99,
+        "residual_stream_write_init": 0.99,
+    },
 )
+```
+
+Residual gates keep the identity path intact and only scale the branch write:
+
+```python
+x = residual + gate * branch_output
+```
+
+For a clean mHC-style run, keep `exp["residual_gate_type"]="none"` and use
+`exp["residual_num_streams"] > 1`; enabling both is supported, but branch gates and
+stream write gates compose and should be logged as a combined experiment.
+Set `exp["residual_stream_mode"]="delay_line"` to make stream index causal over depth:
+stream 0 is newest, stream 1 is one layer old, and each layer performs a learned
+read followed by a deterministic shift write.
+
+After a forward pass, inspect flow statistics:
+
+```python
+stats = model.model.residual_gate_stats()
+print(stats["layer_0/attn/mean"], stats["layer_0/mlp/mean"])
+
+depth_stats = model.model.residual_mixer_stats()
+print(depth_stats["layer_1/residual_conv/current_weight"])
+
+stream_stats = model.model.residual_stream_stats()
+print(stream_stats["layer_0/streams/read_main"])
 ```
 
 ## Testing
