@@ -105,6 +105,25 @@ def test_experimental_config_serializes_under_exp():
     assert "attention_type" not in serialized
     assert "residual_num_streams" not in serialized
 
+def test_exp_config_takes_precedence_over_legacy_experimental_kwargs():
+    """Canonical exp values should win over old top-level experimental kwargs."""
+    cfg = BiBoConfig(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_routed_experts=8,
+        exp={
+            "use_ssmax": False,
+            "attention_type": "linear",
+        },
+        use_ssmax=True,
+        attention_type="gdn",
+    )
+
+    assert cfg.use_ssmax is False
+    assert cfg.attention_type == "linear"
+    assert cfg.exp["use_ssmax"] is False
+    assert cfg.exp["attention_type"] == "linear"
+
 def test_residual_gate_starts_near_identity():
     """Residual write gate should preserve baseline flow at init."""
     cfg = BiBoConfig(

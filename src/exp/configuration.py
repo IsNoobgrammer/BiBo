@@ -57,14 +57,17 @@ def apply_experimental_config(
     are also mirrored as attributes on the config object to keep call-sites tidy.
     """
     exp_values = dict(EXPERIMENTAL_DEFAULTS)
+    explicit_exp_keys = set(exp or ())
     if exp is not None:
-        unknown = set(exp) - EXPERIMENTAL_CONFIG_KEYS
+        unknown = explicit_exp_keys - EXPERIMENTAL_CONFIG_KEYS
         if unknown:
             unknown_keys = ", ".join(sorted(unknown))
             raise ValueError(f"Unknown experimental config option(s): {unknown_keys}")
         exp_values.update(exp)
     if legacy_exp:
-        exp_values.update(legacy_exp)
+        for key, value in legacy_exp.items():
+            if key not in explicit_exp_keys:
+                exp_values[key] = value
 
     if exp_values["max_window_layers"] is None:
         exp_values["max_window_layers"] = num_hidden_layers
