@@ -176,16 +176,24 @@ def benchmark_model(model, model_name, dataloader, device, num_steps=500,
             results['backward_times'].append(bwd_time)
             results['step_times'].append(fwd_time + bwd_time)
             
-            # Log to wandb
+            # Log to wandb with separate step counters per model
             if use_wandb and WANDB_AVAILABLE:
-                wandb.log({
+                log_dict = {
                     f'{model_name}/loss': loss.item(),
                     f'{model_name}/lr': current_lr,
                     f'{model_name}/forward_time_ms': fwd_time * 1000,
                     f'{model_name}/backward_time_ms': bwd_time * 1000,
                     f'{model_name}/step_time_ms': (fwd_time + bwd_time) * 1000,
-                    'step': step,
+                    f'{model_name}/step': step,  # Model-specific step counter
+                }
+                # Also log to comparison metrics (same step axis for both models)
+                log_dict.update({
+                    'comparison/loss': loss.item(),
+                    'comparison/step_time_ms': (fwd_time + bwd_time) * 1000,
+                    'comparison/model': model_name,
+                    'global_step': step,  # Shared step counter for comparison
                 })
+                wandb.log(log_dict)
             
             # Print
             if (step + 1) % 10 == 0:
@@ -231,7 +239,7 @@ def main():
     # Hyperparameters
     num_steps = 600
     batch_size = 8
-    lr = 5e-3  # High LR
+    lr = 1e-3  # High LR
     warmup_steps = 50
     weight_decay = 0.01
     use_compile = False  # torch.compile disabled
@@ -338,6 +346,19 @@ def main():
                 "use_compile": use_compile,
             }
         )
+        
+        # Define custom charts for comparison
+        wandb.define_metric("global_step")
+        wandb.define_metric("BiBo/step")
+        wandb.define_metric("Qwen3MoE/step")
+        
+        # Set x-axis for each model's metrics
+        wandb.define_metric("BiBo/*", step_metric="BiBo/step")
+        wandb.define_metric("Qwen3MoE/*", step_metric="Qwen3MoE/step")
+        
+        # Comparison metrics use global_step
+        wandb.define_metric("comparison/*", step_metric="global_step")
+        
         print(f"\n✓ wandb initialized: {wandb.run.url}")
     
     # Benchmark BiBo
@@ -432,6 +453,37 @@ def main():
             'summary/bibo_avg_step_time_ms': bibo_step,
             'summary/qwen_avg_step_time_ms': qwen_step,
             'summary/speedup': speedup,
+        })
+        
+        # Create comparison table
+        comparison_table = wandb.Table(
+            columns=["step", "BiBo_loss", "Qwen3MoE_loss"],
+            data=[[i, bibo_results['losses'][i], qwen_results['losses'][i]] 
+                  for i in range(min(len(bibo_results['losses']), len(qwen_results['losses'])))]
+        )
+        wandb.log({"comparison_table": comparison_table})
+        
+        # Create line plot comparing losses
+        wandb.log({
+            "loss_comparison": wandb.plot.line_series(
+                xs=list(range(num_steps)),
+                ys=[bibo_results['losses'], qwen_results['losses']],
+                keys=["BiBo", "Qwen3MoE"],
+                title="Training Loss Comparison",
+                xname="Step"
+            )
+        })
+        
+        # Create line plot comparing step times
+        wandb.log({
+            "step_time_comparison": wandb.plot.line_series(
+                xs=list(range(num_steps)),
+                ys=[[t * 1000 for t in bibo_results['step_times']], 
+                    [t * 1000 for t in qwen_results['step_times']]],
+                keys=["BiBo", "Qwen3MoE"],
+                title="Step Time Comparison (ms)",
+                xname="Step"
+            )
         })
         
         print(f"\n✓ View results at: {wandb.run.url}")

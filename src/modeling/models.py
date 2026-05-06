@@ -186,8 +186,8 @@ class BiBoModel(BiBoPreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        # Position embeddings
-        position_embeddings = self.rotary_emb(hidden_states, cache_position)
+        # Position embeddings (Qwen-style: use position_ids)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         # Decoder layers
         all_hidden_states = () if output_hidden_states else None

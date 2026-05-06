@@ -69,7 +69,7 @@ class BiBoAttention(nn.Module):
         self.attention_dropout = config.attention_dropout
 
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         
@@ -248,8 +248,9 @@ class BiBoAttention(nn.Module):
                 getattr(self, 'ssmax_scale', None),
             )
         
+        # Qwen-style: transpose BEFORE reshape
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(batch_size, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         
         return attn_output, None, past_key_value
