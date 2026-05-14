@@ -8,11 +8,8 @@ Structure:
     modeling/
     ├── norm.py              # BiBoRMSNorm
     ├── embed.py             # BiBoRotaryEmbedding, apply_rotary_pos_emb
-    ├── attn/                # Attention mechanisms
-    │   ├── base.py          # BiBoAttention (main class)
-    │   ├── standard.py      # Standard softmax attention
-    │   ├── sliding.py       # Sliding window attention
-    │   ├── recurrent.py     # Linear/GDN/KDA attention
+    ├── attn/                # Attention
+    │   ├── base.py          # BiBoAttention (standard softmax + SSMax)
     │   ├── ssmax.py         # SSMax scaling
     │   └── utils.py         # repeat_kv
     ├── ffn/                 # Feed-forward networks
@@ -35,13 +32,10 @@ Usage:
 
 # Re-export all components for backward compatibility
 from src.modeling.norm import BiBoRMSNorm
-from src.modeling.embed import BiBoRotaryEmbedding, apply_rotary_pos_emb, _rotate_half
+from src.modeling.embed import BiBoRotaryEmbedding, apply_rotary_pos_emb, rotate_half
 from src.modeling.attn import (
     BiBoAttention,
     repeat_kv,
-    eager_standard_attention,
-    eager_sliding_window_attention,
-    eager_recurrent_attention,
     apply_ssmax_query_scaling,
 )
 from src.modeling.ffn import (
@@ -68,14 +62,11 @@ __all__ = [
     # Embeddings
     'BiBoRotaryEmbedding',
     'apply_rotary_pos_emb',
-    '_rotate_half',
+    'rotate_half',
     
     # Attention
     'BiBoAttention',
     'repeat_kv',
-    'eager_standard_attention',
-    'eager_sliding_window_attention',
-    'eager_recurrent_attention',
     'apply_ssmax_query_scaling',
     
     # FFN

@@ -22,17 +22,8 @@ class BiBoDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
-        
-        # Determine sliding window for this layer
-        use_sliding_window = False
-        if config.use_sliding_window and config.max_window_layers is not None:
-            use_sliding_window = layer_idx < config.max_window_layers
-        
-        self.self_attn = BiBoAttention(
-            config=config, 
-            layer_idx=layer_idx,
-            use_sliding_window=use_sliding_window
-        )
+
+        self.self_attn = BiBoAttention(config=config, layer_idx=layer_idx)
 
         # MoE or dense MLP
         self.is_moe_layer = layer_idx not in config.mlp_only_layers
@@ -55,19 +46,6 @@ class BiBoDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        """
-        Args:
-            hidden_states: (batch, seq_len, hidden_size)
-            position_embeddings: (cos, sin) from rotary embedding
-            attention_mask: Optional mask
-            past_key_value: KV cache
-            cache_position: Cache position indices
-            output_attentions: Return attn weights
-            use_cache: Use KV cache
-        
-        Returns:
-            (hidden_states, attn_weights, present_key_value)
-        """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -79,7 +57,6 @@ class BiBoDecoderLayer(nn.Module):
             past_key_value=past_key_value,
             cache_position=cache_position,
             output_attentions=output_attentions,
-            use_cache=use_cache,
         )
         hidden_states = residual + attn_output
 

@@ -4,9 +4,9 @@ __pycache__/
 .aim/
 .kiro/
 logs/
-!logs/router_ablation/
 bugs/
 venv/
 wandb/
 shaurya_notes.md
 pipeline/
+AGENTS.md
