@@ -1,5 +1,5 @@
 # ============================================================
-# Training Config
+# Training Config — Multi-GPU (2×T4)
 # ============================================================
 training:
   seed: 42
@@ -14,17 +14,16 @@ training:
   train_samples: 24000
   val_samples: 4800
   optimizer: adamw_8bit
-  device: "cuda:0"
   num_workers: 2
   log_every_n_steps: 10
-  use_wandb: true
   wandb_project: "bibo-ablation"
-  wandb_run_name: "bibo-vs-qwen3moe-kaggle-t4"
+  wandb_run_name: "bibo-vs-qwen3moe-2xT4"
 
 # ============================================================
 # BiBo Config (~10M)
 # ============================================================
 bibo:
+  device: "cuda:0"
   vocab_size: 2048
   hidden_size: 256
   intermediate_size: 512
@@ -48,6 +47,7 @@ bibo:
 # Qwen3MoE Config (~10M)
 # ============================================================
 qwen3moe:
+  device: "cuda:1"
   vocab_size: 2048
   hidden_size: 256
   intermediate_size: 512
