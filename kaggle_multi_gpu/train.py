@@ -45,29 +45,33 @@ T = CFG['training']
 
 class SequenceDataset(Dataset):
     """
-    Sorting task for causal LM.
-    Sequence: [unsorted tokens] [sorted tokens]
-    Labels: [-100 for input positions] [sorted tokens]
-    Model learns to output sorted version after seeing unsorted input.
+    Sorting task for causal LM (mixed lengths, padded).
+    Sequence: [unsorted | sorted] padded to 2*max_seq_len
+    Labels: [-100 for input + pad positions] [sorted tokens]
     """
-    def __init__(self, npy_path):
-        self.data = np.load(npy_path)  # [N, 2, seq_len]
-        self.seq_len = self.data.shape[2]
+    def __init__(self, npy_path, lengths_path):
+        self.data = np.load(npy_path)        # [N, 2, max_seq_len]
+        self.lengths = np.load(lengths_path)  # [N] actual seq lengths
+        self.max_seq_len = self.data.shape[2]
     
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
-        input_seq = self.data[idx, 0]   # unsorted
-        target_seq = self.data[idx, 1]  # sorted
+        input_seq = self.data[idx, 0]   # unsorted, padded
+        target_seq = self.data[idx, 1]  # sorted, padded
+        seq_len = self.lengths[idx]
         
-        # Concat: [unsorted ; sorted] — model sees unsorted, generates sorted
+        # Concat: [unsorted | sorted] — total 2*max_seq_len
         full_seq = np.concatenate([input_seq, target_seq])
         input_ids = torch.tensor(full_seq[:-1], dtype=torch.long)
         
-        # Labels: mask input portion with -100, only compute loss on sorted output
+        # Labels: -100 for input portion + padding, loss only on sorted output
         labels = torch.tensor(full_seq[1:], dtype=torch.long)
-        labels[:self.seq_len - 1] = -100  # don't compute loss on input portion
+        # Mask: first (seq_len - 1) positions are input, don't compute loss
+        labels[:seq_len - 1] = -100
+        # Also mask padding in target portion (where target is 0/pad)
+        labels[labels == 0] = -100
         
         return input_ids, labels
 
@@ -101,8 +105,8 @@ def train_worker(model_name):
     )
     
     # Data
-    train_ds = SequenceDataset(os.path.join(DATA_DIR, 'train.npy'))
-    val_ds = SequenceDataset(os.path.join(DATA_DIR, 'val.npy'))
+    train_ds = SequenceDataset(os.path.join(DATA_DIR, 'train.npy'), os.path.join(DATA_DIR, 'train_lengths.npy'))
+    val_ds = SequenceDataset(os.path.join(DATA_DIR, 'val.npy'), os.path.join(DATA_DIR, 'val_lengths.npy'))
     train_loader = DataLoader(train_ds, batch_size=T['batch_size'], shuffle=True,
                               num_workers=T['num_workers'], pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=T['batch_size'], shuffle=False,
