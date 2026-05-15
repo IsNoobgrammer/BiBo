@@ -148,6 +148,7 @@ def train_worker(model_name):
     
     total_steps = T['epochs'] * len(train_loader)
     warmup_steps = int(total_steps * T['warmup_ratio'])
+    val_every = T.get('val_every_n_steps', len(train_loader))  # default: every epoch
     
     def lr_lambda(step):
         if step < warmup_steps:
@@ -166,6 +167,7 @@ def train_worker(model_name):
         'warmup_steps': warmup_steps,
         'steps': [],
         'epochs': [],
+        'val_checkpoints': [],
     }
     
     print(f"\n[{model_name}] Params: {n_params:,} | Device: {device}")
@@ -205,41 +207,37 @@ def train_worker(model_name):
                 f'{model_name}/loss': step_loss,
                 f'{model_name}/lr': cur_lr,
             })
+            
+            # Val every N steps
+            if global_step % val_every == 0:
+                model.eval()
+                v_loss = 0
+                v_correct = 0
+                v_total = 0
+                with torch.no_grad():
+                    for v_input, v_labels in val_loader:
+                        v_input, v_labels = v_input.to(device), v_labels.to(device)
+                        v_out = model(input_ids=v_input, labels=v_labels)
+                        v_loss += v_out.loss.item()
+                        mask = v_labels != -100
+                        preds = v_out.logits.argmax(dim=-1)
+                        v_correct += (preds[mask] == v_labels[mask]).sum().item()
+                        v_total += mask.sum().item()
+                v_loss /= len(val_loader)
+                v_acc = v_correct / max(v_total, 1)
+                print(f"  [{model_name}] VAL @ step {global_step} | val_loss={v_loss:.4f} val_acc={v_acc:.4f}")
+                wandb.log({f'{model_name}/val_loss': v_loss, f'{model_name}/val_acc': v_acc})
+                metrics['val_checkpoints'].append({'step': global_step, 'val_loss': v_loss, 'val_acc': v_acc})
+                model.train()
         
         epoch_time = time.time() - t0
         train_loss = total_loss / n_batches
         
-        # Validate
-        model.eval()
-        val_loss = 0
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for input_ids, labels in val_loader:
-                input_ids, labels = input_ids.to(device), labels.to(device)
-                outputs = model(input_ids=input_ids, labels=labels)
-                val_loss += outputs.loss.item()
-                # Accuracy only on non-masked positions (target portion)
-                mask = labels != -100
-                preds = outputs.logits.argmax(dim=-1)
-                correct += (preds[mask] == labels[mask]).sum().item()
-                total += mask.sum().item()
-        
-        val_loss /= len(val_loader)
-        val_acc = correct / total
-        
         metrics['epochs'].append({
-            'epoch': epoch, 'train_loss': train_loss,
-            'val_loss': val_loss, 'val_acc': val_acc, 'time': epoch_time
+            'epoch': epoch, 'train_loss': train_loss, 'time': epoch_time
         })
         
-        print(f"  [{model_name}] === E{epoch:02d} | train={train_loss:.4f} val={val_loss:.4f} acc={val_acc:.4f} time={epoch_time:.1f}s ===")
-        wandb.log({
-            f'{model_name}/train_loss_epoch': train_loss,
-            f'{model_name}/val_loss': val_loss,
-            f'{model_name}/val_acc': val_acc,
-            f'{model_name}/epoch_time': epoch_time,
-        })
+        print(f"  [{model_name}] === E{epoch:02d} | train={train_loss:.4f} time={epoch_time:.1f}s ===")
     
     # Save
     torch.save(model.state_dict(), os.path.join(SAVE_DIR, f'{model_name}.pt'))
