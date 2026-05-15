@@ -13,11 +13,18 @@
 # limitations under the License.
 """Qwen3MoE model configuration"""
 
-from huggingface_hub.dataclasses import strict
-
 from transformers.configuration_utils import PreTrainedConfig
-from transformers.modeling_rope_utils import RopeParameters
 from transformers.utils import auto_docstring
+
+try:
+    from huggingface_hub.dataclasses import strict
+except (ImportError, Exception):
+    strict = lambda cls: cls  # no-op fallback
+
+try:
+    from transformers.modeling_rope_utils import RopeParameters
+except ImportError:
+    RopeParameters = None
 
 
 @auto_docstring(checkpoint="Qwen/Qwen3-30B-A3B-Base")
