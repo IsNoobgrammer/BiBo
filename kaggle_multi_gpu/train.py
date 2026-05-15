@@ -59,7 +59,7 @@ class SequenceDataset(Dataset):
 # Training function (runs in subprocess)
 # ============================================================
 
-def train_worker(model_name, run_id):
+def train_worker(model_name):
     """Train one model. Called as separate process."""
     import wandb
     
@@ -75,13 +75,12 @@ def train_worker(model_name, run_id):
     
     n_params = sum(p.numel() for p in model.parameters())
     
-    # wandb — attach to shared run
+    # wandb — separate run per model, grouped for comparison
     wandb.init(
         project=T['wandb_project'],
-        id=run_id,
-        resume="allow",
+        name=f"{T['wandb_run_name']}-{model_name}",
         group="parallel-2xT4",
-        name=T['wandb_run_name'],
+        config={**T, 'model': model_name, 'params': n_params},
     )
     
     # Data
@@ -216,12 +215,6 @@ def main():
         print("ERROR: Data not found. Run `python kaggle_multi_gpu/data.py` first.")
         sys.exit(1)
     
-    # Generate shared wandb run ID
-    import wandb
-    run_id = wandb.util.generate_id()
-    print(f"Shared wandb run ID: {run_id}")
-    print(f"  View at: https://wandb.ai/<entity>/{T['wandb_project']}/runs/{run_id}")
-    
     # Spawn parallel processes
     print("\nLaunching parallel training...")
     print(f"  BiBo → cuda:0")
@@ -230,8 +223,8 @@ def main():
     
     mp.set_start_method('spawn', force=True)
     
-    p_bibo = mp.Process(target=train_worker, args=('bibo', run_id))
-    p_qwen = mp.Process(target=train_worker, args=('qwen3moe', run_id))
+    p_bibo = mp.Process(target=train_worker, args=('bibo',))
+    p_qwen = mp.Process(target=train_worker, args=('qwen3moe',))
     
     p_bibo.start()
     p_qwen.start()
