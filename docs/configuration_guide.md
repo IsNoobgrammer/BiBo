@@ -872,4 +872,63 @@ When adding new configuration parameters:
 
 ---
 
+## Weight Decay Policy for Routing Parameters
+
+> **Lesson learned from:** PolyGLU RED-0001 (danielxmed/PolyGLU) — L2 regularization on a routing preference parameter silently suppressed specialization for 10,000 training steps.
+
+### The Rule
+
+**Never apply L2 weight decay to parameters that directly encode routing preferences, scales, or temperatures.**
+
+### Why `gate_proj` / `gate_conv` Are Safe Under L2
+
+The router projection weights (`gate_proj.weight`, `gate_conv.weight`) are standard projection matrices. They map hidden states into logit space. Weight decay shrinks their magnitude, but the Skywork-MoE normalization step:
+
+```python
+z̃ = λ · (z - μ) / σ
+```
+
+...removes all magnitude information via z-score normalization before `router_lambda` re-scales. So L2 on these weights:
+- ✓ Regularizes the projection (good for generalization)
+- ✓ Keeps gradients well-behaved
+- ✗ Does NOT affect routing confidence (that's `router_lambda`)
+- ✗ Does NOT push routing toward uniform
+
+### What Must NEVER Have L2
+
+If any of these are added as learnable parameters in the future:
+
+| Parameter | Why L2 Kills It |
+|-----------|-----------------|
+| Learnable `router_lambda` | L2 → λ→0 → post-normalization logits collapse → uniform routing |
+| Learnable `router_temperature` | L2 → τ→0 → softmax degenerates |
+| Per-expert preference bias (α) | L2 → α→0 → routing preferences erased → uniform selection |
+| Any scalar gate on routing logits | Same class — directly controls routing sharpness |
+
+### Optimizer Grouping Template
+
+```python
+for name, param in model.named_parameters():
+    if not param.requires_grad:
+        continue
+    if param.ndim == 1:  # biases, LayerNorm/RMSNorm weights
+        no_decay_params.append(param)
+    elif any(k in name for k in ('router_lambda', 'router_temperature', 'routing_alpha')):
+        no_decay_params.append(param)  # routing scale/preference — never decay
+    else:
+        decay_params.append(param)  # standard weight matrices — decay is fine
+```
+
+### Current Status (Safe, No Action Needed)
+
+| Parameter | Status |
+|-----------|--------|
+| `gate_proj.weight` | L2 OK — projection, magnitude decoupled by Skywork norm |
+| `gate_conv.weight` | L2 OK — same logic |
+| `router.bias` | N/A — `requires_grad=False`, optimizer ignores it |
+| `router_lambda` | Currently a config constant, not a parameter |
+| `router_temperature` | Currently unused (legacy config field) |
+
+---
+
 *Last updated: 2026-05-03*

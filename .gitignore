@@ -1,8 +1,6 @@
 .idea
-.qodo/
 __pycache__/
 .aim/
-.kiro/
 logs/
 bugs/
 venv/
@@ -10,3 +8,5 @@ wandb/
 shaurya_notes.md
 pipeline/
 AGENTS.md
+research_on_activations/
+data

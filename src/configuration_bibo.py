@@ -99,15 +99,19 @@ class BiBoConfig(PretrainedConfig):
             try:
                 import numpy as np
                 def softmax(x):
-                    p = np.exp(x)
-                    return p / p.sum()
+                    e = np.exp(x - x.max())
+                    return e / e.sum()
                 n = self.num_routed_experts
                 k = self.num_experts_per_tok
                 s = getattr(self, 'num_shared_experts', 1) or 1
+                lam = self.router_lambda  # Account for Skywork-MoE logit normalization
                 factors = []
                 for _ in range(10000):
                     logits = np.random.randn(n - s)
-                    p = np.sort(softmax(logits))[::-1][:k - s]
+                    # Simulate actual router: normalize then scale by router_lambda
+                    logits_norm = (logits - logits.mean()) / (logits.std() + 1e-6)
+                    logits_scaled = lam * logits_norm
+                    p = np.sort(softmax(logits_scaled))[::-1][:k - s]
                     factors.append(s**0.5 / (np.sum(p**2)**0.5))
                 approx_lambda = float(np.mean(factors))
                 self.moe_shared_scaling = round(approx_lambda, 2)
@@ -156,8 +160,8 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError("bias_update_factor must be non-negative")
         if self.router_noise < 0.0:
             raise ValueError("router_noise must be non-negative")
-        if self.num_routed_experts < 5:
-            raise ValueError("num_routed_experts must be >= 5 (need at least 1 MLP + identity + zero + noise + relu)")
+        if self.num_routed_experts < 4:
+            raise ValueError("num_routed_experts must be >= 4 (need at least 1 MLP + identity + zero + relu)")
         if self.num_experts_per_tok > self.num_experts:
             raise ValueError("num_experts_per_tok cannot exceed total number of experts")
         for idx in self.mlp_only_layers:

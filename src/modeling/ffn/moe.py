@@ -4,7 +4,7 @@ import torch.nn as nn
 from einops import rearrange
 from src.configuration_bibo import BiBoConfig
 from .mlp import BiBoMLP
-from .experts import BiBoIdentityExpert, BiBoReLUExpert, BiBoZeroExpert, BiBoNoiseExpert, BiBoCausalConv1D
+from .experts import BiBoIdentityExpert, BiBoReLUExpert, BiBoZeroExpert, BiBoCausalConv1D
 from .router import BiBoMoERouter
 
 __all__ = ['BiBoMoELayer']
@@ -32,15 +32,14 @@ class BiBoMoELayer(nn.Module):
         
         self.routed_experts = nn.ModuleList()
         n = config.num_routed_experts
-        if n < 5:
-            raise ValueError("num_routed_experts must be >= 5 (MLPs + identity + zero + noise + relu)")
-        # (n - 4) MLP experts
-        for _ in range(n - 4):
+        if n < 4:
+            raise ValueError("num_routed_experts must be >= 4 (MLPs + identity + zero + relu)")
+        # (n - 3) MLP experts
+        for _ in range(n - 3):
             self.routed_experts.append(BiBoMLP(config, is_expert=True))
-        # 1 identity, 1 zero, 1 noise, 1 relu
+        # 1 identity, 1 zero, 1 relu
         self.routed_experts.append(BiBoIdentityExpert(config))
         self.routed_experts.append(BiBoZeroExpert(config))
-        self.routed_experts.append(BiBoNoiseExpert(config))
         self.routed_experts.append(BiBoReLUExpert(config))
         if len(self.routed_experts) != n:
             raise ValueError(f"Mismatch: Created {len(self.routed_experts)} routed experts, expected {n}")

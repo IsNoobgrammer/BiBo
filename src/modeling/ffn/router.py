@@ -27,7 +27,20 @@ class BiBoMoERouter(nn.Module):
         self.causal_padding = self.kernel_size - 1
         self.router_lambda = getattr(config, 'router_lambda', 1.0)
 
-        self.bias = nn.Parameter(torch.zeros(self.num_routed_experts))        
+        # Load-balancing bias — NOT learned via gradient, updated by Skywork-MoE threshold logic.
+        # requires_grad=False means the optimizer never touches this.
+        self.bias = nn.Parameter(torch.zeros(self.num_routed_experts), requires_grad=False)        
+
+        # --- Weight Decay Note (ref: PolyGLU RED-0001) ---
+        # gate_proj / gate_conv are projection weights that map hidden states → expert logits.
+        # L2 weight decay on these is SAFE because Skywork-MoE normalization (z-score + router_lambda)
+        # decouples weight magnitude from routing confidence. Shrinking weights via L2 does NOT
+        # push routing toward uniform — it only regularizes the projection directions.
+        #
+        # HOWEVER: if a learnable router_lambda, router_temperature, or per-expert preference
+        # parameter (α-style) is ever added here, it MUST be excluded from weight decay.
+        # L2 on such params pulls them toward zero, which directly kills routing specialization.
+        # See AGENTS.md "Weight Decay Policy for Routing Parameters" for the full rule.
         if self.router_type == "mlp":
             self.gate_proj = nn.Linear(config.hidden_size, self.num_routed_experts, bias=False)
         elif self.router_type == "conv":

@@ -10,7 +10,6 @@ __all__ = [
     'BiBoIdentityExpert',
     'BiBoReLUExpert', 
     'BiBoZeroExpert',
-    'BiBoNoiseExpert',
     'BiBoCausalConv1D'
 ]
 
@@ -39,17 +38,6 @@ class BiBoZeroExpert(nn.Module):
         zero = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         return x * zero
 
-
-class BiBoNoiseExpert(nn.Module):
-    """Adds Gaussian noise (std=0.5)"""
-    def __init__(self, config: BiBoConfig, std: float = 0.5, *args, **kwargs):
-        super().__init__()
-        self.std = std
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if True:  # use in inference too
-            with torch.no_grad():
-                noise = torch.randn_like(x) * self.std
-            return x + noise
 
 
 class BiBoCausalConv1D(nn.Module):
