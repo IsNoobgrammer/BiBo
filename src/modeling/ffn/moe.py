@@ -33,7 +33,7 @@ class BiBoMoELayer(nn.Module):
         self.routed_experts = nn.ModuleList()
         n = config.num_routed_experts
         if n < 4:
-            raise ValueError("num_routed_experts must be >= 4 (MLPs + identity + zero + relu)")
+            raise ValueError("num_routed_experts must be >= 4 (MLPs + identity + zero + relu2")
         # (n - 3) MLP experts
         for _ in range(n - 3):
             self.routed_experts.append(BiBoMLP(config, is_expert=True))

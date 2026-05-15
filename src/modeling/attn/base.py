@@ -103,17 +103,29 @@ class BiBoAttention(nn.Module):
         if self.use_ssmax:
             q = apply_ssmax_query_scaling(q, kv_len, self.ssmax_scale)
 
-        # Standard scaled dot-product attention
-        attn_weights = torch.matmul(q, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask[:, :, :, :kv_len]
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+        # Scaled dot-product attention (Flash Attention when available)
+        if not output_attentions:
+            # Use F.scaled_dot_product_attention (Flash/MemEfficient backend)
+            # Scale is already applied via SSMax, so we use 1/sqrt(head_dim) as base scale
+            attn_output = nn.functional.scaled_dot_product_attention(
+                q, key_states, value_states,
+                attn_mask=attention_mask[:, :, :, :kv_len] if attention_mask is not None else None,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                scale=1.0 / math.sqrt(self.head_dim),
+            )
+            attn_weights = None
+        else:
+            # Fallback to manual for output_attentions=True
+            attn_weights = torch.matmul(q, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask[:, :, :, :kv_len]
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+            attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+            attn_output = torch.matmul(attn_weights, value_states)
 
         # Reshape output
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, attn_weights if output_attentions else None, past_key_value
+        return attn_output, attn_weights, past_key_value
