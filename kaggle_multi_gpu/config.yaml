@@ -3,7 +3,7 @@
 # ============================================================
 training:
   seed: 42
-  epochs: 5
+  epochs: 3
   batch_size: 64
   seq_len: 256  # max seq len (sequences padded to this)
   vocab_size: 2048
@@ -12,7 +12,7 @@ training:
   warmup_ratio: 0.05
   weight_decay: 0.01
   grad_clip: 1.0
-  train_samples: 72000
+  train_samples: 126000
   val_samples: 4800
   val_every_n_steps: 200
   optimizer: adamw_8bit
