@@ -259,9 +259,8 @@ def main():
     np.random.seed(T['seed'])
     
     # Verify data exists
-    train_path = os.path.join(DATA_DIR, 'train.npy')
-    val_path = os.path.join(DATA_DIR, 'val.npy')
-    if not os.path.exists(train_path) or not os.path.exists(val_path):
+    check_file = os.path.join(DATA_DIR, 'train_len_64.npy')
+    if not os.path.exists(check_file):
         print("ERROR: Data not found. Run `python kaggle_multi_gpu/data.py` first.")
         sys.exit(1)
     
