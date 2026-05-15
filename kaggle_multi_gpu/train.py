@@ -45,35 +45,66 @@ T = CFG['training']
 
 class SequenceDataset(Dataset):
     """
-    Sorting task for causal LM (mixed lengths, padded).
-    Sequence: [unsorted | sorted] padded to 2*max_seq_len
-    Labels: [-100 for input + pad positions] [sorted tokens]
+    Sorting task — single bucket (fixed length, no padding).
+    Format: [unsorted] [SEP=2047] [sorted]
+    Labels: [-100 for unsorted+SEP] [sorted tokens]
     """
-    def __init__(self, npy_path, lengths_path):
-        self.data = np.load(npy_path)        # [N, 2, max_seq_len]
-        self.lengths = np.load(lengths_path)  # [N] actual seq lengths
-        self.max_seq_len = self.data.shape[2]
+    def __init__(self, npy_path):
+        self.data = np.load(npy_path)  # [N, full_len]
+        self.full_len = self.data.shape[1]
+        self.seq_len = (self.full_len - 1) // 2  # original seq_len
     
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
-        input_seq = self.data[idx, 0]   # unsorted, padded
-        target_seq = self.data[idx, 1]  # sorted, padded
-        seq_len = self.lengths[idx]
-        
-        # Concat: [unsorted | sorted] — total 2*max_seq_len
-        full_seq = np.concatenate([input_seq, target_seq])
+        full_seq = self.data[idx]
         input_ids = torch.tensor(full_seq[:-1], dtype=torch.long)
         
-        # Labels: -100 for input portion + padding, loss only on sorted output
+        # Labels: only compute loss on sorted portion (after SEP)
         labels = torch.tensor(full_seq[1:], dtype=torch.long)
-        # Mask: first (seq_len - 1) positions are input, don't compute loss
-        labels[:seq_len - 1] = -100
-        # Also mask padding in target portion (where target is 0/pad)
-        labels[labels == 0] = -100
+        # Mask everything up to and including SEP position
+        # SEP is at index seq_len, so mask [0..seq_len] in labels (= first seq_len+1 positions shifted)
+        labels[:self.seq_len] = -100
         
         return input_ids, labels
+
+
+class BucketedDataLoader:
+    """
+    Iterates over multiple buckets (different seq lengths) in round-robin.
+    Each batch contains same-length sequences (no padding needed).
+    """
+    def __init__(self, data_dir, split, batch_size, shuffle=True):
+        self.datasets = []
+        self.loaders = []
+        
+        for seq_len in [64, 128, 256]:
+            path = os.path.join(data_dir, f'{split}_len_{seq_len}.npy')
+            if os.path.exists(path):
+                ds = SequenceDataset(path)
+                loader = DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                                    num_workers=T['num_workers'], pin_memory=True, drop_last=True)
+                self.datasets.append(ds)
+                self.loaders.append(loader)
+        
+        self.total_batches = sum(len(l) for l in self.loaders)
+    
+    def __len__(self):
+        return self.total_batches
+    
+    def __iter__(self):
+        """Round-robin across buckets."""
+        iterators = [iter(l) for l in self.loaders]
+        active = list(range(len(iterators)))
+        
+        while active:
+            for i in list(active):
+                try:
+                    batch = next(iterators[i])
+                    yield batch
+                except StopIteration:
+                    active.remove(i)
 
 
 # ============================================================
@@ -104,13 +135,9 @@ def train_worker(model_name):
         config={**T, 'model': model_name, 'params': n_params},
     )
     
-    # Data
-    train_ds = SequenceDataset(os.path.join(DATA_DIR, 'train.npy'), os.path.join(DATA_DIR, 'train_lengths.npy'))
-    val_ds = SequenceDataset(os.path.join(DATA_DIR, 'val.npy'), os.path.join(DATA_DIR, 'val_lengths.npy'))
-    train_loader = DataLoader(train_ds, batch_size=T['batch_size'], shuffle=True,
-                              num_workers=T['num_workers'], pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=T['batch_size'], shuffle=False,
-                            num_workers=T['num_workers'], pin_memory=True)
+    # Data — bucketed (no padding, variable length batches)
+    train_loader = BucketedDataLoader(DATA_DIR, 'train', T['batch_size'], shuffle=True)
+    val_loader = BucketedDataLoader(DATA_DIR, 'val', T['batch_size'], shuffle=False)
     
     # Optimizer
     try:
