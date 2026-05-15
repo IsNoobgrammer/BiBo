@@ -4,7 +4,7 @@
 training:
   seed: 42
   epochs: 15
-  batch_size: 128
+  batch_size: 64
   seq_len: 256  # max seq len (sequences padded to this)
   vocab_size: 2048
   pad_token_id: 0  # padding token for variable-length sequences
@@ -40,7 +40,7 @@ bibo:
   router_lambda: 1.0
   router_noise: 0.3
   bias_update_factor: 0.01
-  bias_update_threshold: 32768
+  bias_update_threshold: 16384
   mlp_only_layers: [0, 5]
   tie_word_embeddings: true
 

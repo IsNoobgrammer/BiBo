@@ -286,7 +286,6 @@ def main():
     print("="*60)
     print(f"  Checkpoints: {SAVE_DIR}/")
     print(f"  Metrics: {METRICS_DIR}/")
-    print(f"  wandb: https://wandb.ai/<entity>/{T['wandb_project']}/runs/{run_id}")
     print("  Next: python kaggle_multi_gpu/extract_metrics.py")
 
 
