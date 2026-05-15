@@ -44,15 +44,32 @@ T = CFG['training']
 # ============================================================
 
 class SequenceDataset(Dataset):
+    """
+    Sorting task for causal LM.
+    Sequence: [unsorted tokens] [sorted tokens]
+    Labels: [-100 for input positions] [sorted tokens]
+    Model learns to output sorted version after seeing unsorted input.
+    """
     def __init__(self, npy_path):
-        self.data = np.load(npy_path)
+        self.data = np.load(npy_path)  # [N, 2, seq_len]
+        self.seq_len = self.data.shape[2]
     
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
-        seq = torch.tensor(self.data[idx], dtype=torch.long)
-        return seq[:-1], seq[1:]
+        input_seq = self.data[idx, 0]   # unsorted
+        target_seq = self.data[idx, 1]  # sorted
+        
+        # Concat: [unsorted ; sorted] — model sees unsorted, generates sorted
+        full_seq = np.concatenate([input_seq, target_seq])
+        input_ids = torch.tensor(full_seq[:-1], dtype=torch.long)
+        
+        # Labels: mask input portion with -100, only compute loss on sorted output
+        labels = torch.tensor(full_seq[1:], dtype=torch.long)
+        labels[:self.seq_len - 1] = -100  # don't compute loss on input portion
+        
+        return input_ids, labels
 
 
 # ============================================================
@@ -171,9 +188,11 @@ def train_worker(model_name):
                 input_ids, labels = input_ids.to(device), labels.to(device)
                 outputs = model(input_ids=input_ids, labels=labels)
                 val_loss += outputs.loss.item()
+                # Accuracy only on non-masked positions (target portion)
+                mask = labels != -100
                 preds = outputs.logits.argmax(dim=-1)
-                correct += (preds == labels).sum().item()
-                total += labels.numel()
+                correct += (preds[mask] == labels[mask]).sum().item()
+                total += mask.sum().item()
         
         val_loss /= len(val_loader)
         val_acc = correct / total

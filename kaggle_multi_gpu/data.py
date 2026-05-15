@@ -1,10 +1,10 @@
 """
-Generate and save train/val datasets to disk.
-Run FIRST before train.
+Generate sorting task data.
+Input: random sequence of tokens [0, vocab_size)
+Target: same tokens sorted in ascending order
 
 Usage: python kaggle_multi_gpu/data.py
 """
-import torch
 import numpy as np
 import yaml
 import os
@@ -18,58 +18,50 @@ with open(CFG_PATH) as f:
 T = CFG['training']
 
 
-def generate_sequences(num_samples, seq_len, vocab_size, seed):
+def generate_sorting_data(num_samples, seq_len, vocab_size, seed):
     """
-    Complex synthetic sequences — polynomial + periodic + skip + XOR patterns.
-    ~30% hard positions, ~10% noise.
+    Generate (input, target) pairs for sorting task.
+    Input: random tokens from [0, vocab_size)
+    Target: sorted version of input
+    
+    Stored as [num_samples, 2, seq_len]:
+        data[:, 0, :] = input (unsorted)
+        data[:, 1, :] = target (sorted)
     """
     rng = np.random.default_rng(seed)
-    data = np.zeros((num_samples, seq_len), dtype=np.int64)
+    inputs = rng.integers(0, vocab_size, size=(num_samples, seq_len)).astype(np.int64)
+    targets = np.sort(inputs, axis=1).astype(np.int64)
     
-    for s in range(num_samples):
-        seq = data[s]
-        seq[:5] = rng.integers(0, vocab_size, size=5)
-        pattern_weights = rng.dirichlet(np.ones(5))
-        period = rng.integers(5, 18)
-        delta = rng.integers(1, vocab_size // 10)
-        
-        for i in range(5, seq_len):
-            r = rng.random()
-            cumw = np.cumsum(pattern_weights)
-            if r < 0.10:
-                seq[i] = rng.integers(0, vocab_size)
-            elif r < cumw[0]:
-                seq[i] = (seq[i-1] * seq[i-2] + seq[i-1] * 3 + 17) % vocab_size
-            elif r < cumw[1]:
-                seq[i] = (seq[i % period] + i * 7) % vocab_size
-            elif r < cumw[2]:
-                skip = 5 if i >= 7 else 2
-                seq[i] = (seq[i-1] * 11 + seq[i-skip] * 23 + 5) % vocab_size
-            elif r < cumw[3]:
-                seq[i] = (seq[i-1] + delta) % vocab_size
-            else:
-                seq[i] = (seq[i-1] ^ seq[i-3]) % vocab_size
-    
+    data = np.stack([inputs, targets], axis=1)  # [N, 2, seq_len]
     return data
 
 
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     
+    seq_len = T['seq_len']
+    vocab_size = T['vocab_size']
+    
+    print(f"Task: Sort {seq_len} tokens from vocab [0, {vocab_size})")
+    
     print("Generating training data...")
-    train_data = generate_sequences(T['train_samples'], T['seq_len'], T['vocab_size'], seed=42)
+    train_data = generate_sorting_data(T['train_samples'], seq_len, vocab_size, seed=42)
     train_path = os.path.join(DATA_DIR, 'train.npy')
     np.save(train_path, train_data)
     print(f"  Saved: {train_path} | shape={train_data.shape}")
     
     print("Generating validation data...")
-    val_data = generate_sequences(T['val_samples'], T['seq_len'], T['vocab_size'], seed=123)
+    val_data = generate_sorting_data(T['val_samples'], seq_len, vocab_size, seed=123)
     val_path = os.path.join(DATA_DIR, 'val.npy')
     np.save(val_path, val_data)
     print(f"  Saved: {val_path} | shape={val_data.shape}")
     
-    print(f"\nDone. {T['train_samples']} train + {T['val_samples']} val sequences.")
-    print(f"  Vocab: {T['vocab_size']} | Seq len: {T['seq_len']}")
+    # Show example
+    print(f"\nExample:")
+    print(f"  Input:  {train_data[0, 0, :20]}...")
+    print(f"  Target: {train_data[0, 1, :20]}...")
+    
+    print(f"\n{T['train_samples']} train + {T['val_samples']} val")
     print(f"  Steps/epoch: {T['train_samples'] // T['batch_size']}")
     print(f"  Val steps: {T['val_samples'] // T['batch_size']}")
 
