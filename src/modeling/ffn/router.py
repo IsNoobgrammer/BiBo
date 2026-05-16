@@ -13,9 +13,6 @@ class BiBoMoERouter(nn.Module):
     """
     MoE router. Supports MLP or conv routing.
     
-    Noise scheduling: call `set_noise_scale(progress)` from training loop
-    where progress ∈ [0, 1]. Noise decays via cosine: full noise at 0, 10% at 1.
-    
     Args:
         config: Model config
     """
@@ -29,9 +26,6 @@ class BiBoMoERouter(nn.Module):
         self.kernel_size = config.kernel_size
         self.causal_padding = self.kernel_size - 1
         self.router_lambda = getattr(config, 'router_lambda', 1.0)
-
-        # Noise schedule: cosine decay from 1.0 → 0.1 over training
-        self.register_buffer('noise_scale', torch.tensor(1.0))
 
         # Load-balancing bias — NOT learned via gradient, updated by Skywork-MoE threshold logic.
         # requires_grad=False means the optimizer never touches this.
@@ -54,21 +48,6 @@ class BiBoMoERouter(nn.Module):
         else:
             raise ValueError(f"Unknown router type: {self.router_type}. Expected 'mlp' or 'conv'.")
 
-    def set_noise_scale(self, progress: float):
-        """
-        Update noise schedule. Call from training loop.
-        
-        Args:
-            progress: training progress in [0, 1] (0=start, 1=end)
-        
-        Cosine decay: 1.0 at start → 0.1 at end.
-        Exploration early, exploitation late.
-        """
-        progress = max(0.0, min(1.0, progress))
-        # cosine decay from 1.0 to 0.1
-        scale = 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
-        self.noise_scale.fill_(scale)
-
     def forward(self, hidden_states: torch.Tensor):
         """
         Args:
@@ -89,7 +68,7 @@ class BiBoMoERouter(nn.Module):
             router_logits = rearrange(conv_out, 'b e s -> (b s) e').float()
 
         if self.training and self.router_noise > 0:
-            noise_stddev = math.sqrt(self.router_noise) * self.noise_scale.item()
+            noise_stddev = math.sqrt(self.router_noise)
             noise = torch.randn_like(router_logits) * noise_stddev
             router_logits = router_logits + noise.detach()  
 
