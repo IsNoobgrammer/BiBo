@@ -935,24 +935,31 @@ def plot_routing_diversity(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_len
         qwen_effective.append(effective_n)
         qwen_used_frac.append(used / n_exp_qwen)
     
-    # Effective experts
-    x_b = np.arange(len(bibo_layers))
-    x_q = np.arange(len(qwen_layers))
-    ax1.bar(x_b - 0.2, bibo_effective, 0.4, color=BIBO_COLOR, alpha=0.8, label='BiBo')
-    ax1.bar(x_q + 0.2, qwen_effective, 0.4, color=QWEN_COLOR, alpha=0.8, label='Qwen3MoE')
+    # Effective experts — handle different layer counts
+    all_layer_ids = sorted(set(bibo_layers) | set(qwen_layers))
+    n_total = len(all_layer_ids)
+    x = np.arange(n_total)
+    
+    # Map layer_id → position
+    layer_to_pos = {l: i for i, l in enumerate(all_layer_ids)}
+    bibo_pos = [layer_to_pos[l] for l in bibo_layers]
+    qwen_pos = [layer_to_pos[l] for l in qwen_layers]
+    
+    ax1.bar(np.array(bibo_pos) - 0.2, bibo_effective, 0.4, color=BIBO_COLOR, alpha=0.8, label='BiBo')
+    ax1.bar(np.array(qwen_pos) + 0.2, qwen_effective, 0.4, color=QWEN_COLOR, alpha=0.8, label='Qwen3MoE')
     ax1.axhline(y=n_exp_bibo, color='gray', linestyle='--', alpha=0.4, label=f'Max ({n_exp_bibo})')
-    ax1.set_xticks(x_b)
-    ax1.set_xticklabels([f'L{l}' for l in bibo_layers])
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([f'L{l}' for l in all_layer_ids])
     ax1.set_ylabel('Effective # Experts (exp(H))')
     ax1.set_title('Effective Expert Count per Layer', fontweight='bold')
     ax1.legend()
     
     # Used fraction
-    ax2.bar(x_b - 0.2, bibo_used_frac, 0.4, color=BIBO_COLOR, alpha=0.8, label='BiBo')
-    ax2.bar(x_q + 0.2, qwen_used_frac, 0.4, color=QWEN_COLOR, alpha=0.8, label='Qwen3MoE')
+    ax2.bar(np.array(bibo_pos) - 0.2, bibo_used_frac, 0.4, color=BIBO_COLOR, alpha=0.8, label='BiBo')
+    ax2.bar(np.array(qwen_pos) + 0.2, qwen_used_frac, 0.4, color=QWEN_COLOR, alpha=0.8, label='Qwen3MoE')
     ax2.axhline(y=1.0, color='gray', linestyle='--', alpha=0.4)
-    ax2.set_xticks(x_b)
-    ax2.set_xticklabels([f'L{l}' for l in bibo_layers])
+    ax2.set_xticks(x)
+    ax2.set_xticklabels([f'L{l}' for l in all_layer_ids])
     ax2.set_ylabel('Fraction of Experts Used')
     ax2.set_title('Expert Utilization per Layer', fontweight='bold')
     ax2.set_ylim(0, 1.1)
@@ -1242,12 +1249,20 @@ def plot_expert_switching_rate(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq
             top1 = idx[:, 0]
             qwen_switch_rates.append((top1[1:] != top1[:-1]).mean())
     
-    x = np.arange(len(bibo_layers))
+    # Handle different number of MoE layers between models
+    all_layer_ids = sorted(set(bibo_layers) | set(qwen_layers))
+    n_total = len(all_layer_ids)
+    layer_to_pos = {l: i for i, l in enumerate(all_layer_ids)}
+    
+    bibo_pos = np.array([layer_to_pos[l] for l in bibo_layers])
+    qwen_pos = np.array([layer_to_pos[l] for l in qwen_layers])
     width = 0.35
-    ax1.bar(x - width/2, bibo_switch_rates, width, color=BIBO_COLOR, alpha=0.8, label='BiBo')
-    ax1.bar(x + width/2, qwen_switch_rates, width, color=QWEN_COLOR, alpha=0.8, label='Qwen3MoE')
-    ax1.set_xticks(x)
-    ax1.set_xticklabels([f'L{l}' for l in bibo_layers])
+    
+    ax1.bar(bibo_pos - width/2, bibo_switch_rates, width, color=BIBO_COLOR, alpha=0.8, label='BiBo')
+    ax1.bar(qwen_pos + width/2, qwen_switch_rates, width, color=QWEN_COLOR, alpha=0.8, label='Qwen3MoE')
+    
+    ax1.set_xticks(np.arange(n_total))
+    ax1.set_xticklabels([f'L{l}' for l in all_layer_ids])
     ax1.set_ylabel('Switch Rate')
     ax1.set_title('Top-1 Expert Switch Rate per Layer\n(fraction of consecutive tokens with different top-1)',
                   fontweight='bold')
