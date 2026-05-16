@@ -3,11 +3,11 @@
 # ============================================================
 training:
   seed: 48
-  epochs: 3
+  epochs: 1
   batch_size: 64
   vocab_size: 512
   pad_token_id: 0
-  lr: 3.0e-4
+  lr: 1.0e-4
   warmup_ratio: 0.10
   weight_decay: 0.01
   grad_clip: 1.0
@@ -23,8 +23,6 @@ training:
   # Curriculum learning: train on progressively longer sequences
   curriculum: true
   curriculum_stages: [2, 8, 32, 64, 128, 256]
-  # Each stage gets equal share of epochs (3 epochs / 6 stages = 0.5 epoch each)
-  # Or: cycle through all stages per epoch
 
 # ============================================================
 # BiBo Config (~10M)
@@ -66,4 +64,5 @@ qwen3moe:
   max_position_embeddings: 512
   decoder_sparse_step: 1
   shared_expert_intermediate_size: 256
+  mlp_only_layers: [0]
   tie_word_embeddings: true
