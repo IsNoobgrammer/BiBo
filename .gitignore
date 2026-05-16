@@ -9,7 +9,8 @@ shaurya_notes.md
 pipeline/
 AGENTS.md
 research_on_activations/
-data
+/data
+!misc/kaggle/multi_gpu/report/src/data/
 aux_loss_for_entropy/
 .vscode/
 kaggle_ablations/
