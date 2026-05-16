@@ -1169,32 +1169,40 @@ def plot_per_layer_weight_kde(bibo_data, qwen_data, seq_len):
     
     fig, axes = plt.subplots(n_layers, 2, figsize=(12, 3*n_layers), squeeze=False)
     
-    for i, (bl, ql) in enumerate(zip(bibo_layers, qwen_layers)):
+    for i in range(n_layers):
         # BiBo
         ax = axes[i, 0]
-        w = bibo_data[bl]['weights'].numpy()
-        if w.ndim == 3:
-            w = w.reshape(-1, w.shape[-1])
-        for k in range(w.shape[1]):
-            sns.kdeplot(w[:, k], ax=ax, label=f'Rank-{k+1}', linewidth=1.5)
-        ax.set_xlim(0, 1)
-        ax.set_title(f'BiBo L{bl}', color=BIBO_COLOR, fontweight='bold')
-        ax.set_xlabel('Weight')
-        if i == 0:
-            ax.legend(fontsize=7)
+        if i < len(bibo_layers):
+            bl = bibo_layers[i]
+            w = bibo_data[bl]['weights'].numpy()
+            if w.ndim == 3:
+                w = w.reshape(-1, w.shape[-1])
+            for k in range(w.shape[1]):
+                sns.kdeplot(w[:, k], ax=ax, label=f'Rank-{k+1}', linewidth=1.5)
+            ax.set_xlim(0, 1)
+            ax.set_title(f'BiBo L{bl}', color=BIBO_COLOR, fontweight='bold')
+            ax.set_xlabel('Weight')
+            if i == 0:
+                ax.legend(fontsize=7)
+        else:
+            ax.set_visible(False)
         
         # Qwen
         ax = axes[i, 1]
-        w = qwen_data[ql]['weights'].numpy()
-        if w.ndim == 3:
-            w = w.reshape(-1, w.shape[-1])
-        for k in range(w.shape[1]):
-            sns.kdeplot(w[:, k], ax=ax, label=f'Rank-{k+1}', linewidth=1.5)
-        ax.set_xlim(0, 1)
-        ax.set_title(f'Qwen L{ql}', color=QWEN_COLOR, fontweight='bold')
-        ax.set_xlabel('Weight')
-        if i == 0:
-            ax.legend(fontsize=7)
+        if i < len(qwen_layers):
+            ql = qwen_layers[i]
+            w = qwen_data[ql]['weights'].numpy()
+            if w.ndim == 3:
+                w = w.reshape(-1, w.shape[-1])
+            for k in range(w.shape[1]):
+                sns.kdeplot(w[:, k], ax=ax, label=f'Rank-{k+1}', linewidth=1.5)
+            ax.set_xlim(0, 1)
+            ax.set_title(f'Qwen L{ql}', color=QWEN_COLOR, fontweight='bold')
+            ax.set_xlabel('Weight')
+            if i == 0:
+                ax.legend(fontsize=7)
+        else:
+            ax.set_visible(False)
     
     plt.suptitle(f'Per-Layer Weight Distribution (KDE) — seq={seq_len}\n'
                  'Peaked near 1.0 = top-1 dominance | Spread = balanced contribution',
@@ -1284,10 +1292,15 @@ def plot_expert_switching_rate(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq
     
     if bibo_idx.ndim == 3:
         bibo_top1 = bibo_idx[0, :, 0]
-        qwen_top1 = qwen_idx[0, :, 0]
     else:
         bibo_top1 = bibo_idx[:, 0]
-        qwen_top1 = qwen_idx[:, 0]
+    
+    if qwen_idx.ndim == 3:
+        qwen_top1 = qwen_idx[0, :, 0]
+    else:
+        # Qwen returns [bs*seq, top_k] — take first seq_len tokens
+        seq_len_actual = len(bibo_top1) if bibo_idx.ndim == 3 else len(bibo_top1)
+        qwen_top1 = qwen_idx[:seq_len_actual, 0]
     
     bibo_switches = np.where(bibo_top1[1:] != bibo_top1[:-1])[0]
     qwen_switches = np.where(qwen_top1[1:] != qwen_top1[:-1])[0]
