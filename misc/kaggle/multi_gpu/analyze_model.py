@@ -54,8 +54,8 @@ with open(CFG_PATH) as f:
 # ============================================================
 TEST_SEQ_LENS = [8, 32, 64, 96, 128, 192]
 BATCH_SIZE = 8
-VOCAB_SIZE = CFG['training']['vocab_size']  # 2048
-SEP_TOKEN = VOCAB_SIZE - 1  # 2047
+VOCAB_SIZE = CFG['training']['vocab_size']  # 512
+SEP_TOKEN = VOCAB_SIZE - 1  # 511
 SEED = CFG['training']['seed']
 NUM_DISPLAY_SAMPLES = 3  # how many samples to show detailed predictions for
 
@@ -529,7 +529,7 @@ def plot_results(all_results):
     
     # --- Plot 6: Length generalization (trained vs untrained lengths) ---
     fig, ax = plt.subplots(figsize=(10, 5))
-    trained_lens = [64, 128, 256]
+    trained_lens = [2, 8, 32, 64, 128, 256]
     
     x = np.arange(len(seq_lens))
     width = 0.35

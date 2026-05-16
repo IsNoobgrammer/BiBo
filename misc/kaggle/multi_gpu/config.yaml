@@ -3,30 +3,35 @@
 # ============================================================
 training:
   seed: 48
-  epochs: 1
+  epochs: 3
   batch_size: 64
-  seq_len: 256  # max seq len (sequences padded to this)
-  vocab_size: 2048
-  pad_token_id: 0  # padding token for variable-length sequences
-  lr: 7.0e-3
+  vocab_size: 512
+  pad_token_id: 0
+  lr: 3.0e-4
   warmup_ratio: 0.10
   weight_decay: 0.01
   grad_clip: 1.0
-  train_samples: 400000
+  train_samples: 500000
   val_samples: 9000
   val_every_n_steps: 500
   optimizer: adamw_8bit
   num_workers: 2
   log_every_n_steps: 10
   wandb_project: "bibo-ablation"
-  wandb_run_name: "bibo-vs-qwen3moe-sort"
+  wandb_run_name: "bibo-vs-qwen3moe-sort-v2"
+
+  # Curriculum learning: train on progressively longer sequences
+  curriculum: true
+  curriculum_stages: [2, 8, 32, 64, 128, 256]
+  # Each stage gets equal share of epochs (3 epochs / 6 stages = 0.5 epoch each)
+  # Or: cycle through all stages per epoch
 
 # ============================================================
 # BiBo Config (~10M)
 # ============================================================
 bibo:
   device: "cuda:0"
-  vocab_size: 2048
+  vocab_size: 512
   hidden_size: 256
   intermediate_size: 512
   num_hidden_layers: 6
@@ -49,7 +54,7 @@ bibo:
 # ============================================================
 qwen3moe:
   device: "cuda:1"
-  vocab_size: 2048
+  vocab_size: 512
   hidden_size: 256
   intermediate_size: 512
   num_hidden_layers: 6
