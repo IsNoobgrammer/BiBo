@@ -3,18 +3,18 @@
 # ============================================================
 training:
   seed: 48
-  epochs: 2
+  epochs: 3
   batch_size: 64
   seq_len: 256  # max seq len (sequences padded to this)
   vocab_size: 2048
   pad_token_id: 0  # padding token for variable-length sequences
-  lr: 5.0e-2
-  warmup_ratio: 0.05
+  lr: 1.0e-2
+  warmup_ratio: 0.10
   weight_decay: 0.01
   grad_clip: 1.0
-  train_samples: 180000
-  val_samples: 6000
-  val_every_n_steps: 200
+  train_samples: 300000
+  val_samples: 9000
+  val_every_n_steps: 300
   optimizer: adamw_8bit
   num_workers: 2
   log_every_n_steps: 10
