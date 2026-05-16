@@ -40,8 +40,8 @@ bibo:
   router_type: "conv"
   router_lambda: 1.0
   router_noise: 0.3
-  bias_update_factor: 0.01
-  bias_update_threshold: 8000
+  bias_update_factor: 0.1
+  bias_update_threshold: 10000
   mlp_only_layers: [0, 5]
   tie_word_embeddings: true
 
