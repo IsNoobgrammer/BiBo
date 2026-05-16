@@ -8,13 +8,13 @@ training:
   seq_len: 256  # max seq len (sequences padded to this)
   vocab_size: 2048
   pad_token_id: 0  # padding token for variable-length sequences
-  lr: 1.0e-2
+  lr: 7.0e-3
   warmup_ratio: 0.10
   weight_decay: 0.01
   grad_clip: 1.0
   train_samples: 300000
   val_samples: 9000
-  val_every_n_steps: 300
+  val_every_n_steps: 400
   optimizer: adamw_8bit
   num_workers: 2
   log_every_n_steps: 10
