@@ -21,7 +21,7 @@ import argparse
 import random
 import multiprocessing as mp
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 
 from src.configuration_bibo import BiBoConfig
 from src.modeling.models import BiBoForCausalLM

@@ -27,7 +27,7 @@ from matplotlib.colors import LinearSegmentedColormap
 import seaborn as sns
 # scipy optional — not required for core analysis
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 
 from src.configuration_bibo import BiBoConfig
 from src.modeling.models import BiBoForCausalLM
