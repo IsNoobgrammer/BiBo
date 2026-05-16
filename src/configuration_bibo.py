@@ -46,7 +46,7 @@ class BiBoConfig(PretrainedConfig):
         router_type="mlp",  # "mlp" or "conv"
         kernel_size=3,
         router_lambda=1.0,  # Skywork-MoE logit normalization scaling
-        router_noise=None,  # Auto: log(num_experts) * 0.1
+        router_noise=0,  # Auto: log(num_experts) * 0.1
         bias_update_factor=None,  # Auto: (1 - exp(-n/48)) * 0.5
         bias_update_threshold=8000,  # User knob: tokens between bias updates
         router_temperature=1.3,  # Legacy (not used; kept for compat)
@@ -108,13 +108,13 @@ class BiBoConfig(PretrainedConfig):
         else:
             self.moe_intermediate_size = self.intermediate_size // self.num_experts_per_tok
 
-        # router_noise: exploration noise, scales with log(num_experts)
-        # more experts → more need for exploration to discover all of them
-        if router_noise is not None:
-            self.router_noise = router_noise
-        else:
-            import math as _math
-            self.router_noise = round(min(1.0, 0.1 * _math.log(self.num_routed_experts)), 4)
+        # # router_noise: exploration noise, scales with log(num_experts)
+        # # more experts → more need for exploration to discover all of them
+        # if router_noise is not None:
+        #     self.router_noise = router_noise
+        # else:
+        #     import math as _math
+        #     self.router_noise = round(min(1.0, 0.1 * _math.log(self.num_routed_experts)), 4)
 
         # bias_update_factor: scales with num_experts
         # Small n → small step (few experts, imbalance less harmful on single GPU)
@@ -124,9 +124,13 @@ class BiBoConfig(PretrainedConfig):
             self.bias_update_factor = bias_update_factor
         else:
             import math as _math
-            self.bias_update_factor = round(
-                (1 - _math.exp(-self.num_routed_experts / 48)) * 0.5, 4
-            )
+            n = self.num_routed_experts
+            # Hill function: A * n^α / (n^α + C)
+            # Derived from: f(8)=0.07, f(16)=0.1417, f(∞)=0.35
+            _alpha = 1.445
+            _C     = 81.0
+            _n_pow = n ** _alpha
+            self.bias_update_factor = round(0.35 * _n_pow / (_n_pow + _C), 4)
 
         # bias_update_threshold: user-controlled frequency knob
         # How many tokens to accumulate before applying a bias update
