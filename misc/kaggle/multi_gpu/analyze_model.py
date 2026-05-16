@@ -52,7 +52,7 @@ with open(CFG_PATH) as f:
 # ============================================================
 # Config
 # ============================================================
-TEST_SEQ_LENS = [8, 32, 64, 128, 256, 512]
+TEST_SEQ_LENS = [8, 32, 48, 64, 128, 192]
 BATCH_SIZE = 8
 VOCAB_SIZE = CFG['training']['vocab_size']  # 2048
 SEP_TOKEN = VOCAB_SIZE - 1  # 2047
@@ -506,12 +506,12 @@ def plot_results(all_results):
     
     # --- Plot 5: Position-wise accuracy for select seq_lens ---
     ax = axes[1]
-    for sl in [64, 128, 256]:
+    for sl in [64, 128, 192]:
         if sl in all_results['bibo'] and all_results['bibo'][sl]['position_accuracy']:
             pos_acc = all_results['bibo'][sl]['position_accuracy']
             positions = np.linspace(0, 1, len(pos_acc))  # normalize to [0,1]
             ax.plot(positions, pos_acc, '-', linewidth=1.5, label=f'BiBo seq={sl}')
-    for sl in [64, 128, 256]:
+    for sl in [64, 128, 192]:
         if sl in all_results['qwen3moe'] and all_results['qwen3moe'][sl]['position_accuracy']:
             pos_acc = all_results['qwen3moe'][sl]['position_accuracy']
             positions = np.linspace(0, 1, len(pos_acc))
