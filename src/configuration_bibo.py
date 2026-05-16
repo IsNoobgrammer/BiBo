@@ -47,8 +47,8 @@ class BiBoConfig(PretrainedConfig):
         kernel_size=3,
         router_lambda=1.0,  # Skywork-MoE logit normalization scaling
         router_noise=None,  # Auto: log(num_experts) * 0.1
-        bias_update_factor=None,  # Auto: router_lambda / sqrt(num_experts)
-        bias_update_threshold=None,  # Auto: num_experts * 1000
+        bias_update_factor=None,  # Auto: (1 - exp(-n/48)) * 0.5
+        bias_update_threshold=8000,  # User knob: tokens between bias updates
         router_temperature=1.3,  # Legacy (not used; kept for compat)
         # Shared expert
         moe_shared_scaling=1.0,  # Auto-computed if 1.0 (DeepSeek-V2/V3 style)
@@ -116,18 +116,24 @@ class BiBoConfig(PretrainedConfig):
             import math as _math
             self.router_noise = round(min(1.0, 0.1 * _math.log(self.num_routed_experts)), 4)
 
-        # bias_update_factor: step size proportional to logit scale after normalization
-        # after z-score + lambda, logits are O(lambda). Bias step should be small relative.
+        # bias_update_factor: scales with num_experts
+        # Small n → small step (few experts, imbalance less harmful on single GPU)
+        # Large n → large step (many experts, need strong balancing for EP)
+        # Bounded [0, 0.5], smooth S-curve via exponential saturation
         if bias_update_factor is not None:
             self.bias_update_factor = bias_update_factor
         else:
-            self.bias_update_factor = round(self.router_lambda / (self.num_routed_experts ** 0.5), 4)
+            import math as _math
+            self.bias_update_factor = round(
+                (1 - _math.exp(-self.num_routed_experts / 48)) * 0.5, 4
+            )
 
-        # bias_update_threshold: need enough tokens for each expert to be seen meaningfully
+        # bias_update_threshold: user-controlled frequency knob
+        # How many tokens to accumulate before applying a bias update
         if bias_update_threshold is not None:
             self.bias_update_threshold = bias_update_threshold
         else:
-            self.bias_update_threshold = self.num_routed_experts * 1000
+            self.bias_update_threshold = 8000
 
         # --- Auto-estimate scaling factor for shared expert if left as 1.0 ---
         self.moe_shared_scaling = moe_shared_scaling
