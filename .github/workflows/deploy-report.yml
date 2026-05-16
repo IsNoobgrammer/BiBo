@@ -28,19 +28,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: misc/kaggle/multi_gpu/report/package-lock.json
+
+      - name: Install dependencies
+        working-directory: misc/kaggle/multi_gpu/report
+        run: npm ci
+
+      - name: Copy plots to public
+        run: |
+          mkdir -p misc/kaggle/multi_gpu/report/public/plots
+          cp misc/kaggle/multi_gpu/plots/*.png misc/kaggle/multi_gpu/report/public/plots/
+
+      - name: Build Next.js
+        working-directory: misc/kaggle/multi_gpu/report
+        run: npx next build
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
 
-      - name: Prepare site
-        run: |
-          mkdir -p _site
-          cp misc/kaggle/multi_gpu/report/index.html _site/
-          cp misc/kaggle/multi_gpu/report/style.css _site/
-          cp misc/kaggle/multi_gpu/report/app.js _site/
-          cp -r misc/kaggle/multi_gpu/plots _site/plots
-
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
+        with:
+          path: misc/kaggle/multi_gpu/report/out
 
       - name: Deploy to GitHub Pages
         id: deployment
