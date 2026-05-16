@@ -30,14 +30,14 @@ class BiBoConfig(PretrainedConfig):
         bos_token_id=0,
         eos_token_id=0,
         tie_word_embeddings=True,
-        rope_theta=10000.0,
+        rope_theta=None,  # Auto-derived from max_position_embeddings if None
         rope_scaling=None,
         attention_dropout=0.0,
         attention_bias=False,
         # MoE
         mlp_only_layers=None,
         decoder_sparse_step=1,
-        moe_intermediate_size=512,
+        moe_intermediate_size=None,  # Auto: intermediate_size // top_k
         num_routed_experts=16,
         num_shared_experts=1,
         num_experts_per_tok=6,
@@ -46,9 +46,9 @@ class BiBoConfig(PretrainedConfig):
         router_type="mlp",  # "mlp" or "conv"
         kernel_size=3,
         router_lambda=1.0,  # Skywork-MoE logit normalization scaling
-        router_noise=0.5,  # Exploration noise during training
-        bias_update_factor=1e-2,  # Step size for load balancing bias updates
-        bias_update_threshold=100_000,  # Tokens before bias update
+        router_noise=None,  # Auto: log(num_experts) * 0.1
+        bias_update_factor=None,  # Auto: router_lambda / sqrt(num_experts)
+        bias_update_threshold=None,  # Auto: num_experts * 1000
         router_temperature=1.3,  # Legacy (not used; kept for compat)
         # Shared expert
         moe_shared_scaling=1.0,  # Auto-computed if 1.0 (DeepSeek-V2/V3 style)
@@ -73,25 +73,61 @@ class BiBoConfig(PretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.tie_word_embeddings = tie_word_embeddings
-        self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
         self.attention_dropout = attention_dropout
         self.attention_bias = attention_bias
         self.decoder_sparse_step = decoder_sparse_step
-        self.moe_intermediate_size = moe_intermediate_size
         self.num_routed_experts = num_routed_experts
         self.num_shared_experts = num_shared_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.num_experts = num_experts if num_experts is not None else (num_routed_experts + num_shared_experts)
         self.router_temperature = router_temperature
-        self.bias_update_factor = bias_update_factor
-        self.bias_update_threshold = bias_update_threshold
-        self.router_noise = router_noise
         self.router_type = router_type
         self.kernel_size = kernel_size
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.router_lambda = router_lambda
+
+        # ============================================================
+        # Auto-derived hyperparameters
+        # ============================================================
+
+        # rope_theta: scales with context length (LLaMA-3 empirical relationship)
+        if rope_theta is not None:
+            self.rope_theta = rope_theta
+        else:
+            base = 10000.0
+            self.rope_theta = base * (self.max_position_embeddings / 4096) ** (4 / 3)
+
+        # moe_intermediate_size: maintain compute parity with dense FFN
+        # dense active params/token = 2 * hidden * intermediate
+        # MoE active params/token = 2 * hidden * moe_intermediate * top_k
+        # parity → moe_intermediate = intermediate // top_k
+        if moe_intermediate_size is not None:
+            self.moe_intermediate_size = moe_intermediate_size
+        else:
+            self.moe_intermediate_size = self.intermediate_size // self.num_experts_per_tok
+
+        # router_noise: exploration noise, scales with log(num_experts)
+        # more experts → more need for exploration to discover all of them
+        if router_noise is not None:
+            self.router_noise = router_noise
+        else:
+            import math as _math
+            self.router_noise = round(min(1.0, 0.1 * _math.log(self.num_routed_experts)), 4)
+
+        # bias_update_factor: step size proportional to logit scale after normalization
+        # after z-score + lambda, logits are O(lambda). Bias step should be small relative.
+        if bias_update_factor is not None:
+            self.bias_update_factor = bias_update_factor
+        else:
+            self.bias_update_factor = round(self.router_lambda / (self.num_routed_experts ** 0.5), 4)
+
+        # bias_update_threshold: need enough tokens for each expert to be seen meaningfully
+        if bias_update_threshold is not None:
+            self.bias_update_threshold = bias_update_threshold
+        else:
+            self.bias_update_threshold = self.num_routed_experts * 1000
 
         # --- Auto-estimate scaling factor for shared expert if left as 1.0 ---
         self.moe_shared_scaling = moe_shared_scaling

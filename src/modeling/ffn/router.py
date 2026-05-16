@@ -13,6 +13,9 @@ class BiBoMoERouter(nn.Module):
     """
     MoE router. Supports MLP or conv routing.
     
+    Noise scheduling: call `set_noise_scale(progress)` from training loop
+    where progress ∈ [0, 1]. Noise decays via cosine: full noise at 0, 10% at 1.
+    
     Args:
         config: Model config
     """
@@ -21,11 +24,14 @@ class BiBoMoERouter(nn.Module):
         self.num_routed_experts = config.num_routed_experts
         self.top_k = config.num_experts_per_tok
         self.temperature = config.router_temperature
-        self.router_noise = config.router_noise
+        self.router_noise = config.router_noise  # base noise variance
         self.router_type = config.router_type
         self.kernel_size = config.kernel_size
         self.causal_padding = self.kernel_size - 1
         self.router_lambda = getattr(config, 'router_lambda', 1.0)
+
+        # Noise schedule: cosine decay from 1.0 → 0.1 over training
+        self.register_buffer('noise_scale', torch.tensor(1.0))
 
         # Load-balancing bias — NOT learned via gradient, updated by Skywork-MoE threshold logic.
         # requires_grad=False means the optimizer never touches this.
@@ -48,6 +54,21 @@ class BiBoMoERouter(nn.Module):
         else:
             raise ValueError(f"Unknown router type: {self.router_type}. Expected 'mlp' or 'conv'.")
 
+    def set_noise_scale(self, progress: float):
+        """
+        Update noise schedule. Call from training loop.
+        
+        Args:
+            progress: training progress in [0, 1] (0=start, 1=end)
+        
+        Cosine decay: 1.0 at start → 0.1 at end.
+        Exploration early, exploitation late.
+        """
+        progress = max(0.0, min(1.0, progress))
+        # cosine decay from 1.0 to 0.1
+        scale = 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
+        self.noise_scale.fill_(scale)
+
     def forward(self, hidden_states: torch.Tensor):
         """
         Args:
@@ -68,20 +89,29 @@ class BiBoMoERouter(nn.Module):
             router_logits = rearrange(conv_out, 'b e s -> (b s) e').float()
 
         if self.training and self.router_noise > 0:
-            noise_stddev = math.sqrt(self.router_noise)
+            noise_stddev = math.sqrt(self.router_noise) * self.noise_scale.item()
             noise = torch.randn_like(router_logits) * noise_stddev
             router_logits = router_logits + noise.detach()  
 
-        router_logits = router_logits + self.bias
         # z = lambda * (z - mean) / std (Skywork-MoE)
         mean = router_logits.mean(dim=1, keepdim=True)
         std = router_logits.std(dim=1, keepdim=True) + 1e-6
         router_logits_norm = (router_logits - mean) / std
         router_logits_scaled = self.router_lambda * router_logits_norm
 
+        # heuristic based bais update via different path 
+        # path 1 — gating weights (clean, no bias)
         routing_weights = F.softmax(router_logits_scaled, dim=1)
-        top_k_weights, top_k_indices = torch.topk(routing_weights, self.top_k, dim=-1)
-        norm_weights = top_k_weights / (top_k_weights.sum(dim=-1, keepdim=True) + 1e-6)
+
+        # path 2 — selection only (bias here)
+        selection_scores = router_logits_scaled + self.bias
+        _, top_k_indices = torch.topk(selection_scores, self.top_k, dim=-1)
+
+
+        # gather weights from unbiased softmax using biased indices
+        top_k_weights = routing_weights.gather(-1, top_k_indices)
+        norm_weights = top_k_weights / (top_k_weights.sum(-1, keepdim=True) + 1e-6)
+
         top_k_indices = rearrange(top_k_indices, '(b s) k -> b s k', b=batch_size)
         norm_weights = rearrange(norm_weights, '(b s) k -> b s k', b=batch_size)
         return top_k_indices.long(), norm_weights.to(hidden_states.dtype)
