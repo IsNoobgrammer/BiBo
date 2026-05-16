@@ -2,7 +2,7 @@
 # Training Config — Multi-GPU (2×T4)
 # ============================================================
 training:
-  seed: 42
+  seed: 48
   epochs: 2
   batch_size: 64
   seq_len: 256  # max seq len (sequences padded to this)

@@ -4,7 +4,8 @@ Both log to same wandb run for side-by-side comparison.
 
 Usage:
     python kaggle_multi_gpu/data.py      # generate data first
-    python kaggle_multi_gpu/train.py     # train both in parallel
+    python kaggle_multi_gpu/train.py     # train both (seed=48 default)
+    python kaggle_multi_gpu/train.py --seed 69
 """
 import torch
 import torch.nn as nn
@@ -16,6 +17,8 @@ import json
 import yaml
 import os
 import sys
+import argparse
+import random
 import multiprocessing as mp
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
@@ -114,6 +117,9 @@ class BucketedDataLoader:
 def train_worker(model_name):
     """Train one model. Called as separate process."""
     import wandb
+    
+    # Seed this subprocess
+    seed_everything(T['seed'])
     
     # Config
     if model_name == 'bibo':
@@ -248,13 +254,34 @@ def train_worker(model_name):
     wandb.finish()
 
 
+def seed_everything(seed):
+    """Set all seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    # Deterministic ops (slower but reproducible)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 # ============================================================
 # Main — spawn both processes
 # ============================================================
 
 def main():
-    torch.manual_seed(T['seed'])
-    np.random.seed(T['seed'])
+    parser = argparse.ArgumentParser(description='BiBo vs Qwen3MoE parallel training')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed (overrides config.yaml, default: config value)')
+    args = parser.parse_args()
+    
+    # Seed: CLI > config
+    seed = args.seed if args.seed is not None else T['seed']
+    T['seed'] = seed  # propagate to workers
+    
+    seed_everything(seed)
+    print(f"\n  Seed: {seed}")
     
     # Verify data exists
     check_file = os.path.join(DATA_DIR, 'train_len_64.npy')

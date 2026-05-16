@@ -8,12 +8,15 @@ Tokens from [0, 2047). Separator = 2047.
 3 buckets: seq_len = 64, 128, 256
 Full sequence lengths: 129, 257, 513
 
-Usage: python kaggle_multi_gpu/data.py
+Usage:
+    python kaggle_multi_gpu/data.py           # seed from config (48)
+    python kaggle_multi_gpu/data.py --seed 69
 """
 import numpy as np
 import yaml
 import os
 import json
+import argparse
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.yaml')
@@ -100,15 +103,23 @@ def generate_val_deduped(val_target, seq_len, rng, train_set):
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Generate sorting task data')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed (overrides config.yaml, default: config value)')
+    args = parser.parse_args()
+    
+    seed = args.seed if args.seed is not None else T['seed']
+    
     os.makedirs(DATA_DIR, exist_ok=True)
     
     print(f"Task: Sort sequences")
+    print(f"  Seed: {seed}")
     print(f"  Vocab: [0, {SEP_TOKEN}) | SEP token: {SEP_TOKEN}")
     print(f"  Buckets: {SEQ_LENS} → full lengths: {[2*s+1 for s in SEQ_LENS]}")
     
     # === Generate training data ===
     print("\nGenerating training data...")
-    train_rng = np.random.default_rng(42)
+    train_rng = np.random.default_rng(seed)
     samples_per_bucket = T['train_samples'] // len(SEQ_LENS)
     
     train_data = {}
@@ -131,7 +142,7 @@ def main():
     
     # === Generate validation data (deduplicated from train) ===
     print("\nGenerating validation data (deduped from train)...")
-    val_rng = np.random.default_rng(123)
+    val_rng = np.random.default_rng(seed + 1000)  # derived from main seed
     val_per_bucket = T['val_samples'] // len(SEQ_LENS)
     
     for seq_len in SEQ_LENS:
