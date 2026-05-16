@@ -3,7 +3,7 @@
 # ============================================================
 training:
   seed: 48
-  epochs: 3
+  epochs: 2
   batch_size: 64
   seq_len: 256  # max seq len (sequences padded to this)
   vocab_size: 2048
