@@ -1,0 +1,47 @@
+name: Deploy Router Analysis Report
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'misc/kaggle/multi_gpu/report/**'
+      - 'misc/kaggle/multi_gpu/plots/**'
+      - '.github/workflows/deploy-report.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Prepare site
+        run: |
+          mkdir -p _site
+          cp misc/kaggle/multi_gpu/report/index.html _site/
+          cp misc/kaggle/multi_gpu/report/style.css _site/
+          cp misc/kaggle/multi_gpu/report/app.js _site/
+          cp -r misc/kaggle/multi_gpu/plots _site/plots
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

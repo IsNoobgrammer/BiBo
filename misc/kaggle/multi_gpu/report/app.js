@@ -45,7 +45,7 @@ document.addEventListener('DOMContentLoaded', () => {
         tab.classList.add('active');
         
         // Update image
-        img.src = `../plots/${imgName}.png`;
+        img.src = `./plots/${imgName}.png`;
         img.alt = imgName;
         
         // Fade effect

@@ -60,7 +60,7 @@
       </div>
       <div class="plot-full">
         <h3>Grand Summary Dashboard</h3>
-        <img src="../plots/grand_summary_dashboard.png" alt="Grand Summary" loading="lazy">
+        <img src="./plots/grand_summary_dashboard.png" alt="Grand Summary" loading="lazy">
       </div>
     </section>
 
@@ -71,13 +71,13 @@
       
       <div class="plot-full">
         <h3>Load Balance Summary (All Configs)</h3>
-        <img src="../plots/load_balance_summary.png" alt="Load Balance Summary" loading="lazy">
+        <img src="./plots/load_balance_summary.png" alt="Load Balance Summary" loading="lazy">
       </div>
 
       <div class="side-by-side">
         <div class="side">
           <h3 class="bibo-title">BiBo — Usage Sweep</h3>
-          <img src="../plots/usage_sweep_BiBo.png" alt="BiBo Usage Sweep" loading="lazy">
+          <img src="./plots/usage_sweep_BiBo.png" alt="BiBo Usage Sweep" loading="lazy">
           <div class="explanation">
             <h4>What you see</h4>
             <p>Expert usage across batch sizes (1→64) and seq lengths (64→256). At seq128/bs64, balance ratio reaches 0.88 with Gini=0.019 — near-perfect uniformity.</p>
@@ -87,7 +87,7 @@
         </div>
         <div class="side">
           <h3 class="qwen-title">Qwen3MoE — Usage Sweep</h3>
-          <img src="../plots/usage_sweep_Qwen3MoE.png" alt="Qwen Usage Sweep" loading="lazy">
+          <img src="./plots/usage_sweep_Qwen3MoE.png" alt="Qwen Usage Sweep" loading="lazy">
           <div class="explanation">
             <h4>What you see</h4>
             <p>Surprisingly uneven: Gini=0.076 at seq128/bs64, balance_ratio=0.68. Some experts get 15% while others get 10%.</p>
@@ -104,7 +104,7 @@
           <button class="tab" data-img="comparative_usage_seq128_bs64">seq=128</button>
           <button class="tab" data-img="comparative_usage_seq256_bs64">seq=256</button>
         </div>
-        <img class="tab-img" src="../plots/comparative_usage_seq64_bs64.png" alt="Comparative Usage" loading="lazy">
+        <img class="tab-img" src="./plots/comparative_usage_seq64_bs64.png" alt="Comparative Usage" loading="lazy">
       </div>
 
       <div class="side-by-side">
@@ -115,7 +115,7 @@
             <button class="tab" data-img="weight_rank_distribution_seq128">seq=128</button>
             <button class="tab" data-img="weight_rank_distribution_seq256">seq=256</button>
           </div>
-          <img class="tab-img" src="../plots/weight_rank_distribution_seq64.png" alt="Weight Rank" loading="lazy">
+          <img class="tab-img" src="./plots/weight_rank_distribution_seq64.png" alt="Weight Rank" loading="lazy">
           <div class="explanation">
             <h4>What this shows</h4>
             <p>Average weight given to rank-1, rank-2, rank-3 expert. Flatter = all top-K experts contribute equally.</p>
@@ -128,7 +128,7 @@
             <button class="tab" data-img="routing_diversity_seq128_bs64">seq=128</button>
             <button class="tab" data-img="routing_diversity_seq256_bs64">seq=256</button>
           </div>
-          <img class="tab-img" src="../plots/routing_diversity_seq64_bs64.png" alt="Diversity" loading="lazy">
+          <img class="tab-img" src="./plots/routing_diversity_seq64_bs64.png" alt="Diversity" loading="lazy">
           <div class="explanation">
             <h4>What this shows</h4>
             <p>Effective expert count (exp(H)) and fraction of experts actually used per layer.</p>
@@ -149,7 +149,7 @@
           <button class="tab" data-img="confidence_evolution_comparative_seq128">seq=128</button>
           <button class="tab" data-img="confidence_evolution_comparative_seq256">seq=256</button>
         </div>
-        <img class="tab-img" src="../plots/confidence_evolution_comparative_seq64.png" alt="Confidence Evolution" loading="lazy">
+        <img class="tab-img" src="./plots/confidence_evolution_comparative_seq64.png" alt="Confidence Evolution" loading="lazy">
         <div class="explanation">
           <h4>Key observation</h4>
           <p>BiBo's Skywork normalization keeps confidence moderate (0.4-0.7) → all top-K experts contribute. Qwen's raw softmax can push top-1 to 0.9+ → wastes the other K-1 experts.</p>
@@ -163,7 +163,7 @@
           <button class="tab" data-img="confidence_distribution_seq128">seq=128</button>
           <button class="tab" data-img="confidence_distribution_seq256">seq=256</button>
         </div>
-        <img class="tab-img" src="../plots/confidence_distribution_seq64.png" alt="Confidence Distribution" loading="lazy">
+        <img class="tab-img" src="./plots/confidence_distribution_seq64.png" alt="Confidence Distribution" loading="lazy">
       </div>
 
       <div class="seq-selector">
@@ -173,7 +173,7 @@
           <button class="tab" data-img="entropy_comparative_seq128">seq=128</button>
           <button class="tab" data-img="entropy_comparative_seq256">seq=256</button>
         </div>
-        <img class="tab-img" src="../plots/entropy_comparative_seq64.png" alt="Entropy" loading="lazy">
+        <img class="tab-img" src="./plots/entropy_comparative_seq64.png" alt="Entropy" loading="lazy">
         <div class="explanation">
           <h4>Higher entropy = more uniform weighting</h4>
           <p>BiBo maintains higher entropy → all selected experts get meaningful weight. This is WHY BiBo outperforms despite fewer params.</p>
@@ -187,7 +187,7 @@
           <button class="tab" data-img="weight_kde_per_layer_seq128">seq=128</button>
           <button class="tab" data-img="weight_kde_per_layer_seq256">seq=256</button>
         </div>
-        <img class="tab-img" src="../plots/weight_kde_per_layer_seq64.png" alt="Weight KDE" loading="lazy">
+        <img class="tab-img" src="./plots/weight_kde_per_layer_seq64.png" alt="Weight KDE" loading="lazy">
       </div>
     </section>
 
@@ -204,7 +204,7 @@
             <button class="tab" data-img="expert_heatmap_v2_BiBo_seq128">seq=128</button>
             <button class="tab" data-img="expert_heatmap_v2_BiBo_seq256">seq=256</button>
           </div>
-          <img class="tab-img" src="../plots/expert_heatmap_v2_BiBo_seq64.png" alt="BiBo Heatmap" loading="lazy">
+          <img class="tab-img" src="./plots/expert_heatmap_v2_BiBo_seq64.png" alt="BiBo Heatmap" loading="lazy">
           <div class="explanation">
             <p>Notice <strong>spatial patterns</strong> — conv router creates local coherence. Same expert handles consecutive tokens (visible as horizontal bands).</p>
           </div>
@@ -216,7 +216,7 @@
             <button class="tab" data-img="expert_heatmap_v2_Qwen3MoE_seq128">seq=128</button>
             <button class="tab" data-img="expert_heatmap_v2_Qwen3MoE_seq256">seq=256</button>
           </div>
-          <img class="tab-img" src="../plots/expert_heatmap_v2_Qwen3MoE_seq64.png" alt="Qwen Heatmap" loading="lazy">
+          <img class="tab-img" src="./plots/expert_heatmap_v2_Qwen3MoE_seq64.png" alt="Qwen Heatmap" loading="lazy">
           <div class="explanation">
             <p>More <strong>random-looking</strong> — linear router has no local context. Each token routed independently.</p>
           </div>
@@ -233,7 +233,7 @@
             <button class="tab" data-img="position_type_routing_BiBo_seq128">seq=128</button>
             <button class="tab" data-img="position_type_routing_BiBo_seq256">seq=256</button>
           </div>
-          <img class="tab-img" src="../plots/position_type_routing_BiBo_seq64.png" alt="BiBo Position Type" loading="lazy">
+          <img class="tab-img" src="./plots/position_type_routing_BiBo_seq64.png" alt="BiBo Position Type" loading="lazy">
         </div>
         <div class="side">
           <h3 class="qwen-title">Qwen3MoE</h3>
@@ -242,7 +242,7 @@
             <button class="tab" data-img="position_type_routing_Qwen3MoE_seq128">seq=128</button>
             <button class="tab" data-img="position_type_routing_Qwen3MoE_seq256">seq=256</button>
           </div>
-          <img class="tab-img" src="../plots/position_type_routing_Qwen3MoE_seq64.png" alt="Qwen Position Type" loading="lazy">
+          <img class="tab-img" src="./plots/position_type_routing_Qwen3MoE_seq64.png" alt="Qwen Position Type" loading="lazy">
         </div>
       </div>
     </section>
@@ -257,7 +257,7 @@
           <button class="tab" data-img="coselection_seq128">seq=128</button>
           <button class="tab" data-img="coselection_seq256">seq=256</button>
         </div>
-        <img class="tab-img" src="../plots/coselection_seq64.png" alt="Co-Selection" loading="lazy">
+        <img class="tab-img" src="./plots/coselection_seq64.png" alt="Co-Selection" loading="lazy">
         <div class="explanation">
           <h4>What to look for</h4>
           <p>High co-selection between two experts = they serve complementary roles. In BiBo, look for MLP+Identity pairs (MLP transforms, Identity preserves).</p>
@@ -272,7 +272,7 @@
           <button class="tab" data-img="specialization_radar_seq128">seq=128</button>
           <button class="tab" data-img="specialization_radar_seq256">seq=256</button>
         </div>
-        <img class="tab-img" src="../plots/specialization_radar_seq64.png" alt="Specialization" loading="lazy">
+        <img class="tab-img" src="./plots/specialization_radar_seq64.png" alt="Specialization" loading="lazy">
       </div>
     </section>
 
@@ -288,7 +288,7 @@
             <button class="tab" data-img="routing_stability_BiBo_seq128">seq=128</button>
             <button class="tab" data-img="routing_stability_BiBo_seq256">seq=256</button>
           </div>
-          <img class="tab-img" src="../plots/routing_stability_BiBo_seq64.png" alt="BiBo Stability" loading="lazy">
+          <img class="tab-img" src="./plots/routing_stability_BiBo_seq64.png" alt="BiBo Stability" loading="lazy">
           <div class="explanation">
             <p><strong>Lower stability = more adaptive.</strong> Conv router makes context-dependent decisions — same token gets different experts depending on neighbors. Scores: seq64=0.31, seq128=0.30, seq256=0.32.</p>
           </div>
@@ -300,7 +300,7 @@
             <button class="tab" data-img="routing_stability_Qwen3MoE_seq128">seq=128</button>
             <button class="tab" data-img="routing_stability_Qwen3MoE_seq256">seq=256</button>
           </div>
-          <img class="tab-img" src="../plots/routing_stability_Qwen3MoE_seq64.png" alt="Qwen Stability" loading="lazy">
+          <img class="tab-img" src="./plots/routing_stability_Qwen3MoE_seq64.png" alt="Qwen Stability" loading="lazy">
           <div class="explanation">
             <p><strong>Higher stability = more predictable.</strong> Linear router sees only current token → same embedding always routes same way. Scores: seq64=0.44, seq128=0.47, seq256=0.49. Better for debugging but less adaptive.</p>
           </div>
@@ -318,7 +318,7 @@
           <button class="tab" data-img="switching_rate_seq128">seq=128</button>
           <button class="tab" data-img="switching_rate_seq256">seq=256</button>
         </div>
-        <img class="tab-img" src="../plots/switching_rate_seq64.png" alt="Switching Rate" loading="lazy">
+        <img class="tab-img" src="./plots/switching_rate_seq64.png" alt="Switching Rate" loading="lazy">
         <div class="explanation">
           <h4>Interpretation</h4>
           <p>Switch rate near random (7/8 = 0.875) = no local coherence. Below random = "sticky" routing (same expert handles consecutive tokens). BiBo's conv router creates local coherence → lower switch rate.</p>
@@ -331,7 +331,7 @@
       <h2>🎭 BiBo Special Expert Analysis</h2>
       <p class="section-desc">BiBo's architectural innovation: Identity, Zero, and ReLU² experts alongside standard MLPs.</p>
       <div class="plot-full">
-        <img src="../plots/special_expert_analysis.png" alt="Special Expert Analysis" loading="lazy">
+        <img src="./plots/special_expert_analysis.png" alt="Special Expert Analysis" loading="lazy">
       </div>
       <div class="card">
         <h3>What Each Special Expert Does</h3>
