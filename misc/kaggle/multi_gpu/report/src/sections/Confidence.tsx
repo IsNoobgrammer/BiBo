@@ -16,7 +16,7 @@ export function Confidence() {
         <h3 className="text-sm font-semibold text-white/80 mb-3">Confidence Evolution Over Token Position</h3>
         <SeqTabs prefix="confidence_evolution_comparative" />
         <Tidbit variant="bibo" title="BiBo behavior">
-          Skywork normalization keeps confidence moderate (0.4–0.7) across all positions.
+          Router logit normalization keeps confidence moderate (0.4–0.7) across all positions.
           This means all 3 selected experts get meaningful weight — the router distributes
           computation rather than concentrating it.
         </Tidbit>

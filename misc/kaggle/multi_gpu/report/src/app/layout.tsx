@@ -3,7 +3,7 @@ import './globals.css';
 
 export const metadata: Metadata = {
   title: 'BiBo vs Qwen3MoE — Router Analysis',
-  description: 'Comprehensive MoE router behavior analysis comparing BiBo (Skywork + Conv router) vs Qwen3MoE (aux loss + linear router)',
+  description: 'Comprehensive MoE router behavior analysis comparing BiBo (logit norm + Conv router + bias heuristics) vs Qwen3MoE (aux loss + linear router)',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

@@ -21,7 +21,7 @@ export function Verdict() {
               <ul className="space-y-1.5 text-xs text-white/60">
                 <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Context-aware routing (Conv1D, kernel=3)</li>
                 <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Meaningful expert diversity (Identity, Zero, ReLU²)</li>
-                <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Skywork normalization prevents expert collapse</li>
+                <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Router logit normalization prevents expert collapse</li>
                 <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> No auxiliary loss needed — self-balancing</li>
                 <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Better balance at seq128+ (Gini=0.019)</li>
                 <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Balance ratio 0.88 (vs Qwen&apos;s 0.68)</li>
@@ -34,7 +34,7 @@ export function Verdict() {
               <ul className="space-y-1.5 text-xs text-white/60">
                 <li className="flex items-start gap-2"><span className="text-red-400">−</span> Lower stability (0.31) — harder to debug</li>
                 <li className="flex items-start gap-2"><span className="text-red-400">−</span> Conv incompatible with sequence parallelism</li>
-                <li className="flex items-start gap-2"><span className="text-red-400">−</span> Bias needs tokens to converge (seq64 weaker)</li>
+                <li className="flex items-start gap-2"><span className="text-red-400">−</span> Bias heuristics need tokens to converge (seq64 weaker)</li>
                 <li className="flex items-start gap-2"><span className="text-red-400">−</span> Novel — less battle-tested at scale</li>
               </ul>
             </div>

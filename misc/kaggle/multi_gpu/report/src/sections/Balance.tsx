@@ -17,7 +17,7 @@ export function Balance() {
         <h3 className="text-sm font-semibold text-white/80 mb-3">Load Balance Summary — All Configurations</h3>
         <PlotImage src="load_balance_summary" alt="Load Balance Summary" />
         <Tidbit variant="insight" title="Key takeaway">
-          BiBo&apos;s balance <em>improves</em> with sequence length — more tokens give the heuristic bias updates
+          BiBo&apos;s balance <em>improves</em> with sequence length — more tokens give the bias heuristics
           more signal to converge. At seq128+, BiBo achieves near-perfect balance without any auxiliary loss.
           Qwen&apos;s balance stays roughly constant regardless of sequence length.
         </Tidbit>
@@ -30,10 +30,10 @@ export function Balance() {
           <PlotImage src="usage_sweep_BiBo" alt="BiBo Usage Sweep" />
           <Tidbit variant="bibo" title="What you see">
             Expert usage across batch sizes (1→64) and seq lengths. At seq128/bs64, balance ratio
-            reaches 0.88 with Gini=0.019. The bias update mechanism converges with sufficient tokens.
+            reaches 0.88 with Gini=0.019. The bias heuristics converge with sufficient tokens.
           </Tidbit>
           <Tidbit variant="bibo" title="Why it matters">
-            Balance is <strong>sequence-length dependent</strong> — longer sequences give the Skywork bias
+            Balance is <strong>sequence-length dependent</strong> — longer sequences give the bias heuristics
             more opportunities to correct imbalances. This is ideal for long-context applications.
           </Tidbit>
         </div>
@@ -70,7 +70,7 @@ export function Balance() {
           <SeqTabs prefix="weight_rank_distribution" />
           <Tidbit variant="neutral" title="Interpretation">
             Shows average weight given to rank-1, rank-2, rank-3 expert. Flatter = all top-K experts
-            contribute equally. BiBo&apos;s Skywork normalization ensures the rank-2 and rank-3 experts
+            contribute equally. BiBo&apos;s router normalization ensures the rank-2 and rank-3 experts
             get meaningful weight, not just crumbs from rank-1.
           </Tidbit>
         </div>

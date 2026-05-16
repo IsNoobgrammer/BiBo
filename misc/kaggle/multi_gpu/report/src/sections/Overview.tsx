@@ -13,7 +13,7 @@ export function Overview() {
             <h2 className="text-lg font-bold text-white mb-1">Key Finding</h2>
             <p className="text-white/60 text-sm leading-relaxed">
               BiBo achieves <strong className="text-emerald-400">both better load balance AND lower loss</strong> than Qwen3MoE.
-              At seq128, BiBo&apos;s Skywork normalization + heuristic bias updates produce near-perfect balance
+              At seq128, BiBo&apos;s router logit normalization + bias heuristics produce near-perfect balance
               (Gini=0.019, ratio=0.88) while Qwen&apos;s aux loss results in worse balance (Gini=0.076, ratio=0.68).
               Combined with 2.5× lower final loss and 26% fewer parameters, BiBo&apos;s routing is strictly superior on this task.
             </p>
@@ -45,8 +45,8 @@ export function Overview() {
           </h3>
           <ul className="space-y-2 text-xs text-white/60">
             <li className="flex items-start gap-2"><span className="text-bibo-400/60 mt-0.5">▸</span> Conv1D router (kernel=3) — sees local context</li>
-            <li className="flex items-start gap-2"><span className="text-bibo-400/60 mt-0.5">▸</span> Skywork-MoE logit normalization (λ=1.0)</li>
-            <li className="flex items-start gap-2"><span className="text-bibo-400/60 mt-0.5">▸</span> Heuristic bias updates (threshold-based)</li>
+            <li className="flex items-start gap-2"><span className="text-bibo-400/60 mt-0.5">▸</span> Router logit normalization (λ=1.0)</li>
+            <li className="flex items-start gap-2"><span className="text-bibo-400/60 mt-0.5">▸</span> Bias heuristics (threshold-based updates)</li>
             <li className="flex items-start gap-2"><span className="text-bibo-400/60 mt-0.5">▸</span> Heterogeneous experts: MLP + Identity + Zero + ReLU²</li>
             <li className="flex items-start gap-2"><span className="text-bibo-400/60 mt-0.5">▸</span> Always-active shared CausalConv1D expert</li>
             <li className="flex items-start gap-2"><span className="text-bibo-400/60 mt-0.5">▸</span> No auxiliary loss — routing is self-balancing</li>
