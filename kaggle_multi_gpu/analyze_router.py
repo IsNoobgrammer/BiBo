@@ -162,18 +162,24 @@ def plot_token_expert_heatmap(layer_data, model_name, seq_len_label):
 
 
 def plot_confidence_evolution(layer_data, model_name, seq_len_label):
-    """Line plot: routing confidence (max weight) over token positions, per layer."""
+    """Smoothed confidence (max weight) over token positions, per layer."""
     layers = sorted(layer_data.keys())
     
     fig, ax = plt.subplots(figsize=(12, 5))
+    window = max(5, layer_data[layers[0]]['weights'].shape[0] // 20)
+    
     for l in layers:
         max_weights = layer_data[l]['weights'].max(axis=1)  # [seq_len]
-        ax.plot(max_weights, label=f'L{l}', alpha=0.7, linewidth=1.2)
+        # Rolling average for cleaner plot
+        smoothed = np.convolve(max_weights, np.ones(window)/window, mode='valid')
+        ax.plot(smoothed, label=f'L{l}', linewidth=2)
     
     ax.set_xlabel('Token Position')
-    ax.set_ylabel('Top-1 Routing Weight (confidence)')
-    ax.set_title(f'{model_name} — Router Confidence Evolution (seq={seq_len_label})')
-    ax.legend(fontsize=8, ncol=2)
+    ax.set_ylabel('Top-1 Routing Weight (smoothed)')
+    ax.set_title(f'{model_name} — Router Confidence (window={window})')
+    ax.legend(fontsize=10)
+    ax.set_ylim(0, 1.05)
+    ax.axhline(y=1/3, color='gray', linestyle='--', alpha=0.4, label='Uniform (1/top_k)')
     plt.tight_layout()
     plt.savefig(os.path.join(PLOTS_DIR, f'confidence_evolution_{model_name}_{seq_len_label}.png'), dpi=150)
     plt.close()
@@ -181,24 +187,25 @@ def plot_confidence_evolution(layer_data, model_name, seq_len_label):
 
 
 def plot_entropy_evolution(layer_data, model_name, seq_len_label, n_experts):
-    """Per-token entropy of routing weights over sequence positions."""
+    """Smoothed per-token entropy of routing weights over sequence positions."""
     layers = sorted(layer_data.keys())
     
     fig, ax = plt.subplots(figsize=(12, 5))
-    max_ent = np.log(n_experts)
+    window = max(5, layer_data[layers[0]]['weights'].shape[0] // 20)
     
     for l in layers:
         weights = layer_data[l]['weights']  # [seq_len, top_k]
-        # Entropy of top-k weights (normalized)
         w_norm = weights / (weights.sum(axis=1, keepdims=True) + 1e-10)
         entropy = -(w_norm * np.log(w_norm + 1e-10)).sum(axis=1)
-        ax.plot(entropy, label=f'L{l}', alpha=0.7, linewidth=1.2)
+        smoothed = np.convolve(entropy, np.ones(window)/window, mode='valid')
+        ax.plot(smoothed, label=f'L{l}', linewidth=2)
     
-    ax.axhline(y=np.log(weights.shape[1]), color='red', linestyle='--', alpha=0.5, label='Max (uniform top-k)')
+    top_k = layer_data[layers[0]]['weights'].shape[1]
+    ax.axhline(y=np.log(top_k), color='red', linestyle='--', alpha=0.5, label=f'Max (uniform top-{top_k})')
     ax.set_xlabel('Token Position')
-    ax.set_ylabel('Routing Entropy')
-    ax.set_title(f'{model_name} — Router Entropy per Token (seq={seq_len_label})')
-    ax.legend(fontsize=8, ncol=2)
+    ax.set_ylabel('Routing Entropy (smoothed)')
+    ax.set_title(f'{model_name} — Router Entropy per Token (window={window})')
+    ax.legend(fontsize=10)
     plt.tight_layout()
     plt.savefig(os.path.join(PLOTS_DIR, f'entropy_evolution_{model_name}_{seq_len_label}.png'), dpi=150)
     plt.close()
@@ -209,6 +216,13 @@ def plot_batch_expert_usage(layer_counts, model_name, n_experts):
     """Bar chart: expert usage across a batch, per layer."""
     layers = sorted(layer_counts.keys())
     
+    # Expert labels for BiBo
+    if model_name == 'BiBo':
+        n_mlp = n_experts - 3
+        labels = [f'MLP{i}' for i in range(n_mlp)] + ['Identity', 'Zero', 'ReLU²']
+    else:
+        labels = [f'MLP{i}' for i in range(n_experts)]
+    
     fig, axes = plt.subplots(1, len(layers), figsize=(4*len(layers), 4), sharey=True)
     if len(layers) == 1:
         axes = [axes]
@@ -216,11 +230,14 @@ def plot_batch_expert_usage(layer_counts, model_name, n_experts):
     for ax, l in zip(axes, layers):
         counts = layer_counts[l].cpu().numpy()
         dist = counts / counts.sum()
-        colors = sns.color_palette('husl', n_experts)
+        colors = ['#4C72B0'] * (n_experts - 3) + ['#55A868', '#C44E52', '#8172B2'] if model_name == 'BiBo' else sns.color_palette('husl', n_experts)
+        if model_name != 'BiBo':
+            colors = sns.color_palette('husl', n_experts)
         ax.bar(range(n_experts), dist, color=colors, edgecolor='black', linewidth=0.5)
         ax.set_xlabel('Expert')
         ax.set_title(f'L{l}')
         ax.set_xticks(range(n_experts))
+        ax.set_xticklabels(labels, rotation=45, fontsize=7)
         entropy = -(dist * np.log(dist + 1e-10)).sum()
         ax.text(0.5, 0.95, f'H={entropy:.2f}', transform=ax.transAxes, ha='center', fontsize=9)
     
