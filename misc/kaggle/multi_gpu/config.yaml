@@ -39,8 +39,9 @@ bibo:
   use_ssmax: true
   router_type: "conv"
   router_lambda: 1.0
-  bias_update_threshold: 10000
-  mlp_only_layers: [0, 5]
+  router_noise: 0
+  bias_update_threshold: 12000
+  mlp_only_layers: [0]
   tie_word_embeddings: true
 
 # ============================================================

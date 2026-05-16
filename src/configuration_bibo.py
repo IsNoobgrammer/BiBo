@@ -87,6 +87,7 @@ class BiBoConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.router_lambda = router_lambda
+        self.router_noise = router_noise
 
         # ============================================================
         # Auto-derived hyperparameters
