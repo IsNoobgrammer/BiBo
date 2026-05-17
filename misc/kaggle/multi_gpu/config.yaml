@@ -12,7 +12,7 @@ training:
   weight_decay: 0.01
   grad_clip: 1.0
   train_samples: 300000
-  val_samples: 30000
+  val_samples: 3000
   val_every_n_steps: 300
   optimizer: adamw_8bit
   num_workers: 2
