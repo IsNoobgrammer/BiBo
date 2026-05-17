@@ -27,8 +27,8 @@ T = CFG['training']
 VOCAB_SIZE = T['vocab_size']
 SEP_TOKEN = VOCAB_SIZE - 1
 
-# Use curriculum stages if defined, else fallback to old buckets
-if T.get('curriculum') and T.get('curriculum_stages'):
+# Use curriculum_stages for bucket sizes (regardless of curriculum mode)
+if T.get('curriculum_stages'):
     SEQ_LENS = T['curriculum_stages']
 else:
     SEQ_LENS = [64, 128, 256]
