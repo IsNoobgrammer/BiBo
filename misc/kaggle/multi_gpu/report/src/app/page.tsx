@@ -50,7 +50,7 @@ export default function Home() {
             Comprehensive MoE Router Behavior Analysis
           </p>
           <div className="flex flex-wrap justify-center gap-2">
-            {['8 Experts', 'Top-3 Routing', 'Seq 64 / 128 / 256', 'BS 1→64', 'Sorting Task', '2×T4 GPUs'].map(badge => (
+            {['8 Experts', 'Top-3 Routing', 'Seq 64 / 256', 'BS 1→64', 'Sorting Task', '2×T4 GPUs'].map(badge => (
               <span key={badge} className="px-3 py-1 rounded-full bg-white/5 border border-white/8 text-xs text-white/50 font-medium">
                 {badge}
               </span>

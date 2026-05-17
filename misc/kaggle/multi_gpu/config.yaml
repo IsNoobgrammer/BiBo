@@ -3,7 +3,7 @@
 # ============================================================
 training:
   seed: 48
-  epochs: 1
+  epochs: 2
   batch_size: 64
   vocab_size: 256
   pad_token_id: 0
@@ -11,7 +11,7 @@ training:
   warmup_ratio: 0.10
   weight_decay: 0.01
   grad_clip: 1.0
-  train_samples: 400000
+  train_samples: 150000
   val_samples: 8000
   val_every_n_steps: 400
   optimizer: adamw_8bit
@@ -26,7 +26,7 @@ training:
 
   # Curriculum learning (disabled — using mixed dataset)
   curriculum: false
-  curriculum_stages: [2, 32, 64, 256]
+  curriculum_stages: [2, 64, 256]
 
 # ============================================================
 # BiBo Config (~10M)

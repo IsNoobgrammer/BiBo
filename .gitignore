@@ -10,7 +10,9 @@ pipeline/
 AGENTS.md
 research_on_activations/
 /data
-!misc/kaggle/multi_gpu/report/src/data/
+# misc/kaggle/multi_gpu/report/
+# misc/kaggle/multi_gpu/plots/
+# misc/kaggle/multi_gpu/metrics/
 aux_loss_for_entropy/
 .vscode/
 kaggle_ablations/

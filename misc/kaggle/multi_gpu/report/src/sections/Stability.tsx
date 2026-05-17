@@ -15,13 +15,11 @@ export function Stability() {
       {/* Stability scores */}
       <div className="glass rounded-xl p-5">
         <h3 className="text-xs font-semibold uppercase tracking-wider text-white/40 mb-4">Average Stability Scores</h3>
-        <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
-          <MetricCard label="BiBo seq64" value="0.31" variant="bibo" />
-          <MetricCard label="BiBo seq128" value="0.30" variant="bibo" />
-          <MetricCard label="BiBo seq256" value="0.32" variant="bibo" />
-          <MetricCard label="Qwen seq64" value="0.44" variant="qwen" />
-          <MetricCard label="Qwen seq128" value="0.47" variant="qwen" />
-          <MetricCard label="Qwen seq256" value="0.49" variant="qwen" />
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <MetricCard label="BiBo seq64" value="0.391" variant="bibo" />
+          <MetricCard label="BiBo seq256" value="0.392" variant="bibo" />
+          <MetricCard label="Qwen seq64" value="0.929" variant="qwen" />
+          <MetricCard label="Qwen seq256" value="0.934" variant="qwen" />
         </div>
         <Tidbit variant="neutral" title="What stability means">
           Stability measures whether the same token embedding routes to the same experts
@@ -33,43 +31,46 @@ export function Stability() {
       {/* Side by side */}
       <div className="grid md:grid-cols-2 gap-4">
         <div className="glass rounded-xl p-5">
-          <h3 className="text-sm font-bold text-bibo-400 mb-3">BiBo — Stability (avg: 0.31)</h3>
+          <h3 className="text-sm font-bold text-bibo-400 mb-3">BiBo — Stability (avg: 0.39)</h3>
           <SeqTabs prefix="routing_stability_BiBo" />
           <Tidbit variant="bibo" title="Lower stability = more adaptive">
             The conv router makes <strong>context-dependent</strong> decisions — the same token
             gets different experts depending on its neighbors. This is by design: a token
             meaning &quot;3&quot; should route differently when surrounded by [1,2,3] vs [7,8,3].
           </Tidbit>
-          <Tidbit variant="bibo" title="Trade-off">
-            Lower stability makes routing harder to predict and debug. But it enables
-            richer representations — the model can process the same token differently
-            based on local context, similar to how attention is context-dependent.
+          <Tidbit variant="bibo" title="Correlated with task awareness">
+            BiBo&apos;s low stability directly enables the sorted-vs-unsorted routing shift
+            visible in the position-type analysis. The same token value routes to Identity
+            (green) in unsorted positions but ReLU² (orange) in sorted positions — impossible
+            with deterministic routing.
           </Tidbit>
         </div>
         <div className="glass rounded-xl p-5">
-          <h3 className="text-sm font-bold text-qwen-400 mb-3">Qwen3MoE — Stability (avg: 0.47)</h3>
+          <h3 className="text-sm font-bold text-qwen-400 mb-3">Qwen3MoE — Stability (avg: 0.93)</h3>
           <SeqTabs prefix="routing_stability_Qwen3MoE" />
-          <Tidbit variant="qwen" title="Higher stability = more predictable">
-            The linear router sees only the current token embedding → same embedding always
-            routes the same way regardless of context. This makes routing deterministic
-            and easy to analyze.
+          <Tidbit variant="qwen" title="Very high stability = rigid routing">
+            The linear router sees only the current token embedding → same embedding almost always
+            routes the same way regardless of context. Stability of 0.93 means routing is nearly
+            deterministic — the router has essentially memorized a fixed token→expert mapping.
           </Tidbit>
-          <Tidbit variant="qwen" title="Trade-off">
-            Higher stability means the router can&apos;t adapt to context. Token &quot;3&quot; always
-            goes to the same expert whether it&apos;s in [1,2,3] or [7,8,3]. This limits
-            the model&apos;s expressiveness in the MoE layers.
+          <Tidbit variant="qwen" title="Consequence: no task phase awareness">
+            Qwen&apos;s sorted-vs-unsorted routing is nearly identical — the router can&apos;t distinguish
+            &quot;understanding input&quot; from &quot;generating output.&quot; Same token → same experts regardless
+            of whether the model is reading or writing. This rigidity limits expressiveness.
           </Tidbit>
         </div>
       </div>
 
       {/* Insight */}
       <div className="glass rounded-xl p-5 border border-emerald-500/10">
-        <Tidbit variant="insight" title="The stability-performance trade-off">
-          BiBo&apos;s lower stability (0.31) correlates with its lower loss (0.10).
-          Context-dependent routing is more expressive — it allows the model to use
-          different expert combinations for the same token based on surrounding context.
-          This is analogous to how attention weights change based on context.
-          The cost is reduced interpretability and harder debugging.
+        <Tidbit variant="insight" title="The stability-performance connection">
+          BiBo&apos;s lower stability (0.39) isn&apos;t just a number — it&apos;s the mechanism behind three
+          observable behaviors: (1) the dramatic sorted-vs-unsorted routing shift where special
+          experts change roles by task phase, (2) the more uniform weight allocation across all
+          3 selected experts (visible in the KDE plots), and (3) the better load balance since
+          context-dependent routing prevents any single expert from becoming a &quot;permanent favorite.&quot;
+          Qwen&apos;s 0.93 stability creates the opposite: rigid favorites, top-1 dominance in weights,
+          and no task-phase awareness.
         </Tidbit>
       </div>
     </div>

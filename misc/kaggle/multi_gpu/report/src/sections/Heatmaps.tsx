@@ -44,12 +44,12 @@ export function Heatmaps() {
         </div>
       </div>
 
-      {/* Position-Type Routing */}
+      {/* Position-Type Routing — the key insight */}
       <div className="glass rounded-xl p-5">
         <h3 className="text-sm font-semibold text-white/80 mb-4">Position-Type Routing: Unsorted vs Sorted Tokens</h3>
         <p className="text-xs text-white/50 mb-4">
           The sorting task has two phases: unsorted input tokens and sorted output tokens.
-          Does the router treat them differently?
+          Does the router treat them differently? Color coding for BiBo: <span className="text-emerald-400 font-semibold">green = Identity</span>, <span className="text-gray-400 font-semibold">grey = Zero</span>, <span className="text-orange-400 font-semibold">orange/red = ReLU²</span>.
         </p>
         <div className="grid md:grid-cols-2 gap-4">
           <div>
@@ -61,10 +61,25 @@ export function Heatmaps() {
             <SeqTabs prefix="position_type_routing_Qwen3MoE" />
           </div>
         </div>
-        <Tidbit variant="insight" title="Position awareness">
-          BiBo&apos;s conv router can distinguish input from output positions because it sees
-          local context — the transition from unsorted to sorted creates a detectable pattern.
-          This allows different expert strategies for &quot;understanding&quot; vs &quot;generating.&quot;
+        <Tidbit variant="bibo" title="BiBo: dramatic sorted-vs-unsorted shift">
+          The special experts completely change roles between task phases. On <strong>unsorted input</strong>,
+          Identity (green) spikes — the router says &quot;these tokens are already fine, just pass them through
+          while I read.&quot; On <strong>sorted output</strong>, ReLU² (orange) spikes — the router says
+          &quot;I need sharp feature selection to generate the correct sorted value.&quot; The router has learned
+          the task structure without being told about it.
+        </Tidbit>
+        <Tidbit variant="qwen" title="Qwen: nearly identical routing for both phases">
+          Qwen&apos;s routing is <strong>almost the same</strong> for unsorted input and sorted output.
+          The same experts dominate in both phases (E0, E2, E3, E7 in L1–L3). The router can&apos;t
+          distinguish &quot;understanding&quot; from &quot;generating&quot; because it only sees individual token
+          embeddings — no context about where in the sequence it is or what phase the task is in.
+        </Tidbit>
+        <Tidbit variant="insight" title="This is the conv router&apos;s killer feature">
+          BiBo&apos;s conv router (kernel=3) sees the transition from unsorted to sorted tokens as a
+          detectable local pattern change. This enables different expert strategies per phase —
+          cheap Identity for reading, expensive ReLU²/MLP for generating. Qwen&apos;s linear router
+          is blind to this transition. This phase-awareness directly explains BiBo&apos;s better
+          generalization to unseen sequence lengths.
         </Tidbit>
       </div>
     </div>

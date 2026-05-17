@@ -23,19 +23,20 @@ export function Verdict() {
                 <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Meaningful expert diversity (Identity, Zero, ReLU²)</li>
                 <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Router logit normalization prevents expert collapse</li>
                 <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> No auxiliary loss needed — self-balancing</li>
-                <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Better balance at seq128+ (Gini=0.019)</li>
-                <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Balance ratio 0.88 (vs Qwen&apos;s 0.68)</li>
-                <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> 2.5× lower final loss with 26% fewer params</li>
+                <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Near-perfect balance at seq256 (Gini=0.022, ratio=0.90)</li>
+                <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> 14% lower validation loss (0.0039 vs 0.0045)</li>
+                <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Wins 3-1 on unseen sequence length generalization</li>
+                <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Better confidence calibration (knows when it&apos;s wrong)</li>
                 <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> ~35% compute savings from cheap experts</li>
               </ul>
             </div>
             <div className="bg-red-500/5 rounded-lg p-4 border border-red-500/10">
               <h4 className="text-xs font-bold text-red-400 uppercase tracking-wider mb-2">Weaknesses</h4>
               <ul className="space-y-1.5 text-xs text-white/60">
-                <li className="flex items-start gap-2"><span className="text-red-400">−</span> Lower stability (0.31) — harder to debug</li>
+                <li className="flex items-start gap-2"><span className="text-red-400">−</span> Lower stability (0.39) — context-dependent, harder to debug</li>
                 <li className="flex items-start gap-2"><span className="text-red-400">−</span> Conv incompatible with sequence parallelism</li>
-                <li className="flex items-start gap-2"><span className="text-red-400">−</span> Bias heuristics need tokens to converge (seq64 weaker)</li>
                 <li className="flex items-start gap-2"><span className="text-red-400">−</span> Novel — less battle-tested at scale</li>
+                <li className="flex items-start gap-2"><span className="text-red-400">−</span> Slightly lower val accuracy (0.9981 vs 0.9987)</li>
               </ul>
             </div>
           </div>
@@ -48,10 +49,10 @@ export function Verdict() {
             <div className="bg-emerald-500/5 rounded-lg p-4 border border-emerald-500/10">
               <h4 className="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-2">Strengths</h4>
               <ul className="space-y-1.5 text-xs text-white/60">
-                <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> High stability (0.47) — predictable, debuggable</li>
+                <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Very high stability (0.93) — deterministic, debuggable</li>
                 <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Simple architecture — easy to parallelize</li>
                 <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Proven at scale in production (Qwen series)</li>
-                <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Continuous gradient signal via aux loss</li>
+                <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Slightly higher val accuracy (0.9987 vs 0.9981)</li>
                 <li className="flex items-start gap-2"><span className="text-emerald-400">+</span> Compatible with all parallelism strategies</li>
               </ul>
             </div>
@@ -60,11 +61,12 @@ export function Verdict() {
               <ul className="space-y-1.5 text-xs text-white/60">
                 <li className="flex items-start gap-2"><span className="text-red-400">−</span> No context awareness — each token isolated</li>
                 <li className="flex items-start gap-2"><span className="text-red-400">−</span> Homogeneous experts only (all SwiGLU)</li>
-                <li className="flex items-start gap-2"><span className="text-red-400">−</span> Aux loss interferes with task loss gradient</li>
-                <li className="flex items-start gap-2"><span className="text-red-400">−</span> Worse balance than BiBo (Gini=0.076)</li>
-                <li className="flex items-start gap-2"><span className="text-red-400">−</span> Higher final loss (0.25) with more params</li>
+                <li className="flex items-start gap-2"><span className="text-red-400">−</span> Extreme load imbalance (Gini=0.235, ratio=0.24)</li>
+                <li className="flex items-start gap-2"><span className="text-red-400">−</span> Higher validation loss (0.0045 vs 0.0039)</li>
+                <li className="flex items-start gap-2"><span className="text-red-400">−</span> Loses 1-3 on generalization to unseen lengths</li>
+                <li className="flex items-start gap-2"><span className="text-red-400">−</span> Worse confidence calibration (overconfident on errors)</li>
                 <li className="flex items-start gap-2"><span className="text-red-400">−</span> No &quot;cheap&quot; expert option — all tokens pay full cost</li>
-                <li className="flex items-start gap-2"><span className="text-red-400">−</span> Persistent favorites (balance_ratio=0.68)</li>
+                <li className="flex items-start gap-2"><span className="text-red-400">−</span> Persistent favorites (4× load imbalance)</li>
               </ul>
             </div>
           </div>
@@ -86,23 +88,23 @@ export function Verdict() {
             <tbody className="text-white/60">
               <tr className="border-b border-white/5 hover:bg-white/[0.02]">
                 <td className="py-3 px-3">Expert Parallelism (64+ experts)</td>
-                <td className="py-3 px-3"><span className="px-2 py-0.5 rounded bg-qwen-500/10 text-qwen-400 font-medium">Qwen</span></td>
-                <td className="py-3 px-3">Predictable routing, simpler to shard across nodes</td>
+                <td className="py-3 px-3"><span className="px-2 py-0.5 rounded bg-bibo-500/10 text-bibo-400 font-medium">BiBo</span></td>
+                <td className="py-3 px-3">Even load = no stragglers; Identity/Zero shards need no GPU compute</td>
               </tr>
               <tr className="border-b border-white/5 hover:bg-white/[0.02]">
                 <td className="py-3 px-3">Single GPU (≤16 experts)</td>
                 <td className="py-3 px-3"><span className="px-2 py-0.5 rounded bg-bibo-500/10 text-bibo-400 font-medium">BiBo</span></td>
-                <td className="py-3 px-3">Better balance + diversity + lower loss + fewer params</td>
+                <td className="py-3 px-3">10× better balance + diversity + lower loss</td>
               </tr>
               <tr className="border-b border-white/5 hover:bg-white/[0.02]">
-                <td className="py-3 px-3">Long context tasks</td>
+                <td className="py-3 px-3">Length generalization</td>
                 <td className="py-3 px-3"><span className="px-2 py-0.5 rounded bg-bibo-500/10 text-bibo-400 font-medium">BiBo</span></td>
-                <td className="py-3 px-3">Conv router + SSMax; balance improves with seq length</td>
+                <td className="py-3 px-3">Wins 3-1 on unseen lengths; SSMax + conv router</td>
               </tr>
               <tr className="border-b border-white/5 hover:bg-white/[0.02]">
-                <td className="py-3 px-3">Production deployment</td>
+                <td className="py-3 px-3">Production (proven track record)</td>
                 <td className="py-3 px-3"><span className="px-2 py-0.5 rounded bg-qwen-500/10 text-qwen-400 font-medium">Qwen</span></td>
-                <td className="py-3 px-3">Higher stability (0.47), debuggable, battle-tested</td>
+                <td className="py-3 px-3">Battle-tested at scale; BiBo is unproven beyond research</td>
               </tr>
               <tr className="border-b border-white/5 hover:bg-white/[0.02]">
                 <td className="py-3 px-3">Research / novel architectures</td>
@@ -117,7 +119,7 @@ export function Verdict() {
               <tr className="hover:bg-white/[0.02]">
                 <td className="py-3 px-3">Load balance critical</td>
                 <td className="py-3 px-3"><span className="px-2 py-0.5 rounded bg-bibo-500/10 text-bibo-400 font-medium">BiBo</span></td>
-                <td className="py-3 px-3">Gini=0.019 at seq128 vs Qwen&apos;s 0.076</td>
+                <td className="py-3 px-3">Gini=0.022 vs Qwen&apos;s 0.235 — 10× better</td>
               </tr>
             </tbody>
           </table>
@@ -127,11 +129,12 @@ export function Verdict() {
       {/* Final Insight */}
       <div className="glass rounded-xl p-6 border border-bibo-500/20 bg-bibo-500/[0.02]">
         <Tidbit variant="insight" title="Bottom line">
-          On this sorting task with 8 experts and top-3 routing, BiBo dominates across every metric
-          that matters for model quality: lower loss, better balance, higher effective expert utilization,
-          and context-aware routing. Qwen&apos;s advantages are operational (stability, parallelizability,
-          proven at scale) — important for production but not for model capability.
-          The question isn&apos;t &quot;which is better&quot; — it&apos;s &quot;what do you optimize for.&quot;
+          On this sorting task with 8 experts and top-3 routing, BiBo dominates on load balance
+          (10× better Gini), generalization (3-1 on unseen lengths), validation loss (14% lower),
+          and confidence calibration. Qwen&apos;s extreme load imbalance (ratio=0.24) means 4 of 8
+          experts are effectively starved. Qwen&apos;s advantages are operational (near-deterministic
+          routing, parallelizability, proven at scale) — important for production but not for
+          model capability. The question isn&apos;t &quot;which is better&quot; — it&apos;s &quot;what do you optimize for.&quot;
         </Tidbit>
       </div>
     </div>

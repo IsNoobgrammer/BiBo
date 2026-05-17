@@ -10,7 +10,7 @@ interface SeqTabsProps {
   seqLens?: SeqLen[];
 }
 
-export function SeqTabs({ prefix, suffix = '', seqLens = [64, 128, 256] }: SeqTabsProps) {
+export function SeqTabs({ prefix, suffix = '', seqLens = [64, 256] }: SeqTabsProps) {
   const [active, setActive] = useState<SeqLen>(seqLens[0]);
 
   const getFilename = (seq: SeqLen) => {

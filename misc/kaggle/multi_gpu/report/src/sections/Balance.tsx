@@ -16,10 +16,17 @@ export function Balance() {
       <div className="glass rounded-xl p-5">
         <h3 className="text-sm font-semibold text-white/80 mb-3">Load Balance Summary — All Configurations</h3>
         <PlotImage src="load_balance_summary" alt="Load Balance Summary" />
-        <Tidbit variant="insight" title="Key takeaway">
-          BiBo&apos;s balance <em>improves</em> with sequence length — more tokens give the bias heuristics
-          more signal to converge. At seq128+, BiBo achieves near-perfect balance without any auxiliary loss.
-          Qwen&apos;s balance stays roughly constant regardless of sequence length.
+        <Tidbit variant="bibo" title="Primary driver: bias heuristics">
+          BiBo&apos;s near-perfect balance is <strong>primarily due to the bias heuristic</strong> —
+          the non-trainable router bias that gets updated every 800 tokens (bias_update_threshold).
+          When an expert is underused, its bias increases; when overused, it decreases. This simple
+          mechanism achieves Gini≈0.02 without any auxiliary loss gradient interference.
+        </Tidbit>
+        <Tidbit variant="qwen" title="Qwen: aux loss can&apos;t fix persistent favorites">
+          Despite the auxiliary load-balancing loss, Qwen maintains Gini≈0.24 and CV≈0.44 across
+          ALL configurations. The aux loss creates a gradient toward uniformity, but the softmax
+          router develops <strong>persistent favorites</strong> (E0, E2, E7 get 20%+ while E1 gets 5%)
+          that the loss can&apos;t fully correct. The loss fights the router — and loses.
         </Tidbit>
       </div>
 
@@ -29,25 +36,27 @@ export function Balance() {
           <h3 className="text-sm font-bold text-bibo-400 mb-3">BiBo — Usage Sweep</h3>
           <PlotImage src="usage_sweep_BiBo" alt="BiBo Usage Sweep" />
           <Tidbit variant="bibo" title="What you see">
-            Expert usage across batch sizes (1→64) and seq lengths. At seq128/bs64, balance ratio
-            reaches 0.88 with Gini=0.019. The bias heuristics converge with sufficient tokens.
+            Expert usage across batch sizes (1→64) and seq lengths. At seq256/bs64, balance ratio
+            reaches 0.90 with Gini=0.022. The bias heuristics converge with sufficient tokens.
           </Tidbit>
-          <Tidbit variant="bibo" title="Why it matters">
-            Balance is <strong>sequence-length dependent</strong> — longer sequences give the bias heuristics
-            more opportunities to correct imbalances. This is ideal for long-context applications.
+          <Tidbit variant="bibo" title="Why bias heuristics work better than aux loss">
+            The bias heuristic is a <strong>direct correction</strong> — it literally adds/subtracts
+            from router logits to steer tokens toward underused experts. No gradient approximation,
+            no interference with the task loss. It&apos;s a control loop, not an optimization objective.
           </Tidbit>
         </div>
         <div className="glass rounded-xl p-5">
           <h3 className="text-sm font-bold text-qwen-400 mb-3">Qwen3MoE — Usage Sweep</h3>
           <PlotImage src="usage_sweep_Qwen3MoE" alt="Qwen Usage Sweep" />
           <Tidbit variant="qwen" title="What you see">
-            Surprisingly uneven: Gini=0.076 at seq128/bs64, balance_ratio=0.68.
-            Some experts consistently get 15% while others get only 10%.
+            Extremely uneven: Gini=0.235 at seq256/bs64, balance_ratio=0.24.
+            Some experts get 21% while others get only 5% — a 4× imbalance.
           </Tidbit>
-          <Tidbit variant="qwen" title="Why it matters">
-            The aux loss creates a gradient signal toward uniformity, but the softmax router
-            develops <strong>persistent favorites</strong> that the loss can&apos;t fully correct.
-            The loss fights the router — and partially loses.
+          <Tidbit variant="qwen" title="Why aux loss fails here">
+            The aux loss is an <strong>indirect signal</strong> — it adds a penalty to the total loss,
+            hoping the optimizer will adjust router weights to balance load. But the task loss gradient
+            pushes toward using the &quot;best&quot; experts, creating a tug-of-war. With only 8 experts and
+            top-3 routing, the task loss wins and creates permanent favorites.
           </Tidbit>
         </div>
       </div>
@@ -58,8 +67,8 @@ export function Balance() {
         <SeqTabs prefix="comparative_usage" suffix="bs64" />
         <Tidbit variant="neutral" title="How to read">
           Each bar shows per-expert token allocation. BiBo&apos;s heterogeneous experts (Identity, Zero, ReLU²)
-          naturally attract different fractions — but the overall distribution is more uniform than Qwen&apos;s
-          supposedly &quot;balanced&quot; homogeneous experts.
+          naturally attract different fractions — but the overall distribution is far more uniform than Qwen&apos;s
+          supposedly &quot;balanced&quot; homogeneous experts. The red dashed line shows the ideal uniform allocation.
         </Tidbit>
       </div>
 
