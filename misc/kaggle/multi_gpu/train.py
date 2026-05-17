@@ -231,16 +231,16 @@ class SequenceDataset(Dataset):
 
 class CurriculumDataLoader:
     """
-    Curriculum learning: iterates through stages of increasing seq_len.
-    Each stage trains on its own bucket for a portion of the epoch.
+    Curriculum learning: iterates through stages of increasing seq_len,
+    then a final mixed stage with 10% of each bucket (all lengths interleaved).
     
-    Strategy: within each epoch, cycle through all stages in order.
-    Earlier stages (shorter) are easier → model learns algorithm first.
+    Strategy: short → long (full data each), then mixed (10% each, round-robin).
     """
     def __init__(self, data_dir, split, batch_size, stages, shuffle=True):
         self.stages = stages
         self.loaders = {}
         self.datasets = {}
+        self.mixed_loaders = {}
         
         for seq_len in stages:
             path = os.path.join(data_dir, f'{split}_len_{seq_len}.npy')
@@ -250,21 +250,43 @@ class CurriculumDataLoader:
                                     num_workers=T['num_workers'], pin_memory=True, drop_last=True)
                 self.datasets[seq_len] = ds
                 self.loaders[seq_len] = loader
+                
+                # Mixed stage: 10% subset of each bucket
+                n_mixed = max(1, len(ds) // 10)
+                mixed_ds = torch.utils.data.Subset(ds, list(range(n_mixed)))
+                mixed_loader = DataLoader(mixed_ds, batch_size=batch_size, shuffle=shuffle,
+                                          num_workers=T['num_workers'], pin_memory=True, drop_last=True)
+                self.mixed_loaders[seq_len] = mixed_loader
             else:
                 print(f"  WARNING: {path} not found, skipping stage seq_len={seq_len}")
         
         self.available_stages = [s for s in stages if s in self.loaders]
-        self.total_batches = sum(len(self.loaders[s]) for s in self.available_stages)
+        # Total = all curriculum stages + mixed final stage
+        mixed_batches = sum(len(self.mixed_loaders[s]) for s in self.available_stages)
+        self.total_batches = sum(len(self.loaders[s]) for s in self.available_stages) + mixed_batches
     
     def __len__(self):
         return self.total_batches
     
     def __iter__(self):
-        """Iterate through stages in curriculum order (short → long)."""
+        """Curriculum stages (short→long), then mixed final stage (10% each, round-robin)."""
+        # Phase 1: curriculum stages in order
         for stage_idx, seq_len in enumerate(self.available_stages):
             loader = self.loaders[seq_len]
             for batch in loader:
                 yield batch, seq_len, stage_idx
+        
+        # Phase 2: mixed stage — round-robin across all lengths (10% each)
+        mixed_stage_idx = len(self.available_stages)
+        iterators = {s: iter(self.mixed_loaders[s]) for s in self.available_stages}
+        active = list(self.available_stages)
+        while active:
+            for s in list(active):
+                try:
+                    batch = next(iterators[s])
+                    yield batch, s, mixed_stage_idx
+                except StopIteration:
+                    active.remove(s)
 
 
 class BucketedDataLoader:
@@ -436,7 +458,10 @@ def train_worker(model_name):
             # Log stage transitions
             if use_curriculum and stage_idx != current_stage:
                 current_stage = stage_idx
-                print(f"  [{model_name}] E{epoch:02d} → Stage {stage_idx}: seq_len={seq_len}")
+                if stage_idx == len(train_loader.available_stages):
+                    print(f"  [{model_name}] E{epoch:02d} → Mixed stage (10% each length)")
+                else:
+                    print(f"  [{model_name}] E{epoch:02d} → Stage {stage_idx}: seq_len={seq_len}")
 
             if batch_idx % T['log_every_n_steps'] == 0:
                 stage_str = f" seq={seq_len}" if seq_len else ""
