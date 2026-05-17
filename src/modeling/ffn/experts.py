@@ -1,4 +1,4 @@
-"""Special expert types"""
+"""Special expert types and PolyGLU experts"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,30 +8,22 @@ from src.configuration_bibo import BiBoConfig
 
 __all__ = [
     'BiBoIdentityExpert',
-    'BiBoReLUExpert', 
     'BiBoZeroExpert',
-    'BiBoCausalConv1D'
+    'BiBoPolyGLUExpert',
+    'BiBoCausalConv1D',
 ]
 
 
 class BiBoIdentityExpert(nn.Module):
-    """Identity/residual expert"""
+    """Identity/residual expert — passes input through unchanged."""
     def __init__(self, config: BiBoConfig, *args, **kwargs): 
         super().__init__()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x
 
 
-class BiBoReLUExpert(nn.Module):
-    """ReLU^2 activated expert"""
-    def __init__(self, config: BiBoConfig, *args, **kwargs): 
-        super().__init__()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.relu(x).square()
-
-
 class BiBoZeroExpert(nn.Module):
-    """Returns x * 0 (preserves shape/dtype/device/sharding)"""
+    """Returns x * 0 (preserves shape/dtype/device/sharding)."""
     def __init__(self, config: BiBoConfig, *args, **kwargs):
         super().__init__()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -39,10 +31,51 @@ class BiBoZeroExpert(nn.Module):
         return x * zero
 
 
+class BiBoPolyGLUExpert(nn.Module):
+    """
+    GLU expert with configurable activation function.
+    
+    PolyGLU idea: diverse activations across experts in the same MoE layer.
+    Each expert uses a different activation in the GLU gate:
+      - "silu"  → SiLU (SwiGLU, standard)
+      - "relu2" → ReLU² (ReGLU², sparse + sharp)
+      - "tanh"  → Tanh (TanhGLU, bounded + smooth)
+    
+    Architecture: down_proj( act(gate_proj(x)) * up_proj(x) )
+    Same structure as BiBoMLP but with explicit activation choice.
+    
+    Args:
+        config: Model config
+        activation: One of "silu", "relu2", "tanh"
+    """
+    VALID_ACTIVATIONS = ("silu", "relu2", "tanh")
+
+    def __init__(self, config: BiBoConfig, activation: str = "silu"):
+        super().__init__()
+        if activation not in self.VALID_ACTIVATIONS:
+            raise ValueError(f"PolyGLU activation must be one of {self.VALID_ACTIVATIONS}, got '{activation}'")
+        self.activation_name = activation
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+    def _activate(self, x: torch.Tensor) -> torch.Tensor:
+        if self.activation_name == "silu":
+            return F.silu(x)
+        elif self.activation_name == "relu2":
+            return F.relu(x).square()
+        elif self.activation_name == "tanh":
+            return torch.tanh(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self._activate(self.gate_proj(x)) * self.up_proj(x))
+
 
 class BiBoCausalConv1D(nn.Module):
     """
-    1D causal conv expert.
+    1D causal conv expert (shared, always-active).
     
     Applies causal (left-padded) 1D conv → gated activation → linear proj.
     Captures local sequential deps while preserving causality.

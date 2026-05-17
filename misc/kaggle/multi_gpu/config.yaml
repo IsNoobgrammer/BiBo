@@ -18,7 +18,7 @@ training:
   num_workers: 2
   log_every_n_steps: 10
   wandb_project: "bibo-ablation"
-  wandb_run_name: "bibo-vs-qwen3moe-sort-v2"
+  wandb_run_name: "bibo-vs-qwen3moe-sort-v3-polyglu"
 
   # NTIL loss weights (arXiv:2505.13077)
   alpha_emd: 0.3       # EMD token-level (ordinal distance)
@@ -29,7 +29,7 @@ training:
   curriculum_stages: [2, 64, 256]
 
 # ============================================================
-# BiBo Config (~10M)
+# BiBo Config (~10M) — PolyGLU layout
 # ============================================================
 bibo:
   device: "cuda:0"
@@ -39,7 +39,11 @@ bibo:
   num_hidden_layers: 6
   num_attention_heads: 4
   num_key_value_heads: 2
-  num_routed_experts: 8
+  # PolyGLU expert layout:
+  #   polyglu_expert_multiplier * 3 (SiLU, ReLU², Tanh) + special_expert_pairs * 2 (Identity, Zero)
+  #   2*3 + 1*2 = 8 routed experts
+  polyglu_expert_multiplier: 2
+  special_expert_pairs: 1
   num_experts_per_tok: 3
   moe_intermediate_size: 256
   max_position_embeddings: 512

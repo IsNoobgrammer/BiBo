@@ -38,10 +38,12 @@ class BiBoConfig(PretrainedConfig):
         mlp_only_layers=None,
         decoder_sparse_step=1,
         moe_intermediate_size=None,  # Auto: intermediate_size // top_k
-        num_routed_experts=16,
         num_shared_experts=1,
         num_experts_per_tok=6,
         num_experts=None,
+        # PolyGLU expert layout
+        polyglu_expert_multiplier=2,  # Groups of 3 (SiLU, ReLU², Tanh) GLU experts
+        special_expert_pairs=1,  # Pairs of (Identity, Zero) experts
         # Router
         router_type="mlp",  # "mlp" or "conv"
         kernel_size=3,
@@ -77,10 +79,13 @@ class BiBoConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.attention_bias = attention_bias
         self.decoder_sparse_step = decoder_sparse_step
-        self.num_routed_experts = num_routed_experts
         self.num_shared_experts = num_shared_experts
         self.num_experts_per_tok = num_experts_per_tok
-        self.num_experts = num_experts if num_experts is not None else (num_routed_experts + num_shared_experts)
+        # PolyGLU layout: experts = polyglu_multiplier * 3 (SiLU, ReLU², Tanh) + special_pairs * 2 (Identity, Zero)
+        self.polyglu_expert_multiplier = polyglu_expert_multiplier
+        self.special_expert_pairs = special_expert_pairs
+        self.num_routed_experts = (polyglu_expert_multiplier * 3) + (special_expert_pairs * 2)
+        self.num_experts = num_experts if num_experts is not None else (self.num_routed_experts + num_shared_experts)
         self.router_temperature = router_temperature
         self.router_type = router_type
         self.kernel_size = kernel_size
@@ -207,8 +212,12 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError("bias_update_factor must be non-negative")
         if self.router_noise < 0.0:
             raise ValueError("router_noise must be non-negative")
-        if self.num_routed_experts < 4:
-            raise ValueError("num_routed_experts must be >= 4 (need at least 1 MLP + identity + zero + relu)")
+        if self.polyglu_expert_multiplier < 1:
+            raise ValueError("polyglu_expert_multiplier must be >= 1 (need at least one group of SiLU/ReLU²/Tanh GLU experts)")
+        if self.special_expert_pairs < 0:
+            raise ValueError("special_expert_pairs must be >= 0")
+        if self.num_routed_experts < 3:
+            raise ValueError(f"num_routed_experts must be >= 3 (got {self.num_routed_experts}). Increase polyglu_expert_multiplier or special_expert_pairs.")
         if self.num_experts_per_tok > self.num_experts:
             raise ValueError("num_experts_per_tok cannot exceed total number of experts")
         for idx in self.mlp_only_layers:

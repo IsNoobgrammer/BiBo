@@ -14,7 +14,7 @@ Structure:
     │   └── utils.py         # repeat_kv
     ├── ffn/                 # Feed-forward networks
     │   ├── mlp.py           # BiBoMLP (standard MLP)
-    │   ├── experts.py       # Special experts (Identity/ReLU/Zero/Conv)
+    │   ├── experts.py       # Special experts (Identity/Zero) + PolyGLU experts
     │   ├── router.py        # BiBoMoERouter
     │   └── moe.py           # BiBoMoELayer
     ├── layers.py            # BiBoDecoderLayer
@@ -41,8 +41,8 @@ from src.modeling.attn import (
 from src.modeling.ffn import (
     BiBoMLP,
     BiBoIdentityExpert,
-    BiBoReLUExpert,
     BiBoZeroExpert,
+    BiBoPolyGLUExpert,
     BiBoCausalConv1D,
     BiBoMoERouter,
     BiBoMoELayer,
@@ -71,8 +71,8 @@ __all__ = [
     # FFN
     'BiBoMLP',
     'BiBoIdentityExpert',
-    'BiBoReLUExpert',
     'BiBoZeroExpert',
+    'BiBoPolyGLUExpert',
     'BiBoCausalConv1D',
     'BiBoMoERouter',
     'BiBoMoELayer',

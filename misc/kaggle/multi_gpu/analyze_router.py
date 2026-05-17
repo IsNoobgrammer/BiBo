@@ -10,12 +10,13 @@ Multi-dimensional comparison of routing behavior across:
 - Load balance metrics (Gini, entropy, CV)
 - Routing weight distributions
 - Expert specialization scores
+- PolyGLU expert-type analysis (SiLU vs ReLU² vs Tanh vs Identity vs Zero)
 - Side-by-side comparative visualizations
 
 Usage:
-    python kaggle_multi_gpu/analyze_router.py
+    python misc/kaggle/multi_gpu/analyze_router.py
 
-Produces ~30+ publication-quality plots in kaggle_multi_gpu/plots/
+Produces publication-quality plots in misc/kaggle/multi_gpu/plots/
 """
 import sys, torch, numpy as np, json, os, math
 from collections import defaultdict
@@ -25,7 +26,6 @@ import matplotlib.gridspec as gridspec
 from matplotlib.patches import FancyBboxPatch
 from matplotlib.colors import LinearSegmentedColormap
 import seaborn as sns
-# scipy optional — not required for core analysis
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 
@@ -54,8 +54,16 @@ BIBO_CMAP = 'Blues'
 QWEN_CMAP = 'Oranges'
 ACCENT_COLORS = ['#4CAF50', '#9C27B0', '#FF9800', '#00BCD4', '#E91E63', '#8BC34A']
 
-# Expert type colors for BiBo
-EXPERT_COLORS_BIBO = None  # set dynamically based on n_experts
+# PolyGLU activation colors
+POLYGLU_COLORS = {
+    'silu': '#1976D2',    # blue
+    'relu2': '#D32F2F',   # red
+    'tanh': '#7B1FA2',    # purple
+}
+SPECIAL_COLORS = {
+    'identity': '#4CAF50',  # green
+    'zero': '#9E9E9E',      # gray
+}
 
 plt.rcParams.update({
     'figure.facecolor': '#FAFAFA',
@@ -77,24 +85,64 @@ plt.rcParams.update({
 sns.set_theme(style='whitegrid', palette='muted')
 
 
-def get_expert_colors(n_experts, model_name):
-    """Color palette: MLPs=blues, special experts=distinct."""
-    if model_name == 'BiBo':
-        n_mlp = n_experts - 3
-        mlp_colors = sns.color_palette('Blues_d', n_mlp)
-        special = ['#4CAF50', '#9E9E9E', '#FF5722']  # Identity=green, Zero=gray, ReLU²=red
-        return list(mlp_colors) + special
+# ============================================================
+# Expert labeling — PolyGLU aware
+# ============================================================
+
+def get_bibo_expert_layout(cfg):
+    """
+    Parse BiBo config to get expert layout info.
+    Returns list of (label, type, color) tuples.
+    """
+    poly_mult = cfg.get('polyglu_expert_multiplier', 2)
+    special_pairs = cfg.get('special_expert_pairs', 1)
+    activations = ['silu', 'relu2', 'tanh']
+    
+    layout = []
+    # PolyGLU experts
+    for g in range(poly_mult):
+        for act in activations:
+            label = f'{act.upper()}_{g}' if poly_mult > 1 else act.upper()
+            layout.append((label, act, POLYGLU_COLORS[act]))
+    # Special experts
+    for p in range(special_pairs):
+        suffix = f'_{p}' if special_pairs > 1 else ''
+        layout.append((f'Id{suffix}', 'identity', SPECIAL_COLORS['identity']))
+        layout.append((f'Zero{suffix}', 'zero', SPECIAL_COLORS['zero']))
+    
+    return layout
+
+
+def get_expert_colors(n_experts, model_name, cfg=None):
+    """Color palette for experts."""
+    if model_name == 'BiBo' and cfg is not None:
+        layout = get_bibo_expert_layout(cfg)
+        return [item[2] for item in layout]
+    elif model_name == 'BiBo':
+        # Fallback if no cfg
+        return sns.color_palette('tab10', n_experts)
     else:
         return sns.color_palette('husl', n_experts)
 
 
-def get_expert_labels(n_experts, model_name):
+def get_expert_labels(n_experts, model_name, cfg=None):
     """Expert labels."""
-    if model_name == 'BiBo':
-        n_mlp = n_experts - 3
-        return [f'MLP{i}' for i in range(n_mlp)] + ['Identity', 'Zero', 'ReLU²']
+    if model_name == 'BiBo' and cfg is not None:
+        layout = get_bibo_expert_layout(cfg)
+        return [item[0] for item in layout]
+    elif model_name == 'BiBo':
+        return [f'E{i}' for i in range(n_experts)]
     else:
         return [f'E{i}' for i in range(n_experts)]
+
+
+def get_expert_types(cfg):
+    """
+    Returns list of expert type strings for BiBo.
+    E.g. ['silu', 'relu2', 'tanh', 'silu', 'relu2', 'tanh', 'identity', 'zero']
+    """
+    layout = get_bibo_expert_layout(cfg)
+    return [item[1] for item in layout]
 
 
 # ============================================================
@@ -108,7 +156,6 @@ def extract_routing_data(model, input_ids, device, model_type='bibo'):
     Returns dict per MoE layer:
         indices: [batch, seq_len, top_k]
         weights: [batch, seq_len, top_k]
-        logits:  [batch*seq_len, n_experts] (raw router output before topk)
     """
     model.eval()
     layer_data = {}
@@ -117,17 +164,15 @@ def extract_routing_data(model, input_ids, device, model_type='bibo'):
     def make_hook(layer_idx, mtype):
         def hook_fn(module, inp, output):
             if mtype == 'bibo':
-                indices, weights = output  # [bs, seq, top_k]
+                indices, weights = output
                 layer_data[layer_idx] = {
                     'indices': indices.detach().cpu(),
                     'weights': weights.detach().cpu().float(),
                 }
             else:
                 logits, scores, indices = output
-                bs_seq = logits.shape[0]
-                # Qwen router flattens batch*seq → need to reshape
                 layer_data[layer_idx] = {
-                    'indices': indices.detach().cpu(),   # [bs*seq, top_k]
+                    'indices': indices.detach().cpu(),
                     'weights': scores.detach().cpu().float(),
                     'logits': logits.detach().cpu().float(),
                 }
@@ -162,16 +207,7 @@ def compute_gini(counts):
 
 
 def compute_load_balance_metrics(indices, n_experts, top_k):
-    """
-    Compute comprehensive load balance metrics from routing indices.
-    
-    Args:
-        indices: flat array of expert indices
-        n_experts: total experts
-        top_k: experts per token
-    
-    Returns dict with: entropy, gini, cv, max_load, min_load, balance_ratio
-    """
+    """Compute comprehensive load balance metrics from routing indices."""
     counts = np.bincount(indices.flatten(), minlength=n_experts).astype(float)
     total = counts.sum()
     if total == 0:
@@ -183,7 +219,7 @@ def compute_load_balance_metrics(indices, n_experts, top_k):
     normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0
     
     gini = compute_gini(counts)
-    cv = np.std(counts) / (np.mean(counts) + 1e-10)  # coefficient of variation
+    cv = np.std(counts) / (np.mean(counts) + 1e-10)
     
     return {
         'entropy': float(entropy),
@@ -198,20 +234,12 @@ def compute_load_balance_metrics(indices, n_experts, top_k):
 
 
 def compute_expert_coselection(indices, n_experts):
-    """
-    Co-selection matrix: how often pairs of experts are selected together for same token.
-    
-    Args:
-        indices: [n_tokens, top_k]
-    Returns:
-        cosel: [n_experts, n_experts] symmetric matrix (normalized)
-    """
+    """Co-selection matrix: how often pairs of experts are selected together."""
     cosel = np.zeros((n_experts, n_experts))
     for row in indices:
         for i, j in combinations(row, 2):
             cosel[i, j] += 1
             cosel[j, i] += 1
-    # Normalize by total pairs
     total_pairs = len(indices) * (indices.shape[1] * (indices.shape[1] - 1) / 2)
     if total_pairs > 0:
         cosel /= total_pairs
@@ -219,50 +247,35 @@ def compute_expert_coselection(indices, n_experts):
 
 
 def compute_specialization_score(indices, n_experts, seq_len):
-    """
-    Expert specialization: do experts prefer certain positions?
-    Score = KL divergence of position distribution from uniform.
-    
-    Returns per-expert specialization scores.
-    """
-    # Position distribution per expert
+    """Expert specialization: KL divergence of position distribution from uniform."""
     scores = np.zeros(n_experts)
-    positions = np.arange(seq_len)
     uniform = np.ones(seq_len) / seq_len
     
     for exp_id in range(n_experts):
-        # Find positions where this expert is selected (any top-k slot)
-        mask = (indices == exp_id).any(axis=-1)  # [n_tokens]
+        mask = (indices == exp_id).any(axis=-1)
         if mask.sum() == 0:
             scores[exp_id] = 0
             continue
-        # Position histogram
         pos_counts = np.zeros(seq_len)
-        token_positions = np.arange(len(mask)) % seq_len  # handle batched
+        token_positions = np.arange(len(mask)) % seq_len
         selected_positions = token_positions[mask]
         for p in selected_positions:
             pos_counts[p] += 1
         pos_dist = pos_counts / (pos_counts.sum() + 1e-10)
-        # KL(pos_dist || uniform)
         kl = np.sum(pos_dist * np.log((pos_dist + 1e-10) / uniform))
         scores[exp_id] = kl
     
     return scores
 
 
-
 # ============================================================
 # PLOT 1: Expert Usage Heatmap — Multi-batch sweep
 # ============================================================
 
-def plot_expert_usage_sweep(all_data, model_name, n_experts, batch_sizes, seq_lens):
-    """
-    Grid plot: rows=seq_lens, cols=batch_sizes.
-    Each cell = expert usage bar chart.
-    Shows how usage stabilizes with more samples.
-    """
-    labels = get_expert_labels(n_experts, model_name)
-    colors = get_expert_colors(n_experts, model_name)
+def plot_expert_usage_sweep(all_data, model_name, n_experts, batch_sizes, seq_lens, bibo_cfg=None):
+    """Grid plot: rows=seq_lens, cols=batch_sizes. Each cell = expert usage bar chart."""
+    labels = get_expert_labels(n_experts, model_name, bibo_cfg)
+    colors = get_expert_colors(n_experts, model_name, bibo_cfg)
     
     n_rows = len(seq_lens)
     n_cols = len(batch_sizes)
@@ -283,12 +296,9 @@ def plot_expert_usage_sweep(all_data, model_name, n_experts, batch_sizes, seq_le
                 counts += np.bincount(idx, minlength=n_experts)
             
             dist = counts / (counts.sum() + 1e-10)
-            bars = ax.bar(range(n_experts), dist, color=colors, edgecolor='white', linewidth=0.5)
-            
-            # Uniform line
+            ax.bar(range(n_experts), dist, color=colors, edgecolor='white', linewidth=0.5)
             ax.axhline(y=1/n_experts, color='red', linestyle='--', alpha=0.5, linewidth=1)
             
-            # Metrics annotation
             metrics = compute_load_balance_metrics(
                 np.concatenate([ld['indices'].numpy().reshape(-1, ld['indices'].shape[-1]) 
                                for ld in data.values()]),
@@ -318,13 +328,13 @@ def plot_expert_usage_sweep(all_data, model_name, n_experts, batch_sizes, seq_le
 # PLOT 2: Side-by-side comparative expert usage
 # ============================================================
 
-def plot_comparative_usage(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_len, batch_size):
+def plot_comparative_usage(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_len, batch_size, bibo_cfg=None):
     """Side-by-side bar charts comparing BiBo vs Qwen expert usage."""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     
     # BiBo
-    bibo_labels = get_expert_labels(n_exp_bibo, 'BiBo')
-    bibo_colors = get_expert_colors(n_exp_bibo, 'BiBo')
+    bibo_labels = get_expert_labels(n_exp_bibo, 'BiBo', bibo_cfg)
+    bibo_colors = get_expert_colors(n_exp_bibo, 'BiBo', bibo_cfg)
     bibo_counts = np.zeros(n_exp_bibo)
     for ld in bibo_data.values():
         bibo_counts += np.bincount(ld['indices'].numpy().flatten(), minlength=n_exp_bibo)
@@ -335,7 +345,7 @@ def plot_comparative_usage(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_len
     ax1.set_xticks(range(n_exp_bibo))
     ax1.set_xticklabels(bibo_labels, rotation=45)
     ax1.set_ylabel('Token Fraction')
-    ax1.set_title('BiBo (Skywork-MoE + Conv Router)', color=BIBO_COLOR, fontweight='bold')
+    ax1.set_title('BiBo (PolyGLU + Conv Router)', color=BIBO_COLOR, fontweight='bold')
     ax1.legend()
     
     # Qwen
@@ -354,7 +364,6 @@ def plot_comparative_usage(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_len
     ax2.set_title('Qwen3MoE (Softmax Router)', color=QWEN_COLOR, fontweight='bold')
     ax2.legend()
     
-    # Metrics comparison text
     bibo_metrics = compute_load_balance_metrics(
         np.concatenate([ld['indices'].numpy().reshape(-1, ld['indices'].shape[-1]) for ld in bibo_data.values()]),
         n_exp_bibo, CFG['bibo']['num_experts_per_tok']
@@ -385,25 +394,22 @@ def plot_confidence_distribution(bibo_data, qwen_data, seq_len):
     """Violin plots of top-1 and top-k weight distributions."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     
-    # Collect all weights
-    bibo_top1 = []
-    bibo_topk_mean = []
-    qwen_top1 = []
-    qwen_topk_mean = []
+    bibo_top1, qwen_top1 = [], []
+    bibo_std, qwen_std = [], []
     
     for ld in bibo_data.values():
         w = ld['weights'].numpy()
-        if w.ndim == 3:  # [bs, seq, top_k]
+        if w.ndim == 3:
             w = w.reshape(-1, w.shape[-1])
         bibo_top1.extend(w[:, 0].tolist())
-        bibo_topk_mean.extend(w.mean(axis=1).tolist())
+        bibo_std.extend(w.std(axis=1).tolist())
     
     for ld in qwen_data.values():
         w = ld['weights'].numpy()
         if w.ndim == 3:
             w = w.reshape(-1, w.shape[-1])
         qwen_top1.extend(w[:, 0].tolist())
-        qwen_topk_mean.extend(w.mean(axis=1).tolist())
+        qwen_std.extend(w.std(axis=1).tolist())
     
     # Top-1 weight distribution
     ax = axes[0]
@@ -416,24 +422,11 @@ def plot_confidence_distribution(bibo_data, qwen_data, seq_len):
     ax.set_ylabel('Top-1 Routing Weight')
     ax.set_title('Top-1 Expert Confidence', fontweight='bold')
     ax.axhline(y=1/CFG['bibo']['num_experts_per_tok'], color='gray', linestyle='--', alpha=0.5,
-               label=f'Uniform (1/top_k={1/CFG["bibo"]["num_experts_per_tok"]:.2f})')
+               label=f'Uniform (1/top_k)')
     ax.legend()
     
-    # Weight spread (std across top-k)
+    # Weight spread
     ax = axes[1]
-    bibo_std = []
-    qwen_std = []
-    for ld in bibo_data.values():
-        w = ld['weights'].numpy()
-        if w.ndim == 3:
-            w = w.reshape(-1, w.shape[-1])
-        bibo_std.extend(w.std(axis=1).tolist())
-    for ld in qwen_data.values():
-        w = ld['weights'].numpy()
-        if w.ndim == 3:
-            w = w.reshape(-1, w.shape[-1])
-        qwen_std.extend(w.std(axis=1).tolist())
-    
     ax.hist(bibo_std, bins=50, alpha=0.7, color=BIBO_COLOR, label='BiBo', density=True)
     ax.hist(qwen_std, bins=50, alpha=0.7, color=QWEN_COLOR, label='Qwen3MoE', density=True)
     ax.set_xlabel('Std of Top-K Weights (per token)')
@@ -448,21 +441,19 @@ def plot_confidence_distribution(bibo_data, qwen_data, seq_len):
     print(f"  ✓ confidence_distribution_seq{seq_len}.png")
 
 
-
 # ============================================================
 # PLOT 4: Expert co-selection heatmap
 # ============================================================
 
-def plot_coselection_matrix(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_len):
+def plot_coselection_matrix(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_len, bibo_cfg=None):
     """Heatmap showing which expert pairs are frequently co-selected."""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
     
-    # BiBo
     bibo_indices = np.concatenate([
         ld['indices'].numpy().reshape(-1, ld['indices'].shape[-1]) for ld in bibo_data.values()
     ])
     bibo_cosel = compute_expert_coselection(bibo_indices, n_exp_bibo)
-    bibo_labels = get_expert_labels(n_exp_bibo, 'BiBo')
+    bibo_labels = get_expert_labels(n_exp_bibo, 'BiBo', bibo_cfg)
     
     mask = np.triu(np.ones_like(bibo_cosel, dtype=bool), k=1)
     sns.heatmap(bibo_cosel, mask=~mask, ax=ax1, cmap='YlOrRd', annot=True, fmt='.3f',
@@ -470,7 +461,6 @@ def plot_coselection_matrix(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_le
                 cbar_kws={'label': 'Co-selection freq', 'shrink': 0.8})
     ax1.set_title('BiBo — Expert Co-Selection', color=BIBO_COLOR, fontweight='bold')
     
-    # Qwen
     qwen_indices = np.concatenate([
         ld['indices'].numpy().reshape(-1, ld['indices'].shape[-1]) for ld in qwen_data.values()
     ])
@@ -496,28 +486,21 @@ def plot_coselection_matrix(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_le
 # PLOT 5: Per-position-type routing (unsorted vs sorted tokens)
 # ============================================================
 
-def plot_position_type_routing(layer_data, model_name, n_experts, seq_len):
-    """
-    Compare routing for unsorted tokens (input) vs sorted tokens (output).
-    Sorting task: [unsorted | SEP | sorted] — first half is input, second half is output.
-    """
-    labels = get_expert_labels(n_experts, model_name)
-    colors = get_expert_colors(n_experts, model_name)
+def plot_position_type_routing(layer_data, model_name, n_experts, seq_len, bibo_cfg=None):
+    """Compare routing for unsorted tokens (input) vs sorted tokens (output)."""
+    labels = get_expert_labels(n_experts, model_name, bibo_cfg)
+    colors = get_expert_colors(n_experts, model_name, bibo_cfg)
     
-    # Split point: seq_len tokens unsorted, 1 SEP, seq_len tokens sorted
-    # In input_ids (shifted), split is at position seq_len (0-indexed)
-    half = seq_len  # first `seq_len` positions = unsorted, rest = sorted
-    
+    half = seq_len
     layers = sorted(layer_data.keys())
     fig, axes = plt.subplots(len(layers), 2, figsize=(12, 3*len(layers)), squeeze=False)
     
     for row, l in enumerate(layers):
         idx = layer_data[l]['indices'].numpy()
-        if idx.ndim == 3:  # [bs, seq, top_k]
-            # Unsorted portion
+        if idx.ndim == 3:
             unsorted_idx = idx[:, :half, :].reshape(-1)
             sorted_idx = idx[:, half:, :].reshape(-1)
-        else:  # [seq, top_k]
+        else:
             unsorted_idx = idx[:half, :].flatten()
             sorted_idx = idx[half:, :].flatten()
         
@@ -561,22 +544,17 @@ def plot_position_type_routing(layer_data, model_name, n_experts, seq_len):
 # PLOT 6: Expert specialization radar chart
 # ============================================================
 
-def plot_specialization_radar(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_len):
-    """Radar/polar chart showing per-expert position specialization (KL from uniform)."""
+def plot_specialization_radar(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_len, bibo_cfg=None):
+    """Radar chart showing per-expert position specialization."""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5), subplot_kw=dict(polar=True))
     
-    # BiBo
     bibo_indices = np.concatenate([
         ld['indices'].numpy().reshape(-1, ld['indices'].shape[-1]) for ld in bibo_data.values()
     ])
-    # Use first layer's seq_len
     first_layer = list(bibo_data.values())[0]
-    if first_layer['indices'].ndim == 3:
-        sl = first_layer['indices'].shape[1]
-    else:
-        sl = first_layer['indices'].shape[0]
+    sl = first_layer['indices'].shape[1] if first_layer['indices'].ndim == 3 else first_layer['indices'].shape[0]
     bibo_spec = compute_specialization_score(bibo_indices, n_exp_bibo, sl)
-    bibo_labels = get_expert_labels(n_exp_bibo, 'BiBo')
+    bibo_labels = get_expert_labels(n_exp_bibo, 'BiBo', bibo_cfg)
     
     angles = np.linspace(0, 2*np.pi, n_exp_bibo, endpoint=False).tolist()
     angles += angles[:1]
@@ -588,15 +566,11 @@ def plot_specialization_radar(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_
     ax1.set_xticklabels(bibo_labels, fontsize=7)
     ax1.set_title('BiBo — Position Specialization\n(KL from uniform)', fontsize=10, fontweight='bold', pad=20)
     
-    # Qwen
     qwen_indices = np.concatenate([
         ld['indices'].numpy().reshape(-1, ld['indices'].shape[-1]) for ld in qwen_data.values()
     ])
     first_layer_q = list(qwen_data.values())[0]
-    if first_layer_q['indices'].ndim == 3:
-        sl_q = first_layer_q['indices'].shape[1]
-    else:
-        sl_q = first_layer_q['indices'].shape[0]
+    sl_q = first_layer_q['indices'].shape[1] if first_layer_q['indices'].ndim == 3 else first_layer_q['indices'].shape[0]
     qwen_spec = compute_specialization_score(qwen_indices, n_exp_qwen, sl_q)
     qwen_labels = get_expert_labels(n_exp_qwen, 'Qwen3MoE')
     
@@ -620,14 +594,11 @@ def plot_specialization_radar(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_
 
 
 # ============================================================
-# PLOT 7: Token-level expert heatmap (improved)
+# PLOT 7: Token-level expert heatmap
 # ============================================================
 
-def plot_token_expert_heatmap_v2(layer_data, model_name, n_experts, seq_len_label):
-    """
-    Improved heatmap: x=token position, y=layer.
-    Color = primary expert. Annotated with position type regions.
-    """
+def plot_token_expert_heatmap_v2(layer_data, model_name, n_experts, seq_len_label, bibo_cfg=None):
+    """Heatmap: x=token position, y=layer. Color = primary expert."""
     layers = sorted(layer_data.keys())
     n_layers = len(layers)
     first_ld = layer_data[layers[0]]
@@ -636,21 +607,19 @@ def plot_token_expert_heatmap_v2(layer_data, model_name, n_experts, seq_len_labe
         actual_seq = first_ld['indices'].shape[1]
         heatmap = np.zeros((n_layers, actual_seq))
         for i, l in enumerate(layers):
-            heatmap[i] = layer_data[l]['indices'][0, :, 0].numpy()  # first sample, top-1
+            heatmap[i] = layer_data[l]['indices'][0, :, 0].numpy()
     else:
         actual_seq = first_ld['indices'].shape[0]
         heatmap = np.zeros((n_layers, actual_seq))
         for i, l in enumerate(layers):
             heatmap[i] = layer_data[l]['indices'][:, 0].numpy()
     
-    # Custom discrete colormap
     cmap = plt.cm.get_cmap('tab10', n_experts)
     
     fig, ax = plt.subplots(figsize=(min(18, max(10, actual_seq//8)), max(3, n_layers*0.8)))
     im = ax.imshow(heatmap, aspect='auto', cmap=cmap, vmin=-0.5, vmax=n_experts-0.5,
                    interpolation='nearest')
     
-    # Separator line (between unsorted and sorted)
     half = int(seq_len_label)
     if half < actual_seq:
         ax.axvline(x=half, color='white', linewidth=2, linestyle='-')
@@ -663,9 +632,9 @@ def plot_token_expert_heatmap_v2(layer_data, model_name, n_experts, seq_len_labe
     ax.set_yticklabels([f'L{l}' for l in layers])
     
     cbar = plt.colorbar(im, ax=ax, ticks=range(n_experts))
-    labels = get_expert_labels(n_experts, model_name)
+    labels = get_expert_labels(n_experts, model_name, bibo_cfg)
     cbar.set_ticklabels(labels)
-    cbar.set_label('Expert ID')
+    cbar.set_label('Expert')
     
     ax.set_title(f'{model_name} — Top-1 Expert per Token (seq_len={seq_len_label})', fontweight='bold')
     plt.tight_layout()
@@ -682,12 +651,11 @@ def plot_confidence_evolution_comparative(bibo_data, qwen_data, seq_len):
     """Side-by-side smoothed confidence evolution over token positions."""
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
     
-    # BiBo
     bibo_layers = sorted(bibo_data.keys())
     for l in bibo_layers:
         w = bibo_data[l]['weights'].numpy()
         if w.ndim == 3:
-            max_w = w[:, :, 0].mean(axis=0)  # avg top-1 across batch
+            max_w = w[:, :, 0].mean(axis=0)
         else:
             max_w = w[:, 0]
         window = max(3, len(max_w) // 15)
@@ -700,7 +668,6 @@ def plot_confidence_evolution_comparative(bibo_data, qwen_data, seq_len):
     ax1.legend(ncol=2, fontsize=8)
     ax1.set_ylim(0, 1.05)
     
-    # Qwen
     qwen_layers = sorted(qwen_data.keys())
     for l in qwen_layers:
         w = qwen_data[l]['weights'].numpy()
@@ -719,7 +686,6 @@ def plot_confidence_evolution_comparative(bibo_data, qwen_data, seq_len):
     ax2.legend(ncol=2, fontsize=8)
     ax2.set_ylim(0, 1.05)
     
-    # Separator
     half = seq_len
     for ax in [ax1, ax2]:
         ax.axvline(x=half, color='green', linestyle=':', alpha=0.6, label='SEP')
@@ -739,15 +705,11 @@ def plot_entropy_evolution_comparative(bibo_data, qwen_data, seq_len):
     """Per-token routing entropy over positions — BiBo vs Qwen."""
     fig, ax = plt.subplots(figsize=(14, 5))
     
-    top_k_bibo = CFG['bibo']['num_experts_per_tok']
-    top_k_qwen = CFG['qwen3moe']['num_experts_per_tok']
-    
-    # Average across layers for cleaner comparison
     bibo_entropies = []
     for l, ld in sorted(bibo_data.items()):
         w = ld['weights'].numpy()
         if w.ndim == 3:
-            w = w.mean(axis=0)  # avg across batch
+            w = w.mean(axis=0)
         w_norm = w / (w.sum(axis=1, keepdims=True) + 1e-10)
         entropy = -(w_norm * np.log(w_norm + 1e-10)).sum(axis=1)
         bibo_entropies.append(entropy)
@@ -770,6 +732,7 @@ def plot_entropy_evolution_comparative(bibo_data, qwen_data, seq_len):
     ax.plot(bibo_smooth, color=BIBO_COLOR, linewidth=2.5, label='BiBo (avg across layers)')
     ax.plot(qwen_smooth, color=QWEN_COLOR, linewidth=2.5, label='Qwen3MoE (avg across layers)')
     
+    top_k_bibo = CFG['bibo']['num_experts_per_tok']
     ax.axhline(y=np.log(top_k_bibo), color=BIBO_COLOR, linestyle='--', alpha=0.4,
                label=f'Max entropy (top-{top_k_bibo})')
     ax.axvline(x=seq_len, color='green', linestyle=':', alpha=0.6, label='SEP position')
@@ -786,16 +749,12 @@ def plot_entropy_evolution_comparative(bibo_data, qwen_data, seq_len):
     print(f"  ✓ entropy_comparative_seq{seq_len}.png")
 
 
-
 # ============================================================
-# PLOT 10: Load balance metrics summary (bar chart)
+# PLOT 10: Load balance metrics summary
 # ============================================================
 
 def plot_load_balance_summary(all_metrics):
-    """
-    Summary bar chart comparing Gini, normalized entropy, CV across
-    all (model, seq_len, batch_size) combinations.
-    """
+    """Summary bar chart comparing Gini, normalized entropy, CV."""
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     metric_names = ['gini', 'normalized_entropy', 'cv']
     metric_labels = ['Gini Coefficient\n(lower = more balanced)', 
@@ -803,9 +762,7 @@ def plot_load_balance_summary(all_metrics):
                      'Coefficient of Variation\n(lower = more balanced)']
     
     for ax, mname, mlabel in zip(axes, metric_names, metric_labels):
-        bibo_vals = []
-        qwen_vals = []
-        x_labels = []
+        bibo_vals, qwen_vals, x_labels = [], [], []
         
         for key, metrics in sorted(all_metrics.items()):
             model, sl, bs = key
@@ -836,15 +793,11 @@ def plot_load_balance_summary(all_metrics):
 # ============================================================
 
 def plot_weight_rank_distribution(bibo_data, qwen_data, seq_len):
-    """
-    How much weight goes to rank-1, rank-2, ..., rank-K expert?
-    Shows if top-1 dominates (Qwen) vs distributed (BiBo).
-    """
+    """How much weight goes to rank-1, rank-2, ..., rank-K expert?"""
     top_k = CFG['bibo']['num_experts_per_tok']
     
     fig, ax = plt.subplots(figsize=(10, 5))
     
-    # BiBo: avg weight per rank
     bibo_rank_weights = np.zeros(top_k)
     bibo_count = 0
     for ld in bibo_data.values():
@@ -855,7 +808,6 @@ def plot_weight_rank_distribution(bibo_data, qwen_data, seq_len):
         bibo_count += 1
     bibo_rank_weights /= bibo_count
     
-    # Qwen
     qwen_rank_weights = np.zeros(top_k)
     qwen_count = 0
     for ld in qwen_data.values():
@@ -871,7 +823,6 @@ def plot_weight_rank_distribution(bibo_data, qwen_data, seq_len):
     bars1 = ax.bar(x - width/2, bibo_rank_weights, width, color=BIBO_COLOR, alpha=0.85, label='BiBo')
     bars2 = ax.bar(x + width/2, qwen_rank_weights, width, color=QWEN_COLOR, alpha=0.85, label='Qwen3MoE')
     
-    # Annotate values
     for bar in bars1:
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
                 f'{bar.get_height():.3f}', ha='center', fontsize=8, color=BIBO_COLOR)
@@ -885,8 +836,7 @@ def plot_weight_rank_distribution(bibo_data, qwen_data, seq_len):
     ax.set_xlabel('Expert Rank (by routing weight)')
     ax.set_ylabel('Average Weight')
     ax.set_title(f'Weight Distribution by Expert Rank — seq={seq_len}\n'
-                 'Flatter = better expert utilization (all top-K contribute equally)',
-                 fontweight='bold')
+                 'Flatter = better expert utilization', fontweight='bold')
     ax.legend()
     ax.set_ylim(0, max(bibo_rank_weights.max(), qwen_rank_weights.max()) * 1.25)
     
@@ -897,68 +847,51 @@ def plot_weight_rank_distribution(bibo_data, qwen_data, seq_len):
 
 
 # ============================================================
-# PLOT 12: Per-layer routing diversity (how many unique experts used)
+# PLOT 12: Per-layer routing diversity
 # ============================================================
 
 def plot_routing_diversity(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_len, batch_size):
-    """
-    Per-layer: what fraction of experts are actually used?
-    + effective number of experts (exp(entropy))
-    """
+    """Per-layer: effective number of experts and fraction used."""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     
-    # BiBo
     bibo_layers = sorted(bibo_data.keys())
-    bibo_effective = []
-    bibo_used_frac = []
+    bibo_effective, bibo_used_frac = [], []
     for l in bibo_layers:
         idx = bibo_data[l]['indices'].numpy().flatten()
         counts = np.bincount(idx, minlength=n_exp_bibo).astype(float)
         dist = counts / (counts.sum() + 1e-10)
         entropy = -np.sum(dist * np.log(dist + 1e-10))
-        effective_n = np.exp(entropy)
-        used = (counts > 0).sum()
-        bibo_effective.append(effective_n)
-        bibo_used_frac.append(used / n_exp_bibo)
+        bibo_effective.append(np.exp(entropy))
+        bibo_used_frac.append((counts > 0).sum() / n_exp_bibo)
     
-    # Qwen
     qwen_layers = sorted(qwen_data.keys())
-    qwen_effective = []
-    qwen_used_frac = []
+    qwen_effective, qwen_used_frac = [], []
     for l in qwen_layers:
         idx = qwen_data[l]['indices'].numpy().flatten()
         counts = np.bincount(idx, minlength=n_exp_qwen).astype(float)
         dist = counts / (counts.sum() + 1e-10)
         entropy = -np.sum(dist * np.log(dist + 1e-10))
-        effective_n = np.exp(entropy)
-        used = (counts > 0).sum()
-        qwen_effective.append(effective_n)
-        qwen_used_frac.append(used / n_exp_qwen)
+        qwen_effective.append(np.exp(entropy))
+        qwen_used_frac.append((counts > 0).sum() / n_exp_qwen)
     
-    # Effective experts — handle different layer counts
     all_layer_ids = sorted(set(bibo_layers) | set(qwen_layers))
-    n_total = len(all_layer_ids)
-    x = np.arange(n_total)
-    
-    # Map layer_id → position
     layer_to_pos = {l: i for i, l in enumerate(all_layer_ids)}
-    bibo_pos = [layer_to_pos[l] for l in bibo_layers]
-    qwen_pos = [layer_to_pos[l] for l in qwen_layers]
+    bibo_pos = np.array([layer_to_pos[l] for l in bibo_layers])
+    qwen_pos = np.array([layer_to_pos[l] for l in qwen_layers])
     
-    ax1.bar(np.array(bibo_pos) - 0.2, bibo_effective, 0.4, color=BIBO_COLOR, alpha=0.8, label='BiBo')
-    ax1.bar(np.array(qwen_pos) + 0.2, qwen_effective, 0.4, color=QWEN_COLOR, alpha=0.8, label='Qwen3MoE')
+    ax1.bar(bibo_pos - 0.2, bibo_effective, 0.4, color=BIBO_COLOR, alpha=0.8, label='BiBo')
+    ax1.bar(qwen_pos + 0.2, qwen_effective, 0.4, color=QWEN_COLOR, alpha=0.8, label='Qwen3MoE')
     ax1.axhline(y=n_exp_bibo, color='gray', linestyle='--', alpha=0.4, label=f'Max ({n_exp_bibo})')
-    ax1.set_xticks(x)
+    ax1.set_xticks(np.arange(len(all_layer_ids)))
     ax1.set_xticklabels([f'L{l}' for l in all_layer_ids])
     ax1.set_ylabel('Effective # Experts (exp(H))')
     ax1.set_title('Effective Expert Count per Layer', fontweight='bold')
     ax1.legend()
     
-    # Used fraction
-    ax2.bar(np.array(bibo_pos) - 0.2, bibo_used_frac, 0.4, color=BIBO_COLOR, alpha=0.8, label='BiBo')
-    ax2.bar(np.array(qwen_pos) + 0.2, qwen_used_frac, 0.4, color=QWEN_COLOR, alpha=0.8, label='Qwen3MoE')
+    ax2.bar(bibo_pos - 0.2, bibo_used_frac, 0.4, color=BIBO_COLOR, alpha=0.8, label='BiBo')
+    ax2.bar(qwen_pos + 0.2, qwen_used_frac, 0.4, color=QWEN_COLOR, alpha=0.8, label='Qwen3MoE')
     ax2.axhline(y=1.0, color='gray', linestyle='--', alpha=0.4)
-    ax2.set_xticks(x)
+    ax2.set_xticks(np.arange(len(all_layer_ids)))
     ax2.set_xticklabels([f'L{l}' for l in all_layer_ids])
     ax2.set_ylabel('Fraction of Experts Used')
     ax2.set_title('Expert Utilization per Layer', fontweight='bold')
@@ -973,36 +906,28 @@ def plot_routing_diversity(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_len
 
 
 # ============================================================
-# PLOT 13: Routing stability — how consistent is routing for similar inputs?
+# PLOT 13: Routing stability
 # ============================================================
 
 def plot_routing_stability(model, device, model_type, model_name, n_experts, val_data, seq_len):
-    """
-    Take N similar sequences, measure routing agreement (Jaccard similarity of expert sets).
-    Shows if router is stable or noisy.
-    """
-    # Pick 20 sequences from same bucket
+    """Measure routing agreement across similar inputs (Jaccard similarity)."""
     n_samples = min(20, len(val_data))
     samples = torch.tensor(val_data[:n_samples, :-1], dtype=torch.long)
     
-    # Extract routing for each
     all_indices = []
     for i in range(n_samples):
         ld = extract_routing_data(model, samples[i], device, model_type)
-        # Flatten all layers into one set per token
         first_layer = list(ld.values())[0]
         idx = first_layer['indices']
         if idx.dim() == 3:
-            idx = idx[0]  # [seq, top_k]
+            idx = idx[0]
         all_indices.append(idx.numpy())
     
-    # Pairwise Jaccard similarity of expert sets
     n_tokens = all_indices[0].shape[0]
     jaccard_matrix = np.zeros((n_samples, n_samples))
     
     for i in range(n_samples):
         for j in range(i, n_samples):
-            # Per-token Jaccard, then average
             jaccards = []
             for t in range(n_tokens):
                 set_i = set(all_indices[i][t])
@@ -1024,7 +949,6 @@ def plot_routing_stability(model, device, model_type, model_name, n_experts, val
     ax.set_xlabel('Sample Index')
     ax.set_ylabel('Sample Index')
     
-    # Overall stability score
     mask = np.triu(np.ones_like(jaccard_matrix, dtype=bool), k=1)
     avg_stability = jaccard_matrix[mask].mean()
     ax.text(0.5, -0.08, f'Average pairwise stability: {avg_stability:.3f}',
@@ -1039,13 +963,374 @@ def plot_routing_stability(model, device, model_type, model_name, n_experts, val
 
 
 # ============================================================
-# PLOT 14: Grand summary dashboard
+# PLOT 14: PolyGLU Expert-Type Deep Dive (BiBo-specific)
 # ============================================================
 
-def plot_grand_summary(all_metrics, stability_scores):
+def plot_expert_type_analysis(bibo_data_dict, bibo_cfg, seq_lens):
     """
-    Single-page dashboard summarizing key findings.
+    BiBo-specific deep analysis of expert types:
+    - Aggregate usage by activation type (SiLU vs ReLU² vs Tanh vs Identity vs Zero)
+    - Per-layer activation preference
+    - Activation preference by token position (unsorted vs sorted)
+    - Weight magnitude by expert type (are some types weighted higher?)
     """
+    expert_types = get_expert_types(bibo_cfg)
+    type_order = ['silu', 'relu2', 'tanh', 'identity', 'zero']
+    type_colors = [POLYGLU_COLORS.get(t, SPECIAL_COLORS.get(t, '#000')) for t in type_order]
+    type_labels = ['SiLU (SwiGLU)', 'ReLU² (ReGLU²)', 'Tanh (TanhGLU)', 'Identity', 'Zero']
+    
+    n_experts = len(expert_types)
+    # Map expert_id → type
+    expert_to_type = {i: expert_types[i] for i in range(n_experts)}
+    
+    fig = plt.figure(figsize=(18, 14))
+    gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.35, wspace=0.3)
+    
+    # --- Panel A: Aggregate usage by type across all layers/seq_lens ---
+    ax = fig.add_subplot(gs[0, 0])
+    type_counts = {t: 0 for t in type_order}
+    total_tokens = 0
+    
+    for sl, data in bibo_data_dict.items():
+        for layer_idx, ld in data.items():
+            idx = ld['indices'].numpy().flatten()
+            total_tokens += len(idx)
+            for exp_id in idx:
+                t = expert_to_type[exp_id]
+                type_counts[t] += 1
+    
+    fracs = [type_counts[t] / (total_tokens + 1e-10) for t in type_order]
+    bars = ax.bar(range(len(type_order)), fracs, color=type_colors, edgecolor='white', linewidth=1)
+    ax.set_xticks(range(len(type_order)))
+    ax.set_xticklabels(type_labels, rotation=20, fontsize=9)
+    ax.set_ylabel('Fraction of All Routing Decisions')
+    ax.set_title('A) Aggregate Expert-Type Usage', fontweight='bold')
+    # Count how many experts of each type
+    type_expert_count = {t: sum(1 for et in expert_types if et == t) for t in type_order}
+    for i, (t, frac) in enumerate(zip(type_order, fracs)):
+        n_of_type = type_expert_count[t]
+        expected = n_of_type / n_experts
+        ax.axhline(y=expected, xmin=(i-0.3)/len(type_order), xmax=(i+0.7)/len(type_order),
+                   color=type_colors[i], linestyle='--', alpha=0.4)
+        ax.text(i, frac + 0.005, f'×{n_of_type}', ha='center', fontsize=8, color='gray')
+    
+    # --- Panel B: Per-layer activation preference ---
+    ax = fig.add_subplot(gs[0, 1])
+    # Collect all layers across seq_lens
+    all_layers = set()
+    for data in bibo_data_dict.values():
+        all_layers.update(data.keys())
+    all_layers = sorted(all_layers)
+    
+    layer_type_usage = {l: {t: 0 for t in type_order} for l in all_layers}
+    layer_totals = {l: 0 for l in all_layers}
+    
+    for sl, data in bibo_data_dict.items():
+        for l, ld in data.items():
+            idx = ld['indices'].numpy().flatten()
+            layer_totals[l] += len(idx)
+            for exp_id in idx:
+                layer_type_usage[l][expert_to_type[exp_id]] += 1
+    
+    # Stacked bar
+    x = np.arange(len(all_layers))
+    bottom = np.zeros(len(all_layers))
+    for t_idx, t in enumerate(type_order):
+        vals = [layer_type_usage[l][t] / (layer_totals[l] + 1e-10) for l in all_layers]
+        ax.bar(x, vals, bottom=bottom, color=type_colors[t_idx], label=type_labels[t_idx],
+               edgecolor='white', linewidth=0.3)
+        bottom += np.array(vals)
+    
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'L{l}' for l in all_layers])
+    ax.set_ylabel('Fraction')
+    ax.set_title('B) Per-Layer Expert-Type Preference', fontweight='bold')
+    ax.legend(fontsize=7, loc='upper right')
+    ax.set_ylim(0, 1.05)
+    
+    # --- Panel C: Activation preference by position (unsorted vs sorted) ---
+    ax = fig.add_subplot(gs[1, 0])
+    unsorted_type_counts = {t: 0 for t in type_order}
+    sorted_type_counts = {t: 0 for t in type_order}
+    unsorted_total = 0
+    sorted_total = 0
+    
+    for sl, data in bibo_data_dict.items():
+        half = sl  # first half = unsorted, second half = sorted
+        for l, ld in data.items():
+            idx = ld['indices'].numpy()
+            if idx.ndim == 3:  # [bs, seq, top_k]
+                actual_seq = idx.shape[1]
+                unsorted_idx = idx[:, :min(half, actual_seq), :].flatten()
+                sorted_idx = idx[:, min(half, actual_seq):, :].flatten()
+            else:
+                unsorted_idx = idx[:half, :].flatten()
+                sorted_idx = idx[half:, :].flatten()
+            
+            unsorted_total += len(unsorted_idx)
+            sorted_total += len(sorted_idx)
+            for exp_id in unsorted_idx:
+                unsorted_type_counts[expert_to_type[exp_id]] += 1
+            for exp_id in sorted_idx:
+                sorted_type_counts[expert_to_type[exp_id]] += 1
+    
+    x = np.arange(len(type_order))
+    width = 0.35
+    unsorted_fracs = [unsorted_type_counts[t] / (unsorted_total + 1e-10) for t in type_order]
+    sorted_fracs = [sorted_type_counts[t] / (sorted_total + 1e-10) for t in type_order]
+    
+    ax.bar(x - width/2, unsorted_fracs, width, color='#FFA726', alpha=0.8, label='Unsorted (input)')
+    ax.bar(x + width/2, sorted_fracs, width, color='#66BB6A', alpha=0.8, label='Sorted (output)')
+    ax.set_xticks(x)
+    ax.set_xticklabels(type_labels, rotation=20, fontsize=9)
+    ax.set_ylabel('Fraction')
+    ax.set_title('C) Expert-Type Preference: Unsorted vs Sorted Tokens', fontweight='bold')
+    ax.legend()
+    
+    # --- Panel D: Average routing weight by expert type ---
+    ax = fig.add_subplot(gs[1, 1])
+    type_weight_sums = {t: 0.0 for t in type_order}
+    type_weight_counts = {t: 0 for t in type_order}
+    
+    for sl, data in bibo_data_dict.items():
+        for l, ld in data.items():
+            idx = ld['indices'].numpy()
+            weights = ld['weights'].numpy()
+            if idx.ndim == 3:
+                idx_flat = idx.reshape(-1)
+                weights_flat = weights.reshape(-1)
+            else:
+                idx_flat = idx.flatten()
+                weights_flat = weights.flatten()
+            
+            for exp_id, w in zip(idx_flat, weights_flat):
+                t = expert_to_type[exp_id]
+                type_weight_sums[t] += w
+                type_weight_counts[t] += 1
+    
+    avg_weights = [type_weight_sums[t] / (type_weight_counts[t] + 1e-10) for t in type_order]
+    bars = ax.bar(range(len(type_order)), avg_weights, color=type_colors, edgecolor='white', linewidth=1)
+    ax.set_xticks(range(len(type_order)))
+    ax.set_xticklabels(type_labels, rotation=20, fontsize=9)
+    ax.set_ylabel('Average Routing Weight')
+    ax.set_title('D) Avg Weight When Selected (confidence per type)', fontweight='bold')
+    for i, v in enumerate(avg_weights):
+        ax.text(i, v + 0.005, f'{v:.3f}', ha='center', fontsize=9)
+    
+    # --- Panel E: Expert-type co-selection patterns ---
+    ax = fig.add_subplot(gs[2, 0])
+    # Which types appear together most often?
+    type_cosel = np.zeros((len(type_order), len(type_order)))
+    type_to_idx = {t: i for i, t in enumerate(type_order)}
+    total_pairs = 0
+    
+    for sl, data in bibo_data_dict.items():
+        for l, ld in data.items():
+            idx = ld['indices'].numpy()
+            if idx.ndim == 3:
+                idx = idx.reshape(-1, idx.shape[-1])
+            for row in idx:
+                types_in_row = [expert_to_type[e] for e in row]
+                for a, b in combinations(types_in_row, 2):
+                    type_cosel[type_to_idx[a], type_to_idx[b]] += 1
+                    type_cosel[type_to_idx[b], type_to_idx[a]] += 1
+                    total_pairs += 1
+    
+    if total_pairs > 0:
+        type_cosel /= total_pairs
+    
+    mask = np.triu(np.ones_like(type_cosel, dtype=bool), k=0)
+    sns.heatmap(type_cosel, mask=mask, ax=ax, cmap='YlOrRd', annot=True, fmt='.4f',
+                xticklabels=type_labels, yticklabels=type_labels, square=True,
+                cbar_kws={'label': 'Co-selection freq', 'shrink': 0.8})
+    ax.set_title('E) Expert-Type Co-Selection\n(which activation types pair together)', fontweight='bold')
+    
+    # --- Panel F: Per-seq-len type preference evolution ---
+    ax = fig.add_subplot(gs[2, 1])
+    for t_idx, t in enumerate(type_order):
+        per_sl_fracs = []
+        for sl in sorted(bibo_data_dict.keys()):
+            data = bibo_data_dict[sl]
+            t_count = 0
+            total = 0
+            for l, ld in data.items():
+                idx = ld['indices'].numpy().flatten()
+                total += len(idx)
+                t_count += sum(1 for e in idx if expert_to_type[e] == t)
+            per_sl_fracs.append(t_count / (total + 1e-10))
+        ax.plot(sorted(bibo_data_dict.keys()), per_sl_fracs, 'o-',
+                color=type_colors[t_idx], linewidth=2, markersize=8, label=type_labels[t_idx])
+    
+    ax.set_xlabel('Sequence Length')
+    ax.set_ylabel('Fraction of Routing Decisions')
+    ax.set_title('F) Expert-Type Usage vs Sequence Length', fontweight='bold')
+    ax.legend(fontsize=8)
+    
+    fig.suptitle('BiBo PolyGLU Expert-Type Deep Dive\n'
+                 'How does the router utilize diverse activation functions?',
+                 fontsize=14, fontweight='bold', y=1.02)
+    plt.savefig(os.path.join(PLOTS_DIR, 'polyglu_expert_type_analysis.png'))
+    plt.close()
+    print(f"  ✓ polyglu_expert_type_analysis.png")
+
+
+# ============================================================
+# PLOT 15: Special expert analysis (Identity + Zero only)
+# ============================================================
+
+def plot_special_expert_analysis(bibo_data_dict, bibo_cfg, seq_lens):
+    """
+    BiBo-specific: how are Identity and Zero experts used?
+    Across seq_lens and layers.
+    """
+    expert_types = get_expert_types(bibo_cfg)
+    n_experts = len(expert_types)
+    
+    # Find indices of special experts
+    identity_ids = [i for i, t in enumerate(expert_types) if t == 'identity']
+    zero_ids = [i for i, t in enumerate(expert_types) if t == 'zero']
+    special_groups = [('Identity', identity_ids, SPECIAL_COLORS['identity']),
+                      ('Zero', zero_ids, SPECIAL_COLORS['zero'])]
+    
+    fig, axes = plt.subplots(1, len(seq_lens), figsize=(5*len(seq_lens), 5), squeeze=False)
+    
+    for col, sl in enumerate(seq_lens):
+        ax = axes[0, col]
+        if sl not in bibo_data_dict:
+            ax.set_visible(False)
+            continue
+        
+        data = bibo_data_dict[sl]
+        layers = sorted(data.keys())
+        
+        usage_matrix = np.zeros((len(special_groups), len(layers)))
+        for i, l in enumerate(layers):
+            idx = data[l]['indices'].numpy().flatten()
+            total = len(idx)
+            for j, (name, ids, color) in enumerate(special_groups):
+                count = sum((idx == eid).sum() for eid in ids)
+                usage_matrix[j, i] = count / total
+        
+        x = np.arange(len(layers))
+        bottom = np.zeros(len(layers))
+        for j, (name, ids, color) in enumerate(special_groups):
+            ax.bar(x, usage_matrix[j], bottom=bottom, color=color,
+                   label=f'{name} (×{len(ids)})', edgecolor='white', linewidth=0.5)
+            bottom += usage_matrix[j]
+        
+        ax.set_xticks(x)
+        ax.set_xticklabels([f'L{l}' for l in layers])
+        ax.set_ylabel('Fraction of Tokens')
+        ax.set_title(f'seq={sl}', fontweight='bold')
+        if col == 0:
+            ax.legend()
+    
+    plt.suptitle('BiBo — Special Expert Usage (Identity + Zero)\n'
+                 'These provide residual bypass and gradient dampening',
+                 fontsize=12, fontweight='bold', y=1.05)
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, 'special_expert_analysis.png'))
+    plt.close()
+    print(f"  ✓ special_expert_analysis.png")
+
+
+# ============================================================
+# PLOT 16: Expert switching rate
+# ============================================================
+
+def plot_expert_switching_rate(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_len):
+    """How often does the top-1 expert change between consecutive tokens?"""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    bibo_layers = sorted(bibo_data.keys())
+    bibo_switch_rates = []
+    for l in bibo_layers:
+        idx = bibo_data[l]['indices'].numpy()
+        if idx.ndim == 3:
+            switches = []
+            for b in range(idx.shape[0]):
+                top1 = idx[b, :, 0]
+                switches.append((top1[1:] != top1[:-1]).mean())
+            bibo_switch_rates.append(np.mean(switches))
+        else:
+            top1 = idx[:, 0]
+            bibo_switch_rates.append((top1[1:] != top1[:-1]).mean())
+    
+    qwen_layers = sorted(qwen_data.keys())
+    qwen_switch_rates = []
+    for l in qwen_layers:
+        idx = qwen_data[l]['indices'].numpy()
+        if idx.ndim == 3:
+            switches = []
+            for b in range(idx.shape[0]):
+                top1 = idx[b, :, 0]
+                switches.append((top1[1:] != top1[:-1]).mean())
+            qwen_switch_rates.append(np.mean(switches))
+        else:
+            top1 = idx[:, 0]
+            qwen_switch_rates.append((top1[1:] != top1[:-1]).mean())
+    
+    all_layer_ids = sorted(set(bibo_layers) | set(qwen_layers))
+    layer_to_pos = {l: i for i, l in enumerate(all_layer_ids)}
+    bibo_pos = np.array([layer_to_pos[l] for l in bibo_layers])
+    qwen_pos = np.array([layer_to_pos[l] for l in qwen_layers])
+    width = 0.35
+    
+    ax1.bar(bibo_pos - width/2, bibo_switch_rates, width, color=BIBO_COLOR, alpha=0.8, label='BiBo')
+    ax1.bar(qwen_pos + width/2, qwen_switch_rates, width, color=QWEN_COLOR, alpha=0.8, label='Qwen3MoE')
+    ax1.set_xticks(np.arange(len(all_layer_ids)))
+    ax1.set_xticklabels([f'L{l}' for l in all_layer_ids])
+    ax1.set_ylabel('Switch Rate')
+    ax1.set_title('Top-1 Expert Switch Rate per Layer', fontweight='bold')
+    ax1.legend()
+    ax1.set_ylim(0, 1)
+    
+    expected_random_bibo = 1 - 1/n_exp_bibo
+    expected_random_qwen = 1 - 1/n_exp_qwen
+    ax1.axhline(y=expected_random_bibo, color=BIBO_COLOR, linestyle='--', alpha=0.4)
+    ax1.axhline(y=expected_random_qwen, color=QWEN_COLOR, linestyle='--', alpha=0.4)
+    
+    # Per-position switch visualization
+    ax2_layer = bibo_layers[0]
+    bibo_idx = bibo_data[ax2_layer]['indices'].numpy()
+    qwen_idx = qwen_data[qwen_layers[0]]['indices'].numpy()
+    
+    if bibo_idx.ndim == 3:
+        bibo_top1 = bibo_idx[0, :, 0]
+    else:
+        bibo_top1 = bibo_idx[:, 0]
+    
+    if qwen_idx.ndim == 3:
+        qwen_top1 = qwen_idx[0, :, 0]
+    else:
+        seq_len_actual = len(bibo_top1)
+        qwen_top1 = qwen_idx[:seq_len_actual, 0]
+    
+    bibo_switches = np.where(bibo_top1[1:] != bibo_top1[:-1])[0]
+    qwen_switches = np.where(qwen_top1[1:] != qwen_top1[:-1])[0]
+    
+    ax2.eventplot([bibo_switches, qwen_switches], lineoffsets=[1, 0],
+                  linelengths=0.8, colors=[BIBO_COLOR, QWEN_COLOR])
+    ax2.set_yticks([0, 1])
+    ax2.set_yticklabels(['Qwen3MoE', 'BiBo'])
+    ax2.set_xlabel('Token Position')
+    ax2.set_title(f'Switch Events (L{ax2_layer}, first sample)', fontweight='bold')
+    ax2.axvline(x=seq_len, color='green', linestyle=':', alpha=0.6, label='SEP')
+    ax2.legend()
+    
+    plt.suptitle(f'Expert Switching Analysis — seq={seq_len}', fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, f'switching_rate_seq{seq_len}.png'))
+    plt.close()
+    print(f"  ✓ switching_rate_seq{seq_len}.png")
+
+
+# ============================================================
+# PLOT 17: Grand summary dashboard
+# ============================================================
+
+def plot_grand_summary(all_metrics, stability_scores, bibo_cfg):
+    """Single-page dashboard summarizing key findings."""
     fig = plt.figure(figsize=(16, 10))
     gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.4, wspace=0.3)
     
@@ -1054,7 +1339,6 @@ def plot_grand_summary(all_metrics, stability_scores):
     metrics_to_show = ['gini', 'normalized_entropy', 'cv']
     labels_show = ['Gini ↓', 'Norm. Entropy ↑', 'CV ↓']
     
-    # Average across all configs
     bibo_avgs = {m: [] for m in metrics_to_show}
     qwen_avgs = {m: [] for m in metrics_to_show}
     for key, metrics in all_metrics.items():
@@ -1097,7 +1381,7 @@ def plot_grand_summary(all_metrics, stability_scores):
         ax2.set_title('Routing Stability', fontweight='bold')
         ax2.set_ylim(0, 1)
     
-    # --- Panel 3: Winner annotation ---
+    # --- Panel 3: Findings ---
     ax3 = fig.add_subplot(gs[1, 1:])
     ax3.axis('off')
     
@@ -1118,10 +1402,13 @@ def plot_grand_summary(all_metrics, stability_scores):
         else:
             findings.append("~ Qwen routing is more stable (expected: simpler router)")
     
-    findings.append(f"\nBiBo: Skywork-MoE norm (λ={CFG['bibo']['router_lambda']}) + Conv router")
-    findings.append(f"Qwen: Raw softmax + linear projection")
-    findings.append(f"\nKey insight: Skywork normalization prevents top-1 dominance")
-    findings.append(f"→ All top-K experts contribute meaningfully")
+    poly_mult = bibo_cfg.get('polyglu_expert_multiplier', 2)
+    special_pairs = bibo_cfg.get('special_expert_pairs', 1)
+    n_routed = poly_mult * 3 + special_pairs * 2
+    findings.append(f"\nBiBo: PolyGLU ({poly_mult}×[SiLU,ReLU²,Tanh]) + {special_pairs}×[Id,Zero] = {n_routed} experts")
+    findings.append(f"Router: Skywork-MoE norm (λ={bibo_cfg.get('router_lambda', 1.0)}) + Conv")
+    findings.append(f"Qwen: {CFG['qwen3moe']['num_experts']} homogeneous MLP experts + linear router")
+    findings.append(f"\nKey insight: PolyGLU diversity + logit norm → all experts contribute")
     
     text = '\n'.join(findings)
     ax3.text(0.05, 0.95, text, transform=ax3.transAxes, fontsize=10,
@@ -1133,16 +1420,17 @@ def plot_grand_summary(all_metrics, stability_scores):
     ax4 = fig.add_subplot(gs[2, :])
     ax4.axis('off')
     
+    expert_desc = f'PolyGLU({poly_mult}×3) + Special({special_pairs}×2)'
     config_text = (
         f"{'='*80}\n"
-        f"{'Config':<20} {'BiBo':<30} {'Qwen3MoE':<30}\n"
+        f"{'Config':<20} {'BiBo':<35} {'Qwen3MoE':<30}\n"
         f"{'='*80}\n"
-        f"{'Experts':<20} {CFG['bibo']['num_routed_experts']:<30} {CFG['qwen3moe']['num_experts']:<30}\n"
-        f"{'Top-K':<20} {CFG['bibo']['num_experts_per_tok']:<30} {CFG['qwen3moe']['num_experts_per_tok']:<30}\n"
-        f"{'Router':<20} {'Conv (k=3) + Skywork norm':<30} {'Linear + softmax':<30}\n"
-        f"{'Expert types':<20} {'MLP×5 + Id + Zero + ReLU²':<30} {'MLP×8 (homogeneous)':<30}\n"
-        f"{'Shared expert':<20} {'CausalConv1D (always on)':<30} {'MLP (always on)':<30}\n"
-        f"{'Load balance':<20} {'Heuristic bias update':<30} {'Aux loss (Switch)':<30}\n"
+        f"{'Experts':<20} {n_routed:<35} {CFG['qwen3moe']['num_experts']:<30}\n"
+        f"{'Top-K':<20} {bibo_cfg['num_experts_per_tok']:<35} {CFG['qwen3moe']['num_experts_per_tok']:<30}\n"
+        f"{'Router':<20} {'Conv (k=3) + Skywork norm':<35} {'Linear + softmax':<30}\n"
+        f"{'Expert types':<20} {expert_desc:<35} {'MLP×8 (homogeneous)':<30}\n"
+        f"{'Shared expert':<20} {'CausalConv1D (always on)':<35} {'MLP (always on)':<30}\n"
+        f"{'Load balance':<20} {'Heuristic bias update':<35} {'Aux loss (Switch)':<30}\n"
         f"{'='*80}"
     )
     ax4.text(0.02, 0.95, config_text, transform=ax4.transAxes, fontsize=8,
@@ -1156,13 +1444,12 @@ def plot_grand_summary(all_metrics, stability_scores):
     print(f"  ✓ grand_summary_dashboard.png")
 
 
-
 # ============================================================
-# PLOT 15: Per-layer weight distribution (KDE)
+# PLOT 18: Per-layer weight KDE
 # ============================================================
 
 def plot_per_layer_weight_kde(bibo_data, qwen_data, seq_len):
-    """KDE of routing weights per layer — shows distribution shape."""
+    """KDE of routing weights per layer."""
     bibo_layers = sorted(bibo_data.keys())
     qwen_layers = sorted(qwen_data.keys())
     n_layers = max(len(bibo_layers), len(qwen_layers))
@@ -1170,7 +1457,6 @@ def plot_per_layer_weight_kde(bibo_data, qwen_data, seq_len):
     fig, axes = plt.subplots(n_layers, 2, figsize=(12, 3*n_layers), squeeze=False)
     
     for i in range(n_layers):
-        # BiBo
         ax = axes[i, 0]
         if i < len(bibo_layers):
             bl = bibo_layers[i]
@@ -1181,13 +1467,11 @@ def plot_per_layer_weight_kde(bibo_data, qwen_data, seq_len):
                 sns.kdeplot(w[:, k], ax=ax, label=f'Rank-{k+1}', linewidth=1.5)
             ax.set_xlim(0, 1)
             ax.set_title(f'BiBo L{bl}', color=BIBO_COLOR, fontweight='bold')
-            ax.set_xlabel('Weight')
             if i == 0:
                 ax.legend(fontsize=7)
         else:
             ax.set_visible(False)
         
-        # Qwen
         ax = axes[i, 1]
         if i < len(qwen_layers):
             ql = qwen_layers[i]
@@ -1198,14 +1482,12 @@ def plot_per_layer_weight_kde(bibo_data, qwen_data, seq_len):
                 sns.kdeplot(w[:, k], ax=ax, label=f'Rank-{k+1}', linewidth=1.5)
             ax.set_xlim(0, 1)
             ax.set_title(f'Qwen L{ql}', color=QWEN_COLOR, fontweight='bold')
-            ax.set_xlabel('Weight')
             if i == 0:
                 ax.legend(fontsize=7)
         else:
             ax.set_visible(False)
     
-    plt.suptitle(f'Per-Layer Weight Distribution (KDE) — seq={seq_len}\n'
-                 'Peaked near 1.0 = top-1 dominance | Spread = balanced contribution',
+    plt.suptitle(f'Per-Layer Weight Distribution (KDE) — seq={seq_len}',
                  fontsize=11, fontweight='bold', y=1.02)
     plt.tight_layout()
     plt.savefig(os.path.join(PLOTS_DIR, f'weight_kde_per_layer_seq{seq_len}.png'))
@@ -1214,186 +1496,27 @@ def plot_per_layer_weight_kde(bibo_data, qwen_data, seq_len):
 
 
 # ============================================================
-# PLOT 16: Expert switching rate
-# ============================================================
-
-def plot_expert_switching_rate(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_len):
-    """
-    How often does the top-1 expert change between consecutive tokens?
-    High switching = router is position-sensitive. Low = sticky routing.
-    """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-    
-    # BiBo
-    bibo_layers = sorted(bibo_data.keys())
-    bibo_switch_rates = []
-    for l in bibo_layers:
-        idx = bibo_data[l]['indices'].numpy()
-        if idx.ndim == 3:
-            # Average across batch
-            switches = []
-            for b in range(idx.shape[0]):
-                top1 = idx[b, :, 0]
-                switch = (top1[1:] != top1[:-1]).mean()
-                switches.append(switch)
-            bibo_switch_rates.append(np.mean(switches))
-        else:
-            top1 = idx[:, 0]
-            bibo_switch_rates.append((top1[1:] != top1[:-1]).mean())
-    
-    # Qwen
-    qwen_layers = sorted(qwen_data.keys())
-    qwen_switch_rates = []
-    for l in qwen_layers:
-        idx = qwen_data[l]['indices'].numpy()
-        if idx.ndim == 3:
-            switches = []
-            for b in range(idx.shape[0]):
-                top1 = idx[b, :, 0]
-                switch = (top1[1:] != top1[:-1]).mean()
-                switches.append(switch)
-            qwen_switch_rates.append(np.mean(switches))
-        else:
-            top1 = idx[:, 0]
-            qwen_switch_rates.append((top1[1:] != top1[:-1]).mean())
-    
-    # Handle different number of MoE layers between models
-    all_layer_ids = sorted(set(bibo_layers) | set(qwen_layers))
-    n_total = len(all_layer_ids)
-    layer_to_pos = {l: i for i, l in enumerate(all_layer_ids)}
-    
-    bibo_pos = np.array([layer_to_pos[l] for l in bibo_layers])
-    qwen_pos = np.array([layer_to_pos[l] for l in qwen_layers])
-    width = 0.35
-    
-    ax1.bar(bibo_pos - width/2, bibo_switch_rates, width, color=BIBO_COLOR, alpha=0.8, label='BiBo')
-    ax1.bar(qwen_pos + width/2, qwen_switch_rates, width, color=QWEN_COLOR, alpha=0.8, label='Qwen3MoE')
-    
-    ax1.set_xticks(np.arange(n_total))
-    ax1.set_xticklabels([f'L{l}' for l in all_layer_ids])
-    ax1.set_ylabel('Switch Rate')
-    ax1.set_title('Top-1 Expert Switch Rate per Layer\n(fraction of consecutive tokens with different top-1)',
-                  fontweight='bold')
-    ax1.legend()
-    ax1.set_ylim(0, 1)
-    
-    # Expected switch rate for random routing
-    expected_random_bibo = 1 - 1/n_exp_bibo
-    expected_random_qwen = 1 - 1/n_exp_qwen
-    ax1.axhline(y=expected_random_bibo, color=BIBO_COLOR, linestyle='--', alpha=0.4,
-                label=f'Random BiBo ({expected_random_bibo:.2f})')
-    ax1.axhline(y=expected_random_qwen, color=QWEN_COLOR, linestyle='--', alpha=0.4,
-                label=f'Random Qwen ({expected_random_qwen:.2f})')
-    
-    # Per-position switch visualization (first sample, first MoE layer)
-    ax2_layer = bibo_layers[0]
-    bibo_idx = bibo_data[ax2_layer]['indices'].numpy()
-    qwen_idx = qwen_data[qwen_layers[0]]['indices'].numpy()
-    
-    if bibo_idx.ndim == 3:
-        bibo_top1 = bibo_idx[0, :, 0]
-    else:
-        bibo_top1 = bibo_idx[:, 0]
-    
-    if qwen_idx.ndim == 3:
-        qwen_top1 = qwen_idx[0, :, 0]
-    else:
-        # Qwen returns [bs*seq, top_k] — take first seq_len tokens
-        seq_len_actual = len(bibo_top1) if bibo_idx.ndim == 3 else len(bibo_top1)
-        qwen_top1 = qwen_idx[:seq_len_actual, 0]
-    
-    bibo_switches = np.where(bibo_top1[1:] != bibo_top1[:-1])[0]
-    qwen_switches = np.where(qwen_top1[1:] != qwen_top1[:-1])[0]
-    
-    ax2.eventplot([bibo_switches, qwen_switches], lineoffsets=[1, 0],
-                  linelengths=0.8, colors=[BIBO_COLOR, QWEN_COLOR])
-    ax2.set_yticks([0, 1])
-    ax2.set_yticklabels(['Qwen3MoE', 'BiBo'])
-    ax2.set_xlabel('Token Position')
-    ax2.set_title(f'Switch Events (L{ax2_layer}, first sample)\n'
-                  'Each tick = top-1 expert changed', fontweight='bold')
-    ax2.axvline(x=seq_len, color='green', linestyle=':', alpha=0.6, label='SEP')
-    ax2.legend()
-    
-    plt.suptitle(f'Expert Switching Analysis — seq={seq_len}', fontsize=13, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(os.path.join(PLOTS_DIR, f'switching_rate_seq{seq_len}.png'))
-    plt.close()
-    print(f"  ✓ switching_rate_seq{seq_len}.png")
-
-
-# ============================================================
-# PLOT 17: BiBo special expert analysis
-# ============================================================
-
-def plot_special_expert_analysis(bibo_data_dict, n_experts, seq_lens):
-    """
-    BiBo-specific: how are Identity, Zero, ReLU² experts used?
-    Across seq_lens and layers.
-    """
-    n_mlp = n_experts - 3
-    special_names = ['Identity', 'Zero', 'ReLU²']
-    special_ids = [n_mlp, n_mlp + 1, n_mlp + 2]
-    special_colors = ['#4CAF50', '#9E9E9E', '#FF5722']
-    
-    fig, axes = plt.subplots(1, len(seq_lens), figsize=(5*len(seq_lens), 5), squeeze=False)
-    
-    for col, sl in enumerate(seq_lens):
-        ax = axes[0, col]
-        if sl not in bibo_data_dict:
-            ax.set_visible(False)
-            continue
-        
-        data = bibo_data_dict[sl]
-        layers = sorted(data.keys())
-        
-        # Per-layer usage of each special expert
-        usage_matrix = np.zeros((3, len(layers)))
-        for i, l in enumerate(layers):
-            idx = data[l]['indices'].numpy().flatten()
-            total = len(idx)
-            for j, exp_id in enumerate(special_ids):
-                usage_matrix[j, i] = (idx == exp_id).sum() / total
-        
-        x = np.arange(len(layers))
-        bottom = np.zeros(len(layers))
-        for j in range(3):
-            ax.bar(x, usage_matrix[j], bottom=bottom, color=special_colors[j],
-                   label=special_names[j], edgecolor='white', linewidth=0.5)
-            bottom += usage_matrix[j]
-        
-        ax.set_xticks(x)
-        ax.set_xticklabels([f'L{l}' for l in layers])
-        ax.set_ylabel('Fraction of Tokens')
-        ax.set_title(f'seq={sl}', fontweight='bold')
-        if col == 0:
-            ax.legend()
-    
-    plt.suptitle('BiBo — Special Expert Usage (Identity + Zero + ReLU²)\n'
-                 'These provide architectural diversity beyond standard SwiGLU MLPs',
-                 fontsize=12, fontweight='bold', y=1.05)
-    plt.tight_layout()
-    plt.savefig(os.path.join(PLOTS_DIR, 'special_expert_analysis.png'))
-    plt.close()
-    print(f"  ✓ special_expert_analysis.png")
-
-
-
-# ============================================================
 # Main orchestrator
 # ============================================================
 
 def main():
     print("=" * 70)
-    print("  COMPREHENSIVE ROUTER ANALYSIS — BiBo vs Qwen3MoE")
+    print("  COMPREHENSIVE ROUTER ANALYSIS — BiBo (PolyGLU) vs Qwen3MoE")
     print("=" * 70)
     
-    n_exp_bibo = CFG['bibo']['num_routed_experts']
+    bibo_cfg = CFG['bibo']
+    poly_mult = bibo_cfg.get('polyglu_expert_multiplier', 2)
+    special_pairs = bibo_cfg.get('special_expert_pairs', 1)
+    n_exp_bibo = poly_mult * 3 + special_pairs * 2
     n_exp_qwen = CFG['qwen3moe']['num_experts']
-    top_k = CFG['bibo']['num_experts_per_tok']
+    top_k = bibo_cfg['num_experts_per_tok']
     
-    # Load validation data (all buckets)
-    print("\n[1/5] Loading data...")
+    print(f"\n  BiBo experts: {poly_mult}×[SiLU,ReLU²,Tanh] + {special_pairs}×[Identity,Zero] = {n_exp_bibo}")
+    print(f"  Qwen experts: {n_exp_qwen} homogeneous MLPs")
+    print(f"  Top-K: {top_k}")
+    
+    # Load validation data
+    print("\n[1/6] Loading data...")
     val_data = {}
     for sl in [64, 128, 256]:
         path = os.path.join(BASE_DIR, 'data', f'val_len_{sl}.npy')
@@ -1402,19 +1525,19 @@ def main():
             print(f"  Loaded val_len_{sl}: {val_data[sl].shape}")
     
     if not val_data:
-        print("ERROR: No validation data found. Run `python kaggle_multi_gpu/data.py` first.")
+        print("ERROR: No validation data found. Run `python misc/kaggle/multi_gpu/data.py` first.")
         sys.exit(1)
     
     available_seq_lens = sorted(val_data.keys())
     batch_sizes = [1, 5, 20, 64]
     
     # Load models
-    print("\n[2/5] Loading models...")
+    print("\n[2/6] Loading models...")
     device_bibo = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     device_qwen = 'cuda:1' if torch.cuda.device_count() > 1 else device_bibo
     
-    bibo_cfg = {k: v for k, v in CFG['bibo'].items() if k != 'device'}
-    bibo_model = BiBoForCausalLM(BiBoConfig(**bibo_cfg))
+    bibo_model_cfg = {k: v for k, v in bibo_cfg.items() if k != 'device'}
+    bibo_model = BiBoForCausalLM(BiBoConfig(**bibo_model_cfg))
     
     bibo_ckpt = os.path.join(BASE_DIR, 'checkpoints', 'bibo.pt')
     if os.path.exists(bibo_ckpt):
@@ -1435,235 +1558,131 @@ def main():
         print(f"  Qwen3MoE: NO CHECKPOINT (using random init) → {device_qwen}")
     qwen_model = qwen_model.to(device_qwen)
     
-    # ============================================================
-    # Phase 3: Multi-batch, multi-seq extraction
-    # ============================================================
-    print("\n[3/5] Extracting routing data (multi-batch × multi-seq)...")
-    
-    bibo_all_data = {}   # (seq_len, batch_size) → layer_data
+    # Extract routing data
+    print("\n[3/6] Extracting routing data...")
+    bibo_all_data = {}  # (seq_len, batch_size) → layer_data
     qwen_all_data = {}
-    all_metrics = {}     # (model, seq_len, batch_size) → metrics dict
+    bibo_by_seq = {}    # seq_len → layer_data (for expert-type analysis)
     
     for sl in available_seq_lens:
         for bs in batch_sizes:
             if bs > len(val_data[sl]):
                 continue
-            
             batch = torch.tensor(val_data[sl][:bs, :-1], dtype=torch.long)
             
-            print(f"  seq={sl}, batch={bs}...")
             bibo_ld = extract_routing_data(bibo_model, batch, device_bibo, 'bibo')
             qwen_ld = extract_routing_data(qwen_model, batch, device_qwen, 'qwen')
             
             bibo_all_data[(sl, bs)] = bibo_ld
             qwen_all_data[(sl, bs)] = qwen_ld
             
-            # Compute metrics
-            bibo_indices_flat = np.concatenate([
-                ld['indices'].numpy().reshape(-1, ld['indices'].shape[-1]) for ld in bibo_ld.values()
-            ])
-            qwen_indices_flat = np.concatenate([
-                ld['indices'].numpy().reshape(-1, ld['indices'].shape[-1]) for ld in qwen_ld.values()
-            ])
+            # Keep largest batch for per-seq analysis
+            if sl not in bibo_by_seq or bs > list(bibo_by_seq[sl].values())[0]['indices'].shape[0]:
+                bibo_by_seq[sl] = bibo_ld
             
-            all_metrics[('BiBo', sl, bs)] = compute_load_balance_metrics(bibo_indices_flat, n_exp_bibo, top_k)
-            all_metrics[('Qwen3MoE', sl, bs)] = compute_load_balance_metrics(qwen_indices_flat, n_exp_qwen, top_k)
+            print(f"  seq={sl}, batch={bs} ✓")
     
-    # ============================================================
-    # Phase 4: Generate all plots
-    # ============================================================
-    print("\n[4/5] Generating plots...")
+    # Compute metrics
+    print("\n[4/6] Computing metrics...")
+    all_metrics = {}
+    for (sl, bs), data in bibo_all_data.items():
+        indices = np.concatenate([
+            ld['indices'].numpy().reshape(-1, ld['indices'].shape[-1]) for ld in data.values()
+        ])
+        all_metrics[('BiBo', sl, bs)] = compute_load_balance_metrics(indices, n_exp_bibo, top_k)
     
-    # --- Plot 1: Usage sweep ---
-    print("\n  --- Expert Usage Sweep ---")
-    plot_expert_usage_sweep(bibo_all_data, 'BiBo', n_exp_bibo, batch_sizes, available_seq_lens)
+    for (sl, bs), data in qwen_all_data.items():
+        indices = np.concatenate([
+            ld['indices'].numpy().reshape(-1, ld['indices'].shape[-1]) for ld in data.values()
+        ])
+        all_metrics[('Qwen3MoE', sl, bs)] = compute_load_balance_metrics(indices, n_exp_qwen, top_k)
+    
+    # Generate plots
+    print("\n[5/6] Generating plots...")
+    
+    # Usage sweep
+    plot_expert_usage_sweep(bibo_all_data, 'BiBo', n_exp_bibo, batch_sizes, available_seq_lens, bibo_cfg)
     plot_expert_usage_sweep(qwen_all_data, 'Qwen3MoE', n_exp_qwen, batch_sizes, available_seq_lens)
     
-    # --- Plot 2: Comparative usage (largest batch, each seq_len) ---
-    print("\n  --- Comparative Usage ---")
+    # Per seq_len plots
+    primary_bs = 64
     for sl in available_seq_lens:
-        # Find largest available batch
-        max_bs = max(bs for bs in batch_sizes if (sl, bs) in bibo_all_data)
-        plot_comparative_usage(
-            bibo_all_data[(sl, max_bs)], qwen_all_data[(sl, max_bs)],
-            n_exp_bibo, n_exp_qwen, sl, max_bs
-        )
+        key = (sl, primary_bs)
+        if key not in bibo_all_data:
+            key = (sl, batch_sizes[-1])
+        if key not in bibo_all_data:
+            continue
+        
+        bibo_ld = bibo_all_data[key]
+        qwen_ld = qwen_all_data[key]
+        
+        plot_comparative_usage(bibo_ld, qwen_ld, n_exp_bibo, n_exp_qwen, sl, key[1], bibo_cfg)
+        plot_confidence_distribution(bibo_ld, qwen_ld, sl)
+        plot_coselection_matrix(bibo_ld, qwen_ld, n_exp_bibo, n_exp_qwen, sl, bibo_cfg)
+        plot_position_type_routing(bibo_ld, 'BiBo', n_exp_bibo, sl, bibo_cfg)
+        plot_position_type_routing(qwen_ld, 'Qwen3MoE', n_exp_qwen, sl)
+        plot_specialization_radar(bibo_ld, qwen_ld, n_exp_bibo, n_exp_qwen, sl, bibo_cfg)
+        plot_token_expert_heatmap_v2(bibo_ld, 'BiBo', n_exp_bibo, sl, bibo_cfg)
+        plot_token_expert_heatmap_v2(qwen_ld, 'Qwen3MoE', n_exp_qwen, sl)
+        plot_confidence_evolution_comparative(bibo_ld, qwen_ld, sl)
+        plot_entropy_evolution_comparative(bibo_ld, qwen_ld, sl)
+        plot_weight_rank_distribution(bibo_ld, qwen_ld, sl)
+        plot_routing_diversity(bibo_ld, qwen_ld, n_exp_bibo, n_exp_qwen, sl, key[1])
+        plot_expert_switching_rate(bibo_ld, qwen_ld, n_exp_bibo, n_exp_qwen, sl)
+        plot_per_layer_weight_kde(bibo_ld, qwen_ld, sl)
     
-    # --- Plot 3: Confidence distribution ---
-    print("\n  --- Confidence Distribution ---")
-    for sl in available_seq_lens:
-        max_bs = max(bs for bs in batch_sizes if (sl, bs) in bibo_all_data)
-        plot_confidence_distribution(
-            bibo_all_data[(sl, max_bs)], qwen_all_data[(sl, max_bs)], sl
-        )
+    # PolyGLU expert-type deep dive (BiBo-specific)
+    print("\n  --- PolyGLU Expert-Type Analysis ---")
+    plot_expert_type_analysis(bibo_by_seq, bibo_cfg, available_seq_lens)
+    plot_special_expert_analysis(bibo_by_seq, bibo_cfg, available_seq_lens)
     
-    # --- Plot 4: Co-selection ---
-    print("\n  --- Expert Co-Selection ---")
-    for sl in available_seq_lens:
-        max_bs = max(bs for bs in batch_sizes if (sl, bs) in bibo_all_data)
-        plot_coselection_matrix(
-            bibo_all_data[(sl, max_bs)], qwen_all_data[(sl, max_bs)],
-            n_exp_bibo, n_exp_qwen, sl
-        )
-    
-    # --- Plot 5: Position-type routing ---
-    print("\n  --- Position-Type Routing ---")
-    for sl in available_seq_lens:
-        max_bs = max(bs for bs in batch_sizes if (sl, bs) in bibo_all_data)
-        plot_position_type_routing(bibo_all_data[(sl, max_bs)], 'BiBo', n_exp_bibo, sl)
-        plot_position_type_routing(qwen_all_data[(sl, max_bs)], 'Qwen3MoE', n_exp_qwen, sl)
-    
-    # --- Plot 6: Specialization radar ---
-    print("\n  --- Specialization Radar ---")
-    for sl in available_seq_lens:
-        max_bs = max(bs for bs in batch_sizes if (sl, bs) in bibo_all_data)
-        plot_specialization_radar(
-            bibo_all_data[(sl, max_bs)], qwen_all_data[(sl, max_bs)],
-            n_exp_bibo, n_exp_qwen, sl
-        )
-    
-    # --- Plot 7: Token-expert heatmap v2 ---
-    print("\n  --- Token-Expert Heatmaps ---")
-    for sl in available_seq_lens:
-        # Use single sample for heatmap clarity
-        if (sl, 1) in bibo_all_data:
-            plot_token_expert_heatmap_v2(bibo_all_data[(sl, 1)], 'BiBo', n_exp_bibo, sl)
-            plot_token_expert_heatmap_v2(qwen_all_data[(sl, 1)], 'Qwen3MoE', n_exp_qwen, sl)
-    
-    # --- Plot 8: Confidence evolution ---
-    print("\n  --- Confidence Evolution ---")
-    for sl in available_seq_lens:
-        max_bs = max(bs for bs in batch_sizes if (sl, bs) in bibo_all_data)
-        plot_confidence_evolution_comparative(
-            bibo_all_data[(sl, max_bs)], qwen_all_data[(sl, max_bs)], sl
-        )
-    
-    # --- Plot 9: Entropy evolution ---
-    print("\n  --- Entropy Evolution ---")
-    for sl in available_seq_lens:
-        max_bs = max(bs for bs in batch_sizes if (sl, bs) in bibo_all_data)
-        plot_entropy_evolution_comparative(
-            bibo_all_data[(sl, max_bs)], qwen_all_data[(sl, max_bs)], sl
-        )
-    
-    # --- Plot 10: Load balance summary ---
-    print("\n  --- Load Balance Summary ---")
+    # Load balance summary
     plot_load_balance_summary(all_metrics)
     
-    # --- Plot 11: Weight rank distribution ---
-    print("\n  --- Weight Rank Distribution ---")
-    for sl in available_seq_lens:
-        max_bs = max(bs for bs in batch_sizes if (sl, bs) in bibo_all_data)
-        plot_weight_rank_distribution(
-            bibo_all_data[(sl, max_bs)], qwen_all_data[(sl, max_bs)], sl
-        )
-    
-    # --- Plot 12: Routing diversity ---
-    print("\n  --- Routing Diversity ---")
-    for sl in available_seq_lens:
-        max_bs = max(bs for bs in batch_sizes if (sl, bs) in bibo_all_data)
-        plot_routing_diversity(
-            bibo_all_data[(sl, max_bs)], qwen_all_data[(sl, max_bs)],
-            n_exp_bibo, n_exp_qwen, sl, max_bs
-        )
-    
-    # --- Plot 13: Routing stability ---
+    # Stability analysis
     print("\n  --- Routing Stability ---")
     stability_scores = {}
-    for sl in available_seq_lens:
-        if len(val_data[sl]) >= 20:
-            s_bibo = plot_routing_stability(
-                bibo_model, device_bibo, 'bibo', 'BiBo', n_exp_bibo, val_data[sl], sl
-            )
-            stability_scores[f'BiBo_seq{sl}'] = s_bibo
-            
-            s_qwen = plot_routing_stability(
-                qwen_model, device_qwen, 'qwen', 'Qwen3MoE', n_exp_qwen, val_data[sl], sl
-            )
-            stability_scores[f'Qwen3MoE_seq{sl}'] = s_qwen
+    for sl in available_seq_lens[:2]:  # Only first 2 seq_lens (expensive)
+        if sl in val_data:
+            s = plot_routing_stability(bibo_model, device_bibo, 'bibo', 'BiBo', n_exp_bibo, val_data[sl], sl)
+            stability_scores[f'BiBo_seq{sl}'] = s
+            s = plot_routing_stability(qwen_model, device_qwen, 'qwen', 'Qwen3MoE', n_exp_qwen, val_data[sl], sl)
+            stability_scores[f'Qwen3MoE_seq{sl}'] = s
     
-    # --- Plot 15: Per-layer weight KDE ---
-    print("\n  --- Per-Layer Weight KDE ---")
-    for sl in available_seq_lens:
-        max_bs = max(bs for bs in batch_sizes if (sl, bs) in bibo_all_data)
-        plot_per_layer_weight_kde(
-            bibo_all_data[(sl, max_bs)], qwen_all_data[(sl, max_bs)], sl
-        )
+    # Grand summary
+    plot_grand_summary(all_metrics, stability_scores, bibo_cfg)
     
-    # --- Plot 16: Expert switching rate ---
-    print("\n  --- Expert Switching Rate ---")
-    for sl in available_seq_lens:
-        max_bs = max(bs for bs in batch_sizes if (sl, bs) in bibo_all_data)
-        plot_expert_switching_rate(
-            bibo_all_data[(sl, max_bs)], qwen_all_data[(sl, max_bs)],
-            n_exp_bibo, n_exp_qwen, sl
-        )
-    
-    # --- Plot 17: BiBo special expert analysis ---
-    print("\n  --- BiBo Special Expert Analysis ---")
-    bibo_by_seq = {}
-    for sl in available_seq_lens:
-        max_bs = max(bs for bs in batch_sizes if (sl, bs) in bibo_all_data)
-        bibo_by_seq[sl] = bibo_all_data[(sl, max_bs)]
-    plot_special_expert_analysis(bibo_by_seq, n_exp_bibo, available_seq_lens)
-    
-    # --- Plot 14: Grand summary dashboard ---
-    print("\n  --- Grand Summary Dashboard ---")
-    plot_grand_summary(all_metrics, stability_scores)
-    
-    # ============================================================
-    # Phase 5: Save metrics JSON
-    # ============================================================
-    print("\n[5/5] Saving metrics...")
-    
-    # Convert metrics for JSON serialization
-    json_metrics = {}
-    for key, metrics in all_metrics.items():
-        model, sl, bs = key
-        json_key = f"{model}_seq{sl}_bs{bs}"
-        json_metrics[json_key] = metrics
-    
-    json_metrics['stability_scores'] = stability_scores
-    json_metrics['config'] = {
-        'bibo_experts': n_exp_bibo,
-        'qwen_experts': n_exp_qwen,
-        'top_k': top_k,
-        'seq_lens_analyzed': available_seq_lens,
-        'batch_sizes_analyzed': batch_sizes,
+    # Save metrics
+    print("\n[6/6] Saving metrics...")
+    metrics_out = {
+        'config': {
+            'bibo': {
+                'polyglu_expert_multiplier': poly_mult,
+                'special_expert_pairs': special_pairs,
+                'num_routed_experts': n_exp_bibo,
+                'num_experts_per_tok': top_k,
+                'router_type': bibo_cfg.get('router_type', 'conv'),
+                'router_lambda': bibo_cfg.get('router_lambda', 1.0),
+            },
+            'qwen3moe': {
+                'num_experts': n_exp_qwen,
+                'num_experts_per_tok': CFG['qwen3moe']['num_experts_per_tok'],
+            }
+        },
+        'load_balance': {f'{m}_seq{sl}_bs{bs}': v 
+                         for (m, sl, bs), v in all_metrics.items()},
+        'stability': stability_scores,
     }
     
     with open(METRICS_OUT, 'w') as f:
-        json.dump(json_metrics, f, indent=2)
-    print(f"  Saved: {METRICS_OUT}")
+        json.dump(metrics_out, f, indent=2, default=str)
+    print(f"  Saved → {METRICS_OUT}")
     
-    # Cleanup
-    del bibo_model, qwen_model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    # Final summary
     print("\n" + "=" * 70)
     print("  ANALYSIS COMPLETE")
-    print("=" * 70)
-    print(f"  Plots: {PLOTS_DIR}/ ({len(os.listdir(PLOTS_DIR))} files)")
+    print(f"  Plots: {PLOTS_DIR}")
     print(f"  Metrics: {METRICS_OUT}")
-    print()
-    
-    # Print key findings
-    print("  KEY FINDINGS:")
-    for sl in available_seq_lens:
-        max_bs = max(bs for bs in batch_sizes if (sl, bs) in bibo_all_data)
-        bm = all_metrics.get(('BiBo', sl, max_bs), {})
-        qm = all_metrics.get(('Qwen3MoE', sl, max_bs), {})
-        if bm and qm:
-            print(f"    seq={sl}, bs={max_bs}:")
-            print(f"      BiBo  — Gini={bm.get('gini',0):.3f} H_norm={bm.get('normalized_entropy',0):.3f} CV={bm.get('cv',0):.3f}")
-            print(f"      Qwen  — Gini={qm.get('gini',0):.3f} H_norm={qm.get('normalized_entropy',0):.3f} CV={qm.get('cv',0):.3f}")
-    
-    if stability_scores:
-        print(f"\n    Stability (avg Jaccard):")
-        for k, v in stability_scores.items():
-            print(f"      {k}: {v:.3f}")
+    print("=" * 70)
 
 
 if __name__ == '__main__':
