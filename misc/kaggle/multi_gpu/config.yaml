@@ -7,13 +7,13 @@ training:
   batch_size: 64
   vocab_size: 512
   pad_token_id: 0
-  lr: 1.0e-4
+  lr: 3.0e-4
   warmup_ratio: 0.10
   weight_decay: 0.01
   grad_clip: 1.0
-  train_samples: 300000
+  train_samples: 400000
   val_samples: 8000
-  val_every_n_steps: 500
+  val_every_n_steps: 400
   optimizer: adamw_8bit
   num_workers: 2
   log_every_n_steps: 10
@@ -47,7 +47,7 @@ bibo:
   router_type: "conv"
   router_lambda: 1.0
   router_noise: 0
-  bias_update_threshold: 9500
+  bias_update_threshold: 800
   mlp_only_layers: [0]
   tie_word_embeddings: true
 
@@ -56,7 +56,7 @@ bibo:
 # ============================================================
 qwen3moe:
   device: "cuda:1"
-  vocab_size: 512
+  vocab_size: 256
   hidden_size: 256
   intermediate_size: 512
   num_hidden_layers: 6
