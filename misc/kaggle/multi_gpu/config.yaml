@@ -3,17 +3,17 @@
 # ============================================================
 training:
   seed: 48
-  epochs: 2
+  epochs: 1
   batch_size: 64
-  vocab_size: 256
+  vocab_size: 512
   pad_token_id: 0
   lr: 3.0e-4
   warmup_ratio: 0.10
   weight_decay: 0.01
   grad_clip: 1.0
-  train_samples: 150000
-  val_samples: 8000
-  val_every_n_steps: 400
+  train_samples: 300000
+  val_samples: 30000
+  val_every_n_steps: 300
   optimizer: adamw_8bit
   num_workers: 2
   log_every_n_steps: 10
@@ -33,7 +33,7 @@ training:
 # ============================================================
 bibo:
   device: "cuda:0"
-  vocab_size: 256
+  vocab_size: 512
   hidden_size: 256
   intermediate_size: 512
   num_hidden_layers: 6
@@ -60,7 +60,7 @@ bibo:
 # ============================================================
 qwen3moe:
   device: "cuda:1"
-  vocab_size: 256
+  vocab_size: 512
   hidden_size: 256
   intermediate_size: 512
   num_hidden_layers: 6
