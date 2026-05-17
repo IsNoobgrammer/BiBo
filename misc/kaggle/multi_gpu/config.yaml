@@ -11,8 +11,8 @@ training:
   warmup_ratio: 0.10
   weight_decay: 0.01
   grad_clip: 1.0
-  train_samples: 500000
-  val_samples: 9000
+  train_samples: 300000
+  val_samples: 8000
   val_every_n_steps: 500
   optimizer: adamw_8bit
   num_workers: 2
@@ -20,9 +20,13 @@ training:
   wandb_project: "bibo-ablation"
   wandb_run_name: "bibo-vs-qwen3moe-sort-v2"
 
+  # NTIL loss weights (arXiv:2505.13077)
+  alpha_emd: 0.3       # EMD token-level (ordinal distance)
+  alpha_seq: 0.3       # Sequence-level (L1 on predicted vs target values)
+
   # Curriculum learning: train on progressively longer sequences
   curriculum: true
-  curriculum_stages: [2, 8, 32, 64, 128, 256]
+  curriculum_stages: [2, 32, 64, 256]
 
 # ============================================================
 # BiBo Config (~10M)
@@ -43,7 +47,7 @@ bibo:
   router_type: "conv"
   router_lambda: 1.0
   router_noise: 0
-  bias_update_threshold: 12000
+  bias_update_threshold: 9500
   mlp_only_layers: [0]
   tie_word_embeddings: true
 
