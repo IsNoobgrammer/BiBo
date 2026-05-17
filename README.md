@@ -1,41 +1,43 @@
-# BiBo: Modular MoE Transformer
+# BiBo: Diverse-Expert MoE Transformer with SSMax Attention
 
-**BiBo** is a research-focused transformer architecture with modular components for experimentation:
+**BiBo** is a research Mixture-of-Experts (MoE) Transformer for causal language modeling. It explores diverse expert architectures and sequence-length-aware attention scaling for improved long-context performance and expert utilization.
 
-- **RMSNorm**: Layer normalization
-- **RoPE**: Rotary position embeddings
-- **SSMax**: Scaling softmax for long context attention
-- **MoE**: Mixture of experts with flexible routing (MLP or Conv)
-- **Diverse experts**: MLP, Identity, Zero, Noise, ReLU, Causal Conv1D
+## Key Innovations
 
-## Features
+1. **SSMax (Scalable-Softmax)** — Learnable per-head query scaling (`scale * log(kv_len)`) that prevents attention fading at long sequences. Based on [arXiv:2501.19399](https://arxiv.org/abs/2501.19399).
 
-### Architecture
+2. **Diverse Expert Pool** — Not all experts are MLPs. The expert layout includes Identity, Zero, and ReLU² experts alongside standard SwiGLU MLPs, enabling the model to learn when tokens need no transformation, gated suppression, or simple non-linearity.
 
-- **Flexible MoE layers**: Configure which layers use MoE vs dense MLP
-- **Mixed routers**: Support both MLP and Conv1D routers per layer
-- **Expert diversity**: 
-  - Standard MLP experts (SwiGLU activation)
-  - Identity expert (skip connection)
-  - Zero expert (learned gating)
-  - Noise expert (regularization)
-  - ReLU expert (simple non-linearity)
-  - Shared causal Conv1D expert
-- **SSMax attention**: Learnable per-head scaling for long context
-- **Sliding window attention**: Optional local attention windows
-- **RoPE**: Rotary position embeddings with configurable base
+3. **Shared Causal Conv1D Expert** — An always-active gated causal convolution that provides local temporal context to every token, independent of routing decisions. Novel — no prior MoE work uses convolution as a shared expert.
 
-### Training Features
+4. **Router Logit Normalization** — `router_lambda` scales normalized logits, preventing top-1 confidence collapse when `top_k > 1`. This ensures all selected experts contribute meaningfully (not just the top-1 dominating).
 
-- **Router logit normalization (Skywork-MoE)**: `router_lambda` controls confidence in expert selection (low entropy routing)
-- **Adaptive router bias**: Automatic load balancing via threshold-based bias updates (ensures even expert utilization)
-- **Router noise**: Gumbel noise for exploration during training
-- **Shared expert scaling**: DeepSeek-V2/V3 style shared expert weighting
-- **Gradient checkpointing**: Memory-efficient training for large models
+5. **Threshold-Based Bias Heuristics** — Non-trainable router bias (`requires_grad=False`) updated via load-balancing heuristics. Avoids FSDP conflicts while maintaining expert utilization balance.
 
-**Key distinction:**
-- `router_lambda`: Controls **confidence** (entropy) of expert selection
-- `bias_update_*`: Controls **load balancing** (which experts get used over time)
+6. **Conv Router Option** — `router_type="conv"` gives the router local context awareness via causal 1D convolution over hidden states before expert selection.
+
+7. **Flash Attention (SDPA)** — Uses `F.scaled_dot_product_attention` by default, with manual fallback when `output_attentions=True`.
+
+## Architecture
+
+```
+BiBoForCausalLM
+├── BiBoModel
+│   ├── Embedding (vocab → hidden)
+│   ├── BiBoRotaryEmbedding (RoPE)
+│   ├── BiBoDecoderLayer × N
+│   │   ├── RMSNorm → BiBoAttention (GQA + QK-Norm + SSMax + SDPA)
+│   │   └── RMSNorm → BiBoMoELayer (or dense BiBoMLP for first/last layers)
+│   │       ├── BiBoMoERouter (MLP or Conv, logit normalization)
+│   │       ├── Routed: (n-3) SwiGLU MLPs + 1 Identity + 1 Zero + 1 ReLU²
+│   │       └── Shared: 1 CausalConv1D (always active, scaled by moe_shared_scaling)
+│   └── Final RMSNorm
+└── LM Head
+```
+
+**Expert layout**: `[0..n-4]` = SwiGLU MLPs, `[n-3]` = Identity, `[n-2]` = Zero, `[n-1]` = ReLU²
+
+**MoE layers**: First and last decoder layers use dense MLP (configurable via `mlp_only_layers`). All middle layers use MoE routing.
 
 ## Installation
 
@@ -45,216 +47,143 @@ cd BiBo
 pip install -r requirements.txt
 ```
 
+**Requirements**: PyTorch ≥ 2.0, Transformers ≥ 4.40, einops ≥ 0.7
+
 ## Quick Start
 
-### Basic Usage
-
 ```python
+import torch
 from src.configuration_bibo import BiBoConfig
 from src.modeling.models import BiBoForCausalLM
 
-# Create config
 config = BiBoConfig(
     vocab_size=5000,
     hidden_size=512,
-    num_hidden_layers=6,
+    num_hidden_layers=4,
     num_attention_heads=8,
+    num_key_value_heads=2,
     num_routed_experts=8,
-    num_experts_per_tok=4,
-    use_ssmax=True,
-)
-
-# Create model
-model = BiBoForCausalLM(config)
-
-# Forward pass
-import torch
-input_ids = torch.randint(0, config.vocab_size, (2, 128))
-outputs = model(input_ids=input_ids)
-loss = outputs.loss
-```
-
-### Training Example
-
-```python
-from torch.optim import AdamW
-
-optimizer = AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
-
-for batch in dataloader:
-    outputs = model(**batch)
-    loss = outputs.loss
-    
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    optimizer.step()
-```
-
-### Mixed Router Configuration
-
-```python
-# Layer 1,3 use Conv routers, Layer 2,4 use MLP routers
-config = BiBoConfig(
-    num_hidden_layers=6,
-    num_routed_experts=8,
-    mlp_only_layers=[0, 5],  # First and last layers are dense
-    router_type="mlp",  # Default router type
-    kernel_size=3,  # For conv routers
+    num_experts_per_tok=2,
+    moe_intermediate_size=256,
+    intermediate_size=1024,
+    moe_shared_scaling=2.0,
 )
 
 model = BiBoForCausalLM(config)
-
-# Override specific layers to use conv routers
-for i in [1, 3]:
-    if hasattr(model.model.layers[i].mlp, 'gate'):
-        conv_config = BiBoConfig(**{k: v for k, v in config.__dict__.items()})
-        conv_config.router_type = "conv"
-        from src.modeling.ffn.router import BiBoMoERouter
-        model.model.layers[i].mlp.gate = BiBoMoERouter(conv_config)
+x = torch.randint(0, 5000, (2, 128))
+out = model(x, labels=x)
+print(f"Loss: {out.loss.item():.4f}")
 ```
 
 ## Configuration
 
-Key configuration parameters:
+Key parameters (see [`docs/configuration_guide.md`](docs/configuration_guide.md) for full reference):
 
-```python
-config = BiBoConfig(
-    # Model architecture
-    vocab_size=128000,
-    hidden_size=1536,
-    intermediate_size=4104,
-    num_hidden_layers=8,
-    num_attention_heads=12,
-    num_key_value_heads=2,
-    
-    # MoE settings
-    num_routed_experts=16,
-    num_shared_experts=1,
-    num_experts_per_tok=6,
-    moe_intermediate_size=512,
-    mlp_only_layers=[0, 7],  # Dense layers
-    
-    # Router settings
-    router_type="mlp",  # "mlp" or "conv"
-    router_lambda=1.0,  # Confidence control (low entropy routing)
-    router_noise=0.5,
-    router_temperature=1.3,  # Legacy (not actively used)
-    bias_update_factor=1e-2,  # Load balancing step size
-    bias_update_threshold=100_000,  # Tokens before bias update
-    
-    # Attention settings
-    use_ssmax=True,
-    use_sliding_window=True,
-    sliding_window=512,
-    max_window_layers=4,
-    
-    # Position embeddings
-    max_position_embeddings=32768,
-    rope_theta=10000.0,
-)
-```
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `use_ssmax` | `True` | Enable SSMax query scaling |
+| `num_routed_experts` | `16` | Total routed experts (must be ≥ 4) |
+| `num_experts_per_tok` | `6` | Top-K routing |
+| `router_type` | `"mlp"` | Router architecture (`"mlp"` or `"conv"`) |
+| `router_lambda` | `1.0` | Logit norm scaling (higher = more decisive) |
+| `router_noise` | `0.5` | Exploration noise during training |
+| `bias_update_factor` | auto | Load balancing step size (Hill function of n) |
+| `bias_update_threshold` | `8000` | Tokens between bias updates |
+| `moe_shared_scaling` | auto | Shared expert output scaling (Monte Carlo estimated) |
+| `mlp_only_layers` | `[0, N-1]` | Layers using dense MLP instead of MoE |
+| `max_position_embeddings` | `32768` | Maximum context length |
+| `rope_theta` | auto | RoPE base frequency (scales with context length) |
 
-## Testing
-
-Run integration tests:
-
-```bash
-python tests/integration/test_bibo_integrated.py
-```
-
-Run training tests:
-
-```bash
-# 50-step basic training
-python tests/training/train_bibo_steps.py
-
-# 100-step mixed router training
-python tests/training/train_mixed_routers.py
-```
-
-## Verification
-
-See `VERIFICATION_GUIDE.md` for detailed component verification:
-
-- Forward/backward pass correctness
-- RoPE application verification
-- SSMax scaling verification
-- MoE routing verification
-- Tensor shape tracing
-
-## Training Results
-
-See `TRAINING_RESULTS.md` for 50-step training results and `training_50steps.png` for visualizations.
-
-Key findings:
-- Model trains stably (no NaN/Inf)
-- Expert load balancing works (balance ratio 0.68-0.78)
-- Layer-wise expert specialization observed
-- Router bias updates improve balance over time
-
-## Model Architecture
+## Project Structure
 
 ```
-BiBoForCausalLM
-├── BiBoModel
-│   ├── Embedding (vocab_size → hidden_size)
-│   ├── BiBoRotaryEmbedding (RoPE)
-│   ├── BiBoDecoderLayer × num_hidden_layers
-│   │   ├── BiBoRMSNorm (input)
-│   │   ├── BiBoAttention
-│   │   │   ├── Q/K/V projections
-│   │   │   ├── RoPE application
-│   │   │   ├── SSMax scaling (optional)
-│   │   │   └── Attention computation
-│   │   ├── BiBoRMSNorm (post-attention)
-│   │   └── BiBoMoELayer or BiBoMLP
-│   │       ├── BiBoMoERouter (MLP or Conv)
-│   │       ├── Routed experts (MLP, Identity, Zero, Noise, ReLU)
-│   │       └── Shared expert (Causal Conv1D)
-│   └── BiBoRMSNorm (final)
-└── LM Head (hidden_size → vocab_size)
+src/
+├── configuration_bibo.py          # BiBoConfig (all hyperparams + auto-derivation)
+├── modeling_bibo.py               # Flat re-export for backward compat
+└── modeling/
+    ├── norm.py                    # BiBoRMSNorm
+    ├── embed.py                   # BiBoRotaryEmbedding (Qwen3-compatible RoPE)
+    ├── attn/
+    │   ├── base.py                # BiBoAttention (GQA + SSMax + SDPA)
+    │   ├── ssmax.py               # apply_ssmax_query_scaling
+    │   └── utils.py               # repeat_kv
+    ├── ffn/
+    │   ├── mlp.py                 # BiBoMLP (SwiGLU)
+    │   ├── experts.py             # Identity, ReLU², Zero, CausalConv1D
+    │   ├── router.py              # BiBoMoERouter (MLP or Conv, logit norm)
+    │   └── moe.py                 # BiBoMoELayer (routing + dispatch + bias update)
+    ├── layers.py                  # BiBoDecoderLayer
+    └── models.py                  # BiBoModel, BiBoForCausalLM
+
+baseline/                          # Reference implementations
+├── qwen3/                         # Qwen3 dense model
+└── qwen3moe/                      # Qwen3MoE (primary baseline)
+
+docs/                              # Technical documentation
+├── ssmax.md                       # SSMax theory + implementation
+├── moe_shared_scaling.md          # Monte Carlo scaling derivation
+├── configuration_guide.md         # Full config parameter reference
+└── deprecated.md                  # Removed components + reasoning
+
+misc/kaggle/multi_gpu/             # 2×T4 parallel ablation
+├── config.yaml, data.py, train.py
+├── analyze_router.py              # Per-token router analysis + plots
+├── metrics/                       # JSON metrics
+├── plots/                         # Generated visualizations
+└── report/                        # Next.js report (GitHub Pages)
 ```
+
+## Ablation Results
+
+BiBo was benchmarked against Qwen3MoE on a sequence sorting task (2×T4 GPUs, Kaggle):
+
+| Metric | BiBo | Qwen3MoE |
+|--------|------|----------|
+| Parameters | 8.3M | 11.2M |
+| Final Loss | ~0.10 | ~0.25 |
+| Convergence | Faster | Slower |
+| Top-1 Confidence | 0.4–0.7 (healthy) | 0.9+ (wasteful) |
+
+**Key insight**: BiBo's logit normalization produces moderate confidence across top-k experts = better expert utilization. Qwen's raw softmax gives 0.9+ top-1 confidence, effectively wasting the other k-1 selected experts.
+
+## Design Decisions
+
+- **No sliding window / recurrent attention** — only standard softmax + SSMax
+- **SSMax init**: `1.0 / log(max_pos_emb / 2)` — ensures attention starts ~neutral, not 6× sharper than standard
+- **Shared expert is NOT routed** — always active CausalConv1D
+- **Router bias is non-trainable** — `requires_grad=False`, updated via heuristic `.add_()`
+- **Noise expert was removed** — no evidence it helps; Identity covers the "dump bucket" use case (see [`docs/deprecated.md`](docs/deprecated.md))
+- **Logit norm prevents expert waste** — when `top_k > 1`, normalization ensures all selected experts contribute meaningfully
 
 ## Expert Types
 
-1. **MLP Expert**: Standard SwiGLU FFN
-2. **Identity Expert**: `output = input` (skip connection)
-3. **Zero Expert**: `output = 0` (learned gating)
-4. **Noise Expert**: `output = input + noise` (regularization)
-5. **ReLU Expert**: `output = ReLU(linear(input))`
-6. **Shared Causal Conv1D**: Temporal convolution across all tokens
+| Expert | Behavior | Purpose |
+|--------|----------|---------|
+| SwiGLU MLP | Standard gated FFN | General transformation |
+| Identity | `output = input` | Skip connection / no-op routing |
+| Zero | `output = 0` | Learned suppression |
+| ReLU² | `ReLU(Wx)²` | Sparse, high-activation features |
+| CausalConv1D (shared) | Gated temporal convolution | Local context (always active) |
 
 ## Router Types
 
-### MLP Router
-- Linear projection: `hidden_size → num_experts`
-- Fast, parameter-efficient
-- Global token-to-expert mapping
+| Type | Mechanism | Use Case |
+|------|-----------|----------|
+| MLP | `Linear(hidden → n_experts)` | Fast, global token-to-expert mapping |
+| Conv | `CausalConv1D(hidden → n_experts)` | Local temporal patterns in routing |
 
-### Conv Router
-- Causal 1D convolution: `hidden_size → num_experts`
-- Captures local temporal patterns
-- Kernel size configurable (default: 3)
+## Documentation
 
-## Performance
-
-**Model sizes tested**:
-- Small: 3M params (256 hidden, 4 layers)
-- Medium: 27M params (512 hidden, 6 layers)
-- Large: 46M params (512 hidden, 6 layers, 16 experts)
-
-**Training stability**:
-- ✓ No NaN/Inf in 100+ training steps
-- ✓ Gradient norms stable (clipped at 1.0)
-- ✓ Loss decreases consistently
-- ✓ Expert utilization balanced
+- [`docs/ssmax.md`](docs/ssmax.md) — SSMax theory, initialization, and integration
+- [`docs/moe_shared_scaling.md`](docs/moe_shared_scaling.md) — Monte Carlo derivation for shared expert scaling
+- [`docs/configuration_guide.md`](docs/configuration_guide.md) — Full parameter reference and tuning guidance
+- [`docs/deprecated.md`](docs/deprecated.md) — Removed components and reasoning
 
 ## Citation
 
 ```bibtex
 @software{bibo2025,
-  title={BiBo: Modular MoE Transformer},
+  title={BiBo: Diverse-Expert MoE Transformer with SSMax Attention},
   author={Shaurya Sharthak and SedGram and adi-kmt},
   year={2025},
   url={https://github.com/IsNoobgrammer/BiBo}
@@ -267,7 +196,7 @@ Apache 2.0
 
 ## Acknowledgments
 
-- RoPE implementation inspired by Qwen3
-- MoE architecture inspired by Qwen3-MoE, DeepSeek-V2/V3
-- SSMax attention from scaling softmax research
-- Router bias balancing from Skywork-MoE
+- SSMax from [Scalable-Softmax Is Superior for Attention](https://arxiv.org/abs/2501.19399) (Nakanishi, 2025)
+- MoE architecture inspired by Qwen3-MoE, DeepSeek-V2/V3, MoE++ (Skywork AI)
+- Router logit normalization from Skywork-MoE
+- RoPE implementation compatible with Qwen3
