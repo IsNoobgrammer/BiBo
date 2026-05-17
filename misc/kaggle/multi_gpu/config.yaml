@@ -5,7 +5,7 @@ training:
   seed: 48
   epochs: 1
   batch_size: 64
-  vocab_size: 512
+  vocab_size: 256
   pad_token_id: 0
   lr: 3.0e-4
   warmup_ratio: 0.10
@@ -33,7 +33,7 @@ training:
 # ============================================================
 bibo:
   device: "cuda:0"
-  vocab_size: 512
+  vocab_size: 256
   hidden_size: 256
   intermediate_size: 512
   num_hidden_layers: 6
