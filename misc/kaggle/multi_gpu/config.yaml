@@ -24,8 +24,8 @@ training:
   alpha_emd: 0.3       # EMD token-level (ordinal distance)
   alpha_seq: 0.3       # Sequence-level (L1 on predicted vs target values)
 
-  # Curriculum learning: train on progressively longer sequences
-  curriculum: true
+  # Curriculum learning (disabled — using mixed dataset)
+  curriculum: false
   curriculum_stages: [2, 32, 64, 256]
 
 # ============================================================
