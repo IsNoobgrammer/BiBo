@@ -159,7 +159,7 @@ class NTILLoss(nn.Module):
             logits: [B, S, V] raw logits from model (no loss computed inside model)
             labels: [B, S] target ids (-100 = ignore)
         Returns:
-            total_loss: scalar (combined CCE + EMD + seq)
+            total_loss: scalar (combined CCE + optional EMD + seq)
             loss_dict: dict with individual components for logging
         """
         B, S, V = logits.shape
@@ -178,10 +178,13 @@ class NTILLoss(nn.Module):
         # 1. CCE (standard cross-entropy)
         cce_loss = F.cross_entropy(flat_logits, flat_labels)
         
-        # 2. EMD (token-level ordinal distance)
-        log_probs = F.log_softmax(flat_logits, dim=-1)
-        emd_per_token = self.emd_1d(log_probs, flat_labels)  # [N]
-        emd_loss = emd_per_token.mean()
+        # 2. EMD (token-level ordinal distance) — skip entirely if alpha_emd == 0
+        if self.alpha_emd > 0:
+            log_probs = F.log_softmax(flat_logits, dim=-1)
+            emd_per_token = self.emd_1d(log_probs, flat_labels)  # [N]
+            emd_loss = emd_per_token.mean()
+        else:
+            emd_loss = torch.tensor(0.0, device=logits.device)
         
         # 3. Sequence-level loss
         seq_loss = self.sequence_loss(logits, labels.clamp(min=0), mask)
@@ -226,6 +229,58 @@ class SequenceDataset(Dataset):
         labels = torch.tensor(full_seq[1:], dtype=torch.long)
         labels[:self.seq_len] = -100
 
+        return input_ids, labels
+
+
+class ArithmeticDataset(Dataset):
+    """
+    Arithmetic task — variable length, padded.
+    Format: [phase1] [SEP] [phase2] [SEP] [phase3]
+    Labels: [-100 for phase1] [SEP + phase2 + SEP + phase3] (predict from first SEP onward)
+    
+    PAD tokens (0) are masked in labels as -100.
+    """
+    def __init__(self, npy_path, lengths_path=None):
+        self.data = np.load(npy_path)  # [N, max_len] (padded)
+        if lengths_path and os.path.exists(lengths_path):
+            self.lengths = np.load(lengths_path)  # [N] actual lengths
+        else:
+            # Infer lengths from PAD tokens
+            self.lengths = np.array([
+                np.max(np.nonzero(row)[0]) + 1 if np.any(row != 0) else 0
+                for row in self.data
+            ])
+        self.sep_token = T['vocab_size'] - 1
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        full_seq = self.data[idx]
+        length = int(self.lengths[idx])
+        
+        # input_ids = full_seq[:-1], labels = full_seq[1:]
+        input_ids = torch.tensor(full_seq[:-1], dtype=torch.long)
+        labels = torch.tensor(full_seq[1:], dtype=torch.long)
+        
+        # Find first SEP position in the ORIGINAL sequence
+        sep_positions = np.where(full_seq == self.sep_token)[0]
+        if len(sep_positions) > 0:
+            first_sep = sep_positions[0]
+            # In shifted labels, mask everything before first_sep (phase1 input)
+            # labels[i] corresponds to predicting full_seq[i+1]
+            # We want to predict from SEP onward, so mask labels[:first_sep-1]
+            # Actually: input_ids[first_sep-1] = last token of phase1
+            #           labels[first_sep-1] = SEP (this IS a target — model should predict SEP)
+            # So mask labels[:first_sep-1] (everything before the SEP prediction)
+            labels[:first_sep - 1] = -100
+        
+        # Mask PAD tokens in labels
+        labels[labels == 0] = -100
+        # Also mask any position beyond actual length
+        if length < len(full_seq):
+            labels[length - 1:] = -100  # shifted: labels go up to length-1
+        
         return input_ids, labels
 
 
@@ -292,20 +347,39 @@ class CurriculumDataLoader:
 class BucketedDataLoader:
     """
     Non-curriculum: round-robin across all buckets (original behavior).
+    Supports both sorting (len_X) and arithmetic (arith_X_Y) bucket naming.
     """
-    def __init__(self, data_dir, split, batch_size, stages=None, shuffle=True):
+    def __init__(self, data_dir, split, batch_size, stages=None, shuffle=True, task='sort'):
         self.datasets = []
         self.loaders = []
         
-        seq_lens = stages if stages else [64, 128, 256]
-        for seq_len in seq_lens:
-            path = os.path.join(data_dir, f'{split}_len_{seq_len}.npy')
-            if os.path.exists(path):
-                ds = SequenceDataset(path)
-                loader = DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
-                                    num_workers=T['num_workers'], pin_memory=True, drop_last=True)
-                self.datasets.append(ds)
-                self.loaders.append(loader)
+        if task == 'arithmetic':
+            # Arithmetic buckets: arith_{min}_{max}
+            arith_cfg = T.get('arithmetic', {})
+            buckets = arith_cfg.get('buckets', [[3, 7], [9, 16], [19, 30], [35, 50]])
+            for min_t, max_t in buckets:
+                bucket_name = f'arith_{min_t}_{max_t}'
+                path = os.path.join(data_dir, f'{split}_{bucket_name}.npy')
+                len_path = os.path.join(data_dir, f'{split}_{bucket_name}_lengths.npy')
+                if os.path.exists(path):
+                    ds = ArithmeticDataset(path, len_path)
+                    loader = DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                                        num_workers=T['num_workers'], pin_memory=True, drop_last=True)
+                    self.datasets.append(ds)
+                    self.loaders.append(loader)
+                else:
+                    print(f"  WARNING: {path} not found, skipping bucket {bucket_name}")
+        else:
+            # Sorting buckets: len_X
+            seq_lens = stages if stages else [64, 128, 256]
+            for seq_len in seq_lens:
+                path = os.path.join(data_dir, f'{split}_len_{seq_len}.npy')
+                if os.path.exists(path):
+                    ds = SequenceDataset(path)
+                    loader = DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+                                        num_workers=T['num_workers'], pin_memory=True, drop_last=True)
+                    self.datasets.append(ds)
+                    self.loaders.append(loader)
         
         self.total_batches = sum(len(l) for l in self.loaders)
     
@@ -347,11 +421,16 @@ def train_worker(model_name):
     n_params = sum(p.numel() for p in model.parameters())
 
     # Loss function — NTIL (external, not inside model)
+    # For arithmetic: disable EMD (not ordinal), keep CCE + seq-level
+    task = T.get('task', 'sort')
+    alpha_emd = T.get('alpha_emd', 0.3) if task == 'sort' else 0.0
+    alpha_seq = T.get('alpha_seq', 0.1)
+    
     ntil_loss_fn = NTILLoss(
         vocab_size=T['vocab_size'],
         sep_token=T['vocab_size'] - 1,
-        alpha_emd=T.get('alpha_emd', 0.3),
-        alpha_seq=T.get('alpha_seq', 0.1),
+        alpha_emd=alpha_emd,
+        alpha_seq=alpha_seq,
     ).to(device)
 
     # wandb
@@ -365,14 +444,35 @@ def train_worker(model_name):
     # Data loader — curriculum or bucketed
     use_curriculum = T.get('curriculum', False)
     stages = T.get('curriculum_stages', [64, 128, 256])
+    task = T.get('task', 'sort')
     
-    if use_curriculum:
+    if task == 'arithmetic':
+        # Arithmetic task: always bucketed (no curriculum for now)
+        train_loader = BucketedDataLoader(DATA_DIR, 'train', T['batch_size'], stages, shuffle=True, task='arithmetic')
+        val_loader = BucketedDataLoader(DATA_DIR, 'val', T['batch_size'], stages, shuffle=False, task='arithmetic')
+        # OOD loader for generalization testing
+        ood_buckets = T.get('arithmetic', {}).get('ood_buckets', [])
+        ood_loaders = {}
+        for min_t, max_t in ood_buckets:
+            bucket_name = f'arith_{min_t}_{max_t}'
+            ood_path = os.path.join(DATA_DIR, f'ood_{bucket_name}.npy')
+            ood_len_path = os.path.join(DATA_DIR, f'ood_{bucket_name}_lengths.npy')
+            if os.path.exists(ood_path):
+                ds = ArithmeticDataset(ood_path, ood_len_path)
+                ood_loaders[bucket_name] = DataLoader(
+                    ds, batch_size=T['batch_size'], shuffle=False,
+                    num_workers=T['num_workers'], pin_memory=True, drop_last=False)
+        print(f"  [{model_name}] Task: arithmetic | OOD buckets: {list(ood_loaders.keys())}")
+    elif use_curriculum:
         train_loader = CurriculumDataLoader(DATA_DIR, 'train', T['batch_size'], stages, shuffle=True)
         val_loader = CurriculumDataLoader(DATA_DIR, 'val', T['batch_size'], stages, shuffle=False)
+        ood_loaders = {}
         print(f"  [{model_name}] Curriculum mode: stages={stages}")
     else:
-        train_loader = BucketedDataLoader(DATA_DIR, 'train', T['batch_size'], stages, shuffle=True)
-        val_loader = BucketedDataLoader(DATA_DIR, 'val', T['batch_size'], stages, shuffle=False)
+        train_loader = BucketedDataLoader(DATA_DIR, 'train', T['batch_size'], stages, shuffle=True, task='sort')
+        val_loader = BucketedDataLoader(DATA_DIR, 'val', T['batch_size'], stages, shuffle=False, task='sort')
+        ood_loaders = {}
+        print(f"  [{model_name}] Task: sort (bucketed)")
 
     # Optimizer
     try:
@@ -513,6 +613,41 @@ def train_worker(model_name):
                 print(f"  [{model_name}] VAL @ step {global_step} | val_loss={v_loss:.4f} val_acc={v_acc:.4f}")
                 wandb.log({f'{model_name}/val_loss': v_loss, f'{model_name}/val_acc': v_acc})
                 metrics['val_checkpoints'].append({'step': global_step, 'val_loss': v_loss, 'val_acc': v_acc})
+                
+                # OOD evaluation (arithmetic only)
+                if task == 'arithmetic' and ood_loaders:
+                    ood_results = {}
+                    with torch.no_grad():
+                        for ood_name, ood_loader in ood_loaders.items():
+                            ood_loss = 0
+                            ood_correct = 0
+                            ood_total = 0
+                            ood_batches = 0
+                            for ood_batch in ood_loader:
+                                if isinstance(ood_batch, (list, tuple)):
+                                    ood_input, ood_labels = ood_batch
+                                else:
+                                    ood_input, ood_labels = ood_batch
+                                ood_input = ood_input.to(device)
+                                ood_labels = ood_labels.to(device)
+                                ood_out = model(input_ids=ood_input)
+                                ood_l, _ = ntil_loss_fn(ood_out.logits, ood_labels)
+                                ood_loss += ood_l.item()
+                                ood_mask = ood_labels != -100
+                                ood_preds = ood_out.logits.argmax(dim=-1)
+                                ood_correct += (ood_preds[ood_mask] == ood_labels[ood_mask]).sum().item()
+                                ood_total += ood_mask.sum().item()
+                                ood_batches += 1
+                            ood_loss /= max(ood_batches, 1)
+                            ood_acc = ood_correct / max(ood_total, 1)
+                            ood_results[ood_name] = {'loss': ood_loss, 'acc': ood_acc}
+                            wandb.log({
+                                f'{model_name}/ood_{ood_name}_loss': ood_loss,
+                                f'{model_name}/ood_{ood_name}_acc': ood_acc,
+                            })
+                    ood_summary = " | ".join(f"{k}={v['acc']:.3f}" for k, v in ood_results.items())
+                    print(f"  [{model_name}] OOD @ step {global_step} | {ood_summary}")
+                
                 model.train()
 
         epoch_time = time.time() - t0
@@ -559,6 +694,7 @@ def main():
 
     seed_everything(seed)
     print(f"\n  Seed: {seed}")
+    print(f"  Task: {T.get('task', 'sort')}")
     print(f"  Curriculum: {T.get('curriculum', False)}")
     if T.get('curriculum'):
         print(f"  Stages: {T.get('curriculum_stages')}")
@@ -567,10 +703,21 @@ def main():
     print(f"  Vocab: {T['vocab_size']}")
 
     # Verify data exists
+    task = T.get('task', 'sort')
     stages = T.get('curriculum_stages', [64, 128, 256])
-    check_file = os.path.join(DATA_DIR, f'train_len_{stages[0]}.npy')
+    
+    if task == 'arithmetic':
+        arith_cfg = T.get('arithmetic', {})
+        buckets = arith_cfg.get('buckets', [[3, 7], [9, 16], [19, 30], [35, 50]])
+        first_bucket = buckets[0]
+        check_file = os.path.join(DATA_DIR, f'train_arith_{first_bucket[0]}_{first_bucket[1]}.npy')
+        data_script = 'data_arithmetic.py'
+    else:
+        check_file = os.path.join(DATA_DIR, f'train_len_{stages[0]}.npy')
+        data_script = 'data.py'
+    
     if not os.path.exists(check_file):
-        print(f"ERROR: Data not found ({check_file}). Run `python misc/kaggle/multi_gpu/data.py` first.")
+        print(f"ERROR: Data not found ({check_file}). Run `python misc/kaggle/multi_gpu/{data_script}` first.")
         sys.exit(1)
 
     # Spawn parallel processes

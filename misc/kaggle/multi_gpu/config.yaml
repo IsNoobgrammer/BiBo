@@ -18,15 +18,36 @@ training:
   num_workers: 2
   log_every_n_steps: 10
   wandb_project: "bibo-ablation"
-  wandb_run_name: "bibo-vs-qwen3moe-sort-v3-polyglu"
+  wandb_run_name: "bibo-vs-qwen3moe-arithmetic-v1"
 
-  # NTIL loss weights (arXiv:2505.13077)
-  alpha_emd: 0.3       # EMD token-level (ordinal distance)
+  # Task selection: "sort" or "arithmetic"
+  task: "arithmetic"
+
+  # NTIL loss weights (arXiv:2505.13077) — used for sort task
+  alpha_emd: 0.0     # EMD token-level (ordinal distance)
   alpha_seq: 0.3       # Sequence-level (L1 on predicted vs target values)
 
   # Curriculum learning (disabled — using mixed dataset)
   curriculum: false
   curriculum_stages: [2, 64, 256]
+
+  # Arithmetic task config
+  arithmetic:
+    max_num: 500          # Numbers in [1, max_num] (uses tokens 1..500, leaves 501-511 for special)
+    operators: ["+", "-", "*", "//"]  # Available operators
+    # Difficulty buckets: [min_terms, max_terms] per bucket
+    buckets:
+      - [3, 7]     # easy
+      - [9, 16]    # medium
+      - [19, 30]   # hard
+      - [35, 50]   # pro
+    # OOD (out-of-distribution) buckets for val only — generalization test
+    ood_buckets:
+      - [8, 8]     # gap between easy and medium
+      - [17, 18]   # gap between medium and hard
+      - [31, 33]   # gap between hard and pro
+      - [52, 55]   # beyond pro
+      - [60, 60]   # extreme generalization
 
 # ============================================================
 # BiBo Config (~10M) — PolyGLU layout
@@ -38,7 +59,7 @@ bibo:
   intermediate_size: 512
   num_hidden_layers: 6
   num_attention_heads: 4
-  num_key_value_heads: 2
+  num_key_value_heads: 4
   # PolyGLU expert layout:
   #   polyglu_expert_multiplier * 3 (SiLU, ReLU², Tanh) + special_expert_pairs * 2 (Identity, Zero)
   #   2*3 + 1*2 = 8 routed experts
@@ -46,7 +67,7 @@ bibo:
   special_expert_pairs: 1
   num_experts_per_tok: 3
   moe_intermediate_size: 256
-  max_position_embeddings: 512
+  max_position_embeddings: 256
   use_ssmax: true
   router_type: "conv"
   router_lambda: 1.0
@@ -65,11 +86,11 @@ qwen3moe:
   intermediate_size: 512
   num_hidden_layers: 6
   num_attention_heads: 4
-  num_key_value_heads: 2
+  num_key_value_heads: 4
   num_experts: 8
   num_experts_per_tok: 3
   moe_intermediate_size: 256
-  max_position_embeddings: 512
+  max_position_embeddings: 256
   decoder_sparse_step: 1
   shared_expert_intermediate_size: 256
   mlp_only_layers: [0]

@@ -487,11 +487,14 @@ def plot_coselection_matrix(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq_le
 # ============================================================
 
 def plot_position_type_routing(layer_data, model_name, n_experts, seq_len, bibo_cfg=None):
-    """Compare routing for unsorted tokens (input) vs sorted tokens (output)."""
+    """Compare routing for different token regions (input vs output)."""
     labels = get_expert_labels(n_experts, model_name, bibo_cfg)
     colors = get_expert_colors(n_experts, model_name, bibo_cfg)
     
+    task = CFG['training'].get('task', 'sort')
     half = seq_len
+    region_names = ('Unsorted (input)', 'Sorted (output)') if task == 'sort' else ('Phase1 (input)', 'Phase2+3 (output)')
+    
     layers = sorted(layer_data.keys())
     fig, axes = plt.subplots(len(layers), 2, figsize=(12, 3*len(layers)), squeeze=False)
     
@@ -510,7 +513,7 @@ def plot_position_type_routing(layer_data, model_name, n_experts, seq_len, bibo_
         dist_u = counts_u / (counts_u.sum() + 1e-10)
         ax.bar(range(n_experts), dist_u, color=colors, edgecolor='white', linewidth=0.5)
         ax.axhline(y=1/n_experts, color='red', linestyle='--', alpha=0.4)
-        ax.set_title(f'L{l} — Unsorted (input)' if row == 0 else f'L{l}')
+        ax.set_title(f'L{l} — {region_names[0]}' if row == 0 else f'L{l}')
         ax.set_ylim(0, max(dist_u.max() * 1.3, 2/n_experts))
         if row == len(layers) - 1:
             ax.set_xticks(range(n_experts))
@@ -524,7 +527,7 @@ def plot_position_type_routing(layer_data, model_name, n_experts, seq_len, bibo_
         dist_s = counts_s / (counts_s.sum() + 1e-10)
         ax.bar(range(n_experts), dist_s, color=colors, edgecolor='white', linewidth=0.5)
         ax.axhline(y=1/n_experts, color='red', linestyle='--', alpha=0.4)
-        ax.set_title(f'L{l} — Sorted (output)' if row == 0 else f'L{l}')
+        ax.set_title(f'L{l} — {region_names[1]}' if row == 0 else f'L{l}')
         ax.set_ylim(0, max(dist_s.max() * 1.3, 2/n_experts))
         if row == len(layers) - 1:
             ax.set_xticks(range(n_experts))
@@ -532,7 +535,7 @@ def plot_position_type_routing(layer_data, model_name, n_experts, seq_len, bibo_
         else:
             ax.set_xticks([])
     
-    fig.suptitle(f'{model_name} — Routing by Token Type (Unsorted Input vs Sorted Output)\nseq_len={seq_len}',
+    fig.suptitle(f'{model_name} — Routing by Token Type ({region_names[0]} vs {region_names[1]})\nseq_len={seq_len}',
                  fontsize=12, fontweight='bold', y=1.02)
     plt.tight_layout()
     plt.savefig(os.path.join(PLOTS_DIR, f'position_type_routing_{model_name}_seq{seq_len}.png'))
@@ -621,7 +624,21 @@ def plot_token_expert_heatmap_v2(layer_data, model_name, n_experts, seq_len_labe
                    interpolation='nearest')
     
     half = int(seq_len_label)
-    if half < actual_seq:
+    task = CFG['training'].get('task', 'sort')
+    if task == 'arithmetic':
+        # For arithmetic: find SEP positions in the first sample's input
+        # Draw vertical lines at both SEP positions
+        sep_token = CFG['training']['vocab_size'] - 1
+        first_ld = layer_data[layers[0]]
+        # Try to get input from the heatmap shape — SEP positions vary per sample
+        # Use approximate thirds as fallback
+        third = actual_seq // 3
+        ax.axvline(x=third, color='white', linewidth=2, linestyle='-')
+        ax.axvline(x=2*third, color='white', linewidth=2, linestyle='--')
+        ax.text(third/2, -0.8, 'Phase1 (input)', ha='center', fontsize=8, color='gray')
+        ax.text(third + third/2, -0.8, 'Phase2 (resolved)', ha='center', fontsize=8, color='gray')
+        ax.text(2*third + (actual_seq-2*third)/2, -0.8, 'P3', ha='center', fontsize=8, color='gray')
+    elif half < actual_seq:
         ax.axvline(x=half, color='white', linewidth=2, linestyle='-')
         ax.text(half/2, -0.8, 'Unsorted', ha='center', fontsize=9, color='gray')
         ax.text(half + (actual_seq-half)/2, -0.8, 'Sorted', ha='center', fontsize=9, color='gray')
@@ -687,8 +704,17 @@ def plot_confidence_evolution_comparative(bibo_data, qwen_data, seq_len):
     ax2.set_ylim(0, 1.05)
     
     half = seq_len
+    task = CFG['training'].get('task', 'sort')
     for ax in [ax1, ax2]:
-        ax.axvline(x=half, color='green', linestyle=':', alpha=0.6, label='SEP')
+        if task == 'arithmetic':
+            # Approximate SEP positions at thirds
+            first_ld = list(bibo_data.values())[0]
+            actual_seq = first_ld['weights'].shape[1] if first_ld['weights'].ndim == 3 else first_ld['weights'].shape[0]
+            third = actual_seq // 3
+            ax.axvline(x=third, color='green', linestyle=':', alpha=0.6, label='SEP1')
+            ax.axvline(x=2*third, color='orange', linestyle=':', alpha=0.6, label='SEP2')
+        else:
+            ax.axvline(x=half, color='green', linestyle=':', alpha=0.6, label='SEP')
     
     plt.suptitle(f'Confidence Evolution — seq={seq_len}', fontsize=13, fontweight='bold')
     plt.tight_layout()
@@ -735,7 +761,14 @@ def plot_entropy_evolution_comparative(bibo_data, qwen_data, seq_len):
     top_k_bibo = CFG['bibo']['num_experts_per_tok']
     ax.axhline(y=np.log(top_k_bibo), color=BIBO_COLOR, linestyle='--', alpha=0.4,
                label=f'Max entropy (top-{top_k_bibo})')
-    ax.axvline(x=seq_len, color='green', linestyle=':', alpha=0.6, label='SEP position')
+    task = CFG['training'].get('task', 'sort')
+    if task == 'arithmetic':
+        actual_len = len(bibo_smooth)
+        third = actual_len // 3
+        ax.axvline(x=third, color='green', linestyle=':', alpha=0.6, label='SEP1')
+        ax.axvline(x=2*third, color='orange', linestyle=':', alpha=0.6, label='SEP2')
+    else:
+        ax.axvline(x=seq_len, color='green', linestyle=':', alpha=0.6, label='SEP position')
     
     ax.set_xlabel('Token Position')
     ax.set_ylabel('Routing Entropy (nats)')
@@ -1056,7 +1089,7 @@ def plot_expert_type_analysis(bibo_data_dict, bibo_cfg, seq_lens):
     sorted_total = 0
     
     for sl, data in bibo_data_dict.items():
-        half = sl  # first half = unsorted, second half = sorted
+        half = sl  # first half = input, second half = output
         for l, ld in data.items():
             idx = ld['indices'].numpy()
             if idx.ndim == 3:  # [bs, seq, top_k]
@@ -1074,17 +1107,21 @@ def plot_expert_type_analysis(bibo_data_dict, bibo_cfg, seq_lens):
             for exp_id in sorted_idx:
                 sorted_type_counts[expert_to_type[exp_id]] += 1
     
+    task = CFG['training'].get('task', 'sort')
+    input_label = 'Phase1 (input)' if task == 'arithmetic' else 'Unsorted (input)'
+    output_label = 'Phase2+3 (output)' if task == 'arithmetic' else 'Sorted (output)'
+    
     x = np.arange(len(type_order))
     width = 0.35
     unsorted_fracs = [unsorted_type_counts[t] / (unsorted_total + 1e-10) for t in type_order]
     sorted_fracs = [sorted_type_counts[t] / (sorted_total + 1e-10) for t in type_order]
     
-    ax.bar(x - width/2, unsorted_fracs, width, color='#FFA726', alpha=0.8, label='Unsorted (input)')
-    ax.bar(x + width/2, sorted_fracs, width, color='#66BB6A', alpha=0.8, label='Sorted (output)')
+    ax.bar(x - width/2, unsorted_fracs, width, color='#FFA726', alpha=0.8, label=input_label)
+    ax.bar(x + width/2, sorted_fracs, width, color='#66BB6A', alpha=0.8, label=output_label)
     ax.set_xticks(x)
     ax.set_xticklabels(type_labels, rotation=20, fontsize=9)
     ax.set_ylabel('Fraction')
-    ax.set_title('C) Expert-Type Preference: Unsorted vs Sorted Tokens', fontweight='bold')
+    ax.set_title(f'C) Expert-Type Preference: {input_label} vs {output_label}', fontweight='bold')
     ax.legend()
     
     # --- Panel D: Average routing weight by expert type ---
@@ -1315,7 +1352,14 @@ def plot_expert_switching_rate(bibo_data, qwen_data, n_exp_bibo, n_exp_qwen, seq
     ax2.set_yticklabels(['Qwen3MoE', 'BiBo'])
     ax2.set_xlabel('Token Position')
     ax2.set_title(f'Switch Events (L{ax2_layer}, first sample)', fontweight='bold')
-    ax2.axvline(x=seq_len, color='green', linestyle=':', alpha=0.6, label='SEP')
+    task = CFG['training'].get('task', 'sort')
+    if task == 'arithmetic':
+        actual_len = ax2.get_xlim()[1]
+        third = int(actual_len) // 3
+        ax2.axvline(x=third, color='green', linestyle=':', alpha=0.6, label='SEP1')
+        ax2.axvline(x=2*third, color='orange', linestyle=':', alpha=0.6, label='SEP2')
+    else:
+        ax2.axvline(x=seq_len, color='green', linestyle=':', alpha=0.6, label='SEP')
     ax2.legend()
     
     plt.suptitle(f'Expert Switching Analysis — seq={seq_len}', fontsize=13, fontweight='bold')
@@ -1504,6 +1548,8 @@ def main():
     print("  COMPREHENSIVE ROUTER ANALYSIS — BiBo (PolyGLU) vs Qwen3MoE")
     print("=" * 70)
     
+    task = CFG['training'].get('task', 'sort')
+    
     bibo_cfg = CFG['bibo']
     poly_mult = bibo_cfg.get('polyglu_expert_multiplier', 2)
     special_pairs = bibo_cfg.get('special_expert_pairs', 1)
@@ -1511,21 +1557,37 @@ def main():
     n_exp_qwen = CFG['qwen3moe']['num_experts']
     top_k = bibo_cfg['num_experts_per_tok']
     
-    print(f"\n  BiBo experts: {poly_mult}×[SiLU,ReLU²,Tanh] + {special_pairs}×[Identity,Zero] = {n_exp_bibo}")
+    print(f"\n  Task: {task}")
+    print(f"  BiBo experts: {poly_mult}×[SiLU,ReLU²,Tanh] + {special_pairs}×[Identity,Zero] = {n_exp_bibo}")
     print(f"  Qwen experts: {n_exp_qwen} homogeneous MLPs")
     print(f"  Top-K: {top_k}")
     
-    # Load validation data
+    # Load validation data (task-aware)
     print("\n[1/6] Loading data...")
     val_data = {}
-    for sl in [64, 128, 256]:
-        path = os.path.join(BASE_DIR, 'data', f'val_len_{sl}.npy')
-        if os.path.exists(path):
-            val_data[sl] = np.load(path)
-            print(f"  Loaded val_len_{sl}: {val_data[sl].shape}")
+    
+    if task == 'arithmetic':
+        # Load arithmetic validation data
+        arith_cfg = CFG['training'].get('arithmetic', {})
+        buckets = arith_cfg.get('buckets', [[3, 7], [9, 16], [19, 30], [35, 50]])
+        for min_t, max_t in buckets:
+            bucket_name = f'arith_{min_t}_{max_t}'
+            path = os.path.join(BASE_DIR, 'data', f'val_{bucket_name}.npy')
+            if os.path.exists(path):
+                data = np.load(path)
+                # Use bucket midpoint as the "seq_len" key for compatibility
+                sl_key = (min_t + max_t) // 2
+                val_data[sl_key] = data
+                print(f"  Loaded val_{bucket_name}: {data.shape} (key={sl_key})")
+    else:
+        for sl in [64, 128, 256]:
+            path = os.path.join(BASE_DIR, 'data', f'val_len_{sl}.npy')
+            if os.path.exists(path):
+                val_data[sl] = np.load(path)
+                print(f"  Loaded val_len_{sl}: {val_data[sl].shape}")
     
     if not val_data:
-        print("ERROR: No validation data found. Run `python misc/kaggle/multi_gpu/data.py` first.")
+        print("ERROR: No validation data found. Run data generation script first.")
         sys.exit(1)
     
     available_seq_lens = sorted(val_data.keys())
