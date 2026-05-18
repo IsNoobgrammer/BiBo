@@ -344,33 +344,61 @@ class CurriculumDataLoader:
                     active.remove(s)
 
 
+def arithmetic_collate_fn(batch):
+    """
+    Custom collate for mixed arithmetic batches (variable lengths).
+    Pads input_ids with 0 and labels with -100 to the max length in the batch.
+    """
+    input_ids_list, labels_list = zip(*batch)
+    max_len = max(ids.shape[0] for ids in input_ids_list)
+    
+    padded_inputs = torch.zeros(len(batch), max_len, dtype=torch.long)
+    padded_labels = torch.full((len(batch), max_len), -100, dtype=torch.long)
+    
+    for i, (ids, lab) in enumerate(zip(input_ids_list, labels_list)):
+        seq_len = ids.shape[0]
+        padded_inputs[i, :seq_len] = ids
+        padded_labels[i, :seq_len] = lab
+    
+    return (padded_inputs, padded_labels)
+
+
 class BucketedDataLoader:
     """
-    Non-curriculum: round-robin across all buckets (original behavior).
-    Supports both sorting (len_X) and arithmetic (arith_X_Y) bucket naming.
+    Non-curriculum: for arithmetic, concatenates ALL buckets into one dataset
+    and shuffles globally (fully mixed). Uses dynamic padding per batch.
+    For sorting, round-robins across buckets (fixed lengths per bucket).
     """
     def __init__(self, data_dir, split, batch_size, stages=None, shuffle=True, task='sort'):
         self.datasets = []
         self.loaders = []
         
         if task == 'arithmetic':
-            # Arithmetic buckets: arith_{min}_{max}
+            # Arithmetic: concatenate all buckets into one mixed dataset
             arith_cfg = T.get('arithmetic', {})
             buckets = arith_cfg.get('buckets', [[3, 7], [9, 16], [19, 30], [35, 50]])
+            all_datasets = []
             for min_t, max_t in buckets:
                 bucket_name = f'arith_{min_t}_{max_t}'
                 path = os.path.join(data_dir, f'{split}_{bucket_name}.npy')
                 len_path = os.path.join(data_dir, f'{split}_{bucket_name}_lengths.npy')
                 if os.path.exists(path):
                     ds = ArithmeticDataset(path, len_path)
-                    loader = DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
-                                        num_workers=T['num_workers'], pin_memory=True, drop_last=True)
-                    self.datasets.append(ds)
-                    self.loaders.append(loader)
+                    all_datasets.append(ds)
                 else:
                     print(f"  WARNING: {path} not found, skipping bucket {bucket_name}")
+            
+            if all_datasets:
+                # Concatenate all buckets — fully mixed when shuffled
+                combined = torch.utils.data.ConcatDataset(all_datasets)
+                loader = DataLoader(combined, batch_size=batch_size, shuffle=shuffle,
+                                    num_workers=T['num_workers'], pin_memory=True, drop_last=True,
+                                    collate_fn=arithmetic_collate_fn)
+                self.datasets = all_datasets
+                self.loaders = [loader]
+            
         else:
-            # Sorting buckets: len_X
+            # Sorting buckets: round-robin (different fixed lengths per bucket)
             seq_lens = stages if stages else [64, 128, 256]
             for seq_len in seq_lens:
                 path = os.path.join(data_dir, f'{split}_len_{seq_len}.npy')
