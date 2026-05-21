@@ -8,6 +8,7 @@ Structure:
     modeling/
     ├── norm.py              # BiBoRMSNorm
     ├── embed.py             # BiBoRotaryEmbedding, apply_rotary_pos_emb
+    ├── masks.py             # Causal mask utilities
     ├── attn/                # Attention
     │   ├── base.py          # BiBoAttention (standard softmax + SSMax)
     │   ├── ssmax.py         # SSMax scaling
@@ -16,14 +17,14 @@ Structure:
     │   ├── mlp.py           # BiBoMLP (standard MLP)
     │   ├── experts.py       # Special experts (Identity/Zero) + PolyGLU experts
     │   ├── router.py        # BiBoMoERouter
-    │   └── moe.py           # BiBoMoELayer
+    │   └── moe.py           # BiBoFusedExperts, BiBoMoELayer
     ├── layers.py            # BiBoDecoderLayer
     └── models.py            # BiBoPreTrainedModel, BiBoModel, BiBoForCausalLM
 
 Usage:
     # Import from this file (backward compatible)
     from src.modeling_bibo import BiBoModel, BiBoForCausalLM
-    
+
     # Or import from submodules (recommended)
     from src.modeling.models import BiBoModel, BiBoForCausalLM
     from src.modeling.attn import BiBoAttention
@@ -33,11 +34,8 @@ Usage:
 # Re-export all components for backward compatibility
 from src.modeling.norm import BiBoRMSNorm
 from src.modeling.embed import BiBoRotaryEmbedding, apply_rotary_pos_emb, rotate_half
-from src.modeling.attn import (
-    BiBoAttention,
-    repeat_kv,
-    apply_ssmax_query_scaling,
-)
+from src.modeling.masks import make_causal_mask, expand_mask, prepare_4d_causal_attention_mask
+from src.modeling.attn import BiBoAttention, repeat_kv, apply_ssmax_query_scaling
 from src.modeling.ffn import (
     BiBoMLP,
     BiBoIdentityExpert,
@@ -45,29 +43,27 @@ from src.modeling.ffn import (
     BiBoPolyGLUExpert,
     BiBoCausalConv1D,
     BiBoMoERouter,
+    BiBoFusedExperts,
     BiBoMoELayer,
 )
 from src.modeling.layers import BiBoDecoderLayer
-from src.modeling.models import (
-    BiBoPreTrainedModel,
-    BiBoModel,
-    BiBoForCausalLM,
-)
+from src.modeling.models import BiBoPreTrainedModel, BiBoModel, BiBoForCausalLM
 
 __all__ = [
     # Normalization
     'BiBoRMSNorm',
-    
     # Embeddings
     'BiBoRotaryEmbedding',
     'apply_rotary_pos_emb',
     'rotate_half',
-    
+    # Masks
+    'make_causal_mask',
+    'expand_mask',
+    'prepare_4d_causal_attention_mask',
     # Attention
     'BiBoAttention',
     'repeat_kv',
     'apply_ssmax_query_scaling',
-    
     # FFN
     'BiBoMLP',
     'BiBoIdentityExpert',
@@ -75,11 +71,10 @@ __all__ = [
     'BiBoPolyGLUExpert',
     'BiBoCausalConv1D',
     'BiBoMoERouter',
+    'BiBoFusedExperts',
     'BiBoMoELayer',
-    
     # Layers
     'BiBoDecoderLayer',
-    
     # Models
     'BiBoPreTrainedModel',
     'BiBoModel',
