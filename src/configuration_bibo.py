@@ -53,6 +53,7 @@ class BiBoConfig(PretrainedConfig):
         bias_update_threshold=8000,  # User knob: tokens between bias updates
         router_temperature=1.3,  # Legacy (not used; kept for compat)
         # Shared expert
+        shared_expert_type="mlp",  # "mlp" (SwiGLU, like Qwen) or "conv" (CausalConv1D)
         moe_shared_scaling=1.0,  # Auto-computed if 1.0 (DeepSeek-V2/V3 style)
         norm_topk_prob=False,
         output_router_logits=False,
@@ -93,6 +94,7 @@ class BiBoConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_lambda = router_lambda
         self.router_noise = router_noise
+        self.shared_expert_type = shared_expert_type
 
         # ============================================================
         # Auto-derived hyperparameters
@@ -212,6 +214,8 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError("bias_update_factor must be non-negative")
         if self.router_noise < 0.0:
             raise ValueError("router_noise must be non-negative")
+        if self.shared_expert_type not in ("mlp", "conv"):
+            raise ValueError(f"shared_expert_type must be 'mlp' or 'conv', got '{self.shared_expert_type}'")
         if self.polyglu_expert_multiplier < 1:
             raise ValueError("polyglu_expert_multiplier must be >= 1 (need at least one group of SiLU/ReLU²/Tanh GLU experts)")
         if self.special_expert_pairs < 0:

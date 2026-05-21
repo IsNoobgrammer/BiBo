@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from src.configuration_bibo import BiBoConfig
 from .experts import BiBoCausalConv1D
+from .mlp import BiBoMLP
 from .router import BiBoMoERouter
 
 __all__ = ['BiBoMoELayer']
@@ -152,9 +153,12 @@ class BiBoMoELayer(nn.Module):
         # Fused experts
         self.experts = BiBoFusedExperts(config)
 
-        # Shared expert: CausalConv1D (always active)
+        # Shared expert (always active)
         self.shared_experts_list = nn.ModuleList()
-        self.shared_experts_list.append(BiBoCausalConv1D(config))
+        if config.shared_expert_type == "conv":
+            self.shared_experts_list.append(BiBoCausalConv1D(config))
+        else:
+            self.shared_experts_list.append(BiBoMLP(config, is_expert=True))
         self.gate = BiBoMoERouter(config)
 
     @torch.no_grad()

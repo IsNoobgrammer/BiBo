@@ -69,10 +69,11 @@ bibo:
   moe_intermediate_size: 256
   max_position_embeddings: 256
   use_ssmax: true
+  shared_expert_type: "mlp"  # "mlp" (SwiGLU, like Qwen) or "conv" (CausalConv1D)
   router_type: "conv"
   router_lambda: 1.0
   router_noise: 0
-  bias_update_threshold: 800
+  bias_update_threshold: 2400
   mlp_only_layers: [0]
   tie_word_embeddings: true
 
