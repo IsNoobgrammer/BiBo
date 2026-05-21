@@ -11,12 +11,14 @@ from baseline.qwen3moe.config import Qwen3MoeConfig
 from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 
 __all__ = [
-    'BASE_DIR', 'CFG', 'CFG_PATH',
-    'load_config', 'load_models', 'load_bibo', 'load_qwen',
+    'BASE_DIR', 'CFG', 'CFG_PATH', 'METRICS_DIR', 'PLOTS_DIR',
+    'load_config', 'load_models', 'load_bibo', 'load_qwen', 'extract_routing_data',
 ]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(BASE_DIR, 'config.yaml')
+METRICS_DIR = os.path.join(BASE_DIR, 'metrics')
+PLOTS_DIR = os.path.join(BASE_DIR, 'plots')
 
 
 def load_config():
