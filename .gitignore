@@ -1,18 +1,7 @@
-.idea
 __pycache__/
-.aim/
-logs/
-bugs/
+*.pyc
 venv/
-wandb/
-shaurya_notes.md
-pipeline/
-AGENTS.md
-research_on_activations/
-/data
-# misc/kaggle/multi_gpu/report/
-# misc/kaggle/multi_gpu/plots/
-# misc/kaggle/multi_gpu/metrics/
-aux_loss_for_entropy/
+.aim/
+.idea/
 .vscode/
-kaggle_ablations/
+local-only/

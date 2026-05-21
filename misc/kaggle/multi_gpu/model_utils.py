@@ -109,7 +109,7 @@ def extract_routing_data(model, input_ids, device, model_type='bibo'):
     hooks = []
 
     def make_hook(layer_idx, mtype):
-        def hook_fn(module, inp, output):
+        def hook_fn(_module, _inp, output):
             if mtype == 'bibo':
                 indices, weights = output
                 layer_data[layer_idx] = {
