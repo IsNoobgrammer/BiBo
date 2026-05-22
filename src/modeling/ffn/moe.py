@@ -155,12 +155,14 @@ class BiBoMoELayer(nn.Module):
         # Fused experts
         self.experts = BiBoFusedExperts(config)
 
-        # Shared expert (always active)
+        # Shared expert (always active) — only if enabled
+        self.use_shared_expert = getattr(config, 'use_shared_expert', True)
         self.shared_experts_list = nn.ModuleList()
-        if config.shared_expert_type == "conv":
-            self.shared_experts_list.append(BiBoCausalConv1D(config))
-        else:
-            self.shared_experts_list.append(BiBoMLP(config, is_expert=True))
+        if self.use_shared_expert:
+            if config.shared_expert_type == "conv":
+                self.shared_experts_list.append(BiBoCausalConv1D(config))
+            else:
+                self.shared_experts_list.append(BiBoMLP(config, is_expert=True))
         self.gate = BiBoMoERouter(config)
 
     @torch.no_grad()
@@ -213,10 +215,12 @@ class BiBoMoELayer(nn.Module):
         final_routed = self.experts(flat_hidden, flat_indices, flat_weights)
         final_routed = rearrange(final_routed, '(b s) h -> b s h', b=bsz)
         
-        # Shared expert (always active)
-        shared_combined = self.shared_experts_list[0](hidden_states)
-        
-        final_output = final_routed + (self.moe_shared_scaling * shared_combined)
+        # Shared expert (only if enabled)
+        if self.use_shared_expert:
+            shared_combined = self.shared_experts_list[0](hidden_states)
+            final_output = final_routed + (self.moe_shared_scaling * shared_combined)
+        else:
+            final_output = final_routed
 
         if tokens_per_expert is not None:
             self.update_bias(tokens_per_expert)

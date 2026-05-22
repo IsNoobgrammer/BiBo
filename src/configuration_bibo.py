@@ -38,6 +38,7 @@ class BiBoConfig(PretrainedConfig):
         mlp_only_layers=None,
         decoder_sparse_step=1,
         moe_intermediate_size=None,  # Auto: intermediate_size // top_k
+        use_shared_expert=False,  # Disable shared expert (match Qwen3MoE — no shared expert)
         num_shared_experts=1,
         num_experts_per_tok=6,
         num_experts=None,
@@ -88,6 +89,7 @@ class BiBoConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.attention_bias = attention_bias
         self.decoder_sparse_step = decoder_sparse_step
+        self.use_shared_expert = use_shared_expert
         self.num_shared_experts = num_shared_experts
         self.num_experts_per_tok = num_experts_per_tok
         # PolyGLU layout: experts = polyglu_multiplier * 3 (SiLU, ReLU², Tanh) + special_pairs * 2 (Identity, Zero)
