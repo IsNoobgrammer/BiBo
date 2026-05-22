@@ -11,11 +11,13 @@ Usage:
 """
 import os
 import sys
-import yaml
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)  # so bare imports work when run from repo root
+
 CFG_PATH = os.path.join(BASE_DIR, 'config.yaml')
 
+import yaml
 with open(CFG_PATH) as f:
     CFG = yaml.safe_load(f)
 

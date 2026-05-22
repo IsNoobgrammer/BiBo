@@ -142,6 +142,7 @@ class BiBoModel(BiBoPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
+        total_aux_loss = None
 
         for decoder_layer in self.layers:
             if output_hidden_states:
@@ -169,13 +170,21 @@ class BiBoModel(BiBoPreTrainedModel):
                     use_cache=use_cache,
                 )
 
+            # layer_outputs: (hidden_states, aux_loss, [attn_weights], [cache])
             hidden_states = layer_outputs[0]
+            layer_aux_loss = layer_outputs[1]
 
+            # Accumulate aux_loss from all MoE layers
+            if layer_aux_loss is not None:
+                total_aux_loss = layer_aux_loss if total_aux_loss is None else total_aux_loss + layer_aux_loss
+
+            # Cache is after aux_loss (idx 2) or after attn_weights (idx 3)
             if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                cache_idx = 3 if output_attentions else 2
+                next_decoder_cache = layer_outputs[cache_idx]
 
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                all_self_attns += (layer_outputs[2],)
 
         hidden_states = self.norm(hidden_states)
 
@@ -191,7 +200,10 @@ class BiBoModel(BiBoPreTrainedModel):
                 next_cache = None
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, total_aux_loss] if v is not None)
+
+        # Store aux_loss for BiBoForCausalLM to access
+        self._last_aux_loss = total_aux_loss
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -330,6 +342,12 @@ class BiBoForCausalLM(BiBoPreTrainedModel):
             shift_labels = shift_labels.view(-1)
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
+
+            # Add auxiliary load-balancing loss if present
+            aux_loss = getattr(self.model, '_last_aux_loss', None)
+            if aux_loss is not None:
+                aux_loss_coef = getattr(self.config, 'aux_loss_coef', 0.001)
+                loss = loss + aux_loss_coef * aux_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]

@@ -52,6 +52,14 @@ class BiBoConfig(PretrainedConfig):
         bias_update_factor=None,  # Auto: (1 - exp(-n/48)) * 0.5
         bias_update_threshold=8000,  # User knob: tokens between bias updates
         router_temperature=1.3,  # Legacy (not used; kept for compat)
+        # Router logit normalization (Skywork-MoE style)
+        use_router_logit_norm=False,  # z-score normalize logits before softmax
+        # Load balancing strategy: "none", "bias" (heuristic bias updates), "aux_loss" (Switch Transformer / Qwen style)
+        load_balance_strategy="bias",
+        aux_loss_coef=0.001,  # Coefficient for auxiliary load-balancing loss (when strategy="aux_loss")
+        # Router activation: applied to raw logits before softmax/selection
+        # "none" (standard softmax), "relu" (DECO-style), "silu"
+        router_activation="none",
         # Shared expert
         shared_expert_type="mlp",  # "mlp" (SwiGLU, like Qwen) or "conv" (CausalConv1D)
         moe_shared_scaling=1.0,  # Auto-computed if 1.0 (DeepSeek-V2/V3 style)
@@ -95,6 +103,10 @@ class BiBoConfig(PretrainedConfig):
         self.router_lambda = router_lambda
         self.router_noise = router_noise
         self.shared_expert_type = shared_expert_type
+        self.use_router_logit_norm = use_router_logit_norm
+        self.load_balance_strategy = load_balance_strategy
+        self.aux_loss_coef = aux_loss_coef
+        self.router_activation = router_activation
 
         # ============================================================
         # Auto-derived hyperparameters
@@ -224,6 +236,10 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError(f"num_routed_experts must be >= 3 (got {self.num_routed_experts}). Increase polyglu_expert_multiplier or special_expert_pairs.")
         if self.num_experts_per_tok > self.num_experts:
             raise ValueError("num_experts_per_tok cannot exceed total number of experts")
+        if self.load_balance_strategy not in ("none", "bias", "aux_loss"):
+            raise ValueError(f"load_balance_strategy must be 'none', 'bias', or 'aux_loss', got '{self.load_balance_strategy}'")
+        if self.router_activation not in ("none", "relu", "silu"):
+            raise ValueError(f"router_activation must be 'none', 'relu', or 'silu', got '{self.router_activation}'")
         for idx in self.mlp_only_layers:
             if not (0 <= idx < self.num_hidden_layers):
                 raise ValueError(f"mlp_only_layers index {idx} is out of range for {self.num_hidden_layers} layers")

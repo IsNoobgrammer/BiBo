@@ -1,4 +1,4 @@
-"""MoE router"""
+"""MoE router — configurable logit norm, activation, load balancing"""
 import math
 import torch
 import torch.nn as nn
@@ -11,42 +11,60 @@ __all__ = ['BiBoMoERouter']
 
 class BiBoMoERouter(nn.Module):
     """
-    MoE router. Supports MLP or conv routing.
+    MoE router with configurable behavior:
     
-    Args:
-        config: Model config
+    - router_activation: "none" | "relu" | "silu" — applied to raw logits before softmax
+    - use_router_logit_norm: bool — z-score normalize logits (Skywork-MoE style)
+    - load_balance_strategy: "none" | "bias" | "aux_loss"
+    - router_type: "mlp" | "conv"
+    - router_noise: float — exploration noise during training
+    
+    Routing pipeline:
+        1. raw_logits = W @ x  (MLP or Conv)
+        2. raw_logits += noise  (if training and router_noise > 0)
+        3. logits = activation(raw_logits)  (relu/silu/none)
+        4. if use_router_logit_norm: logits = lambda * (logits - mean) / std
+        5. routing_weights = softmax(logits)  — for weight computation
+        6. selection_scores = logits + bias  — for top-k selection (bias strategy only)
+        7. top_k_indices = topk(selection_scores)
+        8. top_k_weights = normalize(routing_weights[top_k_indices])
     """
     def __init__(self, config: BiBoConfig):
         super().__init__()
         self.num_routed_experts = config.num_routed_experts
         self.top_k = config.num_experts_per_tok
-        self.temperature = config.router_temperature
-        self.router_noise = config.router_noise  # base noise variance
+        self.router_noise = config.router_noise
         self.router_type = config.router_type
         self.kernel_size = config.kernel_size
         self.causal_padding = self.kernel_size - 1
         self.router_lambda = getattr(config, 'router_lambda', 1.0)
+        
+        # New configurable options
+        self.use_router_logit_norm = getattr(config, 'use_router_logit_norm', False)
+        self.load_balance_strategy = getattr(config, 'load_balance_strategy', 'none')
+        self.aux_loss_coef = getattr(config, 'aux_loss_coef', 0.001)
+        self.router_activation = getattr(config, 'router_activation', 'none')
 
-        # Load-balancing bias — NOT learned via gradient, updated by Skywork-MoE threshold logic.
-        # requires_grad=False means the optimizer never touches this.
-        self.bias = nn.Parameter(torch.zeros(self.num_routed_experts), requires_grad=False)        
+        # Load-balancing bias — only used when load_balance_strategy="bias"
+        # NOT learned via gradient, updated by heuristic threshold logic.
+        self.bias = nn.Parameter(torch.zeros(self.num_routed_experts), requires_grad=False)
 
-        # --- Weight Decay Note (ref: PolyGLU RED-0001) ---
-        # gate_proj / gate_conv are projection weights that map hidden states → expert logits.
-        # L2 weight decay on these is SAFE because Skywork-MoE normalization (z-score + router_lambda)
-        # decouples weight magnitude from routing confidence. Shrinking weights via L2 does NOT
-        # push routing toward uniform — it only regularizes the projection directions.
-        #
-        # HOWEVER: if a learnable router_lambda, router_temperature, or per-expert preference
-        # parameter (α-style) is ever added here, it MUST be excluded from weight decay.
-        # L2 on such params pulls them toward zero, which directly kills routing specialization.
-        # See AGENTS.md "Weight Decay Policy for Routing Parameters" for the full rule.
+        # Router projection
         if self.router_type == "mlp":
             self.gate_proj = nn.Linear(config.hidden_size, self.num_routed_experts, bias=False)
         elif self.router_type == "conv":
             self.gate_conv = nn.Conv1d(config.hidden_size, self.num_routed_experts, self.kernel_size, padding=0, bias=False)
         else:
             raise ValueError(f"Unknown router type: {self.router_type}. Expected 'mlp' or 'conv'.")
+
+    def _apply_router_activation(self, logits: torch.Tensor) -> torch.Tensor:
+        """Apply optional activation to router logits before softmax."""
+        if self.router_activation == "relu":
+            return F.relu(logits)
+        elif self.router_activation == "silu":
+            return F.silu(logits)
+        else:  # "none"
+            return logits
 
     def forward(self, hidden_states: torch.Tensor):
         """
@@ -55,9 +73,11 @@ class BiBoMoERouter(nn.Module):
         Returns:
             top_k_indices: (batch, seq_len, top_k)
             norm_weights: (batch, seq_len, top_k)
+            aux_loss: scalar tensor or None (only when load_balance_strategy="aux_loss")
         """
         batch_size, seq_len, hidden_dim = hidden_states.shape
         
+        # Step 1: raw logits
         if self.router_type == "mlp":
             flat_hidden = rearrange(hidden_states, 'b s h -> (b s) h')
             router_logits = self.gate_proj(flat_hidden).float()
@@ -67,30 +87,53 @@ class BiBoMoERouter(nn.Module):
             conv_out = self.gate_conv(x_padded)
             router_logits = rearrange(conv_out, 'b e s -> (b s) e').float()
 
+        # Step 2: exploration noise (training only)
         if self.training and self.router_noise > 0:
             noise_stddev = math.sqrt(self.router_noise)
             noise = torch.randn_like(router_logits) * noise_stddev
-            router_logits = router_logits + noise.detach()  
+            router_logits = router_logits + noise.detach()
 
-        # z = lambda * (z - mean) / std (Skywork-MoE)
-        mean = router_logits.mean(dim=1, keepdim=True)
-        std = router_logits.std(dim=1, keepdim=True) + 1e-6
-        router_logits_norm = (router_logits - mean) / std
-        router_logits_scaled = self.router_lambda * router_logits_norm
+        # Step 3: router activation (ReLU/SiLU/none)
+        router_logits = self._apply_router_activation(router_logits)
 
-        # heuristic based bais update via different path 
-        # path 1 — gating weights (clean, no bias)
-        routing_weights = F.softmax(router_logits_scaled, dim=1)
+        # Step 4: optional logit normalization (Skywork-MoE style)
+        if self.use_router_logit_norm:
+            mean = router_logits.mean(dim=1, keepdim=True)
+            std = router_logits.std(dim=1, keepdim=True) + 1e-6
+            router_logits = self.router_lambda * (router_logits - mean) / std
 
-        # path 2 — selection only (bias here)
-        selection_scores = router_logits_scaled + self.bias
+        # Step 5: routing weights via softmax (always on clean logits)
+        routing_weights = F.softmax(router_logits, dim=1)
+
+        # Step 6: selection scores (bias only when strategy="bias")
+        if self.load_balance_strategy == "bias":
+            selection_scores = router_logits + self.bias
+        else:
+            selection_scores = router_logits
+
+        # Step 7: top-k selection
         _, top_k_indices = torch.topk(selection_scores, self.top_k, dim=-1)
 
-
-        # gather weights from unbiased softmax using biased indices
+        # Step 8: gather and normalize weights
         top_k_weights = routing_weights.gather(-1, top_k_indices)
         norm_weights = top_k_weights / (top_k_weights.sum(-1, keepdim=True) + 1e-6)
 
+        # Compute auxiliary load-balancing loss if requested
+        aux_loss = None
+        if self.load_balance_strategy == "aux_loss" and self.training:
+            # Switch Transformer style auxiliary loss:
+            # L_aux = N * sum(f_i * P_i)
+            # where f_i = fraction of tokens routed to expert i
+            #       P_i = mean routing probability for expert i
+            num_tokens = router_logits.shape[0]
+            # f_i: fraction of tokens where expert i is in top-k
+            expert_mask = F.one_hot(top_k_indices, num_classes=self.num_routed_experts).float()
+            expert_mask = expert_mask.sum(dim=1)  # (num_tokens, num_experts) — count per expert per token
+            f = expert_mask.sum(dim=0) / (num_tokens * self.top_k)  # (num_experts,)
+            # P_i: mean routing probability across all tokens
+            P = routing_weights.mean(dim=0)  # (num_experts,)
+            aux_loss = self.num_routed_experts * (f * P).sum()
+
         top_k_indices = rearrange(top_k_indices, '(b s) k -> b s k', b=batch_size)
         norm_weights = rearrange(norm_weights, '(b s) k -> b s k', b=batch_size)
-        return top_k_indices.long(), norm_weights.to(hidden_states.dtype)
+        return top_k_indices.long(), norm_weights.to(hidden_states.dtype), aux_loss

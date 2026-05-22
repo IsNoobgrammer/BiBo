@@ -145,8 +145,10 @@ class BiBoMoELayer(nn.Module):
         self.bias_update_factor = config.bias_update_factor
         self.bias_update_threshold = config.bias_update_threshold
         self.moe_shared_scaling = getattr(config, 'moe_shared_scaling', 1.0)
+        self.load_balance_strategy = getattr(config, 'load_balance_strategy', 'none')
+        self.aux_loss_coef = getattr(config, 'aux_loss_coef', 0.001)
 
-        # Token counter + accumulated TPE for threshold-based bias updates
+        # Token counter + accumulated TPE for threshold-based bias updates (only for strategy="bias")
         self.register_buffer("tokens_processed", torch.tensor(0, dtype=torch.long))
         self.register_buffer("accumulated_tpe", torch.zeros(config.num_routed_experts, dtype=torch.float))
         
@@ -180,13 +182,15 @@ class BiBoMoELayer(nn.Module):
         bsz, seq_len, hidden_dim = hidden_states.shape
         num_tokens = bsz * seq_len
         
-        # Get routing decisions
-        top_k_indices, top_k_weights = self.gate(hidden_states)
-        # top_k_indices: [bsz, seq_len, top_k], top_k_weights: [bsz, seq_len, top_k]
+        # Get routing decisions (now returns aux_loss as 3rd value)
+        top_k_indices, top_k_weights, aux_loss = self.gate(hidden_states)
 
-        # Bias update bookkeeping (training only)
+        # Bias update bookkeeping (only when load_balance_strategy="bias")
         tokens_per_expert = None
-        if self.training and hasattr(self.gate, 'bias') and self.bias_update_factor > 0:
+        if (self.training 
+            and self.load_balance_strategy == "bias"
+            and hasattr(self.gate, 'bias') 
+            and self.bias_update_factor > 0):
             current_tpe = torch.bincount(
                 rearrange(top_k_indices, 'b s k -> (b s k)'),
                 minlength=self.num_routed_experts
@@ -217,4 +221,5 @@ class BiBoMoELayer(nn.Module):
         if tokens_per_expert is not None:
             self.update_bias(tokens_per_expert)
 
-        return final_output
+        # Return aux_loss for the model to add to total loss
+        return final_output, aux_loss
