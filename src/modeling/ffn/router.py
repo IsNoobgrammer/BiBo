@@ -44,16 +44,20 @@ class BiBoMoERouter(nn.Module):
         self.load_balance_strategy = getattr(config, 'load_balance_strategy', 'none')
         self.aux_loss_coef = getattr(config, 'aux_loss_coef', 0.001)
         self.router_activation = getattr(config, 'router_activation', 'none')
+        self.norm_topk_prob = getattr(config, 'norm_topk_prob', False)
 
         # Load-balancing bias — only used when load_balance_strategy="bias"
         # NOT learned via gradient, updated by heuristic threshold logic.
         self.bias = nn.Parameter(torch.zeros(self.num_routed_experts), requires_grad=False)
 
-        # Router projection
+        # Router projection — zero-init like Qwen (uniform routing at start)
         if self.router_type == "mlp":
             self.gate_proj = nn.Linear(config.hidden_size, self.num_routed_experts, bias=False)
+            nn.init.zeros_(self.gate_proj.weight)
+            self.gate_proj._is_router_gate = True  # tag so _init_weights skips re-init
         elif self.router_type == "conv":
             self.gate_conv = nn.Conv1d(config.hidden_size, self.num_routed_experts, self.kernel_size, padding=0, bias=False)
+            nn.init.zeros_(self.gate_conv.weight)
         else:
             raise ValueError(f"Unknown router type: {self.router_type}. Expected 'mlp' or 'conv'.")
 
@@ -114,9 +118,12 @@ class BiBoMoERouter(nn.Module):
         # Step 7: top-k selection
         _, top_k_indices = torch.topk(selection_scores, self.top_k, dim=-1)
 
-        # Step 8: gather and normalize weights
+        # Step 8: gather weights — normalize only if norm_topk_prob=True
         top_k_weights = routing_weights.gather(-1, top_k_indices)
-        norm_weights = top_k_weights / (top_k_weights.sum(-1, keepdim=True) + 1e-6)
+        if self.norm_topk_prob:
+            norm_weights = top_k_weights / (top_k_weights.sum(-1, keepdim=True) + 1e-6)
+        else:
+            norm_weights = top_k_weights
 
         # Compute auxiliary load-balancing loss if requested
         aux_loss = None

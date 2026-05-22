@@ -44,9 +44,9 @@ class BiBoFusedExperts(nn.Module):
             torch.empty(self.num_polyglu_experts, self.hidden_size, self.intermediate_size)
         )
         
-        # Initialize (match nn.Linear kaiming_uniform default)
-        nn.init.kaiming_uniform_(self.gate_up_proj, a=5**0.5)
-        nn.init.kaiming_uniform_(self.down_proj, a=5**0.5)
+        # Initialize — normal_(0, std) like Qwen3MoEExperts
+        nn.init.normal_(self.gate_up_proj, mean=0.0, std=config.initializer_range)
+        nn.init.normal_(self.down_proj, mean=0.0, std=config.initializer_range)
         
         # Pre-compute activation name for each expert index
         # Layout: [SiLU_0, ReLU²_0, Tanh_0, SiLU_1, ReLU²_1, Tanh_1, ...]

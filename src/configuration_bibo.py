@@ -22,7 +22,7 @@ class BiBoConfig(PretrainedConfig):
         hidden_act="silu",
         max_position_embeddings=32768,
         initializer_range=0.02,
-        rms_norm_eps=1e-5,
+        rms_norm_eps=1e-6,
         layer_norm_type="rms",
         use_cache=True,
         use_ssmax=True,  # SSMax: scaling softmax for long context
@@ -114,12 +114,11 @@ class BiBoConfig(PretrainedConfig):
         # Auto-derived hyperparameters
         # ============================================================
 
-        # rope_theta: scales with context length (LLaMA-3 empirical relationship)
+        # rope_theta: default 10000 (matches Qwen3MoE / standard LLaMA)
         if rope_theta is not None:
             self.rope_theta = rope_theta
         else:
-            base = 10000.0
-            self.rope_theta = base * (self.max_position_embeddings / 4096) ** (4 / 3)
+            self.rope_theta = 10000.0
 
         # moe_intermediate_size: maintain compute parity with dense FFN
         # dense active params/token = 2 * hidden * intermediate

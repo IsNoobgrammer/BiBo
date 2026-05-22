@@ -33,8 +33,13 @@ class BiBoPreTrainedModel(PreTrainedModel):
     _supports_cache_class = True
 
     def _init_weights(self, module):
+        from src.modeling.ffn.router import BiBoMoERouter
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
+            # Skip router gate_proj — zero-initialized in BiBoMoERouter.__init__
+            if hasattr(module, '_is_router_gate'):
+                module.weight.data.zero_()
+                return
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
