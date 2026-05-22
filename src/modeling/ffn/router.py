@@ -97,6 +97,16 @@ class BiBoMoERouter(nn.Module):
             noise = torch.randn_like(router_logits) * noise_stddev
             router_logits = router_logits + noise.detach()
 
+        # --- AUX LOSS: computed from RAW logits (before activation), matching Qwen ---
+        aux_loss = None
+        if self.load_balance_strategy == "aux_loss" and self.training:
+            raw_routing_weights = F.softmax(router_logits, dim=-1)
+            _, raw_top_k_indices = torch.topk(raw_routing_weights, self.top_k, dim=-1)
+            expert_mask = F.one_hot(raw_top_k_indices, num_classes=self.num_routed_experts).float()
+            tokens_per_expert = expert_mask.mean(dim=0)        # (top_k, num_experts)
+            router_prob_per_expert = raw_routing_weights.mean(dim=0)  # (num_experts,)
+            aux_loss = self.num_routed_experts * (tokens_per_expert * router_prob_per_expert.unsqueeze(0)).sum()
+
         # Step 3: router activation (ReLU/SiLU/none)
         router_logits = self._apply_router_activation(router_logits)
 
@@ -124,22 +134,6 @@ class BiBoMoERouter(nn.Module):
             norm_weights = top_k_weights / (top_k_weights.sum(-1, keepdim=True) + 1e-6)
         else:
             norm_weights = top_k_weights
-
-        # Compute auxiliary load-balancing loss if requested
-        aux_loss = None
-        if self.load_balance_strategy == "aux_loss" and self.training:
-            # Switch Transformer style auxiliary loss:
-            # L_aux = N * sum(f_i * P_i)
-            # where f_i = fraction of tokens routed to expert i
-            #       P_i = mean routing probability for expert i
-            num_tokens = router_logits.shape[0]
-            # f_i: fraction of tokens where expert i is in top-k
-            expert_mask = F.one_hot(top_k_indices, num_classes=self.num_routed_experts).float()
-            expert_mask = expert_mask.sum(dim=1)  # (num_tokens, num_experts) — count per expert per token
-            f = expert_mask.sum(dim=0) / (num_tokens * self.top_k)  # (num_experts,)
-            # P_i: mean routing probability across all tokens
-            P = routing_weights.mean(dim=0)  # (num_experts,)
-            aux_loss = self.num_routed_experts * (f * P).sum()
 
         top_k_indices = rearrange(top_k_indices, '(b s) k -> b s k', b=batch_size)
         norm_weights = rearrange(norm_weights, '(b s) k -> b s k', b=batch_size)
