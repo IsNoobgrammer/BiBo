@@ -382,6 +382,12 @@ def plot_operator_expert_affinity(bibo_model, qwen_model, val_data,
             elif masks['phase3'][pos]:
                 position_phases[sample_idx, pos] = 'phase3'
 
+    def _ensure_3d(indices):
+        """Ensure indices are (bs, seq_len, top_k) — add dim if 2D."""
+        if indices.ndim == 2:
+            return indices[:, :, np.newaxis]
+        return indices
+
     def _gather_category_experts(layer_data, n_experts, categories_map):
         """For each token category, collect which experts were selected."""
         cat_experts = {cat: np.zeros(n_experts) for cat in
@@ -389,7 +395,7 @@ def plot_operator_expert_affinity(bibo_model, qwen_model, val_data,
                         'num_small', 'num_med', 'num_large']}
 
         for layer_idx, ld in layer_data.items():
-            indices = ld['indices'].numpy()  # (bs, seq_len, top_k)
+            indices = _ensure_3d(ld['indices'].numpy())  # (bs, seq_len, top_k)
             for s in range(indices.shape[0]):
                 for p in range(indices.shape[1]):
                     cat = categories_map[s, p] if p < categories_map.shape[1] else ''
@@ -403,7 +409,7 @@ def plot_operator_expert_affinity(bibo_model, qwen_model, val_data,
         phase_experts = {ph: np.zeros(n_experts) for ph in ['phase1', 'phase2', 'phase3']}
 
         for layer_idx, ld in layer_data.items():
-            indices = ld['indices'].numpy()
+            indices = _ensure_3d(ld['indices'].numpy())
             for s in range(indices.shape[0]):
                 for p in range(indices.shape[1]):
                     ph = phases_map[s, p] if p < phases_map.shape[1] else ''
@@ -568,7 +574,9 @@ def plot_expert_confidence_by_token_type(bibo_model, qwen_model, val_data,
         """Get top-1 weight (confidence) per token category."""
         cat_weights = {c: [] for c in categories}
         for layer_idx, ld in layer_data.items():
-            weights = ld['weights'].numpy()  # (bs, seq_len, top_k)
+            weights = ld['weights'].numpy()  # (bs, seq_len, top_k) or (bs, seq_len)
+            if weights.ndim == 2:
+                weights = weights[:, :, np.newaxis]
             for s in range(weights.shape[0]):
                 for p in range(weights.shape[1]):
                     cat = cats_map[s, p] if p < cats_map.shape[1] else ''
@@ -651,7 +659,9 @@ def plot_polyglue_activation_specialization(bibo_model, val_data,
     cat_act_counts = {c: {a: 0 for a in act_types} for c in token_cats}
 
     for layer_idx, ld in bibo_ld.items():
-        indices = ld['indices'].numpy()  # (bs, seq_len, top_k)
+        indices = ld['indices'].numpy()  # (bs, seq_len, top_k) or (bs, seq_len)
+        if indices.ndim == 2:
+            indices = indices[:, :, np.newaxis]
         for s in range(indices.shape[0]):
             for p in range(indices.shape[1]):
                 cat = position_categories[s, p] if p < position_categories.shape[1] else ''
