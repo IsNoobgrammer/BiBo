@@ -184,10 +184,10 @@ class BiBoMoELayer(nn.Module):
         bsz, seq_len, hidden_dim = hidden_states.shape
         num_tokens = bsz * seq_len
         
-        # Get routing decisions (now returns aux_loss as 3rd value)
-        top_k_indices, top_k_weights, aux_loss = self.gate(hidden_states)
+        # Get routing decisions
+        top_k_indices, top_k_weights = self.gate(hidden_states)
 
-        # Bias update bookkeeping (only when load_balance_strategy="bias")
+        # Bias update bookkeeping (heuristic load balancing)
         tokens_per_expert = None
         if (self.training 
             and self.load_balance_strategy == "bias"
@@ -225,5 +225,4 @@ class BiBoMoELayer(nn.Module):
         if tokens_per_expert is not None:
             self.update_bias(tokens_per_expert)
 
-        # Return aux_loss for the model to add to total loss
-        return final_output, aux_loss
+        return final_output

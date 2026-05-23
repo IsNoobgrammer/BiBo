@@ -33,13 +33,8 @@ class BiBoPreTrainedModel(PreTrainedModel):
     _supports_cache_class = True
 
     def _init_weights(self, module):
-        from src.modeling.ffn.router import BiBoMoERouter
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
-            # Skip router gate_proj — zero-initialized in BiBoMoERouter.__init__
-            if hasattr(module, '_is_router_gate'):
-                module.weight.data.zero_()
-                return
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -147,7 +142,6 @@ class BiBoModel(BiBoPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
-        total_aux_loss = None
 
         for decoder_layer in self.layers:
             if output_hidden_states:
@@ -175,21 +169,16 @@ class BiBoModel(BiBoPreTrainedModel):
                     use_cache=use_cache,
                 )
 
-            # layer_outputs: (hidden_states, aux_loss, [attn_weights], [cache])
+            # layer_outputs: (hidden_states, [attn_weights], [cache])
             hidden_states = layer_outputs[0]
-            layer_aux_loss = layer_outputs[1]
 
-            # Accumulate aux_loss from all MoE layers
-            if layer_aux_loss is not None:
-                total_aux_loss = layer_aux_loss if total_aux_loss is None else total_aux_loss + layer_aux_loss
-
-            # Cache is after aux_loss (idx 2) or after attn_weights (idx 3)
+            # Cache is after hidden_states (idx 1) or after attn_weights (idx 2)
             if use_cache:
-                cache_idx = 3 if output_attentions else 2
+                cache_idx = 2 if output_attentions else 1
                 next_decoder_cache = layer_outputs[cache_idx]
 
             if output_attentions:
-                all_self_attns += (layer_outputs[2],)
+                all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
 
@@ -205,10 +194,7 @@ class BiBoModel(BiBoPreTrainedModel):
                 next_cache = None
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, total_aux_loss] if v is not None)
-
-        # Store aux_loss for BiBoForCausalLM to access
-        self._last_aux_loss = total_aux_loss
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -275,7 +261,7 @@ class BiBoForCausalLM(BiBoPreTrainedModel):
     Args:
         config: Model config
     """
-    _tied_weights_keys = None  # Disable weight tying for now
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: BiBoConfig):
         super().__init__(config)
@@ -347,12 +333,6 @@ class BiBoForCausalLM(BiBoPreTrainedModel):
             shift_labels = shift_labels.view(-1)
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
-
-            # Add auxiliary load-balancing loss if present
-            aux_loss = getattr(self.model, '_last_aux_loss', None)
-            if aux_loss is not None:
-                aux_loss_coef = getattr(self.config, 'aux_loss_coef', 0.001)
-                loss = loss + aux_loss_coef * aux_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]

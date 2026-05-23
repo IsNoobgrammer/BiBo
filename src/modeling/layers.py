@@ -63,14 +63,10 @@ class BiBoDecoderLayer(nn.Module):
         # FFN
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        if self.is_moe_layer:
-            hidden_states, aux_loss = self.mlp(hidden_states)
-        else:
-            hidden_states = self.mlp(hidden_states)
-            aux_loss = None
+        hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states, aux_loss)
+        outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights,)
         if use_cache:

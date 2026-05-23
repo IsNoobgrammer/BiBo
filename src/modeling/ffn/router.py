@@ -39,25 +39,21 @@ class BiBoMoERouter(nn.Module):
         self.causal_padding = self.kernel_size - 1
         self.router_lambda = getattr(config, 'router_lambda', 1.0)
         
-        # New configurable options
+        # Configurable options
         self.use_router_logit_norm = getattr(config, 'use_router_logit_norm', False)
-        self.load_balance_strategy = getattr(config, 'load_balance_strategy', 'none')
-        self.aux_loss_coef = getattr(config, 'aux_loss_coef', 0.001)
         self.router_activation = getattr(config, 'router_activation', 'none')
         self.norm_topk_prob = getattr(config, 'norm_topk_prob', False)
 
-        # Load-balancing bias — only used when load_balance_strategy="bias"
-        # NOT learned via gradient, updated by heuristic threshold logic.
+        # Load-balancing bias — heuristically updated (not optimizer-managed)
         self.bias = nn.Parameter(torch.zeros(self.num_routed_experts), requires_grad=False)
 
-        # Router projection — zero-init like Qwen (uniform routing at start)
+        # Router projection — normal init (matches Qwen3MoE)
         if self.router_type == "mlp":
             self.gate_proj = nn.Linear(config.hidden_size, self.num_routed_experts, bias=False)
-            nn.init.zeros_(self.gate_proj.weight)
-            self.gate_proj._is_router_gate = True  # tag so _init_weights skips re-init
+            nn.init.normal_(self.gate_proj.weight, mean=0.0, std=config.initializer_range)
         elif self.router_type == "conv":
             self.gate_conv = nn.Conv1d(config.hidden_size, self.num_routed_experts, self.kernel_size, padding=0, bias=False)
-            nn.init.zeros_(self.gate_conv.weight)
+            nn.init.normal_(self.gate_conv.weight, mean=0.0, std=config.initializer_range)
         else:
             raise ValueError(f"Unknown router type: {self.router_type}. Expected 'mlp' or 'conv'.")
 
@@ -77,7 +73,6 @@ class BiBoMoERouter(nn.Module):
         Returns:
             top_k_indices: (batch, seq_len, top_k)
             norm_weights: (batch, seq_len, top_k)
-            aux_loss: scalar tensor or None (only when load_balance_strategy="aux_loss")
         """
         batch_size, seq_len, hidden_dim = hidden_states.shape
         
@@ -106,14 +101,11 @@ class BiBoMoERouter(nn.Module):
             std = router_logits.std(dim=1, keepdim=True) + 1e-6
             router_logits = self.router_lambda * (router_logits - mean) / std
 
-        # Step 5: routing weights via softmax (always on clean logits)
+        # Step 5: routing weights via softmax
         routing_weights = F.softmax(router_logits, dim=1)
 
-        # Step 6: selection scores (bias only when strategy="bias")
-        if self.load_balance_strategy == "bias":
-            selection_scores = router_logits + self.bias
-        else:
-            selection_scores = router_logits
+        # Step 6: selection uses logits + bias (bias heuristic for load balancing)
+        selection_scores = router_logits + self.bias
 
         # Step 7: top-k selection
         _, top_k_indices = torch.topk(selection_scores, self.top_k, dim=-1)
@@ -125,22 +117,6 @@ class BiBoMoERouter(nn.Module):
         else:
             norm_weights = top_k_weights
 
-        # Compute auxiliary load-balancing loss if requested
-        aux_loss = None
-        if self.load_balance_strategy == "aux_loss" and self.training:
-            # Switch Transformer style auxiliary loss:
-            # L_aux = N * sum(f_i * P_i)
-            # where f_i = fraction of tokens routed to expert i
-            #       P_i = mean routing probability for expert i
-            num_tokens = router_logits.shape[0]
-            # f_i: fraction of tokens where expert i is in top-k
-            expert_mask = F.one_hot(top_k_indices, num_classes=self.num_routed_experts).float()
-            expert_mask = expert_mask.sum(dim=1)  # (num_tokens, num_experts) — count per expert per token
-            f = expert_mask.sum(dim=0) / (num_tokens * self.top_k)  # (num_experts,)
-            # P_i: mean routing probability across all tokens
-            P = routing_weights.mean(dim=0)  # (num_experts,)
-            aux_loss = self.num_routed_experts * (f * P).sum()
-
         top_k_indices = rearrange(top_k_indices, '(b s) k -> b s k', b=batch_size)
         norm_weights = rearrange(norm_weights, '(b s) k -> b s k', b=batch_size)
-        return top_k_indices.long(), norm_weights.to(hidden_states.dtype), aux_loss
+        return top_k_indices.long(), norm_weights.to(hidden_states.dtype)
