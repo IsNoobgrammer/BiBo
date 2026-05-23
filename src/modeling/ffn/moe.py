@@ -30,18 +30,28 @@ class BiBoFusedExperts(nn.Module):
     """
     def __init__(self, config: BiBoConfig):
         super().__init__()
+        self.use_uniform_experts = getattr(config, 'use_uniform_experts', False)
         self.num_polyglu_experts = config.polyglu_expert_multiplier * 3
         self.special_expert_pairs = config.special_expert_pairs
         self.num_routed_experts = config.num_routed_experts
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.moe_intermediate_size
         
-        # Fused weight tensors for all PolyGLU experts
+        if self.use_uniform_experts:
+            # All experts are SiLU GLU (matches Qwen3MoE exactly)
+            # No Identity/Zero — all num_routed_experts are fused SiLU experts
+            num_fused = self.num_routed_experts
+        else:
+            num_fused = self.num_polyglu_experts
+        
+        self.num_fused_experts = num_fused
+        
+        # Fused weight tensors for all fused experts
         self.gate_up_proj = nn.Parameter(
-            torch.empty(self.num_polyglu_experts, 2 * self.intermediate_size, self.hidden_size)
+            torch.empty(num_fused, 2 * self.intermediate_size, self.hidden_size)
         )
         self.down_proj = nn.Parameter(
-            torch.empty(self.num_polyglu_experts, self.hidden_size, self.intermediate_size)
+            torch.empty(num_fused, self.hidden_size, self.intermediate_size)
         )
         
         # Initialize — normal_(0, std) like Qwen3MoEExperts
@@ -50,17 +60,29 @@ class BiBoFusedExperts(nn.Module):
         
         # Pre-compute activation name for each expert index
         # Layout: [SiLU_0, ReLU²_0, Tanh_0, SiLU_1, ReLU²_1, Tanh_1, ...]
+        # If use_uniform_experts=True, all experts use SiLU (matches Qwen3MoE)
         self._expert_activations = []
-        for _ in range(config.polyglu_expert_multiplier):
-            for act in _POLYGLU_ACTIVATIONS:
-                self._expert_activations.append(act)
+        if self.use_uniform_experts:
+            for _ in range(self.num_routed_experts):
+                self._expert_activations.append("silu")
+        else:
+            for _ in range(config.polyglu_expert_multiplier):
+                for act in _POLYGLU_ACTIVATIONS:
+                    self._expert_activations.append(act)
         
         # Identity indices: [num_polyglu, num_polyglu + pairs)
         # Zero indices: [num_polyglu + pairs, num_routed)
-        self.identity_start = self.num_polyglu_experts
-        self.identity_end = self.num_polyglu_experts + self.special_expert_pairs
-        self.zero_start = self.identity_end
-        self.zero_end = self.num_routed_experts
+        # When use_uniform_experts=True, these ranges are empty (no special experts)
+        if self.use_uniform_experts:
+            self.identity_start = self.num_routed_experts  # empty range
+            self.identity_end = self.num_routed_experts
+            self.zero_start = self.num_routed_experts
+            self.zero_end = self.num_routed_experts
+        else:
+            self.identity_start = self.num_polyglu_experts
+            self.identity_end = self.num_polyglu_experts + self.special_expert_pairs
+            self.zero_start = self.identity_end
+            self.zero_end = self.num_routed_experts
 
     def forward(
         self,
@@ -96,7 +118,7 @@ class BiBoFusedExperts(nn.Module):
             current_state = hidden_states[token_idx]  # (n_tokens_for_expert, hidden)
             current_weights = top_k_weights[token_idx, top_k_pos, None]  # (n, 1)
             
-            if eidx < self.num_polyglu_experts:
+            if eidx < self.num_fused_experts:
                 # PolyGLU expert: fused gate+up → activation → down
                 gate_up = F.linear(current_state, self.gate_up_proj[eidx])  # (n, 2*inter)
                 gate, up = gate_up.chunk(2, dim=-1)
@@ -184,8 +206,8 @@ class BiBoMoELayer(nn.Module):
         bsz, seq_len, hidden_dim = hidden_states.shape
         num_tokens = bsz * seq_len
         
-        # Get routing decisions (now returns aux_loss as 3rd value)
-        top_k_indices, top_k_weights, aux_loss = self.gate(hidden_states)
+        # Get routing decisions (now returns aux_loss and router_logits)
+        top_k_indices, top_k_weights, aux_loss, router_logits = self.gate(hidden_states)
 
         # Bias update bookkeeping (only when load_balance_strategy="bias")
         tokens_per_expert = None
@@ -225,5 +247,5 @@ class BiBoMoELayer(nn.Module):
         if tokens_per_expert is not None:
             self.update_bias(tokens_per_expert)
 
-        # Return aux_loss for the model to add to total loss
-        return final_output, aux_loss
+        # Return aux_loss and router_logits for the model to collect
+        return final_output, aux_loss, router_logits

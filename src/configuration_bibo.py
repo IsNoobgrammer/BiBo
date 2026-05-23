@@ -45,6 +45,7 @@ class BiBoConfig(PretrainedConfig):
         # PolyGLU expert layout
         polyglu_expert_multiplier=2,  # Groups of 3 (SiLU, ReLU², Tanh) GLU experts
         special_expert_pairs=1,  # Pairs of (Identity, Zero) experts
+        use_uniform_experts=False,  # If True, all experts use SiLU (like Qwen3MoE) — for fair ablation
         # Router
         router_type="mlp",  # "mlp" or "conv"
         kernel_size=3,
@@ -61,6 +62,8 @@ class BiBoConfig(PretrainedConfig):
         # Router activation: applied to raw logits before softmax/selection
         # "none" (standard softmax), "relu" (DECO-style), "silu"
         router_activation="none",
+        # Router init: "zero" (BiBo default — uniform routing at start) or "normal" (Qwen3MoE style)
+        router_init="zero",
         # Shared expert
         shared_expert_type="mlp",  # "mlp" (SwiGLU, like Qwen) or "conv" (CausalConv1D)
         moe_shared_scaling=1.0,  # Auto-computed if 1.0 (DeepSeek-V2/V3 style)
@@ -95,6 +98,7 @@ class BiBoConfig(PretrainedConfig):
         # PolyGLU layout: experts = polyglu_multiplier * 3 (SiLU, ReLU², Tanh) + special_pairs * 2 (Identity, Zero)
         self.polyglu_expert_multiplier = polyglu_expert_multiplier
         self.special_expert_pairs = special_expert_pairs
+        self.use_uniform_experts = use_uniform_experts
         self.num_routed_experts = (polyglu_expert_multiplier * 3) + (special_expert_pairs * 2)
         self.num_experts = num_experts if num_experts is not None else (self.num_routed_experts + num_shared_experts)
         self.router_temperature = router_temperature
@@ -109,6 +113,7 @@ class BiBoConfig(PretrainedConfig):
         self.load_balance_strategy = load_balance_strategy
         self.aux_loss_coef = aux_loss_coef
         self.router_activation = router_activation
+        self.router_init = router_init
 
         # ============================================================
         # Auto-derived hyperparameters
@@ -241,6 +246,8 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError(f"load_balance_strategy must be 'none', 'bias', or 'aux_loss', got '{self.load_balance_strategy}'")
         if self.router_activation not in ("none", "relu", "silu"):
             raise ValueError(f"router_activation must be 'none', 'relu', or 'silu', got '{self.router_activation}'")
+        if self.router_init not in ("zero", "normal"):
+            raise ValueError(f"router_init must be 'zero' or 'normal', got '{self.router_init}'")
         for idx in self.mlp_only_layers:
             if not (0 <= idx < self.num_hidden_layers):
                 raise ValueError(f"mlp_only_layers index {idx} is out of range for {self.num_hidden_layers} layers")

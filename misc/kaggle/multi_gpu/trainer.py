@@ -167,13 +167,46 @@ def train_worker(model_name):
             optimizer.zero_grad()
 
             # Forward WITHOUT labels — loss computed externally via NTIL
-            outputs = model(input_ids=input_ids)
+            if model_name == 'qwen3moe':
+                outputs = model(input_ids=input_ids, output_router_logits=True)
+            else:
+                outputs = model(input_ids=input_ids)
             logits = outputs.logits
 
             # Dataset already provides shifted labels (input=full[:-1], labels=full[1:])
             # No additional shift needed — logits[i] predicts labels[i]
             # NTIL loss (CCE + EMD + sequence-level)
             loss, loss_components = ntil_loss_fn(logits, labels)
+
+            # Add auxiliary load-balancing loss (MoE needs this to avoid expert collapse)
+            # SAME loss function for both models — Qwen's load_balancing_loss_func
+            aux_loss_val = 0.0
+            if model_name == 'bibo':
+                router_logits_tuple = getattr(model.model, '_last_router_logits', None)
+                if router_logits_tuple is not None and len(router_logits_tuple) > 0:
+                    from baseline.qwen3moe.modeling import load_balancing_loss_func
+                    bibo_cfg = CFG['bibo']
+                    num_experts = bibo_cfg.get('polyglu_expert_multiplier', 2) * 3 + bibo_cfg.get('special_expert_pairs', 1) * 2
+                    aux_loss = load_balancing_loss_func(
+                        router_logits_tuple,
+                        num_experts=num_experts,
+                        top_k=bibo_cfg['num_experts_per_tok'],
+                    )
+                    aux_coef = CFG['bibo'].get('aux_loss_coef', 0.001)
+                    loss = loss + aux_coef * aux_loss
+                    aux_loss_val = aux_loss.item()
+            else:
+                if hasattr(outputs, 'router_logits') and outputs.router_logits is not None:
+                    from baseline.qwen3moe.modeling import load_balancing_loss_func
+                    qwen_cfg = CFG['qwen3moe']
+                    aux_loss = load_balancing_loss_func(
+                        outputs.router_logits,
+                        num_experts=qwen_cfg['num_experts'],
+                        top_k=qwen_cfg['num_experts_per_tok'],
+                    )
+                    aux_coef = qwen_cfg.get('router_aux_loss_coef', 0.001)
+                    loss = loss + aux_coef * aux_loss
+                    aux_loss_val = aux_loss.item()
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), T['grad_clip'])
@@ -190,7 +223,7 @@ def train_worker(model_name):
                 'step': global_step, 'loss': step_loss, 'lr': cur_lr,
                 'seq_len': seq_len, 'stage': stage_idx,
                 'cce': loss_components['cce'], 'emd': loss_components['emd'],
-                'seq_loss': loss_components['seq'],
+                'seq_loss': loss_components['seq'], 'aux_loss': aux_loss_val,
             })
 
             # Log stage transitions
@@ -215,6 +248,7 @@ def train_worker(model_name):
                 f'{model_name}/seq_raw': loss_components['seq'],
                 f'{model_name}/emd_scaled': loss_components['emd_scaled'],
                 f'{model_name}/seq_scaled': loss_components['seq_scaled'],
+                f'{model_name}/aux_loss': aux_loss_val,
                 f'{model_name}/lr': cur_lr,
                 f'{model_name}/seq_len': seq_len if seq_len else 0,
                 'global_step': global_step,

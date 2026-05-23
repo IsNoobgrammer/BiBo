@@ -36,9 +36,8 @@ class BiBoPreTrainedModel(PreTrainedModel):
         from src.modeling.ffn.router import BiBoMoERouter
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
-            # Skip router gate_proj — zero-initialized in BiBoMoERouter.__init__
+            # Skip router gate_proj if it was explicitly initialized (zero or normal)
             if hasattr(module, '_is_router_gate'):
-                module.weight.data.zero_()
                 return
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
@@ -148,6 +147,7 @@ class BiBoModel(BiBoPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
         total_aux_loss = None
+        all_router_logits = ()
 
         for decoder_layer in self.layers:
             if output_hidden_states:
@@ -175,21 +175,26 @@ class BiBoModel(BiBoPreTrainedModel):
                     use_cache=use_cache,
                 )
 
-            # layer_outputs: (hidden_states, aux_loss, [attn_weights], [cache])
+            # layer_outputs: (hidden_states, aux_loss, router_logits, [attn_weights], [cache])
             hidden_states = layer_outputs[0]
             layer_aux_loss = layer_outputs[1]
+            layer_router_logits = layer_outputs[2]
 
             # Accumulate aux_loss from all MoE layers
             if layer_aux_loss is not None:
                 total_aux_loss = layer_aux_loss if total_aux_loss is None else total_aux_loss + layer_aux_loss
 
-            # Cache is after aux_loss (idx 2) or after attn_weights (idx 3)
+            # Collect router logits for external aux_loss computation
+            if layer_router_logits is not None:
+                all_router_logits += (layer_router_logits,)
+
+            # Cache is after router_logits (idx 3) or after attn_weights (idx 4)
             if use_cache:
-                cache_idx = 3 if output_attentions else 2
+                cache_idx = 4 if output_attentions else 3
                 next_decoder_cache = layer_outputs[cache_idx]
 
             if output_attentions:
-                all_self_attns += (layer_outputs[2],)
+                all_self_attns += (layer_outputs[3],)
 
         hidden_states = self.norm(hidden_states)
 
@@ -207,8 +212,9 @@ class BiBoModel(BiBoPreTrainedModel):
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, total_aux_loss] if v is not None)
 
-        # Store aux_loss for BiBoForCausalLM to access
+        # Store aux_loss and router_logits for BiBoForCausalLM to access
         self._last_aux_loss = total_aux_loss
+        self._last_router_logits = all_router_logits if all_router_logits else None
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -275,7 +281,7 @@ class BiBoForCausalLM(BiBoPreTrainedModel):
     Args:
         config: Model config
     """
-    _tied_weights_keys = None  # Disable weight tying for now
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: BiBoConfig):
         super().__init__(config)

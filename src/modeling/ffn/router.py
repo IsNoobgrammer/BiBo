@@ -50,14 +50,22 @@ class BiBoMoERouter(nn.Module):
         # NOT learned via gradient, updated by heuristic threshold logic.
         self.bias = nn.Parameter(torch.zeros(self.num_routed_experts), requires_grad=False)
 
-        # Router projection — zero-init like Qwen (uniform routing at start)
+        # Router projection
+        self.router_init = getattr(config, 'router_init', 'zero')
         if self.router_type == "mlp":
             self.gate_proj = nn.Linear(config.hidden_size, self.num_routed_experts, bias=False)
-            nn.init.zeros_(self.gate_proj.weight)
+            if self.router_init == "zero":
+                nn.init.zeros_(self.gate_proj.weight)
+            else:
+                # "normal" — matches Qwen3MoE: normal_(0, initializer_range)
+                nn.init.normal_(self.gate_proj.weight, mean=0.0, std=config.initializer_range)
             self.gate_proj._is_router_gate = True  # tag so _init_weights skips re-init
         elif self.router_type == "conv":
             self.gate_conv = nn.Conv1d(config.hidden_size, self.num_routed_experts, self.kernel_size, padding=0, bias=False)
-            nn.init.zeros_(self.gate_conv.weight)
+            if self.router_init == "zero":
+                nn.init.zeros_(self.gate_conv.weight)
+            else:
+                nn.init.normal_(self.gate_conv.weight, mean=0.0, std=config.initializer_range)
         else:
             raise ValueError(f"Unknown router type: {self.router_type}. Expected 'mlp' or 'conv'.")
 
@@ -78,6 +86,7 @@ class BiBoMoERouter(nn.Module):
             top_k_indices: (batch, seq_len, top_k)
             norm_weights: (batch, seq_len, top_k)
             aux_loss: scalar tensor or None (only when load_balance_strategy="aux_loss")
+            router_logits: (batch*seq_len, num_experts) raw logits for external aux_loss computation
         """
         batch_size, seq_len, hidden_dim = hidden_states.shape
         
@@ -96,6 +105,9 @@ class BiBoMoERouter(nn.Module):
             noise_stddev = math.sqrt(self.router_noise)
             noise = torch.randn_like(router_logits) * noise_stddev
             router_logits = router_logits + noise.detach()
+
+        # Save raw logits for external aux_loss (Qwen-style load_balancing_loss_func)
+        raw_router_logits = router_logits
 
         # --- AUX LOSS: computed from RAW logits (before activation), matching Qwen ---
         aux_loss = None
@@ -119,11 +131,12 @@ class BiBoMoERouter(nn.Module):
         # Step 5: routing weights via softmax (always on clean logits)
         routing_weights = F.softmax(router_logits, dim=1)
 
-        # Step 6: selection scores (bias only when strategy="bias")
+        # Step 6: selection — Qwen selects from softmax probs, bias strategy selects from logits+bias
         if self.load_balance_strategy == "bias":
             selection_scores = router_logits + self.bias
         else:
-            selection_scores = router_logits
+            # Match Qwen3MoE: select top-k from softmax probs directly
+            selection_scores = routing_weights
 
         # Step 7: top-k selection
         _, top_k_indices = torch.topk(selection_scores, self.top_k, dim=-1)
@@ -137,4 +150,4 @@ class BiBoMoERouter(nn.Module):
 
         top_k_indices = rearrange(top_k_indices, '(b s) k -> b s k', b=batch_size)
         norm_weights = rearrange(norm_weights, '(b s) k -> b s k', b=batch_size)
-        return top_k_indices.long(), norm_weights.to(hidden_states.dtype), aux_loss
+        return top_k_indices.long(), norm_weights.to(hidden_states.dtype), aux_loss, raw_router_logits
