@@ -124,6 +124,8 @@ def extract_routing_data(model, input_ids, device, model_type='bibo'):
                 }
             else:
                 logits, scores, indices = output
+                # Qwen router flattens (batch*seq_len, top_k) — reshape to (batch, seq_len, top_k)
+                # We store the batch_size from input_ids to reshape later
                 layer_data[layer_idx] = {
                     'indices': indices.detach().cpu(),
                     'weights': scores.detach().cpu().float(),
@@ -138,8 +140,19 @@ def extract_routing_data(model, input_ids, device, model_type='bibo'):
     with torch.no_grad():
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
+        batch_size, seq_len = input_ids.shape
         model(input_ids=input_ids.to(device))
 
     for h in hooks:
         h.remove()
+
+    # Reshape Qwen's flat (batch*seq_len, top_k) outputs to (batch, seq_len, top_k)
+    if model_type == 'qwen':
+        for layer_idx in layer_data:
+            ld = layer_data[layer_idx]
+            if ld['indices'].dim() == 2 and ld['indices'].shape[0] == batch_size * seq_len:
+                top_k = ld['indices'].shape[1]
+                ld['indices'] = ld['indices'].reshape(batch_size, seq_len, top_k)
+                ld['weights'] = ld['weights'].reshape(batch_size, seq_len, top_k)
+
     return layer_data

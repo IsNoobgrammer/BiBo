@@ -350,12 +350,15 @@ def plot_per_layer_topk_weights(bibo_model, qwen_model, val_data,
         results = {}
         for layer_idx, ld in sorted(layer_data.items()):
             weights = ld['weights'].numpy()
-            if weights.ndim == 2:
-                weights = weights[:, :, np.newaxis]
-            # weights shape: (bs, seq_len, top_k)
+            # Normalize to (tokens, top_k) regardless of input shape:
+            # - BiBo hook returns (bs, seq_len, top_k) → reshape to (bs*seq_len, top_k)
+            # - Qwen hook returns (bs*seq_len, top_k) → already correct
+            if weights.ndim == 3:
+                weights = weights.reshape(-1, weights.shape[-1])  # (bs*seq_len, top_k)
+            # Now weights is always (num_tokens, top_k)
             # top-1 is index 0, top-2 is index 1 (already sorted by router)
-            top1 = weights[:, :, 0].flatten()
-            top2 = weights[:, :, 1].flatten() if weights.shape[2] > 1 else np.zeros_like(top1)
+            top1 = weights[:, 0]
+            top2 = weights[:, 1] if weights.shape[1] > 1 else np.zeros_like(top1)
             results[layer_idx] = {
                 'top1_mean': float(np.mean(top1)),
                 'top1_std': float(np.std(top1)),
@@ -672,9 +675,11 @@ def plot_expert_confidence_by_token_type(bibo_model, qwen_model, val_data,
         cat_weights = {c: [] for c in categories}
         n_samples, n_positions = cats_map.shape
         for layer_idx, ld in layer_data.items():
-            weights = ld['weights'].numpy()  # (bs, seq_len, top_k) or (bs, seq_len)
+            weights = ld['weights'].numpy()  # (bs, seq_len, top_k)
             if weights.ndim == 2:
-                weights = weights[:, :, np.newaxis]
+                # Safety fallback: if somehow still flat, treat as (tokens, top_k)
+                # Can't iterate per-sample/position, so skip
+                continue
             for s in range(min(weights.shape[0], n_samples)):
                 for p in range(min(weights.shape[1], n_positions)):
                     cat = cats_map[s, p]
