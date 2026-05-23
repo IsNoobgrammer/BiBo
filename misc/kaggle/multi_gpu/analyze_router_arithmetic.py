@@ -160,10 +160,10 @@ def plot_load_balance_vs_batch_size(bibo_model, qwen_model, val_data,
 
     # Use the longest available bucket (closest to seq_len ~128)
     # The "hard" bucket (19-30 terms) produces sequences ~80-130 tokens
-    batch_sizes = list(range(1, 101))  # 1 to 100
+    batch_sizes = list(range(1, 129))  # 1 to 128
 
-    # We need enough data — use up to 100 samples
-    max_samples = min(100, len(val_data))
+    # We need enough data — use up to 128 samples
+    max_samples = min(128, len(val_data))
     data_pool = val_data[:max_samples]
 
     bibo_mads = []
@@ -275,8 +275,8 @@ def plot_per_layer_deviation_vs_batch_size(bibo_model, qwen_model, val_data,
     n_exp_bibo = poly_mult * 3 + special_pairs * 2
     n_exp_qwen = CFG['qwen3moe']['num_experts']
 
-    batch_sizes = [1, 5, 10, 20, 30, 50, 75, 100]
-    max_samples = min(100, len(val_data))
+    batch_sizes = [1, 5, 10, 20, 30, 50, 75, 100, 128]
+    max_samples = min(128, len(val_data))
 
     # Collect per-layer MAD for each batch size
     bibo_layer_mads = {}  # {layer_idx: [mad_per_bs]}
@@ -328,6 +328,101 @@ def plot_per_layer_deviation_vs_batch_size(bibo_model, qwen_model, val_data,
                  fontsize=13, fontweight='bold', y=1.02)
     plt.tight_layout()
     save_figure(fig, 'arithmetic_per_layer_deviation_vs_bs')
+
+
+def plot_per_layer_topk_weights(bibo_model, qwen_model, val_data,
+                                device_bibo, device_qwen, bibo_cfg):
+    """
+    4-panel plot: per-layer mean top-1 and top-2 router weights for BiBo and Qwen.
+
+    Shows how much weight the router assigns to its top choices per layer.
+    High top-1 = router is decisive (one expert dominates).
+    Low gap between top-1 and top-2 = router spreads load more evenly.
+    """
+    bs = min(64, len(val_data))
+    batch = torch.tensor(val_data[:bs, :-1], dtype=torch.long)
+
+    bibo_ld = extract_routing_data(bibo_model, batch, device_bibo, 'bibo')
+    qwen_ld = extract_routing_data(qwen_model, batch, device_qwen, 'qwen')
+
+    def _get_topk_weights_per_layer(layer_data):
+        """Return dict: layer_idx → (mean_top1, std_top1, mean_top2, std_top2)."""
+        results = {}
+        for layer_idx, ld in sorted(layer_data.items()):
+            weights = ld['weights'].numpy()
+            if weights.ndim == 2:
+                weights = weights[:, :, np.newaxis]
+            # weights shape: (bs, seq_len, top_k)
+            # top-1 is index 0, top-2 is index 1 (already sorted by router)
+            top1 = weights[:, :, 0].flatten()
+            top2 = weights[:, :, 1].flatten() if weights.shape[2] > 1 else np.zeros_like(top1)
+            results[layer_idx] = {
+                'top1_mean': float(np.mean(top1)),
+                'top1_std': float(np.std(top1)),
+                'top2_mean': float(np.mean(top2)),
+                'top2_std': float(np.std(top2)),
+            }
+        return results
+
+    bibo_weights = _get_topk_weights_per_layer(bibo_ld)
+    qwen_weights = _get_topk_weights_per_layer(qwen_ld)
+
+    # 4-panel plot: BiBo top-1, BiBo top-2, Qwen top-1, Qwen top-2
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # BiBo Top-1
+    layers_b = sorted(bibo_weights.keys())
+    top1_means_b = [bibo_weights[l]['top1_mean'] for l in layers_b]
+    top1_stds_b = [bibo_weights[l]['top1_std'] for l in layers_b]
+    axes[0, 0].bar(range(len(layers_b)), top1_means_b, yerr=top1_stds_b,
+                   color=BIBO_COLOR, alpha=0.8, capsize=4, edgecolor='white')
+    axes[0, 0].set_xticks(range(len(layers_b)))
+    axes[0, 0].set_xticklabels([f'L{l}' for l in layers_b])
+    axes[0, 0].set_ylabel('Mean Weight')
+    axes[0, 0].set_title('BiBo — Top-1 Router Weight per Layer')
+    axes[0, 0].set_ylim(0, 1)
+
+    # BiBo Top-2
+    top2_means_b = [bibo_weights[l]['top2_mean'] for l in layers_b]
+    top2_stds_b = [bibo_weights[l]['top2_std'] for l in layers_b]
+    axes[0, 1].bar(range(len(layers_b)), top2_means_b, yerr=top2_stds_b,
+                   color=BIBO_COLOR, alpha=0.6, capsize=4, edgecolor='white')
+    axes[0, 1].set_xticks(range(len(layers_b)))
+    axes[0, 1].set_xticklabels([f'L{l}' for l in layers_b])
+    axes[0, 1].set_ylabel('Mean Weight')
+    axes[0, 1].set_title('BiBo — Top-2 Router Weight per Layer')
+    axes[0, 1].set_ylim(0, 1)
+
+    # Qwen Top-1
+    layers_q = sorted(qwen_weights.keys())
+    top1_means_q = [qwen_weights[l]['top1_mean'] for l in layers_q]
+    top1_stds_q = [qwen_weights[l]['top1_std'] for l in layers_q]
+    axes[1, 0].bar(range(len(layers_q)), top1_means_q, yerr=top1_stds_q,
+                   color=QWEN_COLOR, alpha=0.8, capsize=4, edgecolor='white')
+    axes[1, 0].set_xticks(range(len(layers_q)))
+    axes[1, 0].set_xticklabels([f'L{l}' for l in layers_q])
+    axes[1, 0].set_ylabel('Mean Weight')
+    axes[1, 0].set_title('Qwen3MoE — Top-1 Router Weight per Layer')
+    axes[1, 0].set_ylim(0, 1)
+
+    # Qwen Top-2
+    top2_means_q = [qwen_weights[l]['top2_mean'] for l in layers_q]
+    top2_stds_q = [qwen_weights[l]['top2_std'] for l in layers_q]
+    axes[1, 1].bar(range(len(layers_q)), top2_means_q, yerr=top2_stds_q,
+                   color=QWEN_COLOR, alpha=0.6, capsize=4, edgecolor='white')
+    axes[1, 1].set_xticks(range(len(layers_q)))
+    axes[1, 1].set_xticklabels([f'L{l}' for l in layers_q])
+    axes[1, 1].set_ylabel('Mean Weight')
+    axes[1, 1].set_title('Qwen3MoE — Top-2 Router Weight per Layer')
+    axes[1, 1].set_ylim(0, 1)
+
+    fig.suptitle('Per-Layer Top-K Router Weights — Arithmetic Task\n'
+                 '(High top-1 = decisive routing, Low gap = better expert utilization)',
+                 fontsize=13, fontweight='bold', y=1.02)
+    plt.tight_layout()
+    save_figure(fig, 'arithmetic_per_layer_topk_weights')
+
+    return bibo_weights, qwen_weights
 
 
 def plot_operator_expert_affinity(bibo_model, qwen_model, val_data,
@@ -393,12 +488,13 @@ def plot_operator_expert_affinity(bibo_model, qwen_model, val_data,
         cat_experts = {cat: np.zeros(n_experts) for cat in
                        ['op_add', 'op_sub', 'op_mul', 'op_div',
                         'num_small', 'num_med', 'num_large']}
+        n_samples, n_positions = categories_map.shape
 
         for layer_idx, ld in layer_data.items():
             indices = _ensure_3d(ld['indices'].numpy())  # (bs, seq_len, top_k)
-            for s in range(indices.shape[0]):
-                for p in range(indices.shape[1]):
-                    cat = categories_map[s, p] if p < categories_map.shape[1] else ''
+            for s in range(min(indices.shape[0], n_samples)):
+                for p in range(min(indices.shape[1], n_positions)):
+                    cat = categories_map[s, p]
                     if cat in cat_experts:
                         for k in range(indices.shape[2]):
                             cat_experts[cat][indices[s, p, k]] += 1
@@ -407,12 +503,13 @@ def plot_operator_expert_affinity(bibo_model, qwen_model, val_data,
     def _gather_phase_experts(layer_data, n_experts, phases_map):
         """For each phase, collect expert selection distribution."""
         phase_experts = {ph: np.zeros(n_experts) for ph in ['phase1', 'phase2', 'phase3']}
+        n_samples, n_positions = phases_map.shape
 
         for layer_idx, ld in layer_data.items():
             indices = _ensure_3d(ld['indices'].numpy())
-            for s in range(indices.shape[0]):
-                for p in range(indices.shape[1]):
-                    ph = phases_map[s, p] if p < phases_map.shape[1] else ''
+            for s in range(min(indices.shape[0], n_samples)):
+                for p in range(min(indices.shape[1], n_positions)):
+                    ph = phases_map[s, p]
                     if ph in phase_experts:
                         for k in range(indices.shape[2]):
                             phase_experts[ph][indices[s, p, k]] += 1
@@ -573,13 +670,14 @@ def plot_expert_confidence_by_token_type(bibo_model, qwen_model, val_data,
     def _gather_confidence(layer_data, cats_map):
         """Get top-1 weight (confidence) per token category."""
         cat_weights = {c: [] for c in categories}
+        n_samples, n_positions = cats_map.shape
         for layer_idx, ld in layer_data.items():
             weights = ld['weights'].numpy()  # (bs, seq_len, top_k) or (bs, seq_len)
             if weights.ndim == 2:
                 weights = weights[:, :, np.newaxis]
-            for s in range(weights.shape[0]):
-                for p in range(weights.shape[1]):
-                    cat = cats_map[s, p] if p < cats_map.shape[1] else ''
+            for s in range(min(weights.shape[0], n_samples)):
+                for p in range(min(weights.shape[1], n_positions)):
+                    cat = cats_map[s, p]
                     if cat in cat_weights:
                         cat_weights[cat].append(weights[s, p, 0])  # top-1 weight
         return cat_weights
@@ -662,9 +760,9 @@ def plot_polyglue_activation_specialization(bibo_model, val_data,
         indices = ld['indices'].numpy()  # (bs, seq_len, top_k) or (bs, seq_len)
         if indices.ndim == 2:
             indices = indices[:, :, np.newaxis]
-        for s in range(indices.shape[0]):
-            for p in range(indices.shape[1]):
-                cat = position_categories[s, p] if p < position_categories.shape[1] else ''
+        for s in range(min(indices.shape[0], bs)):
+            for p in range(min(indices.shape[1], seq_len)):
+                cat = position_categories[s, p]
                 if cat in cat_act_counts:
                     for k in range(indices.shape[2]):
                         exp_idx = indices[s, p, k]
@@ -720,8 +818,8 @@ def plot_deviation_heatmap_bs_vs_layer(bibo_model, qwen_model, val_data,
     n_exp_bibo = poly_mult * 3 + special_pairs * 2
     n_exp_qwen = CFG['qwen3moe']['num_experts']
 
-    batch_sizes = [1, 2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
-    max_samples = min(100, len(val_data))
+    batch_sizes = [1, 2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 128]
+    max_samples = min(128, len(val_data))
 
     bibo_grid = []  # rows=batch_sizes, cols=layers
     qwen_grid = []
@@ -797,7 +895,7 @@ def main():
 
     # ── Load data ──
     # Use the "hard" bucket (19-30 terms → seq_len ~80-130, avg ~128)
-    print("\n[1/7] Loading arithmetic data...")
+    print("\n[1/8] Loading arithmetic data...")
     arith_cfg = CFG['training'].get('arithmetic', {})
     buckets = arith_cfg.get('buckets', [[3, 7], [9, 16], [19, 30], [35, 50]])
 
@@ -837,39 +935,45 @@ def main():
     print(f"  Sequence length: {val_data.shape[1]}")
 
     # ── Load models ──
-    print("\n[2/7] Loading models...")
+    print("\n[2/8] Loading models...")
     device_bibo = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     device_qwen = 'cuda:1' if torch.cuda.device_count() > 1 else device_bibo
 
     bibo_model = load_bibo(device_bibo, bibo_cfg)
     qwen_model = load_qwen(device_qwen)
 
-    # ── Main analysis: Load balance vs batch size (1→100) ──
-    print("\n[3/7] Load balance convergence (batch size 1→100)...")
+    # ── Main analysis: Load balance vs batch size (1→128) ──
+    print("\n[3/8] Load balance convergence (batch size 1→128)...")
     balance_metrics = plot_load_balance_vs_batch_size(
         bibo_model, qwen_model, val_data, device_bibo, device_qwen, bibo_cfg
     )
 
     # ── Per-layer deviation ──
-    print("\n[4/7] Per-layer deviation vs batch size...")
+    print("\n[4/8] Per-layer deviation vs batch size...")
     plot_per_layer_deviation_vs_batch_size(
         bibo_model, qwen_model, val_data, device_bibo, device_qwen, bibo_cfg
     )
 
+    # ── Per-layer top-1 and top-2 weights ──
+    print("\n[5/8] Per-layer top-1 & top-2 router weights...")
+    bibo_topk_weights, qwen_topk_weights = plot_per_layer_topk_weights(
+        bibo_model, qwen_model, val_data, device_bibo, device_qwen, bibo_cfg
+    )
+
     # ── Operator/Phase/Magnitude affinity ──
-    print("\n[5/7] Operator → Expert affinity analysis...")
+    print("\n[6/8] Operator → Expert affinity analysis...")
     bibo_cat, qwen_cat, bibo_phase, qwen_phase = plot_operator_expert_affinity(
         bibo_model, qwen_model, val_data, device_bibo, device_qwen, bibo_cfg
     )
 
     # ── Confidence by token type ──
-    print("\n[6/7] Router confidence by token type...")
+    print("\n[7/8] Router confidence by token type...")
     plot_expert_confidence_by_token_type(
         bibo_model, qwen_model, val_data, device_bibo, device_qwen, bibo_cfg
     )
 
     # ── PolyGLU specialization ──
-    print("\n[7/7] PolyGLU activation specialization...")
+    print("\n[8/8] PolyGLU activation specialization...")
     plot_polyglue_activation_specialization(
         bibo_model, val_data, device_bibo, bibo_cfg
     )
@@ -922,6 +1026,7 @@ def main():
     print("\n  Key plots generated:")
     print("    • arithmetic_load_balance_vs_batch_size.png  ← THE MAIN ONE")
     print("    • arithmetic_per_layer_deviation_vs_bs.png")
+    print("    • arithmetic_per_layer_topk_weights.png      ← TOP-1/TOP-2 WEIGHTS")
     print("    • arithmetic_operator_expert_affinity.png")
     print("    • arithmetic_phase_expert_routing.png")
     print("    • arithmetic_magnitude_expert_routing.png")
