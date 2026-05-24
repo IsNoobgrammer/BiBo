@@ -1,5 +1,7 @@
 """MoE layer — sorted expert dispatch (Qwen/DeepSeek pattern)"""
 import torch
+import torch._dynamo
+torch._dynamo.config.capture_scalar_outputs = True  # allow .item() in compiled graphs
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
