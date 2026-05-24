@@ -102,11 +102,13 @@ class BiBoFusedExperts(nn.Module):
         output = torch.zeros(num_tokens, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
         
         for expert_idx in range(num_routed):
-            start, end = boundaries[expert_idx].item(), boundaries[expert_idx + 1].item()
-            if start == end:
-                continue
+            # Use tensor indexing instead of .item() to avoid graph breaks
+            start = boundaries[expert_idx]
+            end = boundaries[expert_idx + 1]
             
             token_idx = sorted_token_indices[start:end]
+            if token_idx.shape[0] == 0:
+                continue
             weights = sorted_weights[start:end].unsqueeze(-1)  # (n, 1)
             current_state = hidden_states[token_idx]  # (n, hidden)
             

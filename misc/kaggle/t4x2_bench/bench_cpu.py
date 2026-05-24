@@ -21,6 +21,7 @@ if REPO_ROOT not in sys.path:
 
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True  # fall back to eager if inductor fails (e.g. no cl.exe on Windows)
+torch._dynamo.config.cache_size_limit = 64  # avoid recompile limit hits
 
 from src.configuration_bibo import BiBoConfig
 from src.modeling.models import BiBoForCausalLM
@@ -83,21 +84,22 @@ def make_qwen_10m():
 
 def benchmark_model(name, model_fn, batch_size=8, seq_len=64, num_warmup=5, num_iters=50):
     """Full benchmark: compile, warmup, fwd, bwd."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\n{'='*60}")
-    print(f"  {name}")
+    print(f"  {name}  [{device}]")
     print(f"{'='*60}")
 
     # --- Create model ---
     t0 = time.perf_counter()
-    model = model_fn()
+    model = model_fn().to(device)
     n_params = count_params(model)
     t_create = time.perf_counter() - t0
     print(f"  Params: {n_params/1e6:.2f}M")
     print(f"  Create time: {t_create*1000:.1f}ms")
 
     # --- Dummy input (needed for compile dry run) ---
-    x = torch.randint(0, 256, (batch_size, seq_len))
-    y = torch.randint(0, 256, (batch_size, seq_len))
+    x = torch.randint(0, 256, (batch_size, seq_len), device=device)
+    y = torch.randint(0, 256, (batch_size, seq_len), device=device)
 
     # --- Compile ---
     print(f"  Compiling with torch.compile...")
@@ -120,6 +122,7 @@ def benchmark_model(name, model_fn, batch_size=8, seq_len=64, num_warmup=5, num_
         t_compile = 0
 
     # --- Warmup (trigger actual compilation) ---
+    # Stay in train mode throughout to avoid grad_mode recompilations
     print(f"  Warmup: {num_warmup} iterations...")
     model.train()
     t0 = time.perf_counter()
@@ -130,15 +133,19 @@ def benchmark_model(name, model_fn, batch_size=8, seq_len=64, num_warmup=5, num_
     t_warmup = time.perf_counter() - t0
     print(f"  Warmup time: {t_warmup:.2f}s ({t_warmup/num_warmup*1000:.1f}ms/iter)")
 
-    # --- Forward pass benchmark ---
+    # --- Forward pass benchmark (stay in train mode to avoid grad_mode recompile) ---
     print(f"  Benchmarking fwd: {num_iters} iterations...")
     fwd_times = []
-    with torch.no_grad():
-        for i in range(num_iters):
-            t0 = time.perf_counter()
+    for i in range(num_iters):
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.no_grad():
             out = compiled_model(x, labels=y)
-            t1 = time.perf_counter()
-            fwd_times.append(t1 - t0)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        fwd_times.append(t1 - t0)
 
     fwd_avg = np.mean(fwd_times) * 1000
     fwd_std = np.std(fwd_times) * 1000
@@ -151,10 +158,14 @@ def benchmark_model(name, model_fn, batch_size=8, seq_len=64, num_warmup=5, num_
     print(f"  Benchmarking fwd+bwd: {num_iters} iterations...")
     bwd_times = []
     for i in range(num_iters):
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
         t0 = time.perf_counter()
         out = compiled_model(x, labels=y)
         out.loss.backward()
         compiled_model.zero_grad(set_to_none=True)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
         t1 = time.perf_counter()
         bwd_times.append(t1 - t0)
 
