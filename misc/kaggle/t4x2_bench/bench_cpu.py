@@ -1,5 +1,5 @@
 """
-CPU Benchmark — BiMo vs Qwen3MoE with torch.compile
+CPU Benchmark — BiBo vs Qwen3MoE with torch.compile
 
 Tests: compile time, warmup, avg fwd pass, avg bwd pass
 Params: ~10M each
@@ -22,6 +22,7 @@ if REPO_ROOT not in sys.path:
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True  # fall back to eager if inductor fails (e.g. no cl.exe on Windows)
 torch._dynamo.config.cache_size_limit = 64  # avoid recompile limit hits
+torch._dynamo.reset()  # clear old compile cache
 
 from src.configuration_bibo import BiBoConfig
 from src.modeling.models import BiBoForCausalLM
@@ -34,7 +35,7 @@ def count_params(model):
 
 
 def make_bibo_10m():
-    """~10M param BiMo model."""
+    """~10M param BiBo model."""
     config = BiBoConfig(
         vocab_size=256,
         hidden_size=256,
@@ -200,7 +201,7 @@ def benchmark_model(name, model_fn, batch_size=8, seq_len=64, num_warmup=5, num_
 
 def main():
     print("=" * 60)
-    print("  CPU Benchmark — BiMo vs Qwen3MoE")
+    print("  CPU Benchmark — BiBo vs Qwen3MoE")
     print("  torch.compile | ~10M params | CPU only")
     print("=" * 60)
 
@@ -212,7 +213,7 @@ def main():
     print(f"  batch_size={batch_size}  seq_len={seq_len}")
     print(f"  warmup={num_warmup}  iters={num_iters}")
 
-    r_bibo = benchmark_model("BiMo (BiBo MoE)", make_bibo_10m, batch_size, seq_len, num_warmup, num_iters)
+    r_bibo = benchmark_model("BiBo (BiBo MoE)", make_bibo_10m, batch_size, seq_len, num_warmup, num_iters)
     r_qwen = benchmark_model("Qwen3MoE", make_qwen_10m, batch_size, seq_len, num_warmup, num_iters)
 
     # --- Summary ---
@@ -228,8 +229,8 @@ def main():
     if r_bibo['fwd_avg_ms'] > 0 and r_qwen['fwd_avg_ms'] > 0:
         fwd_ratio = r_qwen['fwd_avg_ms'] / r_bibo['fwd_avg_ms']
         bwd_ratio = r_qwen['bwd_avg_ms'] / r_bibo['bwd_avg_ms']
-        print(f"\n  Fwd speedup (Qwen/BiMo): {fwd_ratio:.2f}x")
-        print(f"  Fwd+Bwd speedup (Qwen/BiMo): {bwd_ratio:.2f}x")
+        print(f"\n  Fwd speedup (Qwen/BiBo): {fwd_ratio:.2f}x")
+        print(f"  Fwd+Bwd speedup (Qwen/BiBo): {bwd_ratio:.2f}x")
 
 
 if __name__ == '__main__':
