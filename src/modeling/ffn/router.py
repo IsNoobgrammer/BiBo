@@ -1,4 +1,4 @@
-"""MoE router — configurable logit norm, activation, load balancing"""
+"""MoE router — DeepSeek-V3 auxiliary-loss-free sigmoid gating + logit norm"""
 import math
 import torch
 import torch.nn as nn
@@ -11,23 +11,23 @@ __all__ = ['BiBoMoERouter']
 
 class BiBoMoERouter(nn.Module):
     """
-    MoE router with configurable behavior:
+    MoE router with DeepSeek-V3 auxiliary-loss-free load balancing.
     
-    - router_activation: "none" | "relu" | "silu" — applied to raw logits before softmax
-    - use_router_logit_norm: bool — z-score normalize logits (Skywork-MoE style)
-    - load_balance_strategy: "none" | "bias" | "aux_loss"
-    - router_type: "mlp" | "conv"
-    - router_noise: float — exploration noise during training
+    Key design (from arXiv:2408.15664 + arXiv:2412.19437):
     
-    Routing pipeline:
+    1. Sigmoid gating (not softmax) — independent expert scoring, no competition
+    2. Bias affects ONLY top-k selection, NOT output computation weights
+    3. Bias updated via: b_i += u * sign(mean_load - expert_load), u=0.001
+    4. No interference gradients — bias is outside the computation graph
+    
+    Pipeline:
         1. raw_logits = W @ x  (MLP or Conv)
         2. raw_logits += noise  (if training and router_noise > 0)
-        3. logits = activation(raw_logits)  (relu/silu/none)
-        4. if use_router_logit_norm: logits = lambda * (logits - mean) / std
-        5. routing_weights = softmax(logits)  — for weight computation
-        6. selection_scores = logits + bias  — for top-k selection (bias strategy only)
-        7. top_k_indices = topk(selection_scores)
-        8. top_k_weights = normalize(routing_weights[top_k_indices])
+        3. scores = sigmoid(raw_logits)  — independent per-expert scores
+        4. if use_router_logit_norm: scores = lambda * (scores - mean) / std
+        5. selection_scores = scores + bias  — for top-k selection ONLY
+        6. top_k_indices = topk(selection_scores)
+        7. top_k_weights = normalize(scores[top_k_indices])  — UNBIASED weights
     """
     def __init__(self, config: BiBoConfig):
         super().__init__()
@@ -43,8 +43,10 @@ class BiBoMoERouter(nn.Module):
         self.use_router_logit_norm = getattr(config, 'use_router_logit_norm', False)
         self.router_activation = getattr(config, 'router_activation', 'none')
         self.norm_topk_prob = getattr(config, 'norm_topk_prob', False)
+        self.gate_type = getattr(config, 'gate_type', 'sigmoid')  # 'sigmoid' or 'softmax'
 
         # Load-balancing bias — heuristically updated (not optimizer-managed)
+        # DeepSeek-V3: bias only affects selection, not output weights
         self.bias = nn.Parameter(torch.zeros(self.num_routed_experts), requires_grad=False)
 
         # Router projection — normal init (matches Qwen3MoE)
@@ -58,7 +60,7 @@ class BiBoMoERouter(nn.Module):
             raise ValueError(f"Unknown router type: {self.router_type}. Expected 'mlp' or 'conv'.")
 
     def _apply_router_activation(self, logits: torch.Tensor) -> torch.Tensor:
-        """Apply optional activation to router logits before softmax."""
+        """Apply optional activation to router logits before gating."""
         if self.router_activation == "relu":
             return F.relu(logits)
         elif self.router_activation == "silu":
@@ -72,7 +74,7 @@ class BiBoMoERouter(nn.Module):
             hidden_states: (batch, seq_len, hidden_size)
         Returns:
             top_k_indices: (batch, seq_len, top_k)
-            norm_weights: (batch, seq_len, top_k)
+            norm_weights: (batch, seq_len, top_k) — UNBIASED routing weights
         """
         batch_size, seq_len, hidden_dim = hidden_states.shape
         
@@ -95,23 +97,30 @@ class BiBoMoERouter(nn.Module):
         # Step 3: router activation (ReLU/SiLU/none)
         router_logits = self._apply_router_activation(router_logits)
 
-        # Step 4: optional logit normalization (Skywork-MoE style)
+        # Step 4: gating — sigmoid (independent) or softmax (competitive)
+        if self.gate_type == "sigmoid":
+            # Sigmoid: each expert scored independently (DeepSeek-V3 preferred)
+            scores = torch.sigmoid(router_logits)
+        else:
+            # Softmax: competitive normalization (legacy)
+            scores = F.softmax(router_logits, dim=1)
+
+        # Step 5: optional logit normalization (Skywork-MoE style)
         if self.use_router_logit_norm:
-            mean = router_logits.mean(dim=1, keepdim=True)
-            std = router_logits.std(dim=1, keepdim=True) + 1e-6
-            router_logits = self.router_lambda * (router_logits - mean) / std
+            mean = scores.mean(dim=1, keepdim=True)
+            std = scores.std(dim=1, keepdim=True) + 1e-6
+            scores = self.router_lambda * (scores - mean) / std
 
-        # Step 5: routing weights via softmax
-        routing_weights = F.softmax(router_logits, dim=1)
-
-        # Step 6: selection uses logits + bias (bias heuristic for load balancing)
-        selection_scores = router_logits + self.bias
+        # Step 6: selection uses scores + bias (bias for load balancing ONLY)
+        # DeepSeek-V3: bias affects selection, NOT output weights
+        selection_scores = scores + self.bias
 
         # Step 7: top-k selection
         _, top_k_indices = torch.topk(selection_scores, self.top_k, dim=-1)
 
-        # Step 8: gather weights — normalize only if norm_topk_prob=True
-        top_k_weights = routing_weights.gather(-1, top_k_indices)
+        # Step 8: gather UNBIASED weights — normalize only if norm_topk_prob=True
+        # CRITICAL: use original scores, NOT selection_scores (which includes bias)
+        top_k_weights = scores.gather(-1, top_k_indices)
         if self.norm_topk_prob:
             norm_weights = top_k_weights / (top_k_weights.sum(-1, keepdim=True) + 1e-6)
         else:

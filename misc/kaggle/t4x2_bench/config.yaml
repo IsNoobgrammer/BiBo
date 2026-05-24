@@ -1,0 +1,76 @@
+# T4x2 Benchmark Config
+# Target: val_loss ~2.8 (±5% z-score → 2.66 - 2.94)
+# Hardware: 2× T4 16GB (Kaggle)
+# Precision: fp16 (T4 does NOT support bf16)
+
+training:
+  seed: 42
+  epochs: 50
+  batch_size: 64
+  lr: 3e-4
+  min_lr: 1e-5
+  warmup_epochs: 3
+  weight_decay: 0.01
+  grad_clip: 1.0
+  eval_every: 500  # steps
+  eval_steps: 100
+  wandb_project: "bibo-t4x2-bench"
+  wandb_run_name: "t4x2-sort"
+  task: "sort"
+  vocab_size: 256
+  seq_len: 64
+  num_train_samples: 100000
+  num_val_samples: 10000
+  alpha_emd: 0.3
+  alpha_seq: 0.1
+
+bibo:
+  device: "cuda:0"
+  vocab_size: 256
+  hidden_size: 256
+  intermediate_size: 512
+  num_hidden_layers: 4
+  num_attention_heads: 4
+  num_key_value_heads: 2
+  max_position_embeddings: 128
+  # MoE
+  polyglu_expert_multiplier: 2   # 2 groups × 3 = 6 PolyGLU
+  special_expert_pairs: 1        # 1 × (Identity + Zero) = 2
+  num_experts_per_tok: 2
+  use_shared_expert: true
+  shared_expert_type: "mlp"
+  # Router (DeepSeek-V3 style)
+  gate_type: "sigmoid"           # sigmoid gating (independent scoring)
+  router_type: "mlp"
+  use_router_logit_norm: false
+  load_balance_strategy: "bias"  # auxiliary-loss-free bias updates
+  bias_update_factor: 0.001
+  bias_update_threshold: 4000
+  router_noise: 0.0
+  norm_topk_prob: false
+  # Architecture
+  use_ssmax: false               # not needed for short sequences
+  hidden_act: "silu"
+  initializer_range: 0.02
+  rms_norm_eps: 1e-6
+
+qwen3moe:
+  device: "cuda:1"
+  vocab_size: 256
+  hidden_size: 256
+  intermediate_size: 512
+  num_hidden_layers: 4
+  num_attention_heads: 4
+  num_key_value_heads: 2
+  max_position_embeddings: 128
+  num_experts: 8
+  num_experts_per_tok: 2
+  moe_intermediate_size: 256
+  shared_expert_intermediate_size: 512
+  num_shared_experts: 1
+  decoder_sparse_step: 1
+  mlp_only_layers: [0, 3]
+  hidden_act: "silu"
+  initializer_range: 0.02
+  rms_norm_eps: 1e-6
+  use_sliding_window: false

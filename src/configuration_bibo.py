@@ -65,6 +65,7 @@ class BiBoConfig(PretrainedConfig):
         shared_expert_type="mlp",  # "mlp" (SwiGLU, like Qwen) or "conv" (CausalConv1D)
         moe_shared_scaling=1.0,  # Auto-computed if 1.0 (DeepSeek-V2/V3 style)
         norm_topk_prob=False,
+        gate_type="sigmoid",  # "sigmoid" (DeepSeek-V3, independent) or "softmax" (legacy, competitive)
         output_router_logits=False,
         **kwargs,
     ):
@@ -102,6 +103,7 @@ class BiBoConfig(PretrainedConfig):
         self.kernel_size = kernel_size
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
+        self.gate_type = gate_type
         self.router_lambda = router_lambda
         self.router_noise = router_noise
         self.shared_expert_type = shared_expert_type

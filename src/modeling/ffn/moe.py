@@ -1,4 +1,4 @@
-"""MoE layer — fused expert dispatch"""
+"""MoE layer — sorted expert dispatch (Qwen/DeepSeek pattern)"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,16 +17,16 @@ _POLYGLU_ACTIVATIONS = ("silu", "relu2", "tanh")
 
 class BiBoFusedExperts(nn.Module):
     """
-    Fused PolyGLU experts — Qwen-style 3D weight tensors with per-expert activation.
+    Fused PolyGLU experts — sorted dispatch (Qwen/DeepSeek pattern).
     
     All PolyGLU expert weights stored as:
       - gate_up_proj: (num_polyglu_experts, 2 * intermediate, hidden)
       - down_proj: (num_polyglu_experts, hidden, intermediate)
     
-    Dispatch: loop over active experts (skip empty), one fused F.linear per expert.
-    No torch.unique — direct gather + index_add_ (Qwen pattern).
+    Dispatch: sort tokens by expert, process contiguous chunks, index_add_ back.
+    No one_hot — no permute — no torch.where.
     
-    Identity/Zero experts handled with zero compute.
+    Identity/Zero experts handled with zero compute (just index_add).
     """
     def __init__(self, config: BiBoConfig):
         super().__init__()
@@ -69,6 +69,8 @@ class BiBoFusedExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         """
+        Sorted dispatch — no one_hot, no permute, no where.
+        
         Args:
             hidden_states: (num_tokens, hidden_size)
             top_k_indices: (num_tokens, top_k)
@@ -76,33 +78,44 @@ class BiBoFusedExperts(nn.Module):
         Returns:
             output: (num_tokens, hidden_size)
         """
-        output = torch.zeros_like(hidden_states)
+        num_tokens, hidden_size = hidden_states.shape
+        num_routed = self.num_routed_experts
         
-        # One-hot → expert_mask[expert_idx] tells us which (top_k_pos, token_idx) pairs route there
-        expert_mask = F.one_hot(top_k_indices, num_classes=self.num_routed_experts)
-        # expert_mask: (num_tokens, top_k, num_experts)
-        expert_mask = expert_mask.permute(2, 1, 0)
-        # expert_mask: (num_experts, top_k, num_tokens)
+        # Flatten: (num_tokens * top_k,)
+        flat_expert_indices = top_k_indices.flatten()
+        flat_token_indices = torch.arange(num_tokens, device=hidden_states.device) \
+            .unsqueeze(1).expand_as(top_k_indices).flatten()
+        flat_weights = top_k_weights.flatten()
         
-        # Find which experts actually have tokens (skip empty ones)
-        with torch.no_grad():
-            expert_hit = (expert_mask.sum(dim=(1, 2)) > 0).nonzero(as_tuple=True)[0]
+        # Sort by expert index — contiguous chunks per expert
+        sorted_expert_indices, sort_order = flat_expert_indices.sort()
+        sorted_token_indices = flat_token_indices[sort_order]
+        sorted_weights = flat_weights[sort_order]
         
-        for expert_idx in expert_hit:
-            eidx = expert_idx.item()
+        # Find boundaries: which chunks of sorted_indices belong to which expert
+        # bincount gives us the count per expert, cumsum gives boundaries
+        expert_counts = torch.bincount(sorted_expert_indices, minlength=num_routed)
+        boundaries = torch.zeros(num_routed + 1, dtype=torch.long, device=hidden_states.device)
+        boundaries[1:] = torch.cumsum(expert_counts, dim=0)
+        
+        # Process each expert's chunk
+        output = torch.zeros(num_tokens, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
+        
+        for expert_idx in range(num_routed):
+            start, end = boundaries[expert_idx].item(), boundaries[expert_idx + 1].item()
+            if start == end:
+                continue
             
-            # Get (top_k_position, token_index) pairs for this expert
-            top_k_pos, token_idx = torch.where(expert_mask[eidx])
-            current_state = hidden_states[token_idx]  # (n_tokens_for_expert, hidden)
-            current_weights = top_k_weights[token_idx, top_k_pos, None]  # (n, 1)
+            token_idx = sorted_token_indices[start:end]
+            weights = sorted_weights[start:end].unsqueeze(-1)  # (n, 1)
+            current_state = hidden_states[token_idx]  # (n, hidden)
             
-            if eidx < self.num_polyglu_experts:
+            if expert_idx < self.num_polyglu_experts:
                 # PolyGLU expert: fused gate+up → activation → down
-                gate_up = F.linear(current_state, self.gate_up_proj[eidx])  # (n, 2*inter)
+                gate_up = F.linear(current_state, self.gate_up_proj[expert_idx])
                 gate, up = gate_up.chunk(2, dim=-1)
                 
-                # Per-expert activation
-                act_name = self._expert_activations[eidx]
+                act_name = self._expert_activations[expert_idx]
                 if act_name == "silu":
                     activated = F.silu(gate)
                 elif act_name == "relu2":
@@ -110,26 +123,23 @@ class BiBoFusedExperts(nn.Module):
                 else:  # tanh
                     activated = torch.tanh(gate)
                 
-                current_hidden = F.linear(activated * up, self.down_proj[eidx])  # (n, hidden)
-                current_hidden = current_hidden * current_weights
-                output.index_add_(0, token_idx, current_hidden)
+                expert_output = F.linear(activated * up, self.down_proj[expert_idx])
+                output.index_add_(0, token_idx, expert_output * weights)
                 
-            elif eidx < self.identity_end:
+            elif expert_idx < self.identity_end:
                 # Identity expert: pass through with weight
-                output.index_add_(0, token_idx, current_state * current_weights)
+                output.index_add_(0, token_idx, current_state * weights)
                 
             else:
-                # Zero expert: multiply by 0 to keep graph alive for router gradients.
-                # Without this, routing weights for Zero get no gradient when top_k=1.
-                # Cost: one multiply + index_add of zeros (trivial).
-                output.index_add_(0, token_idx, current_state * (current_weights * 0))
+                # Zero expert: multiply by 0 (keeps graph alive for router gradients)
+                output.index_add_(0, token_idx, current_state * (weights * 0))
 
         return output
 
 
 class BiBoMoELayer(nn.Module):
     """
-    MoE layer with fused PolyGLU expert dispatch.
+    MoE layer with sorted PolyGLU expert dispatch.
     
     Expert layout:
       - polyglu_expert_multiplier groups × 3 activations (SiLU, ReLU², Tanh) GLU experts
@@ -167,7 +177,14 @@ class BiBoMoELayer(nn.Module):
 
     @torch.no_grad()
     def update_bias(self, tokens_per_expert: torch.Tensor):
-        """Update router bias based on token distribution."""
+        """
+        DeepSeek-V3 auxiliary-loss-free bias update.
+        
+        b_i += u * sign(mean_load - expert_load)
+        
+        u = bias_update_factor (default ~0.001)
+        sign() variant outperforms proportional variant (DeepSeek-V3 paper)
+        """
         if not hasattr(self.gate, 'bias') or self.bias_update_factor <= 0:
             return
 
@@ -211,7 +228,7 @@ class BiBoMoELayer(nn.Module):
         flat_indices = rearrange(top_k_indices, 'b s k -> (b s) k')
         flat_weights = rearrange(top_k_weights, 'b s k -> (b s) k')
 
-        # Fused expert dispatch
+        # Sorted expert dispatch
         final_routed = self.experts(flat_hidden, flat_indices, flat_weights)
         final_routed = rearrange(final_routed, '(b s) h -> b s h', b=bsz)
         
