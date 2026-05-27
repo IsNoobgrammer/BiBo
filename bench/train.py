@@ -110,8 +110,12 @@ def wrap_fsdp(model, device):
 
 
 def compile_model(model):
-    """Apply torch.compile with settings safe for MoE."""
-    return torch.compile(model, mode="reduce-overhead", fullgraph=False)
+    """Apply torch.compile with settings safe for MoE + gradient checkpointing.
+    
+    mode='default' uses Triton kernel fusion WITHOUT CUDA graphs.
+    mode='reduce-overhead' uses CUDA graphs — conflicts with checkpointing recomputation.
+    """
+    return torch.compile(model, mode="default", fullgraph=False)
 
 
 def train(args):
