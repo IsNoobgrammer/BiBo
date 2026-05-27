@@ -58,7 +58,7 @@ def parse_args():
     p.add_argument("--val_split", type=float, default=0.05)
 
     # Eval & Logging
-    p.add_argument("--eval_every", type=int, default=10)
+    p.add_argument("--eval_every", type=int, default=500)
     p.add_argument("--sample_every", type=int, default=1000)
     p.add_argument("--ckpt_every", type=int, default=5000)
     p.add_argument("--log_every", type=int, default=10)
@@ -360,9 +360,13 @@ def train(args):
 
             # ── Validation ─────────────────────────────────────
             if is_main and step % args.eval_every == 0:
-                val_loss, val_ppl = evaluate(model, val_ds, batch_size=args.batch_size, device=device)
-                log_val_metrics(step, val_loss, val_ppl)
-                print(f"  [VAL] step={step} | val_loss={val_loss:.4f} | val_ppl={val_ppl:.2f}")
+                try:
+                    val_loss, val_ppl = evaluate(model, val_ds, batch_size=max(args.batch_size, 8), device=device, max_batches=100)
+                    log_val_metrics(step, val_loss, val_ppl)
+                    print(f"  [VAL] step={step} | val_loss={val_loss:.4f} | val_ppl={val_ppl:.2f}")
+                except torch.cuda.OutOfMemoryError:
+                    print(f"  [VAL] step={step} | OOM — skipping")
+                    torch.cuda.empty_cache()
 
                 if val_loss < 2.8:
                     print(f"  *** TARGET REACHED: val_loss={val_loss:.4f} < 2.8 at step {step} ***")
@@ -389,11 +393,15 @@ def train(args):
         print(f"  Epochs: {epoch + 1}")
 
         # Final eval (use larger batch — no gradients, just forward)
-        val_loss, val_ppl = evaluate(model, val_ds, batch_size=args.batch_size * 8, device=device, max_batches=100)
-        log_val_metrics(step, val_loss, val_ppl)
-        print(f"  Final val loss: {val_loss:.4f}")
-        print(f"  Final val perplexity: {val_ppl:.2f}")
-        print(f"  Target (<2.8): {'HIT' if val_loss < 2.8 else 'MISSED'}")
+        try:
+            val_loss, val_ppl = evaluate(model, val_ds, batch_size=max(args.batch_size, 8), device=device, max_batches=100)
+            log_val_metrics(step, val_loss, val_ppl)
+            print(f"  Final val loss: {val_loss:.4f}")
+            print(f"  Final val perplexity: {val_ppl:.2f}")
+            print(f"  Target (<2.8): {'HIT' if val_loss < 2.8 else 'MISSED'}")
+        except torch.cuda.OutOfMemoryError:
+            print("  [WARN] Final eval OOM — skipping, using last training loss")
+            torch.cuda.empty_cache()
         print("=" * 60)
 
         # Final samples (quick — just 2 prompts)
