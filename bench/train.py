@@ -69,7 +69,7 @@ def parse_args():
 
     # WandB
     p.add_argument("--wandb_project", type=str, default="bibo-bench")
-    p.add_argument("--wandb_name", type=str, default="baseline-50m")
+    p.add_argument("--wandb_name", type=str, default="bibo")
     p.add_argument("--wandb_notes", type=str, default="BiBo ~50M baseline, 2×T4, QTK-81K")
 
     # Mode
@@ -120,6 +120,7 @@ def compile_model(model):
 
 def train(args):
     """Main training loop."""
+    TAG = "[bibo]"
     # ── Setup ──────────────────────────────────────────────────
     is_distributed, rank, world_size, device = setup_distributed()
     is_main = rank == 0
@@ -128,25 +129,25 @@ def train(args):
         torch.cuda.manual_seed(args.seed)
 
     if is_main:
-        print("=" * 60)
-        print("BiBo Benchmark Training")
-        print("=" * 60)
-        print(f"  Device: {device} (world_size={world_size})")
-        print(f"  Muon: {HAS_MUON}, bitsandbytes: {HAS_BNB}")
-        print(f"  Batch size: {args.batch_size}")
-        print(f"  Total steps: {args.total_steps}")
-        print(f"  Seq len: {args.seq_len}")
-        print(f"  LR: {args.lr}, Muon LR: {args.muon_lr}")
-        print("=" * 60)
+        print(f"{TAG} " + "=" * 60)
+        print(f"{TAG} BiBo Benchmark Training")
+        print(f"{TAG} " + "=" * 60)
+        print(f"{TAG}   Device: {device} (world_size={world_size})")
+        print(f"{TAG}   Muon: {HAS_MUON}, bitsandbytes: {HAS_BNB}")
+        print(f"{TAG}   Batch size: {args.batch_size}")
+        print(f"{TAG}   Total steps: {args.total_steps}")
+        print(f"{TAG}   Seq len: {args.seq_len}")
+        print(f"{TAG}   LR: {args.lr}, Muon LR: {args.muon_lr}")
+        print(f"{TAG} " + "=" * 60)
 
     # ── Data (load first — need max token ID for vocab sizing) ───
     if is_main:
-        print("[train] Loading dataset...")
+        print(f"{TAG} [train] Loading dataset...")
     train_ds, val_ds = load_benchmark_data(seq_len=args.seq_len, val_split=args.val_split)
 
     # ── Tokenizer ───────────────────────────────────────────────
     if is_main:
-        print("[train] Loading tokenizer...")
+        print(f"{TAG} [train] Loading tokenizer...")
     tokenizer = get_tokenizer()
     actual_vocab_size = len(tokenizer)  # includes added tokens, not just base BPE
 
@@ -157,26 +158,26 @@ def train(args):
     del _peek_loader, _peek_batch
     _safe_vocab = max(actual_vocab_size, _max_id + 1)
     if is_main:
-        print(f"[train] Tokenizer: vocab_size={tokenizer.vocab_size}, len={actual_vocab_size}")
-        print(f"[train] Dataset max token ID: {_max_id}, safe vocab: {_safe_vocab}")
+        print(f"{TAG} [train] Tokenizer: vocab_size={tokenizer.vocab_size}, len={actual_vocab_size}")
+        print(f"{TAG} [train] Dataset max token ID: {_max_id}, safe vocab: {_safe_vocab}")
 
     # ── Model ──────────────────────────────────────────────────
     if is_main:
-        print("[train] Building model...")
+        print(f"{TAG} [train] Building model...")
     model, config = build_model()
 
     # Resize embeddings to cover all token IDs
     if _safe_vocab != config.vocab_size:
         if is_main:
-            print(f"[train] Resizing embeddings: {config.vocab_size} -> {_safe_vocab}")
+            print(f"{TAG} [train] Resizing embeddings: {config.vocab_size} -> {_safe_vocab}")
         model.resize_token_embeddings(_safe_vocab)
         config.vocab_size = _safe_vocab
 
     stats = count_params(config)
     if is_main:
-        print(f"[train] Model params: {stats['total_m']:.2f}M total, {stats['active_m']:.2f}M active, ratio={stats['ratio']:.2f}x")
-        print(f"[train] Experts: {config.num_routed_experts} routed + {config.num_shared_experts} shared, top-{config.num_experts_per_tok}")
-        print(f"[train] Layers: {config.num_hidden_layers} ({stats['num_moe_layers']} MoE + {stats['num_dense_layers']} dense)")
+        print(f"{TAG} [train] Model params: {stats['total_m']:.2f}M total, {stats['active_m']:.2f}M active, ratio={stats['ratio']:.2f}x")
+        print(f"{TAG} [train] Experts: {config.num_routed_experts} routed + {config.num_shared_experts} shared, top-{config.num_experts_per_tok}")
+        print(f"{TAG} [train] Layers: {config.num_hidden_layers} ({stats['num_moe_layers']} MoE + {stats['num_dense_layers']} dense)")
 
     # Gradient checkpointing — saves ~40% activation memory
     # MoE routing is data-dependent (different experts each recomputation),
@@ -185,7 +186,7 @@ def train(args):
     #   2. use_reentrant=False, determinism_check='none' — new, skip check
     # Use approach 1 (proven with Mixtral 8x7B MoE)
     if is_main:
-        print("[train] Enabling gradient checkpointing (use_reentrant=True for MoE)...")
+        print(f"{TAG} [train] Enabling gradient checkpointing (use_reentrant=True for MoE)...")
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": True}
     )
@@ -196,20 +197,20 @@ def train(args):
     # FSDP2 for multi-GPU
     if is_distributed:
         if is_main:
-            print("[train] Wrapping with FSDP2...")
+            print(f"{TAG} [train] Wrapping with FSDP2...")
         model = wrap_fsdp(model, device)
 
     # torch.compile
     if not args.no_compile:
         if is_main:
-            print("[train] Compiling model with torch.compile...")
+            print(f"{TAG} [train] Compiling model with torch.compile...")
         try:
             model = compile_model(model)
             if is_main:
-                print("[train] torch.compile OK")
+                print(f"{TAG} [train] torch.compile OK")
         except Exception as e:
             if is_main:
-                print(f"[train] torch.compile failed: {e}, continuing in eager mode")
+                print(f"{TAG} [train] torch.compile failed: {e}, continuing in eager mode")
 
     # ── Optimizer & Scheduler ──────────────────────────────────
     optimizer = create_optimizer(model, lr=args.lr, muon_lr=args.muon_lr, weight_decay=args.weight_decay)
@@ -280,18 +281,18 @@ def train(args):
     if args.eval_only:
         if is_main:
             val_loss, val_ppl = evaluate(model, val_ds, batch_size=args.batch_size, device=device)
-            print(f"[eval] Val loss: {val_loss:.4f}, Perplexity: {val_ppl:.2f}")
+            print(f"{TAG} [eval] Val loss: {val_loss:.4f}, Perplexity: {val_ppl:.2f}")
             samples = generate_samples(model, device=device)
             for s in samples:
-                print(f"\n  Prompt: {s['prompt']}")
-                print(f"  Generated: {s['generated'][:200]}...")
+                print(f"{TAG} \n  Prompt: {s['prompt']}")
+                print(f"{TAG}   Generated: {s['generated'][:200]}...")
         return
 
     # ── Training Loop ──────────────────────────────────────────
     if is_main:
-        print(f"\n[train] Starting training from step {start_step}...")
-        print(f"[train] {len(train_ds)} train samples, {len(val_ds)} val samples")
-        print(f"[train] {len(train_loader)} batches per epoch")
+        print(f"{TAG} \n[train] Starting training from step {start_step}...")
+        print(f"{TAG} [train] {len(train_ds)} train samples, {len(val_ds)} val samples")
+        print(f"{TAG} [train] {len(train_loader)} batches per epoch")
         print()
 
     throughput = ThroughputMeter(warmup=3)
@@ -310,7 +311,7 @@ def train(args):
         except StopIteration:
             epoch += 1
             if is_main:
-                print(f"[train] Epoch {epoch} complete, restarting dataloader")
+                print(f"{TAG} [train] Epoch {epoch} complete, restarting dataloader")
             data_iter = iter(train_loader)
             batch = next(data_iter)
 
@@ -367,22 +368,22 @@ def train(args):
                 try:
                     val_loss, val_ppl = evaluate(model, val_ds, batch_size=max(args.batch_size, 8), device=device, max_batches=100)
                     log_val_metrics(step, val_loss, val_ppl)
-                    print(f"  [VAL] step={step} | val_loss={val_loss:.4f} | val_ppl={val_ppl:.2f}")
+                    print(f"{TAG}   [VAL] step={step} | val_loss={val_loss:.4f} | val_ppl={val_ppl:.2f}")
                 except torch.cuda.OutOfMemoryError:
-                    print(f"  [VAL] step={step} | OOM — skipping")
+                    print(f"{TAG}   [VAL] step={step} | OOM — skipping")
                     torch.cuda.empty_cache()
 
                 if val_loss < 2.8:
-                    print(f"  *** TARGET REACHED: val_loss={val_loss:.4f} < 2.8 at step {step} ***")
+                    print(f"{TAG}   *** TARGET REACHED: val_loss={val_loss:.4f} < 2.8 at step {step} ***")
 
             # ── Sample Generation ──────────────────────────────
             if is_main and step % args.sample_every == 0:
                 samples = generate_samples(model, device=device)
                 log_samples(step, samples)
-                print(f"  [SAMPLES] step={step}:")
+                print(f"{TAG}   [SAMPLES] step={step}:")
                 for s in samples[:2]:
                     gen_preview = s["generated"][:150].replace("\n", " ")
-                    print(f"    '{s['prompt']}' -> '{gen_preview}...'")
+                    print(f"{TAG}     '{s['prompt']}' -> '{gen_preview}...'")
 
             # ── Checkpointing ──────────────────────────────────
             if is_main and step % (args.eval_every * 5) == 0:
@@ -391,30 +392,30 @@ def train(args):
 
     # ── Final Summary ──────────────────────────────────────────
     if is_main:
-        print("\n" + "=" * 60)
-        print("Training Complete!")
-        print(f"  Total steps: {step}")
-        print(f"  Epochs: {epoch + 1}")
+        print(f"{TAG} \n" + "=" * 60)
+        print(f"{TAG} Training Complete!")
+        print(f"{TAG}   Total steps: {step}")
+        print(f"{TAG}   Epochs: {epoch + 1}")
 
         # Final eval (use larger batch — no gradients, just forward)
         try:
             val_loss, val_ppl = evaluate(model, val_ds, batch_size=max(args.batch_size, 8), device=device, max_batches=100)
             log_val_metrics(step, val_loss, val_ppl)
-            print(f"  Final val loss: {val_loss:.4f}")
-            print(f"  Final val perplexity: {val_ppl:.2f}")
-            print(f"  Target (<2.8): {'HIT' if val_loss < 2.8 else 'MISSED'}")
+            print(f"{TAG}   Final val loss: {val_loss:.4f}")
+            print(f"{TAG}   Final val perplexity: {val_ppl:.2f}")
+            print(f"{TAG}   Target (<2.8): {'HIT' if val_loss < 2.8 else 'MISSED'}")
         except torch.cuda.OutOfMemoryError:
-            print("  [WARN] Final eval OOM — skipping, using last training loss")
+            print(f"{TAG}   [WARN] Final eval OOM — skipping, using last training loss")
             torch.cuda.empty_cache()
-        print("=" * 60)
+        print(f"{TAG} =" * 60)
 
         # Final samples (quick — just 2 prompts)
         samples = generate_samples(model, device=device, prompts=["The meaning of life is"], max_new_tokens=50)
         log_samples(step, samples)
-        print("\nFinal samples:")
+        print(f"{TAG} \nFinal samples:")
         for s in samples:
-            print(f"\n  Prompt: {s['prompt']}")
-            print(f"  Generated: {s['generated'][:200]}")
+            print(f"{TAG} \n  Prompt: {s['prompt']}")
+            print(f"{TAG}   Generated: {s['generated'][:200]}")
 
         # Save final checkpoint
         ckpt_path = os.path.join(REPO_ROOT, "bench", "checkpoints", "final.pt")
