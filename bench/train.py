@@ -136,9 +136,11 @@ def train(args):
     if is_main:
         print("[train] Loading tokenizer...")
     tokenizer = get_tokenizer()
-    actual_vocab_size = tokenizer.vocab_size
+    # Use len(tokenizer) not tokenizer.vocab_size — vocab_size is base BPE,
+    # len() includes added tokens (pad, special, etc.) which ARE used in data
+    actual_vocab_size = len(tokenizer)
     if is_main:
-        print(f"[train] Tokenizer vocab size: {actual_vocab_size}")
+        print(f"[train] Tokenizer vocab_size={tokenizer.vocab_size}, len(tokenizer)={actual_vocab_size}")
 
     # ── Model ──────────────────────────────────────────────────
     if is_main:
@@ -160,6 +162,26 @@ def train(args):
         print(f"[train] Layers: {config.num_hidden_layers} ({stats['num_moe_layers']} MoE + {stats['num_dense_layers']} dense)")
 
     model = model.to(device)
+
+    # Validate data after model is ready
+    if is_main:
+        print("[train] Validating data token IDs...")
+    # Peek at first batch to check max token ID
+    _peek_loader = create_dataloader(train_ds, batch_size=1, shuffle=False)
+    _peek_batch = next(iter(_peek_loader))
+    _max_id = _peek_batch["input_ids"].max().item()
+    _max_label = _peek_batch["labels"][_peek_batch["labels"] != -100].max().item() if (_peek_batch["labels"] != -100).any() else 0
+    _safe_max = max(_max_id, _max_label)
+    if is_main:
+        print(f"[train] Data max token ID: {_safe_max}, model vocab: {config.vocab_size}")
+    if _safe_max >= config.vocab_size:
+        new_size = _safe_max + 1
+        if is_main:
+            print(f"[train] WARNING: token ID {_safe_max} >= vocab {config.vocab_size}, resizing to {new_size}")
+        model.resize_token_embeddings(new_size)
+        config.vocab_size = new_size
+        stats = count_params(config)
+    del _peek_loader, _peek_batch
 
     # FSDP2 for multi-GPU
     if is_distributed:
