@@ -139,7 +139,7 @@ def parse_args():
     p.add_argument("--grad_accum", type=int, default=4)
     p.add_argument("--total_steps", type=int, default=50000)
     p.add_argument("--warmup_steps", type=int, default=1000)
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--muon_lr", type=float, default=0.02)
     p.add_argument("--weight_decay", type=float, default=0.1)
     p.add_argument("--grad_clip", type=float, default=1.0)

@@ -47,7 +47,7 @@ CUDA_VISIBLE_DEVICES=1 python bench/train_qwen.py \
     --grad_accum 4 \
     --total_steps 2000 \
     --warmup_steps 200 \
-    --lr 3e-4 \
+    --lr 1e-4 \
     --eval_every 200 \
     --log_every 10 \
     --seq_len 1024 \
