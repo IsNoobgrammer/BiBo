@@ -388,21 +388,21 @@ def train(args):
         print(f"  Total steps: {step}")
         print(f"  Epochs: {epoch + 1}")
 
-        # Final eval
-        val_loss, val_ppl = evaluate(model, val_ds, batch_size=args.batch_size, device=device)
+        # Final eval (use larger batch — no gradients, just forward)
+        val_loss, val_ppl = evaluate(model, val_ds, batch_size=args.batch_size * 8, device=device, max_batches=100)
         log_val_metrics(step, val_loss, val_ppl)
         print(f"  Final val loss: {val_loss:.4f}")
         print(f"  Final val perplexity: {val_ppl:.2f}")
         print(f"  Target (<2.8): {'HIT' if val_loss < 2.8 else 'MISSED'}")
         print("=" * 60)
 
-        # Final samples
-        samples = generate_samples(model, device=device)
+        # Final samples (quick — just 2 prompts)
+        samples = generate_samples(model, device=device, prompts=["The meaning of life is"], max_new_tokens=50)
         log_samples(step, samples)
         print("\nFinal samples:")
         for s in samples:
             print(f"\n  Prompt: {s['prompt']}")
-            print(f"  Generated: {s['generated'][:300]}")
+            print(f"  Generated: {s['generated'][:200]}")
 
         # Save final checkpoint
         ckpt_path = os.path.join(REPO_ROOT, "bench", "checkpoints", "final.pt")

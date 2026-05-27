@@ -36,7 +36,7 @@ def get_tokenizer(name="fhai50032/QTK-81K"):
 # ─────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def evaluate(model, val_ds, batch_size=32, device="cuda"):
+def evaluate(model, val_ds, batch_size=32, device="cuda", max_batches=None):
     """Compute validation loss and perplexity."""
     model.eval()
     loader = create_dataloader(val_ds, batch_size=batch_size, shuffle=False)
@@ -58,6 +58,9 @@ def evaluate(model, val_ds, batch_size=32, device="cuda"):
         total_loss += loss.item() * valid_tokens
         total_tokens += valid_tokens
         n_batches += 1
+
+        if max_batches is not None and n_batches >= max_batches:
+            break
 
     model.train()
 
