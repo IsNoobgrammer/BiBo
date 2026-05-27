@@ -931,4 +931,19 @@ for name, param in model.named_parameters():
 
 ---
 
-*Last updated: 2026-05-03*
+## Benchmarking & Config Editing
+
+For commands to run the benchmark suite (smoke tests, throughput, full training), editing BiBoConfig with `%%writefile` on Kaggle/Jupyter, and param sweeps, see:
+
+**[Benchmarking Guide](benchmarking.md)**
+
+Quick links:
+- [Quick Smoke Test](benchmarking.md#quick-smoke-test)
+- [Running the Benchmark](benchmarking.md#running-the-benchmark)
+- [Editing BiBoConfig with %%writefile](benchmarking.md#editing-biboconfig-with-writefile)
+- [Throughput & Memory Benchmarks](benchmarking.md#throughput--memory-benchmarks)
+- [Full Training Run (Kaggle 2×T4)](benchmarking.md#full-training-run-kaggle-2t4)
+
+---
+
+*Last updated: 2026-05-27*
