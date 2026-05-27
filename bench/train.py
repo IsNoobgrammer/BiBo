@@ -132,28 +132,44 @@ def train(args):
         print(f"  LR: {args.lr}, Muon LR: {args.muon_lr}")
         print("=" * 60)
 
-    # ── Tokenizer (load first to get actual vocab size) ─────────
+    # ── Data (load first — need max token ID for vocab sizing) ───
+    if is_main:
+        print("[train] Loading dataset...")
+    train_ds, val_ds = load_benchmark_data(seq_len=args.seq_len, val_split=args.val_split)
+
+    # ── Tokenizer ───────────────────────────────────────────────
     if is_main:
         print("[train] Loading tokenizer...")
     tokenizer = get_tokenizer()
-    # Use len(tokenizer) not tokenizer.vocab_size — vocab_size is base BPE,
-    # len() includes added tokens (pad, special, etc.) which ARE used in data
-    actual_vocab_size = len(tokenizer)
+    actual_vocab_size = len(tokenizer)  # includes added tokens, not just base BPE
+
+    # Scan dataset for max token ID to guarantee no OOB
+    # Only scan first ~1000 batches (64K samples) — fast, catches any OOB tokens
+    _peek_loader = create_dataloader(train_ds, batch_size=64, shuffle=False)
+    _max_id = 0
+    for _i, _batch in enumerate(_peek_loader):
+        _bmax = _batch["input_ids"].max().item()
+        if _bmax > _max_id:
+            _max_id = _bmax
+        if _i >= 1000:
+            break
+    del _peek_loader
+    _safe_vocab = max(actual_vocab_size, _max_id + 1)
     if is_main:
-        print(f"[train] Tokenizer vocab_size={tokenizer.vocab_size}, len(tokenizer)={actual_vocab_size}")
+        print(f"[train] Tokenizer: vocab_size={tokenizer.vocab_size}, len={actual_vocab_size}")
+        print(f"[train] Dataset max token ID: {_max_id}, safe vocab: {_safe_vocab}")
 
     # ── Model ──────────────────────────────────────────────────
     if is_main:
         print("[train] Building model...")
     model, config = build_model()
 
-    # Resize embeddings + lm_head to match actual tokenizer vocab
-    old_vocab = config.vocab_size
-    if actual_vocab_size != old_vocab:
+    # Resize embeddings to cover all token IDs
+    if _safe_vocab != config.vocab_size:
         if is_main:
-            print(f"[train] Resizing embeddings: {old_vocab} -> {actual_vocab_size}")
-        model.resize_token_embeddings(actual_vocab_size)
-        config.vocab_size = actual_vocab_size
+            print(f"[train] Resizing embeddings: {config.vocab_size} -> {_safe_vocab}")
+        model.resize_token_embeddings(_safe_vocab)
+        config.vocab_size = _safe_vocab
 
     stats = count_params(config)
     if is_main:
@@ -162,26 +178,6 @@ def train(args):
         print(f"[train] Layers: {config.num_hidden_layers} ({stats['num_moe_layers']} MoE + {stats['num_dense_layers']} dense)")
 
     model = model.to(device)
-
-    # Validate data after model is ready
-    if is_main:
-        print("[train] Validating data token IDs...")
-    # Peek at first batch to check max token ID
-    _peek_loader = create_dataloader(train_ds, batch_size=1, shuffle=False)
-    _peek_batch = next(iter(_peek_loader))
-    _max_id = _peek_batch["input_ids"].max().item()
-    _max_label = _peek_batch["labels"][_peek_batch["labels"] != -100].max().item() if (_peek_batch["labels"] != -100).any() else 0
-    _safe_max = max(_max_id, _max_label)
-    if is_main:
-        print(f"[train] Data max token ID: {_safe_max}, model vocab: {config.vocab_size}")
-    if _safe_max >= config.vocab_size:
-        new_size = _safe_max + 1
-        if is_main:
-            print(f"[train] WARNING: token ID {_safe_max} >= vocab {config.vocab_size}, resizing to {new_size}")
-        model.resize_token_embeddings(new_size)
-        config.vocab_size = new_size
-        stats = count_params(config)
-    del _peek_loader, _peek_batch
 
     # FSDP2 for multi-GPU
     if is_distributed:
@@ -205,10 +201,7 @@ def train(args):
     optimizer = create_optimizer(model, lr=args.lr, muon_lr=args.muon_lr, weight_decay=args.weight_decay)
     scheduler = create_scheduler(optimizer, args.warmup_steps, args.total_steps)
 
-    # ── Data ───────────────────────────────────────────────────
-    if is_main:
-        print("[train] Loading dataset...")
-    train_ds, val_ds = load_benchmark_data(seq_len=args.seq_len, val_split=args.val_split)
+    # ── DataLoader ───────────────────────────────────────────────
     train_loader = create_dataloader(train_ds, batch_size=args.batch_size)
 
     # ── WandB ──────────────────────────────────────────────────
