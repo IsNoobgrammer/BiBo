@@ -13,6 +13,8 @@ Usage:
 """
 
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import sys
 import math
 import time
@@ -29,7 +31,7 @@ sys.path.insert(0, BENCH_DIR)
 
 from config import BIBO_50M_BASELINE, build_model, count_params
 from data import load_benchmark_data, create_dataloader
-from optim import create_optimizer, create_scheduler, HAS_MUON
+from optim import create_optimizer, create_scheduler, HAS_MUON, HAS_BNB
 from eval import evaluate, generate_samples, get_tokenizer
 from utils import (
     init_wandb, log_train_metrics, log_val_metrics, log_samples,
@@ -41,7 +43,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="BiMo Benchmark Training")
 
     # Training
-    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps (effective batch = batch_size * grad_accum)")
     p.add_argument("--total_steps", type=int, default=50000)
     p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -125,7 +128,7 @@ def train(args):
         print("BiBo Benchmark Training")
         print("=" * 60)
         print(f"  Device: {device} (world_size={world_size})")
-        print(f"  Muon: {HAS_MUON}")
+        print(f"  Muon: {HAS_MUON}, bitsandbytes: {HAS_BNB}")
         print(f"  Batch size: {args.batch_size}")
         print(f"  Total steps: {args.total_steps}")
         print(f"  Seq len: {args.seq_len}")
@@ -171,6 +174,12 @@ def train(args):
         print(f"[train] Experts: {config.num_routed_experts} routed + {config.num_shared_experts} shared, top-{config.num_experts_per_tok}")
         print(f"[train] Layers: {config.num_hidden_layers} ({stats['num_moe_layers']} MoE + {stats['num_dense_layers']} dense)")
 
+    # Gradient checkpointing — saves ~40% activation memory
+    if is_main:
+        print("[train] Enabling gradient checkpointing...")
+    model.gradient_checkpointing_enable()
+    config.use_cache = False  # incompatible with grad checkpointing
+
     model = model.to(device)
 
     # FSDP2 for multi-GPU
@@ -204,6 +213,8 @@ def train(args):
             "model": "BiBo-baseline",
             # Training
             "batch_size": args.batch_size,
+            "grad_accum": args.grad_accum,
+            "effective_batch": args.batch_size * args.grad_accum,
             "total_steps": args.total_steps,
             "warmup_steps": args.warmup_steps,
             "lr": args.lr,
@@ -277,6 +288,9 @@ def train(args):
     epoch = 0
     step = start_step
     data_iter = iter(train_loader)
+    accum_steps = args.grad_accum
+    micro_step = 0  # tracks micro-steps within an accumulation window
+    optimizer.zero_grad(set_to_none=True)
 
     while step < args.total_steps:
         # Refill dataloader when exhausted
@@ -296,63 +310,69 @@ def train(args):
         # Forward — use_cache=False for training (no KV cache needed)
         with torch.autocast("cuda", dtype=torch.float16):
             outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
-            loss = outputs.loss
+            loss = outputs.loss / accum_steps  # scale for accumulation
 
-        # Backward
+        # Backward (accumulate gradients)
         loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad(set_to_none=True)
+        micro_step += 1
 
-        step += 1
-        step_time = time.time() - t0
+        # Only step optimizer every accum_steps micro-batches
+        if micro_step % accum_steps == 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
 
-        # Throughput
-        n_tokens = input_ids.numel()
-        throughput.update(n_tokens)
+            step += 1
+            step_time = time.time() - t0
 
-        # ── Logging (main rank only) ───────────────────────────
-        if is_main and step % args.eval_every == 0 or step == 1:
-            lr_now = scheduler.get_last_lr()[0]
-            tps = throughput.tokens_per_sec()
-            log_train_metrics(step, loss.item(), lr_now, grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm, tps, step_time)
+            # Throughput
+            n_tokens = input_ids.numel() * accum_steps
+            throughput.update(n_tokens)
 
-            # Console print
-            pct = step / args.total_steps * 100
-            eta_steps = args.total_steps - step
-            eta_sec = eta_steps * step_time
-            print(
-                f"  step {step:>6d}/{args.total_steps} ({pct:5.1f}%) | "
-                f"loss={loss.item():.4f} | lr={lr_now:.2e} | "
-                f"tps={tps:.0f} | time={step_time:.3f}s | "
-                f"grad={grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm:.4f} | "
-                f"ETA={format_time(eta_sec)}"
-            )
+            # Unscale loss for logging
+            unscaled_loss = loss.item() * accum_steps
 
-        # ── Validation ─────────────────────────────────────────
-        if is_main and step % args.eval_every == 0:
-            val_loss, val_ppl = evaluate(model, val_ds, batch_size=args.batch_size, device=device)
-            log_val_metrics(step, val_loss, val_ppl)
-            print(f"  [VAL] step={step} | val_loss={val_loss:.4f} | val_ppl={val_ppl:.2f}")
+            # ── Logging (main rank only) ───────────────────────
+            if is_main and (step % args.log_every == 0 or step == 1):
+                lr_now = scheduler.get_last_lr()[0]
+                tps = throughput.tokens_per_sec()
+                gn = grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm
+                log_train_metrics(step, unscaled_loss, lr_now, gn, tps, step_time)
 
-            # Check if we hit the target
-            if val_loss < 2.8:
-                print(f"  *** TARGET REACHED: val_loss={val_loss:.4f} < 2.8 at step {step} ***")
+                pct = step / args.total_steps * 100
+                eta_steps = args.total_steps - step
+                eta_sec = eta_steps * step_time
+                print(
+                    f"  step {step:>6d}/{args.total_steps} ({pct:5.1f}%) | "
+                    f"loss={unscaled_loss:.4f} | lr={lr_now:.2e} | "
+                    f"tps={tps:.0f} | time={step_time:.3f}s | "
+                    f"grad={gn:.4f} | "
+                    f"ETA={format_time(eta_sec)}"
+                )
 
-        # ── Sample Generation ──────────────────────────────────
-        if is_main and step % args.sample_every == 0:
-            samples = generate_samples(model, device=device)
-            log_samples(step, samples)
-            print(f"  [SAMPLES] step={step}:")
-            for s in samples[:2]:  # Print first 2
-                gen_preview = s["generated"][:150].replace("\n", " ")
-                print(f"    '{s['prompt']}' -> '{gen_preview}...'")
+            # ── Validation ─────────────────────────────────────
+            if is_main and step % args.eval_every == 0:
+                val_loss, val_ppl = evaluate(model, val_ds, batch_size=args.batch_size, device=device)
+                log_val_metrics(step, val_loss, val_ppl)
+                print(f"  [VAL] step={step} | val_loss={val_loss:.4f} | val_ppl={val_ppl:.2f}")
 
-        # ── Checkpointing ──────────────────────────────────────
-        if is_main and step % (args.eval_every * 5) == 0:
-            ckpt_path = os.path.join(REPO_ROOT, "bench", "checkpoints", f"step_{step}.pt")
-            save_checkpoint(model, optimizer, scheduler, step, ckpt_path)
+                if val_loss < 2.8:
+                    print(f"  *** TARGET REACHED: val_loss={val_loss:.4f} < 2.8 at step {step} ***")
+
+            # ── Sample Generation ──────────────────────────────
+            if is_main and step % args.sample_every == 0:
+                samples = generate_samples(model, device=device)
+                log_samples(step, samples)
+                print(f"  [SAMPLES] step={step}:")
+                for s in samples[:2]:
+                    gen_preview = s["generated"][:150].replace("\n", " ")
+                    print(f"    '{s['prompt']}' -> '{gen_preview}...'")
+
+            # ── Checkpointing ──────────────────────────────────
+            if is_main and step % (args.eval_every * 5) == 0:
+                ckpt_path = os.path.join(REPO_ROOT, "bench", "checkpoints", f"step_{step}.pt")
+                save_checkpoint(model, optimizer, scheduler, step, ckpt_path)
 
     # ── Final Summary ──────────────────────────────────────────
     if is_main:
