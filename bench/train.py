@@ -21,9 +21,11 @@ import torch
 import torch.distributed as dist
 from torch.distributed._composable.fsdp import fully_shard
 
-# Ensure repo root is in path
+# Ensure repo root and bench dir are in path
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO_ROOT)
+sys.path.insert(0, BENCH_DIR)
 
 from config import BIBO_50M_BASELINE, build_model, count_params
 from data import load_benchmark_data, create_dataloader
