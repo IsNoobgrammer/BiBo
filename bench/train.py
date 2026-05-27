@@ -232,9 +232,9 @@ def train(args):
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
 
-        # Forward
+        # Forward — use_cache=False for training (no KV cache needed)
         with torch.autocast("cuda", dtype=torch.float16):
-            outputs = model(input_ids=input_ids, labels=labels)
+            outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
             loss = outputs.loss
 
         # Backward

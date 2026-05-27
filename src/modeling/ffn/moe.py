@@ -130,7 +130,7 @@ class BiBoFusedExperts(nn.Module):
                 expert_output = F.linear(activated * up, self.down_proj[expert_idx])
                 output.index_add_(0, token_idx, expert_output * weights)
                 
-            elif expert_idx < self.identity_end:
+            elif expert_idx < self.zero_start:
                 # Identity expert: pass through with weight
                 output.index_add_(0, token_idx, current_state * weights)
                 

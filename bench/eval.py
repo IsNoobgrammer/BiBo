@@ -50,7 +50,7 @@ def evaluate(model, val_ds, batch_size=32, device="cuda"):
         labels = batch["labels"].to(device)
 
         with torch.autocast("cuda", dtype=torch.float16):
-            outputs = model(input_ids=input_ids, labels=labels)
+            outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
             loss = outputs.loss
 
         # Count valid tokens (not -100)
