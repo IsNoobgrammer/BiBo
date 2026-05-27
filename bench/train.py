@@ -58,7 +58,7 @@ def parse_args():
     p.add_argument("--val_split", type=float, default=0.05)
 
     # Eval & Logging
-    p.add_argument("--eval_every", type=int, default=500)
+    p.add_argument("--eval_every", type=int, default=10)
     p.add_argument("--sample_every", type=int, default=1000)
     p.add_argument("--ckpt_every", type=int, default=5000)
     p.add_argument("--log_every", type=int, default=10)
