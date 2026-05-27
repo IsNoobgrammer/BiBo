@@ -23,6 +23,17 @@ echo "  Steps: 2000 | Batch: 4 | Grad Accum: 4 | Eff Batch: 16"
 echo "  WandB Project: bibo-bench"
 echo "============================================================"
 
+# ── Download data first (shared, avoids parallel download conflicts) ──
+echo "[launcher] Downloading dataset + tokenizer..."
+python -c "
+from data import load_benchmark_data
+from eval import get_tokenizer
+train_ds, val_ds = load_benchmark_data(seq_len=1024, val_split=0.05)
+tok = get_tokenizer()
+print(f'Dataset ready: {len(train_ds)} train, {len(val_ds)} val')
+print(f'Tokenizer ready: vocab_size={tok.vocab_size}, len={len(tok)}')
+"
+
 # ── Launch BiBo on GPU 0 ──────────────────────────────────────
 echo "[launcher] Starting BiBo on cuda:0..."
 CUDA_VISIBLE_DEVICES=0 python bench/train.py \
