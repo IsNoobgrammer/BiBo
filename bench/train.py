@@ -132,14 +132,32 @@ def train(args):
         print(f"  LR: {args.lr}, Muon LR: {args.muon_lr}")
         print("=" * 60)
 
+    # ── Tokenizer (load first to get actual vocab size) ─────────
+    if is_main:
+        print("[train] Loading tokenizer...")
+    tokenizer = get_tokenizer()
+    actual_vocab_size = tokenizer.vocab_size
+    if is_main:
+        print(f"[train] Tokenizer vocab size: {actual_vocab_size}")
+
     # ── Model ──────────────────────────────────────────────────
     if is_main:
         print("[train] Building model...")
     model, config = build_model()
 
+    # Resize embeddings + lm_head to match actual tokenizer vocab
+    old_vocab = config.vocab_size
+    if actual_vocab_size != old_vocab:
+        if is_main:
+            print(f"[train] Resizing embeddings: {old_vocab} -> {actual_vocab_size}")
+        model.resize_token_embeddings(actual_vocab_size)
+        config.vocab_size = actual_vocab_size
+
+    stats = count_params(config)
     if is_main:
-        stats = count_params(config)
-        print(f"[train] Model params: {stats['total_m']:.2f}M")
+        print(f"[train] Model params: {stats['total_m']:.2f}M total, {stats['active_m']:.2f}M active, ratio={stats['ratio']:.2f}x")
+        print(f"[train] Experts: {config.num_routed_experts} routed + {config.num_shared_experts} shared, top-{config.num_experts_per_tok}")
+        print(f"[train] Layers: {config.num_hidden_layers} ({stats['num_moe_layers']} MoE + {stats['num_dense_layers']} dense)")
 
     model = model.to(device)
 
@@ -174,17 +192,51 @@ def train(args):
     # ── WandB ──────────────────────────────────────────────────
     if not args.no_wandb and is_main:
         wandb_config = {
-            "model": "BiBo-50M-baseline",
+            "model": "BiBo-baseline",
+            # Training
             "batch_size": args.batch_size,
             "total_steps": args.total_steps,
             "warmup_steps": args.warmup_steps,
             "lr": args.lr,
             "muon_lr": args.muon_lr,
+            "weight_decay": args.weight_decay,
+            "grad_clip": args.grad_clip,
             "seq_len": args.seq_len,
+            "seed": args.seed,
+            # Hardware
             "world_size": world_size,
             "has_muon": HAS_MUON,
             "compiled": not args.no_compile,
-            "params_m": stats["total_m"] if is_main else 0,
+            # Architecture
+            "vocab_size": config.vocab_size,
+            "hidden_size": config.hidden_size,
+            "intermediate_size": config.intermediate_size,
+            "num_hidden_layers": config.num_hidden_layers,
+            "num_attention_heads": config.num_attention_heads,
+            "num_key_value_heads": config.num_key_value_heads,
+            "moe_layers": stats["num_moe_layers"],
+            "dense_layers": stats["num_dense_layers"],
+            "num_routed_experts": config.num_routed_experts,
+            "num_shared_experts": config.num_shared_experts,
+            "num_experts_per_tok": config.num_experts_per_tok,
+            "polyglu_expert_multiplier": config.polyglu_expert_multiplier,
+            "special_expert_pairs": config.special_expert_pairs,
+            "moe_intermediate_size": config.moe_intermediate_size,
+            "shared_expert_type": config.shared_expert_type,
+            "router_type": config.router_type,
+            "router_lambda": config.router_lambda,
+            "use_ssmax": config.use_ssmax,
+            # Param counts
+            "total_params": stats["total"],
+            "total_params_m": stats["total_m"],
+            "active_params": stats["active"],
+            "active_params_m": stats["active_m"],
+            "param_ratio": stats["ratio"],
+            "embed_params": stats["embed"],
+            "attn_params": stats["attn"],
+            "dense_params": stats["dense"],
+            "moe_routed_params": stats["moe_routed"],
+            "moe_shared_params": stats["moe_shared"],
         }
         init_wandb(wandb_config, project=args.wandb_project, name=args.wandb_name, notes=args.wandb_notes)
 
