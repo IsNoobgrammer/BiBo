@@ -10,6 +10,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 from transformers.modeling_utils import PreTrainedModel
+from transformers.generation.utils import GenerationMixin
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.utils import logging
@@ -254,7 +255,7 @@ class BiBoModel(BiBoPreTrainedModel):
         return causal_mask
 
 
-class BiBoForCausalLM(BiBoPreTrainedModel):
+class BiBoForCausalLM(BiBoPreTrainedModel, GenerationMixin):
     """
     BiBo causal LM with MoE support.
     
