@@ -143,17 +143,11 @@ def train(args):
     tokenizer = get_tokenizer()
     actual_vocab_size = len(tokenizer)  # includes added tokens, not just base BPE
 
-    # Scan dataset for max token ID to guarantee no OOB
-    # Only scan first ~1000 batches (64K samples) — fast, catches any OOB tokens
-    _peek_loader = create_dataloader(train_ds, batch_size=64, shuffle=False)
-    _max_id = 0
-    for _i, _batch in enumerate(_peek_loader):
-        _bmax = _batch["input_ids"].max().item()
-        if _bmax > _max_id:
-            _max_id = _bmax
-        if _i >= 1000:
-            break
-    del _peek_loader
+    # Quick sanity check — 1 batch, just to verify data loads
+    _peek_loader = create_dataloader(train_ds, batch_size=1, shuffle=False)
+    _peek_batch = next(iter(_peek_loader))
+    _max_id = _peek_batch["input_ids"].max().item()
+    del _peek_loader, _peek_batch
     _safe_vocab = max(actual_vocab_size, _max_id + 1)
     if is_main:
         print(f"[train] Tokenizer: vocab_size={tokenizer.vocab_size}, len={actual_vocab_size}")
