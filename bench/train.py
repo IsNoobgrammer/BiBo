@@ -175,9 +175,10 @@ def train(args):
         print(f"[train] Layers: {config.num_hidden_layers} ({stats['num_moe_layers']} MoE + {stats['num_dense_layers']} dense)")
 
     # Gradient checkpointing — saves ~40% activation memory
+    # use_reentrant=False required for MoE (router picks different experts on recomputation)
     if is_main:
-        print("[train] Enabling gradient checkpointing...")
-    model.gradient_checkpointing_enable()
+        print("[train] Enabling gradient checkpointing (use_reentrant=False)...")
+    model.gradient_checkpointing_enable({"use_reentrant": False})
     config.use_cache = False  # incompatible with grad checkpointing
 
     model = model.to(device)
