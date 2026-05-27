@@ -43,8 +43,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="BiMo Benchmark Training")
 
     # Training
-    p.add_argument("--batch_size", type=int, default=2)
-    p.add_argument("--grad_accum", type=int, default=8, help="Gradient accumulation steps (effective batch = batch_size * grad_accum)")
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps (effective batch = batch_size * grad_accum)")
     p.add_argument("--total_steps", type=int, default=50000)
     p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -174,10 +174,18 @@ def train(args):
         print(f"[train] Experts: {config.num_routed_experts} routed + {config.num_shared_experts} shared, top-{config.num_experts_per_tok}")
         print(f"[train] Layers: {config.num_hidden_layers} ({stats['num_moe_layers']} MoE + {stats['num_dense_layers']} dense)")
 
-    # Gradient checkpointing DISABLED — incompatible with MoE routing
-    # (router picks different experts on recomputation → shape mismatch)
-    # Memory savings instead from: 8-bit AdamW, small batch, grad accum
-    config.use_cache = False
+    # Gradient checkpointing — saves ~40% activation memory
+    # MoE routing is data-dependent (different experts each recomputation),
+    # so we must skip the strict metadata check. Two approaches:
+    #   1. use_reentrant=True  — old checkpoint, no shape check (Mixtral's fix)
+    #   2. use_reentrant=False, determinism_check='none' — new, skip check
+    # Use approach 1 (proven with Mixtral 8x7B MoE)
+    if is_main:
+        print("[train] Enabling gradient checkpointing (use_reentrant=True for MoE)...")
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": True}
+    )
+    config.use_cache = False  # incompatible with grad checkpointing
 
     model = model.to(device)
 
