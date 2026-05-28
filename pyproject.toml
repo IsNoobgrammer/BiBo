@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bibo"
+version = "0.1.0"
+description = "BiBo — Mixture-of-Experts Transformer with PolyGLU experts and SSMax attention"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Shaurya", email = "isnoobgrammer@gmail.com"},
+]
+keywords = ["moe", "transformer", "mixture-of-experts", "ssmax", "polyglu"]
+
+dependencies = [
+    "torch>=2.4.0",
+    "transformers>=4.50.0",
+    "einops>=0.7.0",
+    "datasets>=3.0.0",
+    "safetensors>=0.4.0",
+    "huggingface-hub>=0.20.0",
+]
+
+[project.optional-dependencies]
+# Full training stack (Kaggle / multi-GPU)
+train = [
+    "wandb>=0.17.0",
+    "bitsandbytes>=0.43.0",
+    "accelerate>=0.30.0",
+    "hf_transfer>=0.1.6",
+    "liger-kernel>=0.5.0",
+    "pyyaml>=6.0",
+    "seaborn>=0.13.0",
+    "matplotlib>=3.8.0",
+]
+
+# Development (local, includes profiling)
+dev = [
+    "pytest>=8.0",
+    "ipython>=8.0",
+    "jupyter>=1.0",
+    "triton>=3.0.0; platform_system == 'Linux'",
+]
+
+# Everything
+all = ["bibo[train,dev]"]
+
+[project.urls]
+Repository = "https://github.com/IsNoobgrammer/BiBo"
+
+[tool.setuptools.packages.find]
+include = ["src*", "baseline*", "bench*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.yml", "*.json", "*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
