@@ -41,6 +41,10 @@ class Qwen3Config(PretrainedConfig):
         sliding_window=None,
         max_window_layers=28,
         attention_dropout=0.0,
+        # Standard PreTrainedConfig fields
+        pad_token_id=None,
+        bos_token_id=None,
+        eos_token_id=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -56,12 +60,19 @@ class Qwen3Config(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.rope_theta = rope_theta
+        self.rope_parameters = {"rope_type": "default", "rope_theta": rope_theta}
         self.attention_bias = attention_bias
         self.use_sliding_window = use_sliding_window
         self.sliding_window = sliding_window if use_sliding_window else None
         self.max_window_layers = max_window_layers
         self.attention_dropout = attention_dropout
-        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+        super().__init__(
+            tie_word_embeddings=tie_word_embeddings,
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            **kwargs,
+        )
 
 
 __all__ = ["Qwen3Config"]
