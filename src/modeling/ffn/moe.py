@@ -9,6 +9,7 @@ from src.configuration_bibo import BiBoConfig
 from .experts import BiBoCausalConv1D
 from .mlp import BiBoMLP
 from .router import BiBoMoERouter
+from .triton_moe_kernel import fused_moe_activation_group
 
 __all__ = ['BiBoMoELayer']
 
@@ -70,41 +71,62 @@ class BiBoFusedExperts(nn.Module):
         self.zero_start = self.identity_end
         self.zero_end = self.num_routed_experts
 
-    def _process_activation_group(
+    def _dispatch_activation_group(
         self,
         hidden_states: torch.Tensor,
         sorted_token_indices: torch.Tensor,
         sorted_weights: torch.Tensor,
-        sorted_expert_indices: torch.Tensor,
-        expert_counts: torch.Tensor,
         boundaries: torch.Tensor,
+        expert_counts: torch.Tensor,
         group_expert_ids: list,
-        activation_fn,
+        activation: str,
         output: torch.Tensor,
     ):
-        """Process all experts in one activation group via batched operations."""
-        for expert_idx in group_expert_ids:
-            start = boundaries[expert_idx]
-            end = boundaries[expert_idx + 1]
-            count = expert_counts[expert_idx]
-            
-            if count == 0:
-                continue
-            
-            token_idx = sorted_token_indices[start:end]
-            weights = sorted_weights[start:end].unsqueeze(-1)
-            current_state = hidden_states[token_idx]
-            
-            # gate_up projection
-            gate_up = F.linear(current_state, self.gate_up_proj[expert_idx])
-            gate, up = gate_up.chunk(2, dim=-1)
-            
-            # Activation (same for all experts in this group — enables future fusion)
-            activated = activation_fn(gate)
-            
-            # down projection
-            expert_output = F.linear(activated * up, self.down_proj[expert_idx])
-            output.index_add_(0, token_idx, expert_output * weights)
+        """
+        Dispatch one activation group via fused_moe_activation_group kernel.
+        
+        Builds the per-group offsets and delegates to the Triton kernel
+        (or its PyTorch fallback).
+        """
+        num_in_group = len(group_expert_ids)
+        if num_in_group == 0:
+            return
+        
+        # Build contiguous token IDs and weights for this group's experts
+        # and compute per-expert offsets within the group
+        group_offsets = torch.zeros(num_in_group + 1, dtype=torch.long, device=hidden_states.device)
+        
+        # Collect all tokens for this group contiguously
+        group_token_ids_list = []
+        group_weights_list = []
+        
+        for i, expert_idx in enumerate(group_expert_ids):
+            start = boundaries[expert_idx].item()
+            end = boundaries[expert_idx + 1].item()
+            count = end - start
+            group_offsets[i + 1] = group_offsets[i] + count
+            if count > 0:
+                group_token_ids_list.append(sorted_token_indices[start:end])
+                group_weights_list.append(sorted_weights[start:end])
+        
+        total_tokens = group_offsets[-1].item()
+        if total_tokens == 0:
+            return
+        
+        group_token_ids = torch.cat(group_token_ids_list)
+        group_weights = torch.cat(group_weights_list)
+        
+        # Gather the weights for this group's experts
+        group_gate_up = self.gate_up_proj[group_expert_ids]  # (num_in_group, 2*inter, hidden)
+        group_down = self.down_proj[group_expert_ids]        # (num_in_group, hidden, inter)
+        
+        # Dispatch to fused kernel (Triton or PyTorch fallback)
+        fused_moe_activation_group(
+            hidden_states, output,
+            group_gate_up, group_down,
+            group_token_ids, group_weights,
+            group_offsets, activation
+        )
 
     def forward(
         self,
@@ -113,7 +135,7 @@ class BiBoFusedExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Activation-grouped dispatch — no data-dependent branching per expert.
+        Activation-grouped dispatch via fused kernels.
         
         Args:
             hidden_states: (num_tokens, hidden_size)
@@ -143,25 +165,25 @@ class BiBoFusedExperts(nn.Module):
         
         output = torch.zeros(num_tokens, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
         
-        # ── Group 1: SiLU experts (no branching within group) ──
-        self._process_activation_group(
+        # ── Group 1: SiLU experts → fused kernel ──
+        self._dispatch_activation_group(
             hidden_states, sorted_token_indices, sorted_weights,
-            sorted_expert_indices, expert_counts, boundaries,
-            self.silu_expert_indices, F.silu, output
+            boundaries, expert_counts,
+            self.silu_expert_indices, "silu", output
         )
         
-        # ── Group 2: ReLU² experts ──
-        self._process_activation_group(
+        # ── Group 2: ReLU² experts → fused kernel ──
+        self._dispatch_activation_group(
             hidden_states, sorted_token_indices, sorted_weights,
-            sorted_expert_indices, expert_counts, boundaries,
-            self.relu2_expert_indices, lambda x: F.relu(x).square(), output
+            boundaries, expert_counts,
+            self.relu2_expert_indices, "relu2", output
         )
         
-        # ── Group 3: Tanh experts ──
-        self._process_activation_group(
+        # ── Group 3: Tanh experts → fused kernel ──
+        self._dispatch_activation_group(
             hidden_states, sorted_token_indices, sorted_weights,
-            sorted_expert_indices, expert_counts, boundaries,
-            self.tanh_expert_indices, torch.tanh, output
+            boundaries, expert_counts,
+            self.tanh_expert_indices, "tanh", output
         )
         
         # ── Group 4: Identity experts (passthrough, no GEMM) ──
@@ -175,9 +197,6 @@ class BiBoFusedExperts(nn.Module):
             output.index_add_(0, token_idx, hidden_states[token_idx] * weights)
         
         # ── Group 5: Zero experts (gradient-only, minimal compute) ──
-        # Only need gradient to flow through the routing weights.
-        # We do NOT read hidden_states — just accumulate a zero-valued contribution
-        # that still has gradient connection to the routing weights.
         for expert_idx in range(self.zero_start, self.zero_end):
             start = boundaries[expert_idx]
             end = boundaries[expert_idx + 1]
@@ -186,7 +205,6 @@ class BiBoFusedExperts(nn.Module):
             token_idx = sorted_token_indices[start:end]
             weights = sorted_weights[start:end].unsqueeze(-1)  # (n, 1)
             # Gradient flows through weights, but output contribution is zero.
-            # weights * 0 preserves the gradient graph without reading hidden_states.
             output.index_add_(0, token_idx, weights.expand_as(
                 hidden_states[token_idx]) * 0.0)
 
