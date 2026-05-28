@@ -5,6 +5,16 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple, Union
 from torch.nn import CrossEntropyLoss
 
+# Fused Linear Cross-Entropy — avoids materializing the full logit tensor
+# Saves ~1.3GB for vocab=81K, batch=4, seq=1024
+try:
+    from liger_kernel.ops.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
+    HAS_LIGER = True
+except ImportError:
+    HAS_LIGER = False
+
+from src.modeling.fused_ce import chunked_fused_linear_cross_entropy
+
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -322,17 +332,30 @@ class BiBoForCausalLM(BiBoPreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs.last_hidden_state
-        logits = self.lm_head(hidden_states)
 
         loss = None
-        if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
+        if labels is not None and HAS_LIGER:
+            # Liger fused linear cross-entropy (fastest — Triton kernel)
+            shift_hidden = hidden_states[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            shift_hidden = shift_hidden.view(-1, hidden_states.shape[-1])
+            shift_labels = shift_labels.view(-1).to(shift_hidden.device)
+            fused_ce = LigerFusedLinearCrossEntropyLoss()
+            loss = fused_ce(shift_hidden, self.lm_head.weight, shift_labels)
+            logits = None  # Not computed — saves memory
+        elif labels is not None:
+            # Chunked fused CE (pure PyTorch fallback — still saves memory)
+            shift_hidden = hidden_states[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            shift_hidden = shift_hidden.view(-1, hidden_states.shape[-1])
+            shift_labels = shift_labels.view(-1).to(shift_hidden.device)
+            loss = chunked_fused_linear_cross_entropy(
+                shift_hidden, self.lm_head.weight, shift_labels,
+                chunk_size=4096, ignore_index=-100
+            )
+            logits = None  # Not computed — saves memory
+        else:
+            logits = self.lm_head(hidden_states)
 
         if not return_dict:
             output = (logits,) + outputs[1:]

@@ -76,6 +76,7 @@ def parse_args():
     p.add_argument("--eval_only", action="store_true", help="Run eval only, no training")
     p.add_argument("--no_compile", action="store_true", help="Skip torch.compile")
     p.add_argument("--no_wandb", action="store_true", help="Disable WandB logging")
+    p.add_argument("--grad_checkpoint", action="store_true", help="Enable gradient checkpointing (disabled by default for MFU)")
 
     return p.parse_args()
 
@@ -179,18 +180,19 @@ def train(args):
         print(f"{TAG} [train] Experts: {config.num_routed_experts} routed + {config.num_shared_experts} shared, top-{config.num_experts_per_tok}")
         print(f"{TAG} [train] Layers: {config.num_hidden_layers} ({stats['num_moe_layers']} MoE + {stats['num_dense_layers']} dense)")
 
-    # Gradient checkpointing — saves ~40% activation memory
-    # MoE routing is data-dependent (different experts each recomputation),
-    # so we must skip the strict metadata check. Two approaches:
-    #   1. use_reentrant=True  — old checkpoint, no shape check (Mixtral's fix)
-    #   2. use_reentrant=False, determinism_check='none' — new, skip check
-    # Use approach 1 (proven with Mixtral 8x7B MoE)
-    if is_main:
-        print(f"{TAG} [train] Enabling gradient checkpointing (use_reentrant=True for MoE)...")
-    model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": True}
-    )
-    config.use_cache = False  # incompatible with grad checkpointing
+    # Gradient checkpointing — DISABLED by default for MFU
+    # With fused CE saving ~1.3GB, 50M model fits on T4 16GB without checkpointing.
+    # Enable only if OOM occurs (pass --grad_checkpoint flag).
+    if getattr(args, 'grad_checkpoint', False):
+        if is_main:
+            print(f"{TAG} [train] Enabling gradient checkpointing (use_reentrant=True for MoE)...")
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": True}
+        )
+    else:
+        if is_main:
+            print(f"{TAG} [train] Gradient checkpointing DISABLED (fused CE saves enough memory)")
+    config.use_cache = False  # incompatible with training
 
     model = model.to(device)
 

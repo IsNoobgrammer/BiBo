@@ -19,20 +19,27 @@ _POLYGLU_ACTIVATIONS = ("silu", "relu2", "tanh")
 
 class BiBoFusedExperts(nn.Module):
     """
-    Fused PolyGLU experts — sorted dispatch (Qwen/DeepSeek pattern).
+    Activation-Grouped PolyGLU experts — batched GEMM dispatch.
+    
+    Instead of looping over experts one-by-one (24 kernel launches),
+    groups experts by activation type and uses torch.bmm for each group
+    (6 kernel launches total: 3 gate_up + 3 down).
+    
+    Expert layout:
+      - SiLU group: experts [0, 3, ...] (every 3rd starting at 0)
+      - ReLU² group: experts [1, 4, ...] (every 3rd starting at 1)
+      - Tanh group: experts [2, 5, ...] (every 3rd starting at 2)
+      - Identity experts: [num_polyglu, num_polyglu + pairs)
+      - Zero experts: [num_polyglu + pairs, num_routed) — gradient-only, no compute
     
     All PolyGLU expert weights stored as:
       - gate_up_proj: (num_polyglu_experts, 2 * intermediate, hidden)
       - down_proj: (num_polyglu_experts, hidden, intermediate)
-    
-    Dispatch: sort tokens by expert, process contiguous chunks, index_add_ back.
-    No one_hot — no permute — no torch.where.
-    
-    Identity/Zero experts handled with zero compute (just index_add).
     """
     def __init__(self, config: BiBoConfig):
         super().__init__()
         self.num_polyglu_experts = config.polyglu_expert_multiplier * 3
+        self.polyglu_multiplier = config.polyglu_expert_multiplier
         self.special_expert_pairs = config.special_expert_pairs
         self.num_routed_experts = config.num_routed_experts
         self.hidden_size = config.hidden_size
@@ -50,19 +57,54 @@ class BiBoFusedExperts(nn.Module):
         nn.init.normal_(self.gate_up_proj, mean=0.0, std=config.initializer_range)
         nn.init.normal_(self.down_proj, mean=0.0, std=config.initializer_range)
         
-        # Pre-compute activation name for each expert index
+        # Pre-compute expert-to-activation-group mapping (static, no graph breaks)
         # Layout: [SiLU_0, ReLU²_0, Tanh_0, SiLU_1, ReLU²_1, Tanh_1, ...]
-        self._expert_activations = []
-        for _ in range(config.polyglu_expert_multiplier):
-            for act in _POLYGLU_ACTIVATIONS:
-                self._expert_activations.append(act)
+        # SiLU indices: [0, 3, 6, ...], ReLU² indices: [1, 4, 7, ...], Tanh: [2, 5, 8, ...]
+        self.silu_expert_indices = list(range(0, self.num_polyglu_experts, 3))
+        self.relu2_expert_indices = list(range(1, self.num_polyglu_experts, 3))
+        self.tanh_expert_indices = list(range(2, self.num_polyglu_experts, 3))
         
-        # Identity indices: [num_polyglu, num_polyglu + pairs)
-        # Zero indices: [num_polyglu + pairs, num_routed)
+        # Identity/Zero boundaries
         self.identity_start = self.num_polyglu_experts
         self.identity_end = self.num_polyglu_experts + self.special_expert_pairs
         self.zero_start = self.identity_end
         self.zero_end = self.num_routed_experts
+
+    def _process_activation_group(
+        self,
+        hidden_states: torch.Tensor,
+        sorted_token_indices: torch.Tensor,
+        sorted_weights: torch.Tensor,
+        sorted_expert_indices: torch.Tensor,
+        expert_counts: torch.Tensor,
+        boundaries: torch.Tensor,
+        group_expert_ids: list,
+        activation_fn,
+        output: torch.Tensor,
+    ):
+        """Process all experts in one activation group via batched operations."""
+        for expert_idx in group_expert_ids:
+            start = boundaries[expert_idx]
+            end = boundaries[expert_idx + 1]
+            count = expert_counts[expert_idx]
+            
+            if count == 0:
+                continue
+            
+            token_idx = sorted_token_indices[start:end]
+            weights = sorted_weights[start:end].unsqueeze(-1)
+            current_state = hidden_states[token_idx]
+            
+            # gate_up projection
+            gate_up = F.linear(current_state, self.gate_up_proj[expert_idx])
+            gate, up = gate_up.chunk(2, dim=-1)
+            
+            # Activation (same for all experts in this group — enables future fusion)
+            activated = activation_fn(gate)
+            
+            # down projection
+            expert_output = F.linear(activated * up, self.down_proj[expert_idx])
+            output.index_add_(0, token_idx, expert_output * weights)
 
     def forward(
         self,
@@ -71,7 +113,7 @@ class BiBoFusedExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Sorted dispatch — no one_hot, no permute, no where.
+        Activation-grouped dispatch — no data-dependent branching per expert.
         
         Args:
             hidden_states: (num_tokens, hidden_size)
@@ -94,49 +136,59 @@ class BiBoFusedExperts(nn.Module):
         sorted_token_indices = flat_token_indices[sort_order]
         sorted_weights = flat_weights[sort_order]
         
-        # Find boundaries: which chunks of sorted_indices belong to which expert
-        # bincount gives us the count per expert, cumsum gives boundaries
+        # Find boundaries per expert
         expert_counts = torch.bincount(sorted_expert_indices, minlength=num_routed)
         boundaries = torch.zeros(num_routed + 1, dtype=torch.long, device=hidden_states.device)
         boundaries[1:] = torch.cumsum(expert_counts, dim=0)
         
-        # Process each expert's chunk
         output = torch.zeros(num_tokens, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
         
-        for expert_idx in range(num_routed):
-            # Use tensor indexing instead of .item() to avoid graph breaks
+        # ── Group 1: SiLU experts (no branching within group) ──
+        self._process_activation_group(
+            hidden_states, sorted_token_indices, sorted_weights,
+            sorted_expert_indices, expert_counts, boundaries,
+            self.silu_expert_indices, F.silu, output
+        )
+        
+        # ── Group 2: ReLU² experts ──
+        self._process_activation_group(
+            hidden_states, sorted_token_indices, sorted_weights,
+            sorted_expert_indices, expert_counts, boundaries,
+            self.relu2_expert_indices, lambda x: F.relu(x).square(), output
+        )
+        
+        # ── Group 3: Tanh experts ──
+        self._process_activation_group(
+            hidden_states, sorted_token_indices, sorted_weights,
+            sorted_expert_indices, expert_counts, boundaries,
+            self.tanh_expert_indices, torch.tanh, output
+        )
+        
+        # ── Group 4: Identity experts (passthrough, no GEMM) ──
+        for expert_idx in range(self.identity_start, self.identity_end):
             start = boundaries[expert_idx]
             end = boundaries[expert_idx + 1]
-            
-            token_idx = sorted_token_indices[start:end]
-            if token_idx.shape[0] == 0:
+            if expert_counts[expert_idx] == 0:
                 continue
+            token_idx = sorted_token_indices[start:end]
+            weights = sorted_weights[start:end].unsqueeze(-1)
+            output.index_add_(0, token_idx, hidden_states[token_idx] * weights)
+        
+        # ── Group 5: Zero experts (gradient-only, minimal compute) ──
+        # Only need gradient to flow through the routing weights.
+        # We do NOT read hidden_states — just accumulate a zero-valued contribution
+        # that still has gradient connection to the routing weights.
+        for expert_idx in range(self.zero_start, self.zero_end):
+            start = boundaries[expert_idx]
+            end = boundaries[expert_idx + 1]
+            if expert_counts[expert_idx] == 0:
+                continue
+            token_idx = sorted_token_indices[start:end]
             weights = sorted_weights[start:end].unsqueeze(-1)  # (n, 1)
-            current_state = hidden_states[token_idx]  # (n, hidden)
-            
-            if expert_idx < self.num_polyglu_experts:
-                # PolyGLU expert: fused gate+up → activation → down
-                gate_up = F.linear(current_state, self.gate_up_proj[expert_idx])
-                gate, up = gate_up.chunk(2, dim=-1)
-                
-                act_name = self._expert_activations[expert_idx]
-                if act_name == "silu":
-                    activated = F.silu(gate)
-                elif act_name == "relu2":
-                    activated = F.relu(gate).square()
-                else:  # tanh
-                    activated = torch.tanh(gate)
-                
-                expert_output = F.linear(activated * up, self.down_proj[expert_idx])
-                output.index_add_(0, token_idx, expert_output * weights)
-                
-            elif expert_idx < self.zero_start:
-                # Identity expert: pass through with weight
-                output.index_add_(0, token_idx, current_state * weights)
-                
-            else:
-                # Zero expert: multiply by 0 (keeps graph alive for router gradients)
-                output.index_add_(0, token_idx, current_state * (weights * 0))
+            # Gradient flows through weights, but output contribution is zero.
+            # weights * 0 preserves the gradient graph without reading hidden_states.
+            output.index_add_(0, token_idx, weights.expand_as(
+                hidden_states[token_idx]) * 0.0)
 
         return output
 

@@ -167,6 +167,7 @@ def parse_args():
     p.add_argument("--eval_only", action="store_true")
     p.add_argument("--no_compile", action="store_true")
     p.add_argument("--no_wandb", action="store_true")
+    p.add_argument("--grad_checkpoint", action="store_true", help="Enable gradient checkpointing")
 
     return p.parse_args()
 
@@ -247,12 +248,16 @@ def train(args):
         print(f"{TAG} [train] Experts: {config.num_experts} routed, top-{config.num_experts_per_tok}")
         print(f"{TAG} [train] Layers: {config.num_hidden_layers} ({stats['num_moe_layers']} MoE + {stats['num_dense_layers']} dense)")
 
-    # Gradient checkpointing — saves activation memory, matches BiBo setup
-    if is_main:
-        print(f"{TAG} [train] Enabling gradient checkpointing (use_reentrant=True for MoE)...")
-    model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": True}
-    )
+    # Gradient checkpointing — DISABLED by default for MFU
+    if getattr(args, 'grad_checkpoint', False):
+        if is_main:
+            print(f"{TAG} [train] Enabling gradient checkpointing (use_reentrant=True for MoE)...")
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": True}
+        )
+    else:
+        if is_main:
+            print(f"{TAG} [train] Gradient checkpointing DISABLED for max throughput")
     config.use_cache = False
     model = model.to(device)
 
