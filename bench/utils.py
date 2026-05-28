@@ -28,6 +28,7 @@ def init_wandb(config, project="bibo-bench", name="baseline-50m", notes=""):
     wandb.define_metric("train/*", step_metric="train/step")
     wandb.define_metric("val/step")
     wandb.define_metric("val/*", step_metric="val/step")
+    wandb.define_metric("router/*", step_metric="val/step")
     wandb.define_metric("samples/step")
     wandb.define_metric("samples/*", step_metric="samples/step")
     return run

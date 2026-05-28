@@ -325,8 +325,7 @@ patch_moe_with_triton(model)    # MoE GLU activation (custom Triton)
 
 ## Git Conventions
 
-- Push to feature branches, never main directly (relaxed during rapid iteration)
-- `AGENTS.md` is gitignored (agent-only context)
+- Push to main and revert to old commit hash when user asks for it.
 - `logs/`, `bugs/`, `shaurya_notes.md`, `venv/`, `wandb/`, `research_on_activations/` are all gitignored
 
 ---
