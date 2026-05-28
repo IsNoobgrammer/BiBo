@@ -191,6 +191,7 @@ def compile_model(model):
 
 
 def train(args):
+    TAG = "[qwen]"
     is_distributed, rank, world_size, device = setup_distributed()
     is_main = rank == 0
     torch.manual_seed(args.seed)
@@ -246,6 +247,12 @@ def train(args):
         print(f"{TAG} [train] Experts: {config.num_experts} routed, top-{config.num_experts_per_tok}")
         print(f"{TAG} [train] Layers: {config.num_hidden_layers} ({stats['num_moe_layers']} MoE + {stats['num_dense_layers']} dense)")
 
+    # Gradient checkpointing — saves activation memory, matches BiBo setup
+    if is_main:
+        print(f"{TAG} [train] Enabling gradient checkpointing (use_reentrant=True for MoE)...")
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": True}
+    )
     config.use_cache = False
     model = model.to(device)
 
@@ -339,6 +346,7 @@ def train(args):
         print(f"{TAG} [train] {len(train_loader)} batches per epoch")
         print()
 
+    scaler = torch.amp.GradScaler()
     throughput = ThroughputMeter(warmup=3)
     model.train()
     epoch = 0
@@ -366,12 +374,14 @@ def train(args):
             outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
             loss = outputs.loss / accum_steps
 
-        loss.backward()
+        scaler.scale(loss).backward()
         micro_step += 1
 
         if micro_step % accum_steps == 0:
+            scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 

@@ -295,6 +295,7 @@ def train(args):
         print(f"{TAG} [train] {len(train_loader)} batches per epoch")
         print()
 
+    scaler = torch.amp.GradScaler()
     throughput = ThroughputMeter(warmup=3)
     model.train()
     epoch = 0
@@ -324,14 +325,16 @@ def train(args):
             outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
             loss = outputs.loss / accum_steps  # scale for accumulation
 
-        # Backward (accumulate gradients)
-        loss.backward()
+        # Backward (accumulate gradients) — scaled for fp16 stability
+        scaler.scale(loss).backward()
         micro_step += 1
 
         # Only step optimizer every accum_steps micro-batches
         if micro_step % accum_steps == 0:
+            scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
