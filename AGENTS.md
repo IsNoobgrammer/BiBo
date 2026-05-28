@@ -240,6 +240,73 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 
 ---
 
+## Triton Kernels (`src/kernels/`)
+
+**All custom GPU kernels MUST be written in `src/kernels/`.**
+
+### Architecture
+
+```
+src/kernels/
+├── __init__.py              # Exports all patching functions
+├── patch.py                 # Liger-Kernel patches (RMSNorm, RoPE)
+├── moe_dispatch.py          # Triton MoE kernels (fused GLU activation, router)
+├── bench_moe.py             # MoE benchmark suite (correctness + perf)
+└── verify_e2e.py            # Full model E2E verification
+```
+
+### What's Optimized
+
+| Component | Kernel | Speedup | Source |
+|-----------|--------|---------|--------|
+| RMSNorm | Liger-Kernel `LigerRMSNormFunction` | 8-9x | `patch.py` |
+| RoPE | Liger-Kernel `LigerRopeFunction` | 2-3x | `patch.py` |
+| MoE GLU Activation | Custom Triton `_fused_glu_act_kernel` | 1.5x (full model) | `moe_dispatch.py` |
+| Router Scoring | Custom Triton `_fused_router_kernel` | Available | `moe_dispatch.py` |
+
+### MoE Kernel Design (May 28, 2026)
+
+**Strategy**: cuBLAS for GEMMs (already optimal) + Triton for activation fusion.
+
+The fused GLU activation kernel (`_fused_glu_act_kernel`) replaces:
+```python
+gate, up = gate_up.chunk(2, dim=-1)  # 2 intermediate tensors
+activated = F.silu(gate)              # 1 intermediate tensor
+result = activated * up               # 1 intermediate tensor
+```
+With a single Triton kernel that:
+1. Loads gate and up from the fused (M, 2I) tensor
+2. Applies activation (SiLU/ReLU²/Tanh) in registers
+3. Multiplies gate × up in registers
+4. Stores result — **zero intermediate tensors in global memory**
+
+**Benchmark results (RTX 3050, sm_86):**
+- Full model fwd+bwd: **1.51x speedup** (337ms → 223ms)
+- MoE-only forward: **1.51x** (inference), **1.34x** (small batch)
+- Forward correctness: max_diff=2.38e-07 (essentially perfect)
+- Loss: identical (8.612711 = 8.612711)
+
+### Usage
+
+```python
+from src.kernels import patch_bibo_with_triton, patch_moe_with_triton
+
+model = BiBoForCausalLM(config).cuda()
+patch_bibo_with_triton(model)   # RMSNorm + RoPE (Liger-Kernel)
+patch_moe_with_triton(model)    # MoE GLU activation (custom Triton)
+```
+
+### Rules for New Kernels
+
+1. **All kernels go in `src/kernels/`** — never inline Triton in modeling code
+2. **Liger-Kernel first** — check if Liger already provides the op before writing custom
+3. **cuBLAS for GEMMs** — don't write custom matmul kernels (cuBLAS is faster for typical shapes)
+4. **Monkey-patch pattern** — kernels are applied via `patch_*` functions, never modify modeling code
+5. **Benchmark before promoting** — run `bench_moe.py` or equivalent, record exact numbers
+6. **Correctness is binary** — atol=1e-3 for fp16, atol=1e-5 for fp32
+
+---
+
 ## Verified Correct (May 16, 2026)
 
 - **RoPE**: Bit-for-bit identical to Qwen3MoE
