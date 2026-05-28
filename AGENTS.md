@@ -103,7 +103,7 @@ BiBoForCausalLM
 
 **Attention**: SDPA (Flash Attention) by default. Falls back to manual matmul when `output_attentions=True`. GQA (fewer KV heads). QK-norm. SSMax query scaling.
 
-**MoE**: First and last layers are dense MLP. All middle layers are MoE. Router uses logit normalization. Bias heuristics for load balancing. Router bias is `requires_grad=False` (not optimizer-managed, updated heuristically).
+**MoE**: First 2 layers are dense MLP (layers 0 and 1). All remaining layers are MoE. Router uses logit normalization. Bias heuristics for load balancing. Router bias is `requires_grad=False` (not optimizer-managed, updated heuristically).
 
 **Expert layout (PolyGLU)**: `polyglu_expert_multiplier` groups of 3 (SiLU-GLU, ReLU²-GLU, Tanh-GLU) + `special_expert_pairs` × (Identity, Zero). Default: 2×3 + 1×2 = 8 routed experts.
 
@@ -124,7 +124,7 @@ BiBoForCausalLM
 | `bias_update_threshold` | 100K | Tokens between bias updates |
 | `shared_expert_type` | "mlp" | Shared expert type: `"mlp"` (SwiGLU, like Qwen) or `"conv"` (CausalConv1D) |
 | `moe_shared_scaling` | auto | Shared expert output scaling (auto-computed via Monte Carlo, accounts for router_lambda) |
-| `mlp_only_layers` | [0, N-1] | Which layers use dense MLP instead of MoE |
+| `mlp_only_layers` | [0, 1] | Which layers use dense MLP instead of MoE |
 
 ---
 

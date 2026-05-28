@@ -237,7 +237,7 @@ BIBO_50M_BASELINE = BiBoConfig(
     vocab_size=81000,               # QTK-81K tokenizer
     hidden_size=320,
     intermediate_size=1024,         # 3.2x hidden
-    num_hidden_layers=12,           # first+last dense, 10 MoE
+    num_hidden_layers=12,           # first 2 dense, 10 MoE
     num_attention_heads=5,          # hidden/64
     num_key_value_heads=1,          # GQA 5:1 (aggressive)
     max_position_embeddings=2048,
@@ -578,7 +578,7 @@ os.environ['WANDB_API_KEY'] = 'your_key_here'  # or WANDB_MODE=disabled
 |-----------|----------|---------|-------------|
 | `hidden_size` | 320 | 256 | Hidden dimension |
 | `intermediate_size` | 1024 | 768 | Dense MLP intermediate |
-| `num_hidden_layers` | 12 | 10 | Total layers (first+last dense) |
+| `num_hidden_layers` | 12 | 10 | Total layers (first 2 dense) |
 | `num_attention_heads` | 5 | 4 | Query heads |
 | `num_key_value_heads` | 1 | 2 | KV heads (GQA) |
 | `polyglu_expert_multiplier` | 1 | 2 | Groups of 3 GLU experts |

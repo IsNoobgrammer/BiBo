@@ -37,7 +37,7 @@ BiBoForCausalLM
 
 **Expert layout**: `[0..n-4]` = SwiGLU MLPs, `[n-3]` = Identity, `[n-2]` = Zero, `[n-1]` = ReLU²
 
-**MoE layers**: First and last decoder layers use dense MLP (configurable via `mlp_only_layers`). All middle layers use MoE routing.
+**MoE layers**: First 2 decoder layers use dense MLP (configurable via `mlp_only_layers`). All remaining layers use MoE routing.
 
 ## Installation
 
@@ -90,7 +90,7 @@ Key parameters (see [`docs/configuration_guide.md`](docs/configuration_guide.md)
 | `bias_update_factor` | auto | Load balancing step size (Hill function of n) |
 | `bias_update_threshold` | `8000` | Tokens between bias updates |
 | `moe_shared_scaling` | auto | Shared expert output scaling (Monte Carlo estimated) |
-| `mlp_only_layers` | `[0, N-1]` | Layers using dense MLP instead of MoE |
+| `mlp_only_layers` | `[0, 1]` | Layers using dense MLP instead of MoE |
 | `max_position_embeddings` | `32768` | Maximum context length |
 | `rope_theta` | auto | RoPE base frequency (scales with context length) |
 
