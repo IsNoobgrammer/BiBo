@@ -197,15 +197,18 @@ def train(args):
 
     model = model.to(device)
 
-    # ── Triton Fused RMSNorm (default ON) ──────────────────────
+    # ── Triton Fused Kernels (default ON) ──────────────────────
     if not args.no_triton:
         try:
             from src.kernels.patch import patch_bibo_with_triton
             from src.kernels.moe_dispatch import patch_moe_with_triton
+            from src.kernels.conv_fused import patch_conv_router_with_triton, patch_conv_expert_with_triton
             patch_bibo_with_triton(model)
             patch_moe_with_triton(model)
+            patch_conv_router_with_triton(model)
+            patch_conv_expert_with_triton(model)
             if is_main:
-                print(f"{TAG} [train] Triton kernels: ENABLED (RMSNorm + RoPE + MoE GLU fusion)")
+                print(f"{TAG} [train] Triton kernels: ENABLED (RMSNorm + RoPE + MoE GLU + Conv fusion)")
         except Exception as e:
             if is_main:
                 print(f"{TAG} [train] Triton kernels: FAILED ({e}), using PyTorch eager")
