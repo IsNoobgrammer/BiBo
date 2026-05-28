@@ -50,8 +50,13 @@ CUDA_VISIBLE_DEVICES=0 python bench/train.py \
     --wandb_project bibo-bench \
     --wandb_name bibo \
     $EXTRA_ARGS \
-    &
+    2>&1 | sed 's/^/[GPU0] /' &
 PID_BIBO=$!
+
+# Wait for dataset to be downloaded/cached before starting Qwen
+# Prevents HuggingFace cache race condition
+echo "[launcher] Waiting 30s for dataset cache to settle..."
+sleep 30
 
 # ── Launch Qwen3MoE on GPU 1 ──────────────────────────────────
 echo "[launcher] Starting Qwen3MoE on cuda:1..."
@@ -67,17 +72,25 @@ CUDA_VISIBLE_DEVICES=1 python bench/train_qwen.py \
     --wandb_project bibo-bench \
     --wandb_name qwen \
     $EXTRA_ARGS \
-    &
+    2>&1 | sed 's/^/[GPU1] /' &
 PID_QWEN=$!
 
 echo "[launcher] BiBo PID: $PID_BIBO | Qwen3MoE PID: $PID_QWEN"
 echo "[launcher] Waiting for both to finish..."
 
 wait $PID_BIBO
-echo "[launcher] BiBo done (exit=$?)"
+BIBO_EXIT=$?
+echo "[launcher] BiBo done (exit=$BIBO_EXIT)"
 
 wait $PID_QWEN
-echo "[launcher] Qwen3MoE done (exit=$?)"
+QWEN_EXIT=$?
+echo "[launcher] Qwen3MoE done (exit=$QWEN_EXIT)"
+
+if [ $BIBO_EXIT -ne 0 ] || [ $QWEN_EXIT -ne 0 ]; then
+    echo "[launcher] WARNING: One or both processes failed!"
+    echo "[launcher]   BiBo exit: $BIBO_EXIT"
+    echo "[launcher]   Qwen exit: $QWEN_EXIT"
+fi
 
 echo ""
 echo "============================================================"
