@@ -304,6 +304,7 @@ patch_moe_with_triton(model)    # MoE GLU activation (custom Triton)
 4. **Monkey-patch pattern** — kernels are applied via `patch_*` functions, never modify modeling code
 5. **Benchmark before promoting** — run `bench_moe.py` or equivalent, record exact numbers
 6. **Correctness is binary** — atol=1e-3 for fp16, atol=1e-5 for fp32
+7. **Integrate into `bench/train.py` once verified** — every kernel that passes correctness AND shows measurable speedup MUST be enabled by default in `bench/train.py` (under the `if not args.no_triton:` block). Users can disable with `--no_triton`. This ensures training always uses the fastest available path.
 
 ---
 
