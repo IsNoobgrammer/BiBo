@@ -344,16 +344,9 @@ class BiBoForCausalLM(BiBoPreTrainedModel, GenerationMixin):
             loss = fused_ce(shift_hidden, self.lm_head.weight, shift_labels)
             logits = None  # Not computed — saves memory
         elif labels is not None:
-            # Chunked fused CE (pure PyTorch fallback — still saves memory)
-            shift_hidden = hidden_states[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            shift_hidden = shift_hidden.view(-1, hidden_states.shape[-1])
-            shift_labels = shift_labels.view(-1).to(shift_hidden.device)
-            loss = chunked_fused_linear_cross_entropy(
-                shift_hidden, self.lm_head.weight, shift_labels,
-                chunk_size=4096, ignore_index=-100
-            )
-            logits = None  # Not computed — saves memory
+            # Chunked fused CE — incompatible with torch.compile Inductor,
+            # so we wrap it with compiler.disable to prevent tracing.
+            loss, logits = self._compute_chunked_loss(hidden_states, labels)
         else:
             logits = self.lm_head(hidden_states)
 
@@ -368,6 +361,19 @@ class BiBoForCausalLM(BiBoPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+    @torch.compiler.disable
+    def _compute_chunked_loss(self, hidden_states, labels):
+        """Chunked fused CE — excluded from torch.compile to avoid Inductor shape errors."""
+        shift_hidden = hidden_states[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        shift_hidden = shift_hidden.view(-1, hidden_states.shape[-1])
+        shift_labels = shift_labels.view(-1).to(shift_hidden.device)
+        loss = chunked_fused_linear_cross_entropy(
+            shift_hidden, self.lm_head.weight, shift_labels,
+            chunk_size=4096, ignore_index=-100
+        )
+        return loss, None  # logits=None (not materialized)
 
     def prepare_inputs_for_generation(
         self,

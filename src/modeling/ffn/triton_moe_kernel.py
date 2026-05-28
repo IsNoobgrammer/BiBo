@@ -19,15 +19,15 @@ On Windows, falls back to PyTorch (still fast due to grouped dispatch).
 import torch
 import torch.nn.functional as F
 
-# Try importing Triton — available on Linux (Kaggle), not performant on Windows
+# Try importing Triton — available on Linux (Kaggle) and Windows (triton-windows)
 try:
     import triton
     import triton.language as tl
     import platform
-    # Triton kernels are only beneficial on Linux (native Triton).
-    # triton-windows exists but atomic_add and JIT are slower than PyTorch.
-    HAS_TRITON = (platform.system() == "Linux")
     _TRITON_IMPORTABLE = True
+    # Triton kernels are net-positive only on Linux where JIT overhead is low.
+    # On Windows, triton-windows has higher dispatch overhead that cancels fusion gains.
+    HAS_TRITON = (platform.system() != "Windows")
 except ImportError:
     HAS_TRITON = False
     _TRITON_IMPORTABLE = False
@@ -269,16 +269,15 @@ def _triton_activation_group_dispatch(
     """
     Triton-accelerated dispatch for one activation group.
     
-    Per expert:
-      1. Gather tokens (indexing — no kernel needed)
-      2. gate_up = F.linear(tokens, weight)  [cuBLAS GEMM]
-      3. activated = triton_fused_glu(gate, up)  [FUSED — saves 2 kernels]
-      4. down_out = F.linear(activated, down_weight)  [cuBLAS GEMM]
-      5. triton_weighted_scatter_add(down_out, output, ids, weights)  [FUSED]
+    Uses Triton ONLY for the fused activation kernel (saves 2 kernel launches/expert).
+    Uses PyTorch for GEMMs (cuBLAS) and scatter (index_add_ — already optimal).
     
-    Total kernel launches per expert: 2 GEMMs + 1 fused activation + 1 fused scatter = 4
-    vs old code: 2 GEMMs + 3 elementwise + 1 index_add = 6
-    Savings: 2 kernel launches per expert × num_experts_in_group
+    Per expert:
+      1. Gather tokens (indexing)
+      2. gate_up = F.linear(tokens, weight)  [cuBLAS]
+      3. activated = triton_fused_glu(gate, up)  [TRITON — fuses 2 ops into 1]
+      4. down_out = F.linear(activated, down_weight)  [cuBLAS]
+      5. output.index_add_(...)  [PyTorch — faster than Triton atomic_add]
     """
     num_experts = gate_up_weights.shape[0]
     
@@ -289,21 +288,21 @@ def _triton_activation_group_dispatch(
             continue
         
         token_idx = sorted_token_ids[start:end]
-        weights = sorted_weights[start:end]
-        current_state = hidden_states[token_idx]  # gather (just indexing)
+        weights = sorted_weights[start:end].unsqueeze(-1)
+        current_state = hidden_states[token_idx]
         
-        # Step 2: gate_up GEMM (cuBLAS — optimal)
+        # Step 2: gate_up GEMM (cuBLAS)
         gate_up = F.linear(current_state, gate_up_weights[i])
         gate, up = gate_up.chunk(2, dim=-1)
         
-        # Step 3: Fused activation — Triton kernel
+        # Step 3: Fused activation — Triton kernel (saves 2 kernel launches)
         activated = _triton_fused_glu_activation(gate.contiguous(), up.contiguous(), activation)
         
-        # Step 4: down GEMM (cuBLAS — optimal)
+        # Step 4: down GEMM (cuBLAS)
         expert_output = F.linear(activated, down_weights[i])
         
-        # Step 5: Fused weighted scatter-add — Triton kernel
-        _triton_weighted_scatter_add(expert_output, output, token_idx, weights)
+        # Step 5: Weighted scatter — PyTorch index_add_ (faster than Triton atomic_add)
+        output.index_add_(0, token_idx, expert_output * weights)
 
 
 def _pytorch_activation_group_dispatch(

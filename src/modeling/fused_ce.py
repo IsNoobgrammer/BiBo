@@ -21,6 +21,10 @@ class ChunkedFusedLinearCrossEntropy(torch.autograd.Function):
     
     Forward: chunks the vocab dimension, computes loss via log-sum-exp trick.
     Backward: recomputes logit chunks on-the-fly (no stored logits).
+    
+    NOTE: This is incompatible with torch.compile's Inductor backend due to
+    dynamic shapes in the backward pass. The calling code must be wrapped with
+    torch.compiler.disable or the model should use --no_compile.
     """
     
     @staticmethod
