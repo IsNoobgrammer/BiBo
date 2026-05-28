@@ -32,7 +32,7 @@ sys.path.insert(0, BENCH_DIR)
 from config import BIBO_50M_BASELINE, build_model, count_params
 from data import load_benchmark_data, create_dataloader
 from optim import create_optimizer, create_scheduler, HAS_MUON, HAS_BNB
-from eval import evaluate, generate_samples, get_tokenizer
+from eval import evaluate, generate_samples, get_tokenizer, print_router_diagnostics, log_router_diagnostics_wandb
 from utils import (
     init_wandb, log_train_metrics, log_val_metrics, log_samples,
     save_checkpoint, load_checkpoint, ThroughputMeter, format_time,
@@ -201,15 +201,17 @@ def train(args):
     if not args.no_triton:
         try:
             from src.kernels.patch import patch_bibo_with_triton
+            from src.kernels.moe_dispatch import patch_moe_with_triton
             patch_bibo_with_triton(model)
+            patch_moe_with_triton(model)
             if is_main:
-                print(f"{TAG} [train] Triton fused RMSNorm: ENABLED")
+                print(f"{TAG} [train] Triton kernels: ENABLED (RMSNorm + RoPE + MoE GLU fusion)")
         except Exception as e:
             if is_main:
-                print(f"{TAG} [train] Triton fused RMSNorm: FAILED ({e}), using PyTorch eager")
+                print(f"{TAG} [train] Triton kernels: FAILED ({e}), using PyTorch eager")
     else:
         if is_main:
-            print(f"{TAG} [train] Triton fused RMSNorm: DISABLED (--no_triton)")
+            print(f"{TAG} [train] Triton kernels: DISABLED (--no_triton)")
 
     # FSDP2 for multi-GPU
     if is_distributed:
@@ -297,8 +299,22 @@ def train(args):
     # ── Eval Only ──────────────────────────────────────────────
     if args.eval_only:
         if is_main:
-            val_loss, val_ppl = evaluate(model, val_ds, batch_size=args.batch_size, device=device)
+            val_loss, val_ppl, router_summary = evaluate(
+                model, val_ds,
+                batch_size=args.batch_size,
+                device=device,
+                min_batches=10,
+                log_running=True,
+                run_router_diagnostics=True,
+            )
             print(f"{TAG} [eval] Val loss: {val_loss:.4f}, Perplexity: {val_ppl:.2f}")
+
+            # Router diagnostics
+            if router_summary:
+                print_router_diagnostics(router_summary, config)
+                if not args.no_wandb:
+                    log_router_diagnostics_wandb(0, router_summary, config)
+
             samples = generate_samples(model, device=device)
             for s in samples:
                 print(f"{TAG} \n  Prompt: {s['prompt']}")
@@ -386,9 +402,25 @@ def train(args):
             # ── Validation ─────────────────────────────────────
             if is_main and step % args.eval_every == 0:
                 try:
-                    val_loss, val_ppl = evaluate(model, val_ds, batch_size=max(args.batch_size, 8), device=device, max_batches=100)
+                    val_loss, val_ppl, router_summary = evaluate(
+                        model, val_ds,
+                        batch_size=max(args.batch_size, 8),
+                        device=device,
+                        max_batches=100,
+                        min_batches=10,
+                        log_running=True,
+                        run_router_diagnostics=True,
+                    )
                     log_val_metrics(step, val_loss, val_ppl)
                     print(f"{TAG}   [VAL] step={step} | val_loss={val_loss:.4f} | val_ppl={val_ppl:.2f}")
+
+                    # Router diagnostics
+                    if router_summary:
+                        base_m = model._orig_mod if hasattr(model, "_orig_mod") else model
+                        print_router_diagnostics(router_summary, base_m.config)
+                        if not args.no_wandb:
+                            log_router_diagnostics_wandb(step, router_summary, base_m.config)
+
                 except torch.cuda.OutOfMemoryError:
                     print(f"{TAG}   [VAL] step={step} | OOM — skipping")
                     torch.cuda.empty_cache()
@@ -419,11 +451,27 @@ def train(args):
 
         # Final eval (use larger batch — no gradients, just forward)
         try:
-            val_loss, val_ppl = evaluate(model, val_ds, batch_size=max(args.batch_size, 8), device=device, max_batches=100)
+            val_loss, val_ppl, router_summary = evaluate(
+                model, val_ds,
+                batch_size=max(args.batch_size, 8),
+                device=device,
+                max_batches=100,
+                min_batches=10,
+                log_running=True,
+                run_router_diagnostics=True,
+            )
             log_val_metrics(step, val_loss, val_ppl)
             print(f"{TAG}   Final val loss: {val_loss:.4f}")
             print(f"{TAG}   Final val perplexity: {val_ppl:.2f}")
             print(f"{TAG}   Target (<2.8): {'HIT' if val_loss < 2.8 else 'MISSED'}")
+
+            # Final router diagnostics
+            if router_summary:
+                base_m = model._orig_mod if hasattr(model, "_orig_mod") else model
+                print_router_diagnostics(router_summary, base_m.config)
+                if not args.no_wandb:
+                    log_router_diagnostics_wandb(step, router_summary, base_m.config)
+
         except torch.cuda.OutOfMemoryError:
             print(f"{TAG}   [WARN] Final eval OOM — skipping, using last training loss")
             torch.cuda.empty_cache()
