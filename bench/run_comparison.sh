@@ -14,11 +14,11 @@
 set -e
 cd "$(dirname "$0")/.."
 
-STEPS=2000
-BS=4
+STEPS=3000
+BS=8
 GRAD_ACCUM=4
-WARMUP=200
-LR=3e-4
+WARMUP=300
+LR=5e-4
 
 echo "============================================================"
 echo "  BiBo vs Qwen3MoE — 2×T4 Parallel Training"
