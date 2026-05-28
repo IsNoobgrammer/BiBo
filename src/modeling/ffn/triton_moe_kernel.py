@@ -1,137 +1,215 @@
 """
-Custom Triton kernel for fused MoE expert dispatch.
+Triton-accelerated MoE expert dispatch for BiBo.
 
-Fuses: gather tokens → gate_up GEMM → activation → down GEMM → weighted scatter
-into a single kernel per activation group.
+Strategy: Don't reimplement GEMM in Triton (cuBLAS is already optimal).
+Instead, fuse the operations AROUND the GEMMs that cause kernel launch overhead:
+  1. Fused gather + weight application (scatter-to-output after down proj)
+  2. Fused activation kernels (SiLU-GLU, ReLU²-GLU, Tanh-GLU)
+  3. Fused weighted scatter-add
 
-This eliminates:
-- Separate gather/scatter kernel launches
-- Intermediate tensor allocations for gate_up output
-- Per-expert kernel launch overhead
+For BiBo's scale (hidden=320, intermediate=768, ~1024 tokens/expert):
+- The GEMMs themselves are fast (cuBLAS handles them)
+- The overhead is in gather/scatter/activation being separate kernel launches
+- Fusing activation with the gating (gate * up) saves one kernel launch per expert
 
-For BiBo's PolyGLU layout with 8 experts (6 GLU + 1 Identity + 1 Zero):
-- Old: 24+ kernel launches per MoE layer
-- New: 3 fused kernels (one per activation group) + 1 identity scatter
+On Kaggle (Linux + T4/A100), Triton kernels compile and run.
+On Windows, falls back to PyTorch (still fast due to grouped dispatch).
 """
 
 import torch
-import triton
-import triton.language as tl
+import torch.nn.functional as F
+
+# Try importing Triton — available on Linux (Kaggle), not performant on Windows
+try:
+    import triton
+    import triton.language as tl
+    import platform
+    # Triton kernels are only beneficial on Linux (native Triton).
+    # triton-windows exists but atomic_add and JIT are slower than PyTorch.
+    HAS_TRITON = (platform.system() == "Linux")
+    _TRITON_IMPORTABLE = True
+except ImportError:
+    HAS_TRITON = False
+    _TRITON_IMPORTABLE = False
 
 
-@triton.jit
-def _fused_moe_silu_kernel(
-    # Token data
-    hidden_ptr,          # (num_tokens, hidden_size)
-    output_ptr,          # (num_tokens, hidden_size)
-    # Expert weights (for this activation group)
-    gate_up_ptr,         # (num_experts_in_group, 2*intermediate, hidden)
-    down_ptr,            # (num_experts_in_group, hidden, intermediate)
-    # Dispatch info
-    sorted_token_ids_ptr,  # sorted token indices
-    sorted_weights_ptr,    # sorted routing weights
-    expert_offsets_ptr,    # cumulative offsets per expert in this group
-    # Dimensions
-    hidden_size: tl.constexpr,
-    intermediate_size: tl.constexpr,
-    num_experts: tl.constexpr,
-    # Strides
-    stride_h_tok: tl.constexpr,    # hidden_ptr stride for token dim
-    stride_gu_exp: tl.constexpr,   # gate_up stride for expert dim
-    stride_gu_out: tl.constexpr,   # gate_up stride for output dim
-    stride_d_exp: tl.constexpr,    # down stride for expert dim
-    stride_d_out: tl.constexpr,    # down stride for output dim
-    # Block sizes
-    BLOCK_M: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+# ═══════════════════════════════════════════════════════════════
+# Triton Kernels (Linux/Kaggle only)
+# ═══════════════════════════════════════════════════════════════
+
+if _TRITON_IMPORTABLE:
+
+    @triton.jit
+    def _fused_silu_gate_kernel(
+        gate_ptr,       # (N, intermediate_size) — gate projection output
+        up_ptr,         # (N, intermediate_size) — up projection output  
+        out_ptr,        # (N, intermediate_size) — SiLU(gate) * up
+        N,              # number of tokens
+        D: tl.constexpr,  # intermediate_size
+        BLOCK_N: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Fused SiLU(gate) * up — eliminates 2 separate elementwise kernels."""
+        pid_n = tl.program_id(0)
+        pid_d = tl.program_id(1)
+        
+        n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        
+        n_mask = n_offsets < N
+        d_mask = d_offsets < D
+        mask = n_mask[:, None] & d_mask[None, :]
+        
+        # Load gate and up values
+        offsets = n_offsets[:, None] * D + d_offsets[None, :]
+        gate = tl.load(gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(up_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        
+        # SiLU(gate) * up = gate * sigmoid(gate) * up
+        result = gate * tl.sigmoid(gate) * up
+        
+        tl.store(out_ptr + offsets, result.to(tl.float16), mask=mask)
+
+    @triton.jit
+    def _fused_relu2_gate_kernel(
+        gate_ptr, up_ptr, out_ptr,
+        N, D: tl.constexpr,
+        BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        """Fused ReLU²(gate) * up."""
+        pid_n = tl.program_id(0)
+        pid_d = tl.program_id(1)
+        
+        n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        
+        n_mask = n_offsets < N
+        d_mask = d_offsets < D
+        mask = n_mask[:, None] & d_mask[None, :]
+        
+        offsets = n_offsets[:, None] * D + d_offsets[None, :]
+        gate = tl.load(gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(up_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        
+        # ReLU²(gate) * up = max(0, gate)² * up
+        relu_gate = tl.maximum(gate, 0.0)
+        result = relu_gate * relu_gate * up
+        
+        tl.store(out_ptr + offsets, result.to(tl.float16), mask=mask)
+
+    @triton.jit
+    def _fused_tanh_gate_kernel(
+        gate_ptr, up_ptr, out_ptr,
+        N, D: tl.constexpr,
+        BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+    ):
+        """Fused tanh(gate) * up."""
+        pid_n = tl.program_id(0)
+        pid_d = tl.program_id(1)
+        
+        n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        
+        n_mask = n_offsets < N
+        d_mask = d_offsets < D
+        mask = n_mask[:, None] & d_mask[None, :]
+        
+        offsets = n_offsets[:, None] * D + d_offsets[None, :]
+        gate = tl.load(gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(up_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        
+        # tanh via libdevice
+        result = tl.extra.cuda.libdevice.tanh(gate) * up
+        
+        tl.store(out_ptr + offsets, result.to(tl.float16), mask=mask)
+
+    @triton.jit
+    def _fused_weighted_scatter_add_kernel(
+        expert_output_ptr,   # (N, hidden_size) — expert output to scatter
+        output_ptr,          # (total_tokens, hidden_size) — global output accumulator
+        token_ids_ptr,       # (N,) — which global token each row maps to
+        weights_ptr,         # (N,) — routing weights
+        N,                   # number of tokens for this expert
+        D: tl.constexpr,     # hidden_size
+        stride_out: tl.constexpr,  # output stride (hidden_size)
+        BLOCK_N: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Fused: output[token_ids] += expert_output * weights."""
+        pid_n = tl.program_id(0)
+        pid_d = tl.program_id(1)
+        
+        n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        d_offsets = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        
+        n_mask = n_offsets < N
+        d_mask = d_offsets < D
+        
+        # Load token IDs and weights
+        token_ids = tl.load(token_ids_ptr + n_offsets, mask=n_mask, other=0)
+        weights = tl.load(weights_ptr + n_offsets, mask=n_mask, other=0.0)
+        
+        # Load expert output
+        in_offsets = n_offsets[:, None] * D + d_offsets[None, :]
+        mask_2d = n_mask[:, None] & d_mask[None, :]
+        expert_out = tl.load(expert_output_ptr + in_offsets, mask=mask_2d, other=0.0)
+        
+        # Apply weights
+        weighted = expert_out * weights[:, None]
+        
+        # Scatter-add to output
+        out_offsets = token_ids[:, None] * stride_out + d_offsets[None, :]
+        tl.atomic_add(output_ptr + out_offsets, weighted, mask=mask_2d)
+
+
+def _triton_fused_glu_activation(gate: torch.Tensor, up: torch.Tensor, activation: str) -> torch.Tensor:
+    """
+    Launch the appropriate fused GLU activation Triton kernel.
+    Fuses: activation(gate) * up into a single kernel (saves 1-2 kernel launches).
+    """
+    N, D = gate.shape
+    out = torch.empty_like(gate)
+    
+    # Grid: tile over (N, D)
+    BLOCK_N = 32
+    BLOCK_D = min(128, triton.next_power_of_2(D))
+    grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(D, BLOCK_D))
+    
+    if activation == "silu":
+        _fused_silu_gate_kernel[grid](gate, up, out, N, D, BLOCK_N, BLOCK_D)
+    elif activation == "relu2":
+        _fused_relu2_gate_kernel[grid](gate, up, out, N, D, BLOCK_N, BLOCK_D)
+    else:  # tanh
+        _fused_tanh_gate_kernel[grid](gate, up, out, N, D, BLOCK_N, BLOCK_D)
+    
+    return out
+
+
+def _triton_weighted_scatter_add(
+    expert_output: torch.Tensor,
+    output: torch.Tensor,
+    token_ids: torch.Tensor,
+    weights: torch.Tensor,
 ):
     """
-    Fused SiLU-GLU expert kernel.
-    
-    Each program handles one expert's tokens:
-    1. Gather tokens assigned to this expert
-    2. Compute gate_up = tokens @ gate_up_weight.T
-    3. Split into gate, up; apply SiLU(gate) * up
-    4. Compute down = activated @ down_weight.T
-    5. Scatter weighted results back to output
-    
-    This is a simplified version — processes tokens in BLOCK_M chunks.
+    Fused weighted scatter-add via Triton.
+    output[token_ids] += expert_output * weights[:, None]
     """
-    # Which expert in this activation group are we processing?
-    expert_id = tl.program_id(0)
+    N, D = expert_output.shape
+    BLOCK_N = 32
+    BLOCK_D = min(128, triton.next_power_of_2(D))
+    grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(D, BLOCK_D))
     
-    # Get token range for this expert
-    start_offset = tl.load(expert_offsets_ptr + expert_id)
-    end_offset = tl.load(expert_offsets_ptr + expert_id + 1)
-    num_tokens_for_expert = end_offset - start_offset
-    
-    if num_tokens_for_expert == 0:
-        return
-    
-    # Process tokens in blocks of BLOCK_M
-    for token_block_start in range(0, num_tokens_for_expert, BLOCK_M):
-        # How many tokens in this block
-        block_size = tl.minimum(BLOCK_M, num_tokens_for_expert - token_block_start)
-        token_offsets = tl.arange(0, BLOCK_M)
-        mask = token_offsets < block_size
-        
-        # Load token indices and weights for this block
-        dispatch_idx = start_offset + token_block_start + token_offsets
-        token_ids = tl.load(sorted_token_ids_ptr + dispatch_idx, mask=mask, other=0)
-        weights = tl.load(sorted_weights_ptr + dispatch_idx, mask=mask, other=0.0)
-        
-        # ── Step 1: Load hidden states for these tokens ──
-        # hidden[token_ids, :] — gather
-        # We process hidden_size in chunks of BLOCK_K
-        # Accumulate gate_up result
-        gate_result = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        up_result = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        
-        for k_start in range(0, hidden_size, BLOCK_K):
-            k_offsets = k_start + tl.arange(0, BLOCK_K)
-            k_mask = k_offsets < hidden_size
-            
-            # Load hidden states chunk: (BLOCK_M, BLOCK_K)
-            h_ptrs = hidden_ptr + token_ids[:, None] * stride_h_tok + k_offsets[None, :]
-            h_block = tl.load(h_ptrs, mask=mask[:, None] & k_mask[None, :], other=0.0)
-            
-            # Load gate weights chunk: (BLOCK_N, BLOCK_K) — for gate part
-            gate_w_ptrs = gate_up_ptr + expert_id * stride_gu_exp + tl.arange(0, BLOCK_N)[:, None] * hidden_size + k_offsets[None, :]
-            gate_w = tl.load(gate_w_ptrs, mask=k_mask[None, :], other=0.0)
-            
-            # Load up weights chunk: (BLOCK_N, BLOCK_K) — offset by intermediate_size
-            up_w_ptrs = gate_up_ptr + expert_id * stride_gu_exp + (intermediate_size + tl.arange(0, BLOCK_N))[:, None] * hidden_size + k_offsets[None, :]
-            up_w = tl.load(up_w_ptrs, mask=k_mask[None, :], other=0.0)
-            
-            # Accumulate: (BLOCK_M, BLOCK_N) += (BLOCK_M, BLOCK_K) @ (BLOCK_K, BLOCK_N)
-            gate_result += tl.dot(h_block, tl.trans(gate_w))
-            up_result += tl.dot(h_block, tl.trans(up_w))
-        
-        # ── Step 2: Apply SiLU activation ──
-        # SiLU(x) = x * sigmoid(x)
-        gate_sigmoid = tl.sigmoid(gate_result)
-        activated = gate_result * gate_sigmoid * up_result  # SiLU(gate) * up
-        
-        # ── Step 3: Down projection ──
-        # down_output: (BLOCK_M, hidden_size) = activated @ down_weight.T
-        for h_start in range(0, hidden_size, BLOCK_K):
-            h_offsets = h_start + tl.arange(0, BLOCK_K)
-            h_mask = h_offsets < hidden_size
-            
-            # Load down weights: (BLOCK_K, BLOCK_N) — transposed access
-            down_w_ptrs = down_ptr + expert_id * stride_d_exp + h_offsets[:, None] * intermediate_size + tl.arange(0, BLOCK_N)[None, :]
-            down_w = tl.load(down_w_ptrs, mask=h_mask[:, None], other=0.0)
-            
-            # Compute: (BLOCK_M, BLOCK_K) = (BLOCK_M, BLOCK_N) @ (BLOCK_N, BLOCK_K)
-            out_chunk = tl.dot(activated, tl.trans(down_w))
-            
-            # ── Step 4: Weighted scatter back ──
-            # output[token_ids, h_offsets] += out_chunk * weights
-            weighted_out = out_chunk * weights[:, None]
-            out_ptrs = output_ptr + token_ids[:, None] * stride_h_tok + h_offsets[None, :]
-            tl.atomic_add(out_ptrs, weighted_out, mask=mask[:, None] & h_mask[None, :])
+    _fused_weighted_scatter_add_kernel[grid](
+        expert_output, output, token_ids, weights,
+        N, D, output.stride(0),
+        BLOCK_N, BLOCK_D,
+    )
 
+
+# ═══════════════════════════════════════════════════════════════
+# Public API
+# ═══════════════════════════════════════════════════════════════
 
 def fused_moe_activation_group(
     hidden_states: torch.Tensor,
@@ -144,7 +222,17 @@ def fused_moe_activation_group(
     activation: str = "silu",
 ):
     """
-    Launch fused MoE kernel for one activation group.
+    Dispatch one activation group of MoE experts.
+    
+    On Linux (Kaggle): Uses Triton kernels for fused activation + scatter.
+    On Windows: Falls back to pure PyTorch.
+    
+    The GEMMs (gate_up and down projections) always use cuBLAS via F.linear
+    because cuBLAS is already optimal for these shapes.
+    
+    What Triton fuses:
+      - activation(gate) * up → single kernel instead of 2-3 separate ops
+      - output[token_ids] += result * weights → fused scatter-add
     
     Args:
         hidden_states: (num_tokens, hidden_size)
@@ -156,19 +244,66 @@ def fused_moe_activation_group(
         expert_offsets: (num_experts_in_group + 1,) cumulative token counts
         activation: "silu", "relu2", or "tanh"
     """
+    if HAS_TRITON and hidden_states.is_cuda:
+        _triton_activation_group_dispatch(
+            hidden_states, output, gate_up_weights, down_weights,
+            sorted_token_ids, sorted_weights, expert_offsets, activation
+        )
+    else:
+        _pytorch_activation_group_dispatch(
+            hidden_states, output, gate_up_weights, down_weights,
+            sorted_token_ids, sorted_weights, expert_offsets, activation
+        )
+
+
+def _triton_activation_group_dispatch(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    gate_up_weights: torch.Tensor,
+    down_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_weights: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    activation: str,
+):
+    """
+    Triton-accelerated dispatch for one activation group.
+    
+    Per expert:
+      1. Gather tokens (indexing — no kernel needed)
+      2. gate_up = F.linear(tokens, weight)  [cuBLAS GEMM]
+      3. activated = triton_fused_glu(gate, up)  [FUSED — saves 2 kernels]
+      4. down_out = F.linear(activated, down_weight)  [cuBLAS GEMM]
+      5. triton_weighted_scatter_add(down_out, output, ids, weights)  [FUSED]
+    
+    Total kernel launches per expert: 2 GEMMs + 1 fused activation + 1 fused scatter = 4
+    vs old code: 2 GEMMs + 3 elementwise + 1 index_add = 6
+    Savings: 2 kernel launches per expert × num_experts_in_group
+    """
     num_experts = gate_up_weights.shape[0]
-    hidden_size = hidden_states.shape[1]
-    intermediate_size = down_weights.shape[2]
     
-    # For now, fall back to PyTorch for non-silu activations
-    # (Triton kernel above is SiLU-specific; relu2/tanh need separate kernels)
-    # TODO: Write relu2 and tanh variants
-    
-    # Use the PyTorch fallback for all activations (Triton kernel is WIP)
-    _pytorch_activation_group_dispatch(
-        hidden_states, output, gate_up_weights, down_weights,
-        sorted_token_ids, sorted_weights, expert_offsets, activation
-    )
+    for i in range(num_experts):
+        start = expert_offsets[i].item()
+        end = expert_offsets[i + 1].item()
+        if start == end:
+            continue
+        
+        token_idx = sorted_token_ids[start:end]
+        weights = sorted_weights[start:end]
+        current_state = hidden_states[token_idx]  # gather (just indexing)
+        
+        # Step 2: gate_up GEMM (cuBLAS — optimal)
+        gate_up = F.linear(current_state, gate_up_weights[i])
+        gate, up = gate_up.chunk(2, dim=-1)
+        
+        # Step 3: Fused activation — Triton kernel
+        activated = _triton_fused_glu_activation(gate.contiguous(), up.contiguous(), activation)
+        
+        # Step 4: down GEMM (cuBLAS — optimal)
+        expert_output = F.linear(activated, down_weights[i])
+        
+        # Step 5: Fused weighted scatter-add — Triton kernel
+        _triton_weighted_scatter_add(expert_output, output, token_idx, weights)
 
 
 def _pytorch_activation_group_dispatch(
@@ -183,18 +318,14 @@ def _pytorch_activation_group_dispatch(
 ):
     """
     PyTorch fallback for activation-grouped dispatch.
-    Still faster than the old code because:
-    1. No data-dependent branching (activation is known statically)
-    2. No if/elif per expert
-    3. Processes contiguous chunks
+    Used on Windows or when Triton is unavailable.
     """
     num_experts = gate_up_weights.shape[0]
     
-    # Select activation function (static, no branching in the loop)
     if activation == "silu":
-        act_fn = torch.nn.functional.silu
+        act_fn = F.silu
     elif activation == "relu2":
-        act_fn = lambda x: torch.nn.functional.relu(x).square()
+        act_fn = lambda x: F.relu(x).square()
     else:  # tanh
         act_fn = torch.tanh
     
@@ -208,9 +339,8 @@ def _pytorch_activation_group_dispatch(
         weights = sorted_weights[start:end].unsqueeze(-1)
         current_state = hidden_states[token_idx]
         
-        # gate_up → activation → down (3 ops, same activation for all)
-        gate_up = torch.nn.functional.linear(current_state, gate_up_weights[i])
+        gate_up = F.linear(current_state, gate_up_weights[i])
         gate, up = gate_up.chunk(2, dim=-1)
         activated = act_fn(gate)
-        expert_output = torch.nn.functional.linear(activated * up, down_weights[i])
+        expert_output = F.linear(activated * up, down_weights[i])
         output.index_add_(0, token_idx, expert_output * weights)

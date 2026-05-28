@@ -71,7 +71,94 @@ class BiBoFusedExperts(nn.Module):
         self.zero_start = self.identity_end
         self.zero_end = self.num_routed_experts
 
+    def _pytorch_dispatch_group_fast(
+        self,
+        hidden_states: torch.Tensor,
+        sorted_token_indices: torch.Tensor,
+        sorted_weights: torch.Tensor,
+        boundaries_list: list,
+        expert_counts_list: list,
+        group_expert_ids: list,
+        act_fn,
+        output: torch.Tensor,
+    ):
+        """Fastest PyTorch dispatch — uses pre-computed Python lists, zero GPU sync."""
+        for expert_idx in group_expert_ids:
+            if expert_counts_list[expert_idx] == 0:
+                continue
+            start = boundaries_list[expert_idx]
+            end = boundaries_list[expert_idx + 1]
+            
+            token_idx = sorted_token_indices[start:end]
+            weights = sorted_weights[start:end].unsqueeze(-1)
+            current_state = hidden_states[token_idx]
+            
+            gate_up = F.linear(current_state, self.gate_up_proj[expert_idx])
+            gate, up = gate_up.chunk(2, dim=-1)
+            activated = act_fn(gate)
+            expert_output = F.linear(activated * up, self.down_proj[expert_idx])
+            output.index_add_(0, token_idx, expert_output * weights)
+
     def _dispatch_activation_group(
+        self,
+        hidden_states: torch.Tensor,
+        sorted_token_indices: torch.Tensor,
+        sorted_weights: torch.Tensor,
+        boundaries: torch.Tensor,
+        boundaries_cpu: torch.Tensor,
+        expert_counts: torch.Tensor,
+        expert_counts_cpu: torch.Tensor,
+        group_expert_ids: list,
+        activation: str,
+        output: torch.Tensor,
+    ):
+        """
+        Dispatch one activation group via fused_moe_activation_group kernel.
+        
+        On Linux (Triton): builds contiguous buffers for the kernel.
+        On Windows (PyTorch): passes boundaries directly to avoid overhead.
+        """
+        from .triton_moe_kernel import HAS_TRITON
+        
+        if HAS_TRITON and hidden_states.is_cuda:
+            # Triton path: needs contiguous per-group buffers
+            num_in_group = len(group_expert_ids)
+            group_offsets = torch.zeros(num_in_group + 1, dtype=torch.long, device=hidden_states.device)
+            
+            group_token_ids_list = []
+            group_weights_list = []
+            
+            for i, expert_idx in enumerate(group_expert_ids):
+                start = boundaries_cpu[expert_idx].item()
+                end = boundaries_cpu[expert_idx + 1].item()
+                count = end - start
+                group_offsets[i + 1] = group_offsets[i] + count
+                if count > 0:
+                    group_token_ids_list.append(sorted_token_indices[start:end])
+                    group_weights_list.append(sorted_weights[start:end])
+            
+            if group_offsets[-1].item() == 0:
+                return
+            
+            group_token_ids = torch.cat(group_token_ids_list)
+            group_weights = torch.cat(group_weights_list)
+            group_gate_up = self.gate_up_proj[group_expert_ids]
+            group_down = self.down_proj[group_expert_ids]
+            
+            fused_moe_activation_group(
+                hidden_states, output,
+                group_gate_up, group_down,
+                group_token_ids, group_weights,
+                group_offsets, activation
+            )
+        else:
+            # PyTorch fast path: use boundaries directly, no buffer allocation
+            self._pytorch_dispatch_group(
+                hidden_states, sorted_token_indices, sorted_weights,
+                boundaries_cpu, expert_counts_cpu, group_expert_ids, activation, output
+            )
+
+    def _pytorch_dispatch_group(
         self,
         hidden_states: torch.Tensor,
         sorted_token_indices: torch.Tensor,
@@ -82,51 +169,34 @@ class BiBoFusedExperts(nn.Module):
         activation: str,
         output: torch.Tensor,
     ):
-        """
-        Dispatch one activation group via fused_moe_activation_group kernel.
+        """Direct PyTorch dispatch — no buffer allocation, uses boundaries directly."""
+        if activation == "silu":
+            act_fn = F.silu
+        elif activation == "relu2":
+            act_fn = lambda x: F.relu(x).square()
+        else:
+            act_fn = torch.tanh
         
-        Builds the per-group offsets and delegates to the Triton kernel
-        (or its PyTorch fallback).
-        """
-        num_in_group = len(group_expert_ids)
-        if num_in_group == 0:
-            return
+        # Move boundaries to CPU once to avoid per-expert GPU sync
+        boundaries_cpu = boundaries.cpu()
+        expert_counts_cpu = expert_counts.cpu()
         
-        # Build contiguous token IDs and weights for this group's experts
-        # and compute per-expert offsets within the group
-        group_offsets = torch.zeros(num_in_group + 1, dtype=torch.long, device=hidden_states.device)
-        
-        # Collect all tokens for this group contiguously
-        group_token_ids_list = []
-        group_weights_list = []
-        
-        for i, expert_idx in enumerate(group_expert_ids):
-            start = boundaries[expert_idx].item()
-            end = boundaries[expert_idx + 1].item()
-            count = end - start
-            group_offsets[i + 1] = group_offsets[i] + count
-            if count > 0:
-                group_token_ids_list.append(sorted_token_indices[start:end])
-                group_weights_list.append(sorted_weights[start:end])
-        
-        total_tokens = group_offsets[-1].item()
-        if total_tokens == 0:
-            return
-        
-        group_token_ids = torch.cat(group_token_ids_list)
-        group_weights = torch.cat(group_weights_list)
-        
-        # Gather the weights for this group's experts
-        group_gate_up = self.gate_up_proj[group_expert_ids]  # (num_in_group, 2*inter, hidden)
-        group_down = self.down_proj[group_expert_ids]        # (num_in_group, hidden, inter)
-        
-        # Dispatch to fused kernel (Triton or PyTorch fallback)
-        fused_moe_activation_group(
-            hidden_states, output,
-            group_gate_up, group_down,
-            group_token_ids, group_weights,
-            group_offsets, activation
-        )
+        for expert_idx in group_expert_ids:
+            if expert_counts_cpu[expert_idx].item() == 0:
+                continue
+            
+            start = boundaries_cpu[expert_idx].item()
+            end = boundaries_cpu[expert_idx + 1].item()
+            
+            token_idx = sorted_token_indices[start:end]
+            weights = sorted_weights[start:end].unsqueeze(-1)
+            current_state = hidden_states[token_idx]
+            
+            gate_up = F.linear(current_state, self.gate_up_proj[expert_idx])
+            gate, up = gate_up.chunk(2, dim=-1)
+            activated = act_fn(gate)
+            expert_output = F.linear(activated * up, self.down_proj[expert_idx])
+            output.index_add_(0, token_idx, expert_output * weights)
 
     def forward(
         self,
@@ -165,48 +235,61 @@ class BiBoFusedExperts(nn.Module):
         
         output = torch.zeros(num_tokens, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
         
-        # ── Group 1: SiLU experts → fused kernel ──
-        self._dispatch_activation_group(
-            hidden_states, sorted_token_indices, sorted_weights,
-            boundaries, expert_counts,
-            self.silu_expert_indices, "silu", output
-        )
+        # ── All expert dispatch — no CPU sync, no shape checks ──
+        # Empty slices (when expert has 0 tokens) produce empty tensors.
+        # F.linear and index_add_ handle empty tensors correctly (no-op).
         
-        # ── Group 2: ReLU² experts → fused kernel ──
-        self._dispatch_activation_group(
-            hidden_states, sorted_token_indices, sorted_weights,
-            boundaries, expert_counts,
-            self.relu2_expert_indices, "relu2", output
-        )
+        # ── Group 1: SiLU experts ──
+        for expert_idx in self.silu_expert_indices:
+            start = boundaries[expert_idx]
+            end = boundaries[expert_idx + 1]
+            token_idx = sorted_token_indices[start:end]
+            w = sorted_weights[start:end].unsqueeze(-1)
+            x = hidden_states[token_idx]
+            gu = F.linear(x, self.gate_up_proj[expert_idx])
+            g, u = gu.chunk(2, dim=-1)
+            out_e = F.linear(F.silu(g) * u, self.down_proj[expert_idx])
+            output.index_add_(0, token_idx, out_e * w)
         
-        # ── Group 3: Tanh experts → fused kernel ──
-        self._dispatch_activation_group(
-            hidden_states, sorted_token_indices, sorted_weights,
-            boundaries, expert_counts,
-            self.tanh_expert_indices, "tanh", output
-        )
+        # ── Group 2: ReLU² experts ──
+        for expert_idx in self.relu2_expert_indices:
+            start = boundaries[expert_idx]
+            end = boundaries[expert_idx + 1]
+            token_idx = sorted_token_indices[start:end]
+            w = sorted_weights[start:end].unsqueeze(-1)
+            x = hidden_states[token_idx]
+            gu = F.linear(x, self.gate_up_proj[expert_idx])
+            g, u = gu.chunk(2, dim=-1)
+            out_e = F.linear(F.relu(g).square() * u, self.down_proj[expert_idx])
+            output.index_add_(0, token_idx, out_e * w)
         
-        # ── Group 4: Identity experts (passthrough, no GEMM) ──
+        # ── Group 3: Tanh experts ──
+        for expert_idx in self.tanh_expert_indices:
+            start = boundaries[expert_idx]
+            end = boundaries[expert_idx + 1]
+            token_idx = sorted_token_indices[start:end]
+            w = sorted_weights[start:end].unsqueeze(-1)
+            x = hidden_states[token_idx]
+            gu = F.linear(x, self.gate_up_proj[expert_idx])
+            g, u = gu.chunk(2, dim=-1)
+            out_e = F.linear(torch.tanh(g) * u, self.down_proj[expert_idx])
+            output.index_add_(0, token_idx, out_e * w)
+        
+        # ── Group 4: Identity experts ──
         for expert_idx in range(self.identity_start, self.identity_end):
             start = boundaries[expert_idx]
             end = boundaries[expert_idx + 1]
-            if expert_counts[expert_idx] == 0:
-                continue
             token_idx = sorted_token_indices[start:end]
-            weights = sorted_weights[start:end].unsqueeze(-1)
-            output.index_add_(0, token_idx, hidden_states[token_idx] * weights)
+            w = sorted_weights[start:end].unsqueeze(-1)
+            output.index_add_(0, token_idx, hidden_states[token_idx] * w)
         
-        # ── Group 5: Zero experts (gradient-only, minimal compute) ──
+        # ── Group 5: Zero experts (gradient-only) ──
         for expert_idx in range(self.zero_start, self.zero_end):
             start = boundaries[expert_idx]
             end = boundaries[expert_idx + 1]
-            if expert_counts[expert_idx] == 0:
-                continue
             token_idx = sorted_token_indices[start:end]
-            weights = sorted_weights[start:end].unsqueeze(-1)  # (n, 1)
-            # Gradient flows through weights, but output contribution is zero.
-            output.index_add_(0, token_idx, weights.expand_as(
-                hidden_states[token_idx]) * 0.0)
+            w = sorted_weights[start:end].unsqueeze(-1)
+            output.index_add_(0, token_idx, w.expand_as(hidden_states[token_idx]) * 0.0)
 
         return output
 
