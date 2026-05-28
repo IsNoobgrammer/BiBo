@@ -168,6 +168,7 @@ def parse_args():
     p.add_argument("--no_compile", action="store_true")
     p.add_argument("--no_wandb", action="store_true")
     p.add_argument("--grad_checkpoint", action="store_true", help="Enable gradient checkpointing")
+    p.add_argument("--no_triton", action="store_true", help="Disable Triton fused RMSNorm kernel (use PyTorch eager)")
 
     return p.parse_args()
 
@@ -260,6 +261,20 @@ def train(args):
             print(f"{TAG} [train] Gradient checkpointing DISABLED for max throughput")
     config.use_cache = False
     model = model.to(device)
+
+    # ── Triton Fused RMSNorm (default ON) ──────────────────────
+    if not args.no_triton:
+        try:
+            from src.kernels.patch import patch_qwen3_with_triton
+            patch_qwen3_with_triton(model)
+            if is_main:
+                print(f"{TAG} [train] Triton fused RMSNorm: ENABLED")
+        except Exception as e:
+            if is_main:
+                print(f"{TAG} [train] Triton fused RMSNorm: FAILED ({e}), using PyTorch eager")
+    else:
+        if is_main:
+            print(f"{TAG} [train] Triton fused RMSNorm: DISABLED (--no_triton)")
 
     # ── FSDP2 ──────────────────────────────────────────────────
     if is_distributed:

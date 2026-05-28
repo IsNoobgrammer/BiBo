@@ -7,24 +7,32 @@
 #
 # Both in project "bibo-bench" — compare loss curves side-by-side.
 #
+# Triton fused RMSNorm is ON by default (8-9x faster norm ops).
+# To disable: bash bench/run_comparison.sh --no_triton
+#
 # Usage:
 #   bash bench/run_comparison.sh
+#   bash bench/run_comparison.sh --no_triton
 # ================================================================
 
 set -e
 cd "$(dirname "$0")/.."
 
 STEPS=3000
-BS=8
+BS=12
 GRAD_ACCUM=4
 WARMUP=300
-LR=5e-4
+LR=7e-4
+
+# Pass through extra args (e.g. --no_triton)
+EXTRA_ARGS="$@"
 
 echo "============================================================"
 echo "  BiBo vs Qwen3MoE — 2×T4 Parallel Training"
 echo "============================================================"
 echo "  Steps: $STEPS | Batch: $BS | Grad Accum: $GRAD_ACCUM"
 echo "  LR: $LR | Warmup: $WARMUP"
+echo "  Extra args: $EXTRA_ARGS"
 echo "  WandB: bibo-bench/bibo vs bibo-bench/qwen"
 echo "============================================================"
 
@@ -41,6 +49,7 @@ CUDA_VISIBLE_DEVICES=0 python bench/train.py \
     --seq_len 1024 \
     --wandb_project bibo-bench \
     --wandb_name bibo \
+    $EXTRA_ARGS \
     &
 PID_BIBO=$!
 
@@ -57,6 +66,7 @@ CUDA_VISIBLE_DEVICES=1 python bench/train_qwen.py \
     --seq_len 1024 \
     --wandb_project bibo-bench \
     --wandb_name qwen \
+    $EXTRA_ARGS \
     &
 PID_QWEN=$!
 
