@@ -11,110 +11,74 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen3MoE model configuration"""
+"""Qwen3MoE model configuration — traditional __init__ for cross-version compat."""
 
-from huggingface_hub.dataclasses import strict
-
-from transformers.configuration_utils import PreTrainedConfig
-from transformers.modeling_rope_utils import RopeParameters
-from transformers.utils import auto_docstring
+from transformers import PretrainedConfig
 
 
-@auto_docstring(checkpoint="Qwen/Qwen3-30B-A3B-Base")
-@strict
-class Qwen3MoeConfig(PreTrainedConfig):
-    r"""
-    decoder_sparse_step (`int`, *optional*, defaults to 1):
-        The frequency of the MoE layer.
-    mlp_only_layers (`list[int]`, *optional*, defaults to `[]`):
-        Indicate which layers use Qwen3MoeMLP rather than Qwen3MoeSparseMoeBlock
-        The list contains layer index, from 0 to num_layers-1 if we have num_layers layers
-        If `mlp_only_layers` is empty, `decoder_sparse_step` is used to determine the sparsity.
-
-    ```python
-    >>> from transformers import Qwen3MoeModel, Qwen3MoeConfig
-
-    >>> # Initializing a Qwen3MoE style configuration
-    >>> configuration = Qwen3MoeConfig()
-
-    >>> # Initializing a model from the Qwen3-15B-A2B" style configuration
-    >>> model = Qwen3MoeModel(configuration)
-
-    >>> # Accessing the model configuration
-    >>> configuration = model.config
-    ```
-    """
-
+class Qwen3MoeConfig(PretrainedConfig):
     model_type = "qwen3_moe"
     keys_to_ignore_at_inference = ["past_key_values"]
 
-    attribute_map = {
-        "num_experts": "num_local_experts",
-    }
-
-    # Default tensor parallel plan for base model `Qwen3Moe`
-    base_model_tp_plan = {
-        "layers.*.self_attn.q_proj": "colwise",
-        "layers.*.self_attn.k_proj": "colwise",
-        "layers.*.self_attn.v_proj": "colwise",
-        "layers.*.self_attn.q_norm": "replicated_with_grad_allreduce",
-        "layers.*.self_attn.k_norm": "replicated_with_grad_allreduce",
-        "layers.*.self_attn.o_proj": "rowwise",
-        "layers.*.mlp.experts.gate_up_proj": "packed_colwise",
-        "layers.*.mlp.experts.down_proj": "rowwise",
-        "layers.*.mlp.experts": "moe_tp_experts",
-        "layers.*.mlp.gate_proj": "colwise",
-        "layers.*.mlp.up_proj": "colwise",
-        "layers.*.mlp.down_proj": "rowwise",
-    }
-    # Expert-only EP plan: only shards MoE experts, not attention.
-    # Attention is left unsharded — FSDP2 handles attention weight distribution.
-    # This allows EP to scale beyond num_kv_heads (not constrained by 4 for Qwen3-30B).
-    base_model_ep_plan = {
-        "layers.*.mlp.gate": "ep_router",
-        "layers.*.mlp.experts.gate_up_proj": "grouped_gemm",
-        "layers.*.mlp.experts.down_proj": "grouped_gemm",
-        "layers.*.mlp.experts": "moe_tp_experts",
-    }
-    base_model_pp_plan = {
-        "embed_tokens": (["input_ids"], ["inputs_embeds"]),
-        "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
-        "norm": (["hidden_states"], ["hidden_states"]),
-    }
-
-    vocab_size: int = 151936
-    hidden_size: int = 1792
-    intermediate_size: int = 5120
-    num_hidden_layers: int = 24
-    num_attention_heads: int = 24
-    num_key_value_heads: int = 3
-    hidden_act: str = "silu"
-    max_position_embeddings: int = 32768
-    initializer_range: float = 0.02
-    rms_norm_eps: float = 1e-6
-    use_cache: bool = True
-    tie_word_embeddings: bool = False
-    rope_parameters: RopeParameters | dict | None = None
-    attention_bias: bool = False
-    use_sliding_window: bool = False
-    sliding_window: int | None = None
-    attention_dropout: float | int = 0.0
-    decoder_sparse_step: int = 1
-    moe_intermediate_size: int = 640
-    num_experts_per_tok: int = 6
-    num_experts: int = 64
-    norm_topk_prob: bool = False
-    output_router_logits: bool = False
-    router_aux_loss_coef: float = 0.001
-    mlp_only_layers: list[int] | None = None
-    pad_token_id: int | None = None
-    bos_token_id: int | None = None
-    eos_token_id: int | list[int] | None = None
-
-    def __post_init__(self, **kwargs):
-        self.sliding_window = self.sliding_window if self.use_sliding_window else None
-        self.mlp_only_layers = [] if self.mlp_only_layers is None else self.mlp_only_layers
-        super().__post_init__(**kwargs)
+    def __init__(
+        self,
+        vocab_size=151936,
+        hidden_size=1792,
+        intermediate_size=5120,
+        num_hidden_layers=24,
+        num_attention_heads=24,
+        num_key_value_heads=3,
+        head_dim=None,
+        hidden_act="silu",
+        max_position_embeddings=32768,
+        initializer_range=0.02,
+        rms_norm_eps=1e-6,
+        use_cache=True,
+        tie_word_embeddings=False,
+        rope_theta=10000.0,
+        attention_bias=False,
+        use_sliding_window=False,
+        sliding_window=None,
+        attention_dropout=0.0,
+        # MoE
+        decoder_sparse_step=1,
+        moe_intermediate_size=640,
+        num_experts_per_tok=6,
+        num_experts=64,
+        norm_topk_prob=False,
+        output_router_logits=False,
+        router_aux_loss_coef=0.001,
+        mlp_only_layers=None,
+        **kwargs,
+    ):
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim or (hidden_size // num_attention_heads)
+        self.hidden_act = hidden_act
+        self.max_position_embeddings = max_position_embeddings
+        self.initializer_range = initializer_range
+        self.rms_norm_eps = rms_norm_eps
+        self.use_cache = use_cache
+        self.rope_theta = rope_theta
+        self.attention_bias = attention_bias
+        self.use_sliding_window = use_sliding_window
+        self.sliding_window = sliding_window if use_sliding_window else None
+        self.attention_dropout = attention_dropout
+        # MoE
+        self.decoder_sparse_step = decoder_sparse_step
+        self.moe_intermediate_size = moe_intermediate_size
+        self.num_experts_per_tok = num_experts_per_tok
+        self.num_experts = num_experts
+        self.num_local_experts = num_experts  # alias used by modeling code
+        self.norm_topk_prob = norm_topk_prob
+        self.output_router_logits = output_router_logits
+        self.router_aux_loss_coef = router_aux_loss_coef
+        self.mlp_only_layers = mlp_only_layers if mlp_only_layers is not None else []
+        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
 
 __all__ = ["Qwen3MoeConfig"]
