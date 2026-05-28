@@ -454,7 +454,9 @@ def train(args):
         ckpt_path = os.path.join(REPO_ROOT, "bench", "checkpoints_qwen", "final.pt")
         save_checkpoint(model, optimizer, scheduler, step, ckpt_path)
 
-        wandb.finish()
+        if not args.no_wandb:
+            import wandb
+            wandb.finish()
 
 
 if __name__ == "__main__":
