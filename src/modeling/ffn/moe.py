@@ -198,6 +198,7 @@ class BiBoFusedExperts(nn.Module):
             expert_output = F.linear(activated * up, self.down_proj[expert_idx])
             output.index_add_(0, token_idx, expert_output * weights)
 
+    @torch.compiler.disable
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -206,6 +207,11 @@ class BiBoFusedExperts(nn.Module):
     ) -> torch.Tensor:
         """
         Activation-grouped dispatch via fused kernels.
+        
+        NOTE: @torch.compiler.disable is required because expert dispatch has
+        inherently dynamic shapes (each expert gets a different number of tokens).
+        Inductor's reinplace_inplaceable_ops pass crashes on the variable-size
+        index_add_ operations. Attention + dense layers are still compiled.
         
         Args:
             hidden_states: (num_tokens, hidden_size)
