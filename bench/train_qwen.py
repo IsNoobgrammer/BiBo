@@ -19,12 +19,14 @@ import argparse
 import logging
 import torch
 import torch._dynamo
+import torch._logging
 import torch.distributed as dist
 from torch.distributed._composable.fsdp import fully_shard
 
 # ── Suppress torch.compile recompilation warnings ──────────────
 torch._dynamo.config.verbose = False
 torch._dynamo.config.cache_size_limit = 64
+torch._logging.set_logs(dynamo=logging.ERROR, inductor=logging.ERROR, recompiles=logging.ERROR)
 logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
 logging.getLogger("torch._inductor").setLevel(logging.ERROR)
 
