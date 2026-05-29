@@ -194,7 +194,7 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError(f"Only 'rms' layer_norm_type is supported. Got: {self.layer_norm_type}")
 
         if mlp_only_layers is None:
-            self.mlp_only_layers = [0, 1]
+            self.mlp_only_layers = [0, 1, num_hidden_layers - 1]
         else:
             self.mlp_only_layers = mlp_only_layers
 

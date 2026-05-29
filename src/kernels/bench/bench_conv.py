@@ -9,12 +9,12 @@ Benchmarks:
 3. Scaling analysis across sequence lengths
 4. Memory comparison
 
-Run: .\\venv\\Scripts\\python src/kernels/bench_conv.py
+Run: .\\venv\\Scripts\\python src/kernels/bench/bench_conv.py
 """
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 import torch
 import torch.nn as nn

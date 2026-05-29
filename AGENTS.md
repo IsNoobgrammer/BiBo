@@ -103,7 +103,7 @@ BiBoForCausalLM
 
 **Attention**: SDPA (Flash Attention) by default. Falls back to manual matmul when `output_attentions=True`. GQA (fewer KV heads). QK-norm. SSMax query scaling.
 
-**MoE**: First 2 layers are dense MLP (layers 0 and 1). All remaining layers are MoE. Router uses logit normalization. Bias heuristics for load balancing. Router bias is `requires_grad=False` (not optimizer-managed, updated heuristically).
+**MoE**: First 2 layers and last layer are dense MLP (layers 0, 1, and N-1). All remaining layers are MoE. Router uses logit normalization. Bias heuristics for load balancing. Router bias is `requires_grad=False` (not optimizer-managed, updated heuristically).
 
 **Expert layout (PolyGLU)**: `polyglu_expert_multiplier` groups of 3 (SiLU-GLU, ReLU²-GLU, Tanh-GLU) + `special_expert_pairs` × (Identity, Zero). Default: 2×3 + 1×2 = 8 routed experts.
 
@@ -124,7 +124,7 @@ BiBoForCausalLM
 | `bias_update_threshold` | 100K | Tokens between bias updates |
 | `shared_expert_type` | "mlp" | Shared expert type: `"mlp"` (SwiGLU, like Qwen) or `"conv"` (CausalConv1D) |
 | `moe_shared_scaling` | auto | Shared expert output scaling (auto-computed via Monte Carlo, accounts for router_lambda) |
-| `mlp_only_layers` | [0, 1] | Which layers use dense MLP instead of MoE |
+| `mlp_only_layers` | [0, 1, N-1] | Which layers use dense MLP instead of MoE (first 2 + last) |
 
 ---
 
@@ -251,8 +251,15 @@ src/kernels/
 ├── __init__.py              # Exports all patching functions
 ├── patch.py                 # Liger-Kernel patches (RMSNorm, RoPE)
 ├── moe_dispatch.py          # Triton MoE kernels (fused GLU activation, router)
-├── bench_moe.py             # MoE benchmark suite (correctness + perf)
-└── verify_e2e.py            # Full model E2E verification
+├── dense_mlp.py             # Triton fused SwiGLU for dense MLP layers
+├── conv_fused.py            # Triton fused conv permute + activation + gate
+└── bench/                   # All kernel benchmarks
+    ├── __init__.py
+    ├── bench_moe.py         # MoE benchmark suite (correctness + perf)
+    ├── bench_dense_mlp.py   # Dense MLP benchmark (correctness + perf)
+    ├── bench_conv.py        # Conv fusion benchmark
+    ├── bench_moe_fwdbwd.py  # MoE full fwd+bwd training step benchmark
+    └── verify_e2e.py        # Full model E2E verification
 ```
 
 ### What's Optimized
@@ -262,7 +269,34 @@ src/kernels/
 | RMSNorm | Liger-Kernel `LigerRMSNormFunction` | 8-9x | `patch.py` |
 | RoPE | Liger-Kernel `LigerRopeFunction` | 2-3x | `patch.py` |
 | MoE GLU Activation | Custom Triton `_fused_glu_act_kernel` | 1.5x (full model) | `moe_dispatch.py` |
+| Dense MLP SwiGLU | Custom Triton `_fused_swiglu_kernel` | 1.8-2.25x kernel, 1.12x model | `dense_mlp.py` |
+| Conv Permute+Act+Gate | Custom Triton `_fused_conv_gate_multiply` | 1.34-1.41x training | `conv_fused.py` |
 | Router Scoring | Custom Triton `_fused_router_kernel` | Available | `moe_dispatch.py` |
+
+### Dense MLP Kernel Design (May 28, 2026)
+
+**Strategy**: Fuse gate_proj + up_proj into single GEMM + Triton SwiGLU activation.
+
+The fused SwiGLU kernel (`_fused_swiglu_kernel`) replaces:
+```python
+gate = gate_proj(x)          # (M, I) — separate GEMM
+up = up_proj(x)              # (M, I) — separate GEMM
+activated = F.silu(gate)     # (M, I) — 1 intermediate tensor
+result = activated * up      # (M, I) — 1 intermediate tensor
+```
+With:
+```python
+gate_up = F.linear(x, fused_weight)  # (M, 2I) — single GEMM (cuBLAS)
+result = triton_fused_swiglu(gate_up) # (M, I) — 1 Triton kernel, 0 intermediates
+```
+
+**Benchmark results (RTX 3050, sm_86):**
+- Kernel-level: **1.80-2.25x** speedup (activation fusion only)
+- MLP module: **1.17-1.27x** (small/medium batches, GEMM-dominated at large)
+- Full model fwd+bwd: **1.12x** additional over existing patches
+- Memory: **20.7% reduction** (35 MB saved on dense MLP)
+- Forward correctness: max_diff=4.88e-04 (fp16), 9.54e-07 (fp32)
+- Loss: identical (8.582651 ≈ 8.582869, diff=2.17e-04)
 
 ### MoE Kernel Design (May 28, 2026)
 
@@ -289,22 +323,35 @@ With a single Triton kernel that:
 ### Usage
 
 ```python
-from src.kernels import patch_bibo_with_triton, patch_moe_with_triton
+from src.kernels import patch_bibo_with_triton, patch_moe_with_triton, patch_dense_mlp_with_triton
 
 model = BiBoForCausalLM(config).cuda()
-patch_bibo_with_triton(model)   # RMSNorm + RoPE (Liger-Kernel)
-patch_moe_with_triton(model)    # MoE GLU activation (custom Triton)
+patch_bibo_with_triton(model)          # RMSNorm + RoPE (Liger-Kernel)
+patch_moe_with_triton(model)           # MoE GLU activation (custom Triton)
+patch_dense_mlp_with_triton(model)     # Dense MLP SwiGLU (custom Triton)
+# Also available: patch_conv_router_with_triton, patch_conv_expert_with_triton
+```
+
+### Running Benchmarks
+
+```bash
+.\venv\Scripts\python src/kernels/bench/bench_dense_mlp.py   # Dense MLP
+.\venv\Scripts\python src/kernels/bench/bench_moe.py         # MoE layer
+.\venv\Scripts\python src/kernels/bench/bench_conv.py        # Conv fusion
+.\venv\Scripts\python src/kernels/bench/bench_moe_fwdbwd.py  # Full fwd+bwd
+.\venv\Scripts\python src/kernels/bench/verify_e2e.py        # E2E correctness
 ```
 
 ### Rules for New Kernels
 
 1. **All kernels go in `src/kernels/`** — never inline Triton in modeling code
-2. **Liger-Kernel first** — check if Liger already provides the op before writing custom
-3. **cuBLAS for GEMMs** — don't write custom matmul kernels (cuBLAS is faster for typical shapes)
-4. **Monkey-patch pattern** — kernels are applied via `patch_*` functions, never modify modeling code
-5. **Benchmark before promoting** — run `bench_moe.py` or equivalent, record exact numbers
-6. **Correctness is binary** — atol=1e-3 for fp16, atol=1e-5 for fp32
-7. **Integrate into `bench/train.py` once verified** — every kernel that passes correctness AND shows measurable speedup MUST be enabled by default in `bench/train.py` (under the `if not args.no_triton:` block). Users can disable with `--no_triton`. This ensures training always uses the fastest available path.
+2. **All benchmarks go in `src/kernels/bench/`** — one bench file per kernel
+3. **Liger-Kernel first** — check if Liger already provides the op before writing custom
+4. **cuBLAS for GEMMs** — don't write custom matmul kernels (cuBLAS is faster for typical shapes)
+5. **Monkey-patch pattern** — kernels are applied via `patch_*` functions, never modify modeling code
+6. **Benchmark before promoting** — run the bench script, record exact numbers
+7. **Correctness is binary** — atol=1e-3 for fp16, atol=1e-5 for fp32
+8. **Integrate into `bench/train.py` once verified** — every kernel that passes correctness AND shows measurable speedup MUST be enabled by default in `bench/train.py` (under the `if not args.no_triton:` block). Users can disable with `--no_triton`. This ensures training always uses the fastest available path.
 
 ---
 
@@ -318,6 +365,9 @@ patch_moe_with_triton(model)    # MoE GLU activation (custom Triton)
 - **Forward + backward**: Verified end-to-end with loss computation
 - **MC simulation**: Correctly accounts for router_lambda normalization
 - **Router bias**: Non-trainable, heuristic updates work correctly
+- **Noise expert removed**: All references cleaned, model works with n-3 special experts
+- **Ablation**: BiBo outperforms Qwen3MoE on sorting task (lower loss, fewer params)
+- **Dense MLP Triton kernel**: Correct (max_diff=4.88e-04 fp16), 1.12x full model speedup, 20.7% memory savings (May 28, 2026)
 - **Noise expert removed**: All references cleaned, model works with n-3 special experts
 - **Ablation**: BiBo outperforms Qwen3MoE on sorting task (lower loss, fewer params)
 

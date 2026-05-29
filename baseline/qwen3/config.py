@@ -66,6 +66,7 @@ class Qwen3Config(PretrainedConfig):
         self.sliding_window = sliding_window if use_sliding_window else None
         self.max_window_layers = max_window_layers
         self.attention_dropout = attention_dropout
+        self.layer_types = ["full_attention"] * num_hidden_layers
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             pad_token_id=pad_token_id,

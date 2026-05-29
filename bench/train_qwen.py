@@ -59,7 +59,7 @@ QWEN_72M_BASELINE = Qwen3MoeConfig(
     num_experts_per_tok=2,          # Top-2 routing (same as BiBo)
     moe_intermediate_size=768,      # Per-expert FFN (same as BiBo)
     decoder_sparse_step=1,          # MoE every layer
-    mlp_only_layers=[0, 1],         # First 2 dense (same as BiBo)
+    mlp_only_layers=[0, 1, 9],      # First 2 + last dense (same as BiBo)
     norm_topk_prob=False,
     router_aux_loss_coef=0.001,
     # Other
@@ -262,19 +262,22 @@ def train(args):
     config.use_cache = False
     model = model.to(device)
 
-    # ── Triton Fused RMSNorm (default ON) ──────────────────────
+    # ── Triton Fused Kernels (default ON) ──────────────────────
     if not args.no_triton:
         try:
             from src.kernels.patch import patch_qwen3_with_triton
+            from src.kernels.dense_mlp import patch_qwen_dense_mlp_with_triton
             patch_qwen3_with_triton(model)
+            patch_qwen_dense_mlp_with_triton(model)
+            dense_count = getattr(model, '_triton_qwen_dense_mlp_count', 0)
             if is_main:
-                print(f"{TAG} [train] Triton fused RMSNorm: ENABLED")
+                print(f"{TAG} [train] Triton kernels: ENABLED (RMSNorm + RoPE + Dense MLP×{dense_count})")
         except Exception as e:
             if is_main:
-                print(f"{TAG} [train] Triton fused RMSNorm: FAILED ({e}), using PyTorch eager")
+                print(f"{TAG} [train] Triton kernels: FAILED ({e}), using PyTorch eager")
     else:
         if is_main:
-            print(f"{TAG} [train] Triton fused RMSNorm: DISABLED (--no_triton)")
+            print(f"{TAG} [train] Triton kernels: DISABLED (--no_triton)")
 
     # ── FSDP2 ──────────────────────────────────────────────────
     if is_distributed:

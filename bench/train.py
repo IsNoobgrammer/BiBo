@@ -202,13 +202,16 @@ def train(args):
         try:
             from src.kernels.patch import patch_bibo_with_triton
             from src.kernels.moe_dispatch import patch_moe_with_triton
+            from src.kernels.dense_mlp import patch_dense_mlp_with_triton
             from src.kernels.conv_fused import patch_conv_router_with_triton, patch_conv_expert_with_triton
             patch_bibo_with_triton(model)
             patch_moe_with_triton(model)
+            patch_dense_mlp_with_triton(model)
             patch_conv_router_with_triton(model)
             patch_conv_expert_with_triton(model)
+            dense_count = getattr(model, '_triton_dense_mlp_count', 0)
             if is_main:
-                print(f"{TAG} [train] Triton kernels: ENABLED (RMSNorm + RoPE + MoE GLU + Conv fusion)")
+                print(f"{TAG} [train] Triton kernels: ENABLED (RMSNorm + RoPE + MoE GLU + Dense MLP×{dense_count} + Conv fusion)")
         except Exception as e:
             if is_main:
                 print(f"{TAG} [train] Triton kernels: FAILED ({e}), using PyTorch eager")

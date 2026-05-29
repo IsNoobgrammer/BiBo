@@ -7,12 +7,12 @@ Verifies:
 3. Works under torch.amp.autocast (mixed precision)
 4. Multi-step training convergence matches
 
-Run: .\\venv\\Scripts\\python src/kernels/verify_e2e.py
+Run: .\\venv\\Scripts\\python src/kernels/bench/verify_e2e.py
 """
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 import torch
 import torch.nn as nn

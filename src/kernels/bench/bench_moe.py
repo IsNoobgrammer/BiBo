@@ -6,7 +6,7 @@ Tests:
 2. Performance: wall-clock timing comparison
 3. Memory: peak GPU memory usage
 
-Run: .\\venv\\Scripts\\python src/kernels/bench_moe.py
+Run: .\\venv\\Scripts\\python src/kernels/bench/bench_moe.py
 
 Follows tritonify protocol:
 - Task Contract defined
@@ -17,7 +17,7 @@ Follows tritonify protocol:
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 import torch
 import torch.nn.functional as F

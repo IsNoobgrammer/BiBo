@@ -6,12 +6,12 @@ Measures the COMPLETE training iteration cost:
 
 This is what matters for training speed.
 
-Run: .\\venv\\Scripts\\python src/kernels/bench_moe_fwdbwd.py
+Run: .\\venv\\Scripts\\python src/kernels/bench/bench_moe_fwdbwd.py
 """
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 import torch
 import torch.nn.functional as F

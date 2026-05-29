@@ -23,7 +23,7 @@ BIBO_50M_BASELINE = BiBoConfig(
     vocab_size=81000,               # QTK-81K tokenizer
     hidden_size=320,
     intermediate_size=1024,         # 3.2x hidden (dense MLP)
-    num_hidden_layers=10,           # first 2 dense, 8 MoE
+    num_hidden_layers=10,           # first 2 + last dense, 7 MoE
     num_attention_heads=5,          # hidden/64
     num_key_value_heads=1,          # GQA 5:1 (aggressive)
     max_position_embeddings=2048,
@@ -35,7 +35,7 @@ BIBO_50M_BASELINE = BiBoConfig(
     moe_intermediate_size=768,      # Per-expert FFN size (tuned for ~50M)
     use_shared_expert=True,
     shared_expert_type="mlp",       # SwiGLU shared expert
-    mlp_only_layers=[0, 1],         # First 2 layers dense, rest MoE
+    mlp_only_layers=[0, 1, 9],      # First 2 + last layer dense, rest MoE
     # Router
     router_type="mlp",
     router_lambda=1.0,
