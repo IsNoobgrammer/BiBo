@@ -16,9 +16,17 @@ import sys
 import math
 import time
 import argparse
+import logging
 import torch
+import torch._dynamo
 import torch.distributed as dist
 from torch.distributed._composable.fsdp import fully_shard
+
+# ── Suppress torch.compile recompilation warnings ──────────────
+torch._dynamo.config.verbose = False
+torch._dynamo.config.cache_size_limit = 64
+logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor").setLevel(logging.ERROR)
 
 # Ensure repo root and bench dir are in path
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -188,7 +196,34 @@ def setup_distributed():
 
 
 def compile_model(model):
-    return torch.compile(model, mode="default", fullgraph=False)
+    """Selective torch.compile for Qwen3MoE — same strategy as BiBo.
+    
+    Compile attention + dense MLP (static shapes).
+    Skip MoE expert dispatch (dynamic shapes, @dynamo.disable handles it).
+    Suppress harmless recompilation warnings.
+    """
+    import torch._dynamo
+    import logging
+    
+    torch._dynamo.config.verbose = False
+    logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+    
+    from baseline.qwen3moe.modeling import Qwen3MoeSparseMoeBlock, Qwen3MoeMLP
+    
+    for layer in model.model.layers:
+        # Attention: always static shapes, compile it
+        layer.self_attn = torch.compile(layer.self_attn, mode="default", fullgraph=False)
+        
+        # Dense MLP layers: static shapes
+        if isinstance(layer.mlp, Qwen3MoeMLP):
+            layer.mlp = torch.compile(layer.mlp, mode="default", fullgraph=False)
+        # MoE layers: expert dispatch has @dynamo.disable, router is small
+    
+    # Embedding + LM head
+    model.model.embed_tokens = torch.compile(model.model.embed_tokens, mode="default", fullgraph=False)
+    model.lm_head = torch.compile(model.lm_head, mode="default", fullgraph=False)
+    
+    return model
 
 
 def train(args):

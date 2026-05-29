@@ -16,6 +16,7 @@ from collections.abc import Callable
 from typing import Optional
 
 import torch
+import torch._dynamo
 import torch.nn.functional as F
 from torch import nn
 
@@ -190,6 +191,7 @@ class Qwen3MoeExperts(nn.Module):
         self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
         self.act_fn = ACT2FN[config.hidden_act]
 
+    @torch._dynamo.disable
     def forward(
         self,
         hidden_states: torch.Tensor,
