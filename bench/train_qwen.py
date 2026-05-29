@@ -196,34 +196,12 @@ def setup_distributed():
 
 
 def compile_model(model):
-    """Selective torch.compile for Qwen3MoE — same strategy as BiBo.
+    """Whole-model torch.compile with graph breaks at MoE dispatch.
     
-    Compile attention + dense MLP (static shapes).
-    Skip MoE expert dispatch (dynamic shapes, @dynamo.disable handles it).
-    Suppress harmless recompilation warnings.
+    Qwen3MoeExperts.forward has @torch._dynamo.disable — creates a graph break.
+    torch.compile handles this with fullgraph=False, compiling everything else.
     """
-    import torch._dynamo
-    import logging
-    
-    torch._dynamo.config.verbose = False
-    logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
-    
-    from baseline.qwen3moe.modeling import Qwen3MoeSparseMoeBlock, Qwen3MoeMLP
-    
-    for layer in model.model.layers:
-        # Attention: always static shapes, compile it
-        layer.self_attn = torch.compile(layer.self_attn, mode="default", fullgraph=False)
-        
-        # Dense MLP layers: static shapes
-        if isinstance(layer.mlp, Qwen3MoeMLP):
-            layer.mlp = torch.compile(layer.mlp, mode="default", fullgraph=False)
-        # MoE layers: expert dispatch has @dynamo.disable, router is small
-    
-    # Embedding + LM head
-    model.model.embed_tokens = torch.compile(model.model.embed_tokens, mode="default", fullgraph=False)
-    model.lm_head = torch.compile(model.lm_head, mode="default", fullgraph=False)
-    
-    return model
+    return torch.compile(model, mode="default", fullgraph=False)
 
 
 def train(args):

@@ -121,44 +121,19 @@ def wrap_fsdp(model, device):
 
 
 def compile_model(model):
-    """Apply torch.compile selectively — compile what benefits, skip what doesn't.
+    """Apply torch.compile to the whole model.
     
-    Strategy (production MoE pattern):
-    - Attention layers: COMPILE (static shapes, big GEMM fusion wins)
-    - Dense MLP layers: COMPILE (static shapes, fused gate_up + activation)
-    - MoE expert dispatch: SKIP (dynamic shapes cause recompilation storms)
-    - Embedding + LM head: COMPILE (static shapes)
+    Uses mode='default' (Triton fusion WITHOUT CUDA graphs).
+    fullgraph=False allows graph breaks at @dynamo.disable boundaries
+    (MoE expert dispatch) without failing compilation.
     
-    This avoids the recompilation storm from MoE's variable token-per-expert
-    counts while still getting compile benefits on 60%+ of the model.
+    The MoE expert dispatch has @torch._dynamo.disable which creates a
+    graph break — torch.compile handles this gracefully with fullgraph=False,
+    compiling everything around it while leaving the dynamic dispatch in eager.
     
-    Also suppresses harmless dynamo recompilation warnings that fire during
-    the first 1-2 steps (type_id guards for heterogeneous layers).
+    Dynamo warnings are suppressed at module level (top of file).
     """
-    import torch._dynamo
-    import logging
-    
-    # Suppress recompilation warnings (they're harmless warmup noise)
-    torch._dynamo.config.verbose = False
-    torch._dynamo.config.suppress_errors = False  # still fail on real errors
-    logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
-    
-    # Compile individual components that have static shapes
-    # Attention: always static (batch*seq, heads, head_dim)
-    for layer in model.model.layers:
-        layer.self_attn = torch.compile(layer.self_attn, mode="default", fullgraph=False)
-        
-        # Dense MLP layers: static shapes, compile them
-        if not layer.is_moe_layer:
-            layer.mlp = torch.compile(layer.mlp, mode="default", fullgraph=False)
-        # MoE layers: already have @torch._dynamo.disable on expert dispatch
-        # The router + shared expert still benefit from compile via the layer wrapper
-    
-    # Embedding + final norm + LM head
-    model.model.embed_tokens = torch.compile(model.model.embed_tokens, mode="default", fullgraph=False)
-    model.lm_head = torch.compile(model.lm_head, mode="default", fullgraph=False)
-    
-    return model
+    return torch.compile(model, mode="default", fullgraph=False)
 
 
 def train(args):
