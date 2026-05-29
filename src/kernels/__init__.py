@@ -41,6 +41,8 @@ from .dense_mlp import (
     patch_qwen_dense_mlp_with_triton,
     unpatch_qwen_dense_mlp,
     triton_fused_swiglu,
+    _TritonSwiGLUFunction,
+    _TritonFusedGLUFunction,
 )
 from .conv_fused import (
     patch_conv_router_with_triton,

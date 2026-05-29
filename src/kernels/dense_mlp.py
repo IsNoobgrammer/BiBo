@@ -38,7 +38,9 @@ import triton
 import triton.language as tl
 from typing import Optional
 
-__all__ = ['patch_dense_mlp_with_triton', 'unpatch_dense_mlp']
+__all__ = ['patch_dense_mlp_with_triton', 'unpatch_dense_mlp',
+           'patch_qwen_dense_mlp_with_triton', 'unpatch_qwen_dense_mlp',
+           'triton_fused_swiglu', '_TritonSwiGLUFunction', '_TritonFusedGLUFunction']
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -143,6 +145,125 @@ def triton_fused_swiglu(gate_up: torch.Tensor) -> torch.Tensor:
 
 
 # ═══════════════════════════════════════════════════════════════
+# Autograd-Compatible Wrapper for Triton SwiGLU
+#
+# The raw Triton kernel writes into torch.empty() — autograd can't
+# trace through that. This wrapper uses torch.autograd.Function to:
+# - Forward: run Triton kernel (fast, no intermediates)
+# - Backward: recompute gate/up from saved gate_up, compute grads
+#   using PyTorch ops (correct, autograd-compatible)
+#
+# This gives us the forward speedup + memory savings while keeping
+# backward correctness for training.
+# ═══════════════════════════════════════════════════════════════
+
+class _TritonSwiGLUFunction(torch.autograd.Function):
+    """Autograd wrapper for Triton fused SwiGLU: silu(gate) * up."""
+    
+    @staticmethod
+    def forward(ctx, gate_up: torch.Tensor) -> torch.Tensor:
+        """
+        Forward: use Triton kernel for speed.
+        Input: (M, 2*I) — concatenated gate and up
+        Output: (M, I) — silu(gate) * up
+        """
+        ctx.save_for_backward(gate_up)
+        return triton_fused_swiglu(gate_up)
+    
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """
+        Backward: recompute from saved gate_up using PyTorch ops.
+        
+        f(gate_up) = silu(gate) * up
+        df/d(gate_up) = [df/d(gate), df/d(up)]
+        
+        df/d(gate) = grad_output * up * d(silu(gate))/d(gate)
+                   = grad_output * up * (sigmoid(gate) + gate * sigmoid(gate) * (1 - sigmoid(gate)))
+                   = grad_output * up * sigmoid(gate) * (1 + gate * (1 - sigmoid(gate)))
+        df/d(up) = grad_output * silu(gate)
+        """
+        gate_up, = ctx.saved_tensors
+        M = gate_up.shape[0]
+        I = gate_up.shape[1] // 2
+        
+        gate = gate_up[:, :I]
+        up = gate_up[:, I:]
+        
+        # Compute sigmoid and silu
+        sig_gate = torch.sigmoid(gate)
+        silu_gate = gate * sig_gate
+        
+        # Gradient w.r.t. up: grad_output * silu(gate)
+        grad_up = grad_output * silu_gate
+        
+        # Gradient w.r.t. gate: grad_output * up * sigmoid(gate) * (1 + gate * (1 - sigmoid(gate)))
+        # = grad_output * up * (silu(gate) + gate * sigmoid(gate) * (1 - sigmoid(gate)))
+        # Simplified: d(silu)/d(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+        dsilu = sig_gate * (1.0 + gate * (1.0 - sig_gate))
+        grad_gate = grad_output * up * dsilu
+        
+        # Concatenate back to (M, 2*I)
+        grad_gate_up = torch.cat([grad_gate, grad_up], dim=-1)
+        return grad_gate_up
+
+
+class _TritonFusedGLUFunction(torch.autograd.Function):
+    """Autograd wrapper for Triton fused GLU with variable activation (SiLU/ReLU²/Tanh)."""
+    
+    @staticmethod
+    def forward(ctx, gate_up: torch.Tensor, act_type: int) -> torch.Tensor:
+        """
+        Forward: use Triton kernel for speed.
+        Input: (M, 2*I) — concatenated gate and up
+        Output: (M, I) — act(gate) * up
+        """
+        ctx.save_for_backward(gate_up)
+        ctx.act_type = act_type
+        from .moe_dispatch import triton_fused_glu_activation
+        return triton_fused_glu_activation(gate_up, act_type)
+    
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """
+        Backward: recompute from saved gate_up using PyTorch ops.
+        Supports SiLU (0), ReLU² (1), Tanh (2).
+        """
+        gate_up, = ctx.saved_tensors
+        act_type = ctx.act_type
+        M = gate_up.shape[0]
+        I = gate_up.shape[1] // 2
+        
+        gate = gate_up[:, :I]
+        up = gate_up[:, I:]
+        
+        if act_type == 0:  # SiLU
+            sig_gate = torch.sigmoid(gate)
+            act_gate = gate * sig_gate
+            # d(silu)/d(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+            dact = sig_gate * (1.0 + gate * (1.0 - sig_gate))
+        elif act_type == 1:  # ReLU²
+            relu_gate = F.relu(gate)
+            act_gate = relu_gate * relu_gate
+            # d(relu²)/d(x) = 2 * relu(x) * (x > 0) = 2 * relu(x)
+            dact = 2.0 * relu_gate
+        else:  # Tanh
+            act_gate = torch.tanh(gate)
+            # d(tanh)/d(x) = 1 - tanh²(x)
+            dact = 1.0 - act_gate * act_gate
+        
+        # Gradient w.r.t. up: grad_output * act(gate)
+        grad_up = grad_output * act_gate
+        
+        # Gradient w.r.t. gate: grad_output * up * d(act)/d(gate)
+        grad_gate = grad_output * up * dact
+        
+        # Concatenate back to (M, 2*I)
+        grad_gate_up = torch.cat([grad_gate, grad_up], dim=-1)
+        return grad_gate_up, None  # None for act_type
+
+
+# ═══════════════════════════════════════════════════════════════
 # Fused Dense MLP Module
 #
 # Replaces BiBoMLP with a version that:
@@ -209,22 +330,23 @@ def _triton_dense_mlp_forward(self, x: torch.Tensor) -> torch.Tensor:
     """
     Drop-in replacement for BiBoMLP.forward using fused gate_up + Triton SwiGLU.
     
-    Uses the original separate gate_proj and up_proj weights but calls them
-    as a single fused GEMM by concatenating weights at call time.
+    Concatenates gate_proj.weight and up_proj.weight ON EVERY FORWARD so that
+    autograd traces through the actual parameters (enabling gradient flow).
     
-    This avoids restructuring the model's state_dict while still getting
-    the Triton fusion benefit.
+    The torch.cat is cheap (~0.01ms) compared to the GEMM it feeds.
     """
     orig_shape = x.shape[:-1]
     x_2d = x.view(-1, self.hidden_size)
     
-    # Fused gate+up: concatenate weights and do single GEMM
+    # Fused gate+up: concatenate LIVE parameters (not a buffer!) for autograd
     # gate_proj.weight: (I, H), up_proj.weight: (I, H)
     # fused: (2*I, H) → F.linear(x, fused) → (M, 2*I)
-    gate_up = F.linear(x_2d, self._fused_gate_up_weight)
+    fused_weight = torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
+    gate_up = F.linear(x_2d, fused_weight)
     
     # Triton fused SwiGLU: (M, 2*I) → (M, I)
-    intermediate = triton_fused_swiglu(gate_up)
+    # Use autograd-compatible wrapper that preserves gradient flow
+    intermediate = _TritonSwiGLUFunction.apply(gate_up)
     
     # Down projection: (M, I) → (M, H)
     out = self.down_proj(intermediate)
@@ -245,6 +367,9 @@ def patch_dense_mlp_with_triton(model):
     
     Only patches non-MoE layers (those using BiBoMLP with is_expert=False).
     
+    IMPORTANT: The fused weight is recomputed from live parameters on every forward
+    to preserve gradient flow. The torch.cat cost (~0.01ms) is negligible vs GEMM.
+    
     Args:
         model: BiBoForCausalLM or any model containing BiBoMLP
     Returns:
@@ -255,17 +380,8 @@ def patch_dense_mlp_with_triton(model):
     patched = 0
     for module in model.modules():
         if isinstance(module, BiBoMLP) and not getattr(module, '_is_expert_mlp', False):
-            # Check it's a dense layer MLP (not an expert MLP inside MoE)
-            # Expert MLPs use moe_intermediate_size, dense use intermediate_size
-            # We only want to patch the dense ones (layers 0, 1)
             if not hasattr(module, '_original_forward'):
                 module._original_forward = module.forward
-            
-            # Pre-compute fused weight (avoids cat on every forward)
-            # gate_proj.weight: (I, H), up_proj.weight: (I, H)
-            # Concatenated: (2*I, H)
-            fused_w = torch.cat([module.gate_proj.weight.data, module.up_proj.weight.data], dim=0)
-            module.register_buffer('_fused_gate_up_weight', fused_w)
             
             module.forward = _triton_dense_mlp_forward.__get__(module, BiBoMLP)
             patched += 1
@@ -284,6 +400,7 @@ def unpatch_dense_mlp(model):
             if hasattr(module, '_original_forward'):
                 module.forward = module._original_forward
                 del module._original_forward
+            # Clean up legacy buffer if present (from old buggy version)
             if hasattr(module, '_fused_gate_up_weight'):
                 del module._fused_gate_up_weight
     
@@ -302,15 +419,18 @@ def unpatch_dense_mlp(model):
 def _triton_qwen_mlp_forward(self, x: torch.Tensor) -> torch.Tensor:
     """
     Drop-in replacement for Qwen3MLP/Qwen3MoeMLP.forward using fused gate_up + Triton SwiGLU.
+    
+    Concatenates live parameters on every forward for correct gradient flow.
     """
     orig_shape = x.shape[:-1]
     x_2d = x.view(-1, self.hidden_size)
     
-    # Fused gate+up GEMM: (M, H) → (M, 2*I)
-    gate_up = F.linear(x_2d, self._fused_gate_up_weight)
+    # Fused gate+up GEMM from LIVE parameters: (M, H) → (M, 2*I)
+    fused_weight = torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
+    gate_up = F.linear(x_2d, fused_weight)
     
-    # Triton fused SwiGLU: (M, 2*I) → (M, I)
-    intermediate = triton_fused_swiglu(gate_up)
+    # Triton fused SwiGLU with autograd: (M, 2*I) → (M, I)
+    intermediate = _TritonSwiGLUFunction.apply(gate_up)
     
     # Down projection: (M, I) → (M, H)
     out = self.down_proj(intermediate)
@@ -328,6 +448,9 @@ def patch_qwen_dense_mlp_with_triton(model):
     What's fused:
     - gate_proj + up_proj → single fused GEMM (1 kernel launch instead of 2)
     - SiLU activation + gate*up multiply → 1 Triton kernel (eliminates intermediates)
+    
+    IMPORTANT: Fused weight is recomputed from live parameters on every forward
+    to preserve gradient flow for training.
     
     Args:
         model: Qwen3ForCausalLM or Qwen3MoeForCausalLM
@@ -358,10 +481,6 @@ def patch_qwen_dense_mlp_with_triton(model):
             if not hasattr(module, '_original_forward'):
                 module._original_forward = module.forward
             
-            # Pre-compute fused weight: (2*I, H)
-            fused_w = torch.cat([module.gate_proj.weight.data, module.up_proj.weight.data], dim=0)
-            module.register_buffer('_fused_gate_up_weight', fused_w)
-            
             module.forward = _triton_qwen_mlp_forward.__get__(module, type(module))
             patched += 1
     
@@ -391,6 +510,7 @@ def unpatch_qwen_dense_mlp(model):
             if hasattr(module, '_original_forward'):
                 module.forward = module._original_forward
                 del module._original_forward
+            # Clean up legacy buffer if present
             if hasattr(module, '_fused_gate_up_weight'):
                 del module._fused_gate_up_weight
     

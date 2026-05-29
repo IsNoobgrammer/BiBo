@@ -352,6 +352,9 @@ patch_dense_mlp_with_triton(model)     # Dense MLP SwiGLU (custom Triton)
 6. **Benchmark before promoting** — run the bench script, record exact numbers
 7. **Correctness is binary** — atol=1e-3 for fp16, atol=1e-5 for fp32
 8. **Integrate into `bench/train.py` once verified** — every kernel that passes correctness AND shows measurable speedup MUST be enabled by default in `bench/train.py` (under the `if not args.no_triton:` block). Users can disable with `--no_triton`. This ensures training always uses the fastest available path.
+9. **NEVER use `register_buffer` for tensors that need gradients** — buffers are excluded from autograd. If you need a cached tensor derived from parameters, recompute it from live parameters on every forward (the `torch.cat` cost is negligible vs GEMM).
+10. **ALWAYS wrap raw Triton kernel calls in `torch.autograd.Function`** — when a Triton kernel writes into `torch.empty()`, autograd has no record of how output depends on input. The graph is severed. Use `autograd.Function` with: forward = Triton kernel (fast), backward = PyTorch ops (correct).
+11. **Run `verify_grads.py` before promoting any kernel** — `python src/kernels/bench/verify_grads.py` checks gradient equivalence, frozen params, and multi-step convergence. A kernel that passes forward correctness but fails gradient verification is BROKEN for training.
 
 ---
 

@@ -324,13 +324,16 @@ def triton_moe_experts_forward(
     
     Approach:
     - cuBLAS for gate_up GEMM (F.linear — already optimal)
-    - Triton for fused GLU activation (eliminates 3 intermediate tensors)
+    - Triton for fused GLU activation via autograd.Function (correct backward)
     - cuBLAS for down GEMM (F.linear — already optimal)  
     - Fused weight application during scatter
     
     For small chunks (< 8 tokens), falls back to PyTorch eager
     since kernel launch overhead dominates.
     """
+    # Import the autograd wrapper from dense_mlp (shared code)
+    from .dense_mlp import _TritonFusedGLUFunction
+    
     num_tokens, hidden_size = hidden_states.shape
     
     # Sort tokens by expert
@@ -375,10 +378,10 @@ def triton_moe_experts_forward(
                 # 1. cuBLAS GEMM for gate_up (already fast)
                 gate_up = F.linear(current_state, gate_up_proj[expert_idx])
                 
-                # 2. Triton fused GLU activation (saves 3 tensors)
-                intermediate = triton_fused_glu_activation(gate_up, act_type)
+                # 2. Triton fused GLU activation via autograd.Function (correct backward!)
+                intermediate = _TritonFusedGLUFunction.apply(gate_up, act_type)
                 
-                # 3. cuBLAS GEMM for down + fused weight multiply
+                # 3. cuBLAS GEMM for down + weight multiply
                 expert_out = F.linear(intermediate, down_proj[expert_idx])
                 output.index_add_(0, token_idx, expert_out * weights.unsqueeze(-1))
             else:
