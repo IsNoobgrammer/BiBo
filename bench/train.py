@@ -31,7 +31,7 @@ sys.path.insert(0, BENCH_DIR)
 
 from config import BIBO_50M_BASELINE, build_model, count_params
 from data import load_benchmark_data, create_dataloader
-from optim import create_optimizer, create_scheduler, HAS_MUON, HAS_BNB
+from optim import create_optimizer, create_scheduler, HAS_BNB
 from eval import evaluate, generate_samples, get_tokenizer
 from utils import (
     init_wandb, log_train_metrics, log_val_metrics, log_samples,
@@ -48,7 +48,6 @@ def parse_args():
     p.add_argument("--total_steps", type=int, default=50000)
     p.add_argument("--warmup_steps", type=int, default=1000)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--muon_lr", type=float, default=0.02)
     p.add_argument("--weight_decay", type=float, default=0.1)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)
@@ -135,11 +134,11 @@ def train(args):
         print(f"{TAG} BiBo Benchmark Training")
         print(f"{TAG} " + "=" * 60)
         print(f"{TAG}   Device: {device} (world_size={world_size})")
-        print(f"{TAG}   Muon: {HAS_MUON}, bitsandbytes: {HAS_BNB}")
+        print(f"{TAG}   bitsandbytes: {HAS_BNB}")
         print(f"{TAG}   Batch size: {args.batch_size}")
         print(f"{TAG}   Total steps: {args.total_steps}")
         print(f"{TAG}   Seq len: {args.seq_len}")
-        print(f"{TAG}   LR: {args.lr}, Muon LR: {args.muon_lr}")
+        print(f"{TAG}   LR: {args.lr}")
         print(f"{TAG} " + "=" * 60)
 
     # ── Data (load first — need max token ID for vocab sizing) ───
@@ -238,7 +237,7 @@ def train(args):
                 print(f"{TAG} [train] torch.compile failed: {e}, continuing in eager mode")
 
     # ── Optimizer & Scheduler ──────────────────────────────────
-    optimizer = create_optimizer(model, lr=args.lr, muon_lr=args.muon_lr, weight_decay=args.weight_decay)
+    optimizer = create_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = create_scheduler(optimizer, args.warmup_steps, args.total_steps)
 
     # ── DataLoader ───────────────────────────────────────────────
@@ -255,14 +254,12 @@ def train(args):
             "total_steps": args.total_steps,
             "warmup_steps": args.warmup_steps,
             "lr": args.lr,
-            "muon_lr": args.muon_lr,
             "weight_decay": args.weight_decay,
             "grad_clip": args.grad_clip,
             "seq_len": args.seq_len,
             "seed": args.seed,
             # Hardware
             "world_size": world_size,
-            "has_muon": HAS_MUON,
             "has_bnb": HAS_BNB,
             "compiled": not args.no_compile,
             # Architecture
