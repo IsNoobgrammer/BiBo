@@ -413,8 +413,15 @@ def triton_moe_experts_forward(
 # Monkey-Patch Interface
 # ═══════════════════════════════════════════════════════════════
 
+@torch._dynamo.disable
 def _triton_fused_experts_forward(self, hidden_states, top_k_indices, top_k_weights):
-    """Drop-in replacement for BiBoFusedExperts.forward."""
+    """Drop-in replacement for BiBoFusedExperts.forward.
+    
+    @torch._dynamo.disable: MoE dispatch has fundamentally dynamic shapes
+    (variable tokens per expert per step) + variable act_type per expert.
+    torch.compile recompiles endlessly on this — disable it here.
+    The Triton kernels inside already provide the fusion benefit.
+    """
     return triton_moe_experts_forward(
         hidden_states=hidden_states,
         top_k_indices=top_k_indices,

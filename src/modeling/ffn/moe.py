@@ -64,6 +64,7 @@ class BiBoFusedExperts(nn.Module):
         self.zero_start = self.identity_end
         self.zero_end = self.num_routed_experts
 
+    @torch._dynamo.disable
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -72,6 +73,9 @@ class BiBoFusedExperts(nn.Module):
     ) -> torch.Tensor:
         """
         Sorted dispatch — no one_hot, no permute, no where.
+        
+        @torch._dynamo.disable: Expert dispatch has fundamentally dynamic shapes
+        (variable tokens per expert per step). torch.compile recompiles endlessly.
         
         Args:
             hidden_states: (num_tokens, hidden_size)
