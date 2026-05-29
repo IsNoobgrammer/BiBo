@@ -18,6 +18,9 @@
 set -e
 cd "$(dirname "$0")/.."
 
+# Suppress torch.compile recompilation warnings (expected for MoE act_type dispatch)
+export TORCH_LOGS="-recompiles"
+
 STEPS=3000
 BS=12
 GRAD_ACCUM=4
@@ -38,7 +41,7 @@ echo "============================================================"
 
 # ── Launch BiBo on GPU 0 ──────────────────────────────────────
 echo "[launcher] Starting BiBo on cuda:0..."
-CUDA_VISIBLE_DEVICES=0 python bench/train.py \
+CUDA_VISIBLE_DEVICES=0 python -u bench/train.py \
     --batch_size $BS \
     --grad_accum $GRAD_ACCUM \
     --total_steps $STEPS \
@@ -50,7 +53,7 @@ CUDA_VISIBLE_DEVICES=0 python bench/train.py \
     --wandb_project bibo-bench \
     --wandb_name bibo \
     $EXTRA_ARGS \
-    2>&1 | sed 's/^/[GPU0] /' &
+    2>&1 | sed -u 's/^/[GPU0] /' &
 PID_BIBO=$!
 
 # Wait for dataset to be downloaded/cached before starting Qwen
@@ -60,7 +63,7 @@ sleep 30
 
 # ── Launch Qwen3MoE on GPU 1 ──────────────────────────────────
 echo "[launcher] Starting Qwen3MoE on cuda:1..."
-CUDA_VISIBLE_DEVICES=1 python bench/train_qwen.py \
+CUDA_VISIBLE_DEVICES=1 python -u bench/train_qwen.py \
     --batch_size $BS \
     --grad_accum $GRAD_ACCUM \
     --total_steps $STEPS \
@@ -72,7 +75,7 @@ CUDA_VISIBLE_DEVICES=1 python bench/train_qwen.py \
     --wandb_project bibo-bench \
     --wandb_name qwen \
     $EXTRA_ARGS \
-    2>&1 | sed 's/^/[GPU1] /' &
+    2>&1 | sed -u 's/^/[GPU1] /' &
 PID_QWEN=$!
 
 echo "[launcher] BiBo PID: $PID_BIBO | Qwen3MoE PID: $PID_QWEN"
