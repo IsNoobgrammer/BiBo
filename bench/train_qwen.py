@@ -59,7 +59,7 @@ QWEN_72M_BASELINE = Qwen3MoeConfig(
     num_experts_per_tok=2,          # Top-2 routing (same as BiBo)
     moe_intermediate_size=768,      # Per-expert FFN (same as BiBo)
     decoder_sparse_step=1,          # MoE every layer
-    mlp_only_layers=[0, 1, 9],      # First 2 + last dense (same as BiBo)
+    mlp_only_layers=[0, 9],          # First + last layer dense (same as BiBo)
     norm_topk_prob=False,
     router_aux_loss_coef=0.001,
     # Other
@@ -358,7 +358,7 @@ def train(args):
     # ── Eval Only ──────────────────────────────────────────────
     if args.eval_only:
         if is_main:
-            val_loss, val_ppl, _ = evaluate(model, val_ds, batch_size=args.batch_size, device=device, max_batches=100, run_router_diagnostics=False)
+            val_loss, val_ppl = evaluate(model, val_ds, batch_size=args.batch_size, device=device, max_batches=100)
             print(f"{TAG} [eval] Val loss: {val_loss:.4f}, Perplexity: {val_ppl:.2f}")
         return
 
@@ -435,7 +435,7 @@ def train(args):
 
             if is_main and step % args.eval_every == 0:
                 try:
-                    val_loss, val_ppl, _ = evaluate(model, val_ds, batch_size=max(args.batch_size, 8), device=device, max_batches=100, run_router_diagnostics=False)
+                    val_loss, val_ppl = evaluate(model, val_ds, batch_size=max(args.batch_size, 8), device=device, max_batches=100)
                     log_val_metrics(step, val_loss, val_ppl)
                     print(f"{TAG}   [VAL] step={step} | val_loss={val_loss:.4f} | val_ppl={val_ppl:.2f}")
                 except torch.cuda.OutOfMemoryError:
@@ -458,7 +458,7 @@ def train(args):
         print(f"{TAG}   Epochs: {epoch + 1}")
 
         try:
-            val_loss, val_ppl, _ = evaluate(model, val_ds, batch_size=max(args.batch_size, 8), device=device, max_batches=100, run_router_diagnostics=False)
+            val_loss, val_ppl = evaluate(model, val_ds, batch_size=max(args.batch_size, 8), device=device, max_batches=100)
             log_val_metrics(step, val_loss, val_ppl)
             print(f"{TAG}   Final val loss: {val_loss:.4f}")
             print(f"{TAG}   Final val perplexity: {val_ppl:.2f}")

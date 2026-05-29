@@ -35,7 +35,7 @@ BIBO_50M_BASELINE = BiBoConfig(
     moe_intermediate_size=768,      # Per-expert FFN size (tuned for ~50M)
     use_shared_expert=True,
     shared_expert_type="mlp",       # SwiGLU shared expert
-    mlp_only_layers=[0, 1, 9],      # First 2 + last layer dense, rest MoE
+    mlp_only_layers=[0, 9],          # First + last layer dense, rest MoE
     # Router
     router_type="mlp",
     router_lambda=1.0,
