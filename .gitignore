@@ -4,6 +4,7 @@ venv/
 .aim/
 .idea/
 .vscode/
+.triton_cache/
 local-only/
 researcher/
 postmortem/

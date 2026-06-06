@@ -255,12 +255,20 @@ src/kernels/
 ├── conv_fused.py            # Triton fused conv permute + activation + gate
 └── bench/                   # All kernel benchmarks
     ├── __init__.py
+    ├── profile_optmaxx.py   # torch.profiler 4-way benchmark (Baseline/Liger/Triton/Triton+AT)
+    ├── verify_grads.py      # Gradient equivalence verification (6 tests)
     ├── bench_moe.py         # MoE benchmark suite (correctness + perf)
     ├── bench_dense_mlp.py   # Dense MLP benchmark (correctness + perf)
     ├── bench_conv.py        # Conv fusion benchmark
     ├── bench_moe_fwdbwd.py  # MoE full fwd+bwd training step benchmark
     └── verify_e2e.py        # Full model E2E verification
 ```
+
+**Kernel pattern**: Each kernel has two variants for runtime autotune toggling:
+- `_kernel` — `@triton.jit` only (fixed block sizes, selected when `USE_AUTOTUNE=False`)
+- `_kernel_at` — `triton.autotune(configs)(_kernel)` (autotuned, selected when `USE_AUTOTUNE=True`)
+
+The `USE_AUTOTUNE` flag on each module (`dense_mlp.py`, `moe_dispatch.py`, `conv_fused.py`) is a **runtime toggle**, not import-time. Set it before calling `patch_*()` to select which variant runs.
 
 ### What's Optimized
 
@@ -340,7 +348,35 @@ patch_dense_mlp_with_triton(model)     # Dense MLP SwiGLU (custom Triton)
 .\venv\Scripts\python src/kernels/bench/bench_conv.py        # Conv fusion
 .\venv\Scripts\python src/kernels/bench/bench_moe_fwdbwd.py  # Full fwd+bwd
 .\venv\Scripts\python src/kernels/bench/verify_e2e.py        # E2E correctness
+.\venv\Scripts\python src/kernels/bench/verify_grads.py      # Gradient verification (6 tests)
 ```
+
+### Profiling with torch.profiler (OptMaxx)
+
+**Use `torch.profiler` for all performance benchmarking.** It gives kernel-level CUDA timing, memory allocation tracking, and Chrome trace visualization.
+
+```bash
+# 4-way comparison: Baseline vs Liger vs Triton(no autotune) vs Triton(autotune)
+.\venv\Scripts\python src/kernels/bench/profile_optmaxx.py --batch_size 2 --seq_len 256 --warmup 8 --active 5
+
+# With Chrome trace export (open in chrome://tracing)
+.\venv\Scripts\python src/kernels/bench/profile_optmaxx.py --batch_size 2 --seq_len 256 --traces
+
+# Sweep mode (multiple sizes)
+.\venv\Scripts\python src/kernels/bench/profile_optmaxx.py --config small
+```
+
+**Profiling best practices:**
+1. **CUDA events for wall-clock timing** — `torch.cuda.Event(enable_timing=True)` + `elapsed_time()` gives the most reliable per-step timing. Use this for the summary table.
+2. **torch.profiler for kernel breakdowns** — `prof.key_averages()` with `self_device_time_total` shows which individual CUDA kernels consume the most time.
+3. **Pre-compile before profiling** — always run 1+ warmup fwd+bwd pass BEFORE the timed warmup to trigger Triton kernel compilation.
+4. **Fresh model per config** — each patch config gets a freshly constructed model to avoid stale Triton state.
+5. **Use `USE_AUTOTUNE` flag for fair comparison** — each kernel module has a runtime-toggleable `USE_AUTOTUNE` flag. Set it before patching to test fixed-block vs autotuned kernels.
+6. **Minimum 5 warmup + 3 active iterations** — fewer iterations gives noisy results on small GPUs.
+7. **Chrome traces for deep inspection** — `prof.export_chrome_trace("trace.json")` produces a JSON file viewable in `chrome://tracing` or `ui.perfetto.dev`.
+8. **Profile both forward AND backward** — training requires both. A kernel that's fast forward but slow backward is NOT a win.
+9. **Check `record_shapes=True`** — helps identify which tensor sizes are causing slowdowns.
+10. **Liger is only RMSNorm + RoPE + CrossEntropy** — don't confuse "Liger" with "all Triton patches". Liger = production kernels from LinkedIn. Custom Triton = our fused GLU/SwiGLU/Conv kernels.
 
 ### Rules for New Kernels
 
@@ -349,12 +385,14 @@ patch_dense_mlp_with_triton(model)     # Dense MLP SwiGLU (custom Triton)
 3. **Liger-Kernel first** — check if Liger already provides the op before writing custom
 4. **cuBLAS for GEMMs** — don't write custom matmul kernels (cuBLAS is faster for typical shapes)
 5. **Monkey-patch pattern** — kernels are applied via `patch_*` functions, never modify modeling code
-6. **Benchmark before promoting** — run the bench script, record exact numbers
+6. **Benchmark before promoting** — run `profile_optmaxx.py` with torch.profiler, record exact numbers for all 4 configs (baseline, liger, triton+no-autotune, triton+autotune)
 7. **Correctness is binary** — atol=1e-3 for fp16, atol=1e-5 for fp32
 8. **Integrate into `bench/train.py` once verified** — every kernel that passes correctness AND shows measurable speedup MUST be enabled by default in `bench/train.py` (under the `if not args.no_triton:` block). Users can disable with `--no_triton`. This ensures training always uses the fastest available path.
 9. **NEVER use `register_buffer` for tensors that need gradients** — buffers are excluded from autograd. If you need a cached tensor derived from parameters, recompute it from live parameters on every forward (the `torch.cat` cost is negligible vs GEMM).
 10. **ALWAYS wrap raw Triton kernel calls in `torch.autograd.Function`** — when a Triton kernel writes into `torch.empty()`, autograd has no record of how output depends on input. The graph is severed. Use `autograd.Function` with: forward = Triton kernel (fast), backward = PyTorch ops (correct).
 11. **Run `verify_grads.py` before promoting any kernel** — `python src/kernels/bench/verify_grads.py` checks gradient equivalence, frozen params, and multi-step convergence. A kernel that passes forward correctness but fails gradient verification is BROKEN for training.
+12. **Define both `_kernel` (JIT) and `_kernel_at` (autotune) variants** — each kernel MUST have a base `@triton.jit` version and an autotuned version (`_kernel_at = triton.autotune(...)(_kernel)`). The `USE_AUTOTUNE` flag selects at runtime. This enables apples-to-apples benchmarking.
+13. **Use `torch.profiler` + CUDA events for benchmarking** — never use `time.time()` or manual CUDA events alone. `torch.profiler` gives kernel-level breakdowns + Chrome trace export. CUDA events give wall-clock timing. Use both together.
 
 ---
 
