@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
+from torch.utils.checkpoint import checkpoint
 from src.configuration_bibo import BiBoConfig
 from .norm import BiBoRMSNorm
 from .attn import BiBoAttention
@@ -35,6 +36,17 @@ class BiBoDecoderLayer(nn.Module):
         self.input_layernorm = BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # Selective gradient checkpointing flag
+        self.use_selective_checkpointing = False
+
+    def _ffn_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """FFN forward pass (used for selective checkpointing)"""
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -60,11 +72,11 @@ class BiBoDecoderLayer(nn.Module):
         )
         hidden_states = residual + attn_output
 
-        # FFN
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        # FFN with selective checkpointing
+        if self.use_selective_checkpointing and self.training:
+            hidden_states = checkpoint(self._ffn_forward, hidden_states)
+        else:
+            hidden_states = self._ffn_forward(hidden_states)
 
         outputs = (hidden_states,)
         if output_attentions:

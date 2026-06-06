@@ -285,6 +285,16 @@ class BiBoForCausalLM(BiBoPreTrainedModel, GenerationMixin):
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
 
+    def enable_selective_gradient_checkpointing(self):
+        """Enable selective gradient checkpointing (checkpoint MoE/MLP only, not attention)"""
+        for layer in self.model.layers:
+            layer.use_selective_checkpointing = True
+
+    def disable_selective_gradient_checkpointing(self):
+        """Disable selective gradient checkpointing"""
+        for layer in self.model.layers:
+            layer.use_selective_checkpointing = False
+
     def get_output_embeddings(self):
         return self.lm_head
 
