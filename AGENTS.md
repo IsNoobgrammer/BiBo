@@ -3,6 +3,12 @@
 > This file is the system prompt for any AI agent working on this repo.
 > Read this FIRST before doing anything.
 
+## ⛔ No Commits Without Asking
+
+**NEVER run `git commit` or `git push` unless the user explicitly says "commit" or "push".**
+
+The user decides when the code is stable enough to commit. Work freely, stage files, but NEVER commit without being told to.
+
 ---
 
 ## What Is BiBo
@@ -62,6 +68,10 @@ misc/kaggle/multi_gpu/             # 2×T4 parallel ablation
 └── report/                        # Next.js report (deployed via GitHub Pages)
 
 research_on_activations/           # Activation function research (gitignored)
+old_kernels/                        # Retired kernel variants (kept for re-benchmarking)
+├── dense_mlp.py                   # Forward-only variant (Triton fwd, PyTorch bwd)
+└── dense_mlp_fused.py             # Fully fused fwd+bwd single kernel
+
 legacy/                            # Old monolithic code (DO NOT USE for new work)
 ```
 
@@ -242,7 +252,7 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 
 ## Triton Kernels (`src/kernels/`)
 
-**All custom GPU kernels MUST be written in `src/kernels/`.**
+**All custom GPU kernels MUST be written in `src/kernels/`. Read the `tritonify` skill before implementing any kernel.**
 
 ### Architecture
 
@@ -255,144 +265,102 @@ src/kernels/
 ├── conv_fused.py            # Triton fused conv permute + activation + gate
 └── bench/                   # All kernel benchmarks
     ├── __init__.py
-    ├── profile_optmaxx.py   # torch.profiler 4-way benchmark (Baseline/Liger/Triton/Triton+AT)
+    ├── bench_utils.py       # Shared: benchmark_phase, gradient check, NaN check
+    ├── profile_benchmark.py # torch.profiler 4-way benchmark (Baseline/Liger/Triton/Triton+AT)
     ├── verify_grads.py      # Gradient equivalence verification (6 tests)
-    ├── bench_moe.py         # MoE benchmark suite (correctness + perf)
-    ├── bench_dense_mlp.py   # Dense MLP benchmark (correctness + perf)
+    ├── bench_moe.py         # MoE benchmark (correctness + 3-phase perf)
+    ├── bench_dense_mlp.py   # Dense MLP 3-variant head-to-head
     ├── bench_conv.py        # Conv fusion benchmark
     ├── bench_moe_fwdbwd.py  # MoE full fwd+bwd training step benchmark
     └── verify_e2e.py        # Full model E2E verification
+
+old_kernels/                  # Retired variants (kept for re-benchmarking)
+├── dense_mlp.py             # Forward-only (Triton fwd, PyTorch bwd)
+└── dense_mlp_fused.py       # Fully fused fwd+bwd single kernel
 ```
 
-**Kernel pattern**: Each kernel has two variants for runtime autotune toggling:
-- `_kernel` — `@triton.jit` only (fixed block sizes, selected when `USE_AUTOTUNE=False`)
-- `_kernel_at` — `triton.autotune(configs)(_kernel)` (autotuned, selected when `USE_AUTOTUNE=True`)
+### 4 Mandatory Rules for All Triton Kernels
 
-The `USE_AUTOTUNE` flag on each module (`dense_mlp.py`, `moe_dispatch.py`, `conv_fused.py`) is a **runtime toggle**, not import-time. Set it before calling `patch_*()` to select which variant runs.
+Every kernel implementation and benchmark MUST satisfy ALL 4 rules:
 
-### What's Optimized
+**Rule 1: Gradient Equivalence**
+> For every Triton implementation, the gradient must match the **baseline (original PyTorch)** — NOT the Triton-patched version.
 
-| Component | Kernel | Speedup | Source |
-|-----------|--------|---------|--------|
-| RMSNorm | Liger-Kernel `LigerRMSNormFunction` | 8-9x | `patch.py` |
-| RoPE | Liger-Kernel `LigerRopeFunction` | 2-3x | `patch.py` |
-| MoE GLU Activation | Custom Triton `_fused_glu_act_kernel` | 1.5x (full model) | `moe_dispatch.py` |
-| Dense MLP SwiGLU | Custom Triton `_fused_swiglu_kernel` | 1.8-2.25x kernel, 1.12x model | `dense_mlp.py` |
-| Conv Permute+Act+Gate | Custom Triton `_fused_conv_gate_multiply` | 1.34-1.41x training | `conv_fused.py` |
-| Router Scoring | Custom Triton `_fused_router_kernel` | Available | `moe_dispatch.py` |
+- Baseline = PyTorch eager with no patches applied
+- Tolerance: atol=1e-3, rtol=1e-3 (fp16); atol=1e-5 (fp32)
+- Verified by: `verify_grads.py` + per-bench gradient checks
+- If a kernel passes forward correctness but fails gradient equivalence, it is BROKEN for training
 
-### Dense MLP Kernel Design (May 28, 2026)
+**Rule 2: NaN-Free Multi-Pass Stability**
+> Every kernel must complete ≥2 full forward+backward passes with zero NaN losses.
 
-**Strategy**: Fuse gate_proj + up_proj into single GEMM + Triton SwiGLU activation.
+- Run 2+ forward+backward cycles on the same input
+- Check `loss.isnan().any() == False` after every pass
+- Check `all(p.grad is not None and not p.grad.isnan().any() for p in model.parameters())`
+- If any NaN → kernel is broken, do not proceed to benchmarking
 
-The fused SwiGLU kernel (`_fused_swiglu_kernel`) replaces:
-```python
-gate = gate_proj(x)          # (M, I) — separate GEMM
-up = up_proj(x)              # (M, I) — separate GEMM
-activated = F.silu(gate)     # (M, I) — 1 intermediate tensor
-result = activated * up      # (M, I) — 1 intermediate tensor
-```
-With:
-```python
-gate_up = F.linear(x, fused_weight)  # (M, 2I) — single GEMM (cuBLAS)
-result = triton_fused_swiglu(gate_up) # (M, I) — 1 Triton kernel, 0 intermediates
-```
+**Rule 3: Three-Phase Benchmark (Fwd / Bwd / Fwd+Bwd)**
+> Every kernel must be benchmarked separately for forward, backward, and forward+backward.
 
-**Benchmark results (RTX 3050, sm_86):**
-- Kernel-level: **1.80-2.25x** speedup (activation fusion only)
-- MLP module: **1.17-1.27x** (small/medium batches, GEMM-dominated at large)
-- Full model fwd+bwd: **1.12x** additional over existing patches
-- Memory: **20.7% reduction** (35 MB saved on dense MLP)
-- Forward correctness: max_diff=4.88e-04 (fp16), 9.54e-07 (fp32)
-- Loss: identical (8.582651 ≈ 8.582869, diff=2.17e-04)
+- **Forward-only**: `model(x)` with `torch.no_grad()` — measures inference speed
+- **Backward-only**: Run forward once, then `loss.backward()` — measures gradient computation
+- **Forward+Backward**: Full training step — measures total training cost
+- Each phase runs **≥3 warmup steps + ≥3 timed steps** before averaging
+- Report: median time (ms), speedup vs baseline, peak memory (MB)
 
-### MoE Kernel Design (May 28, 2026)
+**Rule 4: torch.profiler for All Benchmarks**
+> All benchmarks MUST use `torch.profiler` for timing and kernel breakdowns.
 
-**Strategy**: cuBLAS for GEMMs (already optimal) + Triton for activation fusion.
+- Use `torch.profiler` with `ProfilerActivity.CPU, ProfilerActivity.CUDA`
+- Use `prof.key_averages().table(sort_by="cuda_time_total")` for kernel breakdown
+- Use `torch.cuda.Event(enable_timing=True)` for wall-clock timing
+- NEVER use `time.time()` for GPU benchmarking
 
-The fused GLU activation kernel (`_fused_glu_act_kernel`) replaces:
-```python
-gate, up = gate_up.chunk(2, dim=-1)  # 2 intermediate tensors
-activated = F.silu(gate)              # 1 intermediate tensor
-result = activated * up               # 1 intermediate tensor
-```
-With a single Triton kernel that:
-1. Loads gate and up from the fused (M, 2I) tensor
-2. Applies activation (SiLU/ReLU²/Tanh) in registers
-3. Multiplies gate × up in registers
-4. Stores result — **zero intermediate tensors in global memory**
+### GEMM Policy: When to Use Triton vs cuBLAS
 
-**Benchmark results (RTX 3050, sm_86):**
-- Full model fwd+bwd: **1.51x speedup** (337ms → 223ms)
-- MoE-only forward: **1.51x** (inference), **1.34x** (small batch)
-- Forward correctness: max_diff=2.38e-07 (essentially perfect)
-- Loss: identical (8.612711 = 8.612711)
+**Default: cuBLAS** for standard large GEMMs (M ≥ 128, K, N ≥ 512).
 
-### Usage
+**Use Triton GEMMs when fusion eliminates HBM round-trips:**
 
-```python
-from src.kernels import patch_bibo_with_triton, patch_moe_with_triton, patch_dense_mlp_with_triton
+| Case | Why Triton wins | BiBo target | Expected gain |
+|------|----------------|-------------|---------------|
+| GEMM + SwiGLU activation | Fuses gate_up GEMM + silu(gate)*up into 1 kernel. Eliminates (M,2I) write + read. | Dense MLP layers | 1.2-1.5x on activation |
+| Small-M expert GEMM | cuBLAS overhead dominates at M<32. Memory-bound, not compute-bound. | MoE expert dispatch | 1.3-1.5x on MoE fwd |
+| GEMM + bias + activation | Eliminates 2 HBM round-trips. | Conv expert gate | 1.3-1.4x |
 
-model = BiBoForCausalLM(config).cuda()
-patch_bibo_with_triton(model)          # RMSNorm + RoPE (Liger-Kernel)
-patch_moe_with_triton(model)           # MoE GLU activation (custom Triton)
-patch_dense_mlp_with_triton(model)     # Dense MLP SwiGLU (custom Triton)
-# Also available: patch_conv_router_with_triton, patch_conv_expert_with_triton
-```
+**Do NOT write Triton GEMMs for:**
+- Large standard shapes (M ≥ 128) without fusion — cuBLAS tensor cores win
+- Router matmul (small N) — cuBLAS heuristic handles this efficiently
+
+**Sources:** Liger-Kernel paper (arXiv:2410.10989), TritonMoE paper (arXiv:2605.23911),
+Triton matmul tutorial, CSDN Triton matmul optimization, GitHub triton-fp8-matmul
+
+**Key insight from research:** The win from "Triton GEMM" is almost always **fusion** —
+combining the GEMM with a subsequent operation into a single kernel launch. A standalone
+Triton GEMM that replaces cuBLAS without fusion rarely wins.
+
+### Kernel Development Rules
+
+1. **Liger-Kernel first** — check if Liger already provides the op before writing custom
+2. **Monkey-patch pattern** — kernels applied via `patch_*` functions, never modify modeling code
+3. **autograd.Function mandatory** — wrap every raw Triton kernel in `torch.autograd.Function`
+4. **JIT + Autotune toggle** — every kernel has `_kernel` (fixed) and `_kernel_at` (autotuned), controlled by `USE_AUTOTUNE` flag
+5. **NEVER use `register_buffer` for tensors that need gradients** — buffers are excluded from autograd
+6. **Read the tritonify skill** — before implementing any kernel, load the `tritonify` skill and read its references
+7. **Correctness is binary** — atol=1e-3 for fp16, atol=1e-5 for fp32
+8. **Run `verify_grads.py` before promoting any kernel** — gradient equivalence check
 
 ### Running Benchmarks
 
 ```bash
-.\venv\Scripts\python src/kernels/bench/bench_dense_mlp.py   # Dense MLP
-.\venv\Scripts\python src/kernels/bench/bench_moe.py         # MoE layer
-.\venv\Scripts\python src/kernels/bench/bench_conv.py        # Conv fusion
-.\venv\Scripts\python src/kernels/bench/bench_moe_fwdbwd.py  # Full fwd+bwd
-.\venv\Scripts\python src/kernels/bench/verify_e2e.py        # E2E correctness
-.\venv\Scripts\python src/kernels/bench/verify_grads.py      # Gradient verification (6 tests)
+.\\venv\\Scripts\\python src/kernels/bench/bench_dense_mlp.py   # Dense MLP (3-variant head-to-head)
+.\\venv\\Scripts\\python src/kernels/bench/bench_moe.py         # MoE layer
+.\\venv\\Scripts\\python src/kernels/bench/bench_conv.py        # Conv fusion
+.\\venv\\Scripts\\python src/kernels/bench/bench_moe_fwdbwd.py  # Full fwd+bwd
+.\\venv\\Scripts\\python src/kernels/bench/verify_e2e.py        # E2E correctness
+.\\venv\\Scripts\\python src/kernels/bench/verify_grads.py      # Gradient verification
+.\\venv\\Scripts\\python src/kernels/bench/profile_benchmark.py # torch.profiler 4-way
 ```
-
-### Profiling with torch.profiler (OptMaxx)
-
-**Use `torch.profiler` for all performance benchmarking.** It gives kernel-level CUDA timing, memory allocation tracking, and Chrome trace visualization.
-
-```bash
-# 4-way comparison: Baseline vs Liger vs Triton(no autotune) vs Triton(autotune)
-.\venv\Scripts\python src/kernels/bench/profile_optmaxx.py --batch_size 2 --seq_len 256 --warmup 8 --active 5
-
-# With Chrome trace export (open in chrome://tracing)
-.\venv\Scripts\python src/kernels/bench/profile_optmaxx.py --batch_size 2 --seq_len 256 --traces
-
-# Sweep mode (multiple sizes)
-.\venv\Scripts\python src/kernels/bench/profile_optmaxx.py --config small
-```
-
-**Profiling best practices:**
-1. **CUDA events for wall-clock timing** — `torch.cuda.Event(enable_timing=True)` + `elapsed_time()` gives the most reliable per-step timing. Use this for the summary table.
-2. **torch.profiler for kernel breakdowns** — `prof.key_averages()` with `self_device_time_total` shows which individual CUDA kernels consume the most time.
-3. **Pre-compile before profiling** — always run 1+ warmup fwd+bwd pass BEFORE the timed warmup to trigger Triton kernel compilation.
-4. **Fresh model per config** — each patch config gets a freshly constructed model to avoid stale Triton state.
-5. **Use `USE_AUTOTUNE` flag for fair comparison** — each kernel module has a runtime-toggleable `USE_AUTOTUNE` flag. Set it before patching to test fixed-block vs autotuned kernels.
-6. **Minimum 5 warmup + 3 active iterations** — fewer iterations gives noisy results on small GPUs.
-7. **Chrome traces for deep inspection** — `prof.export_chrome_trace("trace.json")` produces a JSON file viewable in `chrome://tracing` or `ui.perfetto.dev`.
-8. **Profile both forward AND backward** — training requires both. A kernel that's fast forward but slow backward is NOT a win.
-9. **Check `record_shapes=True`** — helps identify which tensor sizes are causing slowdowns.
-10. **Liger is only RMSNorm + RoPE + CrossEntropy** — don't confuse "Liger" with "all Triton patches". Liger = production kernels from LinkedIn. Custom Triton = our fused GLU/SwiGLU/Conv kernels.
-
-### Rules for New Kernels
-
-1. **All kernels go in `src/kernels/`** — never inline Triton in modeling code
-2. **All benchmarks go in `src/kernels/bench/`** — one bench file per kernel
-3. **Liger-Kernel first** — check if Liger already provides the op before writing custom
-4. **cuBLAS for GEMMs** — don't write custom matmul kernels (cuBLAS is faster for typical shapes)
-5. **Monkey-patch pattern** — kernels are applied via `patch_*` functions, never modify modeling code
-6. **Benchmark before promoting** — run `profile_optmaxx.py` with torch.profiler, record exact numbers for all 4 configs (baseline, liger, triton+no-autotune, triton+autotune)
-7. **Correctness is binary** — atol=1e-3 for fp16, atol=1e-5 for fp32
-8. **Integrate into `bench/train.py` once verified** — every kernel that passes correctness AND shows measurable speedup MUST be enabled by default in `bench/train.py` (under the `if not args.no_triton:` block). Users can disable with `--no_triton`. This ensures training always uses the fastest available path.
-9. **NEVER use `register_buffer` for tensors that need gradients** — buffers are excluded from autograd. If you need a cached tensor derived from parameters, recompute it from live parameters on every forward (the `torch.cat` cost is negligible vs GEMM).
-10. **ALWAYS wrap raw Triton kernel calls in `torch.autograd.Function`** — when a Triton kernel writes into `torch.empty()`, autograd has no record of how output depends on input. The graph is severed. Use `autograd.Function` with: forward = Triton kernel (fast), backward = PyTorch ops (correct).
-11. **Run `verify_grads.py` before promoting any kernel** — `python src/kernels/bench/verify_grads.py` checks gradient equivalence, frozen params, and multi-step convergence. A kernel that passes forward correctness but fails gradient verification is BROKEN for training.
-12. **Define both `_kernel` (JIT) and `_kernel_at` (autotune) variants** — each kernel MUST have a base `@triton.jit` version and an autotuned version (`_kernel_at = triton.autotune(...)(_kernel)`). The `USE_AUTOTUNE` flag selects at runtime. This enables apples-to-apples benchmarking.
-13. **Use `torch.profiler` + CUDA events for benchmarking** — never use `time.time()` or manual CUDA events alone. `torch.profiler` gives kernel-level breakdowns + Chrome trace export. CUDA events give wall-clock timing. Use both together.
 
 ---
 

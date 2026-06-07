@@ -1,331 +1,180 @@
 """
-MoE Layer — Full Forward + Backward Benchmark.
+MoE Full Training Step Benchmark — Forward + Backward through full model.
 
-Measures the COMPLETE training iteration cost:
+Measures the COMPLETE training iteration cost with all MoE layers:
   forward pass + loss.backward() + gradient accumulation
 
-This is what matters for training speed.
+All benchmarks follow the 4 mandatory rules:
+  Rule 1: Gradient equivalence vs baseline
+  Rule 2: NaN-free multi-pass stability
+  Rule 3: Three-phase timing (fwd, bwd, fwd+bwd)
+  Rule 4: torch.profiler
 
 Run: .\\venv\\Scripts\\python src/kernels/bench/bench_moe_fwdbwd.py
 """
-
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, _REPO_ROOT)
 
 import torch
-import torch.nn.functional as F
-import gc
+
+from src.kernels.bench.bench_utils import (
+    benchmark_phase,
+    benchmark_three_phase,
+    check_gradient_equivalence,
+    check_nan_stability,
+    print_separator,
+    print_three_phase_results,
+)
 
 
 def make_config():
     from src.configuration_bibo import BiBoConfig
     return BiBoConfig(
-        vocab_size=5000,
-        hidden_size=512,
-        intermediate_size=1536,
-        num_hidden_layers=4,
-        num_attention_heads=8,
-        num_key_value_heads=2,
-        max_position_embeddings=2048,
-        use_ssmax=True,
-        polyglu_expert_multiplier=2,
-        special_expert_pairs=1,
-        num_experts_per_tok=4,
-        moe_intermediate_size=256,
-        use_shared_expert=True,
-        shared_expert_type="mlp",
-        router_type="mlp",
-        router_lambda=1.0,
-        router_noise=0.0,
-        moe_shared_scaling=2.0,
-        gate_type="sigmoid",
-        load_balance_strategy="none",
-        tie_word_embeddings=True,
+        vocab_size=5000, hidden_size=512, intermediate_size=1536,
+        num_hidden_layers=4, num_attention_heads=8, num_key_value_heads=2,
+        max_position_embeddings=2048, use_ssmax=True,
+        polyglu_expert_multiplier=2, special_expert_pairs=1,
+        num_experts_per_tok=4, moe_intermediate_size=256,
+        use_shared_expert=True, shared_expert_type="mlp",
+        router_type="mlp", router_lambda=1.0, router_noise=0.0,
+        moe_shared_scaling=2.0, gate_type="sigmoid",
+        load_balance_strategy="none", tie_word_embeddings=True,
     )
 
 
-def benchmark_fn(fn, warmup=10, rep=50):
-    """Precise CUDA timing."""
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    
-    times = []
-    for _ in range(rep):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        fn()
-        end.record()
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end))
-    
-    times.sort()
-    n = len(times)
-    return {
-        'median_ms': times[n // 2],
-        'mean_ms': sum(times) / n,
-        'min_ms': times[0],
-        'p95_ms': times[int(0.95 * n)],
-        'p5_ms': times[int(0.05 * n)],
-    }
-
-
-def bench_moe_layer_fwdbwd():
-    """Benchmark MoE layer forward + backward in isolation."""
-    print("\n" + "=" * 60)
-    print("MoE LAYER: Forward + Backward (isolated)")
-    print("=" * 60)
-    
-    from src.configuration_bibo import BiBoConfig
-    from src.modeling.ffn.moe import BiBoMoELayer
-    from src.kernels.moe_dispatch import patch_moe_with_triton, unpatch_moe
-    
-    device = 'cuda'
-    config = make_config()
-    
-    shapes = [
-        (2, 128, "2×128 (256 tokens)"),
-        (4, 256, "4×256 (1024 tokens)"),
-        (8, 512, "8×512 (4096 tokens)"),
-    ]
-    
-    results = []
-    
-    for batch, seq, desc in shapes:
-        print(f"\n  Shape: {desc}")
-        
-        # --- Baseline ---
-        torch.manual_seed(42)
-        moe = BiBoMoELayer(config).to(device).train()
-        x = torch.randn(batch, seq, config.hidden_size, device=device, requires_grad=True)
-        
-        def run_baseline():
-            # Simulate training: zero grad, forward, backward
-            if x.grad is not None:
-                x.grad = None
-            for p in moe.parameters():
-                if p.grad is not None:
-                    p.grad = None
-            out = moe(x)
-            loss = out.sum()
-            loss.backward()
-        
-        base_times = benchmark_fn(run_baseline, warmup=10, rep=30)
-        
-        # --- Triton ---
-        patch_moe_with_triton(moe)
-        
-        def run_triton():
-            if x.grad is not None:
-                x.grad = None
-            for p in moe.parameters():
-                if p.grad is not None:
-                    p.grad = None
-            out = moe(x)
-            loss = out.sum()
-            loss.backward()
-        
-        tri_times = benchmark_fn(run_triton, warmup=10, rep=30)
-        unpatch_moe(moe)
-        
-        speedup = base_times['median_ms'] / tri_times['median_ms']
-        results.append((desc, base_times, tri_times, speedup))
-        
-        print(f"    Baseline fwd+bwd: {base_times['median_ms']:.3f} ms (p5={base_times['p5_ms']:.3f}, p95={base_times['p95_ms']:.3f})")
-        print(f"    Triton fwd+bwd:   {tri_times['median_ms']:.3f} ms (p5={tri_times['p5_ms']:.3f}, p95={tri_times['p95_ms']:.3f})")
-        print(f"    Speedup:          {speedup:.2f}x")
-        
-        del moe, x
-        torch.cuda.empty_cache()
-        gc.collect()
-    
-    return results
-
-
-def bench_full_model_fwdbwd():
-    """Benchmark full model forward + backward (training step)."""
-    print("\n" + "=" * 60)
-    print("FULL MODEL: Forward + Backward (training step)")
-    print("=" * 60)
-    
-    from src.configuration_bibo import BiBoConfig
+def setup_models(config, device):
+    """Create baseline and triton-patched models."""
     from src.modeling.models import BiBoForCausalLM
-    from src.kernels.patch import patch_bibo_with_triton, unpatch_bibo
-    from src.kernels.moe_dispatch import patch_moe_with_triton, unpatch_moe
-    
+    from src.kernels.patch import patch_bibo_with_triton
+    from src.kernels.moe_dispatch import patch_moe_with_triton
+
+    torch.manual_seed(42)
+    baseline = BiBoForCausalLM(config).to(device).train().half()
+
+    torch.manual_seed(42)
+    triton = BiBoForCausalLM(config).to(device).train().half()
+    patch_bibo_with_triton(triton)
+    patch_moe_with_triton(triton)
+
+    return baseline, triton
+
+
+def test_gradient_equivalence(config):
+    """Rule 1: Gradient equivalence — full model with all MoE patches."""
+    print_separator("RULE 1: Gradient Equivalence (full model + MoE patches)")
+
     device = 'cuda'
-    config = make_config()
-    
-    shapes = [
-        (2, 64, "2×64 (128 tokens)"),
-        (2, 128, "2×128 (256 tokens)"),
-        (4, 128, "4×128 (512 tokens)"),
-        (4, 256, "4×256 (1024 tokens)"),
-    ]
-    
-    results = []
-    
-    for batch, seq, desc in shapes:
-        print(f"\n  Shape: {desc}")
-        
-        # --- Baseline (pure PyTorch) ---
-        torch.manual_seed(42)
-        model = BiBoForCausalLM(config).to(device).train()
-        input_ids = torch.randint(0, 5000, (batch, seq), device=device)
-        labels = input_ids.clone()
-        
-        def run_baseline():
-            model.zero_grad()
-            out = model(input_ids=input_ids, labels=labels)
-            out.loss.backward()
-        
-        base_times = benchmark_fn(run_baseline, warmup=5, rep=20)
-        
-        # --- Triton (RMSNorm + RoPE + MoE) ---
-        patch_bibo_with_triton(model)
-        patch_moe_with_triton(model)
-        
-        def run_triton():
-            model.zero_grad()
-            out = model(input_ids=input_ids, labels=labels)
-            out.loss.backward()
-        
-        tri_times = benchmark_fn(run_triton, warmup=5, rep=20)
-        
-        # --- Triton (only RMSNorm + RoPE, no MoE) ---
-        unpatch_moe(model)
-        
-        def run_liger_only():
-            model.zero_grad()
-            out = model(input_ids=input_ids, labels=labels)
-            out.loss.backward()
-        
-        liger_times = benchmark_fn(run_liger_only, warmup=5, rep=20)
-        
-        unpatch_bibo(model)
-        
-        speedup_full = base_times['median_ms'] / tri_times['median_ms']
-        speedup_liger = base_times['median_ms'] / liger_times['median_ms']
-        moe_contribution = liger_times['median_ms'] / tri_times['median_ms']
-        
-        results.append({
-            'desc': desc,
-            'baseline': base_times['median_ms'],
-            'liger_only': liger_times['median_ms'],
-            'full_triton': tri_times['median_ms'],
-            'speedup_full': speedup_full,
-            'speedup_liger': speedup_liger,
-            'moe_contribution': moe_contribution,
-        })
-        
-        print(f"    Baseline (PyTorch):     {base_times['median_ms']:.3f} ms")
-        print(f"    Liger only (Norm+RoPE): {liger_times['median_ms']:.3f} ms ({speedup_liger:.2f}x)")
-        print(f"    Full Triton (+MoE):     {tri_times['median_ms']:.3f} ms ({speedup_full:.2f}x)")
-        print(f"    MoE kernel contrib:     {moe_contribution:.2f}x additional over Liger")
-        
-        del model, input_ids, labels
-        torch.cuda.empty_cache()
-        gc.collect()
-    
-    return results
+    input_fn = lambda: torch.randint(0, 5000, (2, 64), device=device)
+    label_fn = lambda: torch.randint(0, 5000, (2, 64), device=device)
+
+    baseline, triton = setup_models(config, device)
+    result = check_gradient_equivalence(baseline, triton, input_fn, label_fn, fp16=True)
+
+    status = "PASS" if result['passed'] else "FAIL"
+    print(f"  Full model gradient equivalence: {status} (max_diff={result['max_grad_diff']:.2e})")
+
+    del baseline, triton
+    torch.cuda.empty_cache()
+    return result['passed']
 
 
-def bench_memory():
-    """Measure peak GPU memory for baseline vs Triton."""
-    print("\n" + "=" * 60)
-    print("MEMORY: Peak GPU allocation")
-    print("=" * 60)
-    
-    from src.configuration_bibo import BiBoConfig
+def test_nan_stability(config):
+    """Rule 2: NaN-free multi-pass stability on full model."""
+    print_separator("RULE 2: NaN-Free Stability (full model, 2 passes)")
+
+    device = 'cuda'
     from src.modeling.models import BiBoForCausalLM
-    from src.kernels.patch import patch_bibo_with_triton, unpatch_bibo
-    from src.kernels.moe_dispatch import patch_moe_with_triton, unpatch_moe
-    
-    device = 'cuda'
-    config = make_config()
-    batch, seq = 4, 256
-    
-    # Baseline
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.empty_cache()
-    gc.collect()
-    
+    from src.kernels.patch import patch_bibo_with_triton
+    from src.kernels.moe_dispatch import patch_moe_with_triton
+
     torch.manual_seed(42)
-    model = BiBoForCausalLM(config).to(device).train()
-    input_ids = torch.randint(0, 5000, (batch, seq), device=device)
-    labels = input_ids.clone()
-    
-    model.zero_grad()
-    out = model(input_ids=input_ids, labels=labels)
-    out.loss.backward()
-    
-    base_peak = torch.cuda.max_memory_allocated() / 1024**2  # MB
-    
-    del model, out
-    torch.cuda.empty_cache()
-    gc.collect()
-    
-    # Triton
-    torch.cuda.reset_peak_memory_stats()
-    
-    torch.manual_seed(42)
-    model = BiBoForCausalLM(config).to(device).train()
+    model = BiBoForCausalLM(config).to(device).train().half()
     patch_bibo_with_triton(model)
     patch_moe_with_triton(model)
-    
-    model.zero_grad()
-    out = model(input_ids=input_ids, labels=labels)
-    out.loss.backward()
-    
-    tri_peak = torch.cuda.max_memory_allocated() / 1024**2  # MB
-    
-    del model, out
+
+    input_fn = lambda: torch.randint(0, 5000, (2, 64), device=device)
+    label_fn = lambda: torch.randint(0, 5000, (2, 64), device=device)
+
+    result = check_nan_stability(model, input_fn, label_fn, n_passes=2)
+    status = "PASS" if result['passed'] else "FAIL"
+    print(f"  Full model NaN stability: {status}")
+    for pr in result['pass_results']:
+        print(f"    Pass {pr['pass']}: loss={pr['loss_value']:.6f}, nan={pr['has_nan_loss']}, nan_grad={pr['has_nan_grad']}")
+
+    del model
     torch.cuda.empty_cache()
-    gc.collect()
-    
-    savings = base_peak - tri_peak
-    print(f"  Baseline peak: {base_peak:.1f} MB")
-    print(f"  Triton peak:   {tri_peak:.1f} MB")
-    print(f"  Savings:       {savings:.1f} MB ({savings/base_peak*100:.1f}%)")
-    
-    return base_peak, tri_peak
+    return result['passed']
+
+
+def test_three_phase_performance(config):
+    """Rule 3: Three-phase benchmark — baseline vs triton full model."""
+    print_separator("RULE 3: Three-Phase Performance (full model)")
+
+    device = 'cuda'
+    batch, seq = 4, 256
+
+    input_fn = lambda: torch.randint(0, 5000, (batch, seq), device=device)
+    label_fn = lambda: torch.randint(0, 5000, (batch, seq), device=device)
+
+    all_results = {}
+    baseline_results = None
+
+    for name in ["baseline", "triton_all"]:
+        print(f"\n  Benchmarking {name}...")
+        baseline, triton = setup_models(config, device)
+        model = baseline if name == "baseline" else triton
+
+        result = benchmark_three_phase(
+            model=model,
+            input_fn=lambda: input_fn(),
+            label_fn=lambda: label_fn(),
+            n_warmup=5, n_steps=3, do_profile=True,
+        )
+
+        all_results[name] = result
+        if name == "baseline":
+            baseline_results = result
+
+        print_three_phase_results(result, name, baseline_results)
+        del baseline, triton
+        torch.cuda.empty_cache()
+
+    # Summary
+    print_separator("FULL MODEL PERFORMANCE SUMMARY")
+    base_fb = baseline_results['fwd_bwd']['median_ms']
+    print(f"  {'Variant':20s} | {'Fwd (ms)':>10s} | {'Bwd (ms)':>10s} | {'Fwd+Bwd (ms)':>12s} | {'Speedup':>10s}")
+    print(f"  {'-'*20}-+-{'-'*10}-+-{'-'*10}-+-{'-'*12}-+-{'-'*10}")
+    for name in all_results:
+        r = all_results[name]
+        fb = r['fwd_bwd']['median_ms']
+        speedup = base_fb / fb if fb > 0 else 0
+        print(f"  {name:20s} | {r['forward']['median_ms']:10.3f} | {r['backward']['median_ms']:10.3f} | {fb:12.3f} | {speedup:9.2f}x")
+
+    return all_results
+
+
+def main():
+    print("=" * 70)
+    print("  BiBo Full Model MoE Benchmark — Forward + Backward")
+    print("=" * 70)
+    print(f"Device: {torch.cuda.get_device_name(0)}")
+    print(f"PyTorch: {torch.__version__}")
+
+    config = make_config()
+
+    grad_ok = test_gradient_equivalence(config)
+    nan_ok = test_nan_stability(config)
+    perf_results = test_three_phase_performance(config)
+
+    print_separator("FINAL VERDICT")
+    print(f"  Rule 1 (Grad Equiv):  {'PASS' if grad_ok else 'FAIL'}")
+    print(f"  Rule 2 (NaN Stable):  {'PASS' if nan_ok else 'FAIL'}")
+    print(f"  Rule 3 (Perf):        See table above")
+    print(f"  Rule 4 (Profiler):    See profiler output above")
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("BiBo MoE — Full Forward+Backward Benchmark")
-    print("=" * 60)
-    print(f"Device: {torch.cuda.get_device_name(0)}")
-    print(f"Compute: sm_{torch.cuda.get_device_capability()[0]}{torch.cuda.get_device_capability()[1]}")
-    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
-    print(f"PyTorch: {torch.__version__}")
-    import triton
-    print(f"Triton: {triton.__version__}")
-    
-    # 1. MoE layer isolated
-    moe_results = bench_moe_layer_fwdbwd()
-    
-    # 2. Full model
-    model_results = bench_full_model_fwdbwd()
-    
-    # 3. Memory
-    base_mem, tri_mem = bench_memory()
-    
-    # Final summary
-    print("\n" + "=" * 60)
-    print("FINAL SUMMARY")
-    print("=" * 60)
-    
-    print("\n  MoE Layer (fwd+bwd):")
-    print(f"  {'Shape':<25} {'Baseline':>10} {'Triton':>10} {'Speedup':>8}")
-    for desc, base, tri, spd in moe_results:
-        print(f"  {desc:<25} {base['median_ms']:>8.3f}ms {tri['median_ms']:>8.3f}ms {spd:>6.2f}x")
-    
-    print("\n  Full Model (fwd+bwd):")
-    print(f"  {'Shape':<25} {'Baseline':>10} {'Liger':>10} {'Full':>10} {'Speedup':>8}")
-    for r in model_results:
-        print(f"  {r['desc']:<25} {r['baseline']:>8.3f}ms {r['liger_only']:>8.3f}ms {r['full_triton']:>8.3f}ms {r['speedup_full']:>6.2f}x")
-    
-    print(f"\n  Memory: {base_mem:.0f}MB → {tri_mem:.0f}MB ({base_mem-tri_mem:.0f}MB saved)")
+    main()

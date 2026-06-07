@@ -15,7 +15,7 @@ bash bench/run.sh
 
 ## What This Does
 
-Trains a ~50M parameter baseline BiMo (MLP router, shared expert, uniform SwiGLU experts) on language modeling using the QTK-81K tokenizer dataset. Target: < 2.8 val loss.
+Trains a ~50M parameter baseline BiBo (MLP router, shared expert, uniform SwiGLU experts) on language modeling using the QTK-81K tokenizer dataset. Target: < 2.8 val loss.
 
 ## Key Settings
 

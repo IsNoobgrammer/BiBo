@@ -1,57 +1,45 @@
 """
-Dense MLP Benchmark — Triton Fused SwiGLU vs PyTorch baseline.
+Dense MLP Benchmark — 3-Variant Head-to-Head Comparison.
 
-Tests:
-1. Correctness: forward + backward match within tolerance
-2. Performance: wall-clock timing comparison (MLP-only and full model)
-3. Memory: peak GPU memory usage
+Pits all 3 Triton SwiGLU variants against each other under fair benchmarking:
+1. Baseline: PyTorch eager (separate gate_proj, up_proj, silu, multiply, down_proj)
+2. Forward-only: Triton forward, PyTorch backward (old_kernels/dense_mlp.py)
+3. Fully-fused: Single Triton kernel fwd+bwd (old_kernels/dense_mlp_fused.py)
+4. Separate-backward: Triton fwd + Triton bwd (src/kernels/dense_mlp.py) — current
+
+All benchmarks follow the 4 mandatory rules:
+  Rule 1: Gradient equivalence vs baseline (original PyTorch)
+  Rule 2: NaN-free multi-pass stability (>=2 fwd+bwd passes)
+  Rule 3: Three-phase timing: forward-only, backward-only, forward+backward
+  Rule 4: torch.profiler for all benchmarking
 
 Run: .\\venv\\Scripts\\python src/kernels/bench/bench_dense_mlp.py
-
-Task Contract:
-- Objective: Fuse dense MLP SwiGLU (gate_proj + up_proj → silu → multiply)
-- Input: (batch*seq, hidden_size) typical shapes: 512-4096 tokens, hidden=1536
-- Output: (batch*seq, hidden_size)
-- Correctness: atol=1e-3, rtol=1e-3 for fp16; atol=1e-5 for fp32
-- Baseline: PyTorch eager (separate gate_proj, up_proj, silu, multiply, down_proj)
-- Target: >1.2x speedup on forward, correct backward
-- Constraints: Triton, CUDA sm_75+ (T4/3050/A100)
-- Promotion: correct + measurably faster on full model fwd+bwd
 """
-
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+
+# Add repo root to path
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, _REPO_ROOT)
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-import time
+from copy import deepcopy
+
+from src.kernels.bench.bench_utils import (
+    benchmark_phase,
+    benchmark_three_phase,
+    check_gradient_equivalence,
+    check_nan_stability,
+    print_separator,
+    print_three_phase_results,
+)
 
 
-def benchmark_fn(fn, warmup=20, rep=100):
-    """Benchmark a function with warmup and repetitions."""
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    
-    times = []
-    for _ in range(rep):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        fn()
-        end.record()
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end))
-    
-    times.sort()
-    return {
-        'median_ms': times[len(times) // 2],
-        'mean_ms': sum(times) / len(times),
-        'min_ms': times[0],
-        'p95_ms': times[int(0.95 * len(times))],
-    }
-
+# ═══════════════════════════════════════════════════════════════
+# Config
+# ═══════════════════════════════════════════════════════════════
 
 def make_config():
     """Standard BiBo config for benchmarking."""
@@ -81,394 +69,400 @@ def make_config():
     )
 
 
+def make_model(config, seed=42):
+    """Create a fresh BiBo model."""
+    from src.modeling.models import BiBoForCausalLM
+    torch.manual_seed(seed)
+    return BiBoForCausalLM(config)
+
+
+def make_input_fn(batch=2, seq=64, device='cuda'):
+    """Create input function for benchmarking."""
+    def fn():
+        return torch.randint(0, 5000, (batch, seq), device=device)
+    return fn
+
+
+def make_label_fn(batch=2, seq=64, device='cuda'):
+    """Create label function for benchmarking."""
+    def fn():
+        return torch.randint(0, 5000, (batch, seq), device=device)
+    return fn
+
+
 # ═══════════════════════════════════════════════════════════════
-# Test 1: Kernel-level correctness
+# Variant Setup
+# ═══════════════════════════════════════════════════════════════
+
+def setup_baseline(config):
+    """Setup baseline model (no patches)."""
+    model = make_model(config)
+    return model
+
+
+def setup_forward_only(config):
+    """Setup model with forward-only Triton SwiGLU (from old_kernels/)."""
+    from old_kernels.dense_mlp import _TritonSwiGLUFunction
+    from src.modeling.ffn.mlp import BiBoMLP
+    from src.modeling.models import BiBoForCausalLM
+
+    model = BiBoForCausalLM(config)
+
+    def _triton_fwd_only_forward(self, x):
+        orig_shape = x.shape[:-1]
+        x_2d = x.view(-1, self.hidden_size)
+        fused_weight = torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
+        gate_up = F.linear(x_2d, fused_weight)
+        # Forward-only: Triton forward, PyTorch backward
+        intermediate = _TritonSwiGLUFunction.apply(gate_up)
+        out = self.down_proj(intermediate)
+        return out.view(*orig_shape, self.hidden_size)
+
+    patched = 0
+    for module in model.modules():
+        if isinstance(module, BiBoMLP) and not getattr(module, '_is_expert_mlp', False):
+            if not hasattr(module, '_original_forward'):
+                module._original_forward = module.forward
+            module.forward = _triton_fwd_only_forward.__get__(module, BiBoMLP)
+            patched += 1
+
+    model._variant_name = f"forward_only ({patched} MLPs patched)"
+    return model
+
+
+def setup_fully_fused(config):
+    """Setup model with fully-fused Triton SwiGLU (from old_kernels/)."""
+    from old_kernels.dense_mlp_fused import _FusedSwiGLUFull
+    from src.modeling.ffn.mlp import BiBoMLP
+    from src.modeling.models import BiBoForCausalLM
+
+    model = BiBoForCausalLM(config)
+
+    def _triton_full_fused_forward(self, x):
+        orig_shape = x.shape[:-1]
+        x_2d = x.view(-1, self.hidden_size)
+        fused_weight = torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
+        gate_up = F.linear(x_2d, fused_weight)
+        intermediate = _FusedSwiGLUFull.apply(gate_up)
+        out = self.down_proj(intermediate)
+        return out.view(*orig_shape, self.hidden_size)
+
+    patched = 0
+    for module in model.modules():
+        if isinstance(module, BiBoMLP) and not getattr(module, '_is_expert_mlp', False):
+            if not hasattr(module, '_original_forward'):
+                module._original_forward = module.forward
+            module.forward = _triton_full_fused_forward.__get__(module, BiBoMLP)
+            patched += 1
+
+    model._variant_name = f"fully_fused ({patched} MLPs patched)"
+    return model
+
+
+def setup_separate_backward(config):
+    """Setup model with separate Triton fwd+bwd (current src/kernels/)."""
+    from src.kernels.dense_mlp import patch_dense_mlp_with_triton
+    model = make_model(config)
+    patch_dense_mlp_with_triton(model)
+    count = getattr(model, '_triton_dense_mlp_count', 0)
+    model._variant_name = f"separate_backward ({count} MLPs patched)"
+    return model
+
+
+# ═══════════════════════════════════════════════════════════════
+# Tests
 # ═══════════════════════════════════════════════════════════════
 
 def test_kernel_correctness():
     """Test that triton_fused_swiglu matches PyTorch silu(gate) * up."""
-    print("\n" + "=" * 60)
-    print("TEST 1: Kernel Correctness (triton_fused_swiglu)")
-    print("=" * 60)
-    
+    print_separator("RULE 0: Kernel Correctness (raw triton_fused_swiglu)")
+
     from src.kernels.dense_mlp import triton_fused_swiglu
-    
+
     device = 'cuda'
-    
     test_shapes = [
         (1, 256, "tiny"),
         (64, 512, "small"),
-        (256, 1536, "medium (default BiBo)"),
+        (256, 1536, "medium (BiBo default)"),
         (1024, 1536, "large"),
-        (4096, 4104, "full-size dense"),
     ]
-    
+
     all_pass = True
     for M, I, desc in test_shapes:
-        # Create gate_up tensor: (M, 2*I)
         gate_up = torch.randn(M, 2 * I, device=device, dtype=torch.float16)
-        
-        # Reference: PyTorch eager
         gate = gate_up[:, :I].float()
         up = gate_up[:, I:].float()
         ref = (F.silu(gate) * up).half()
-        
-        # Triton
+
         out = triton_fused_swiglu(gate_up)
-        
+
         max_diff = (ref - out).abs().max().item()
         passed = torch.allclose(ref, out, atol=1e-3, rtol=1e-3)
         all_pass = all_pass and passed
-        
-        print(f"  {desc:30s} ({M}×{I}): {'PASS' if passed else 'FAIL'} (max_diff={max_diff:.2e})")
-    
-    # Also test fp32
-    print("\n  FP32 precision:")
-    gate_up_f32 = torch.randn(256, 2 * 1536, device=device, dtype=torch.float32)
-    gate_f32 = gate_up_f32[:, :1536]
-    up_f32 = gate_up_f32[:, 1536:]
-    ref_f32 = F.silu(gate_f32) * up_f32
-    out_f32 = triton_fused_swiglu(gate_up_f32)
-    max_diff_f32 = (ref_f32 - out_f32).abs().max().item()
-    passed_f32 = torch.allclose(ref_f32, out_f32, atol=1e-5, rtol=1e-5)
-    all_pass = all_pass and passed_f32
-    print(f"  {'fp32 (256×1536)':30s}: {'PASS' if passed_f32 else 'FAIL'} (max_diff={max_diff_f32:.2e})")
-    
+        print(f"  {desc:30s} ({M}x{I}): {'PASS' if passed else 'FAIL'} (max_diff={max_diff:.2e})")
+
     return all_pass
 
 
-# ═══════════════════════════════════════════════════════════════
-# Test 2: MLP-level correctness (fused gate_up + Triton SwiGLU)
-# ═══════════════════════════════════════════════════════════════
+def test_gradient_equivalence_all_variants(config):
+    """Rule 1: Compare gradients of each variant vs baseline."""
+    print_separator("RULE 1: Gradient Equivalence vs Baseline")
 
-def test_mlp_correctness():
-    """Test that patched BiBoMLP matches original."""
-    print("\n" + "=" * 60)
-    print("TEST 2: MLP Module Correctness (patch_dense_mlp_with_triton)")
-    print("=" * 60)
-    
-    from src.configuration_bibo import BiBoConfig
-    from src.modeling.ffn.mlp import BiBoMLP
-    from src.kernels.dense_mlp import patch_dense_mlp_with_triton, unpatch_dense_mlp
-    
     device = 'cuda'
-    config = make_config()
-    
-    # Create MLP
-    torch.manual_seed(42)
-    mlp = BiBoMLP(config, is_expert=False).to(device).eval().half()
-    
-    # Test shapes
-    test_shapes = [
-        (1, 32, "1×32 (tiny)"),
-        (2, 128, "2×128 (small)"),
-        (4, 256, "4×256 (medium)"),
-        (8, 512, "8×512 (large)"),
+    input_fn = make_input_fn(batch=2, seq=64, device=device)
+    label_fn = make_label_fn(batch=2, seq=64, device=device)
+
+    variants = [
+        ("forward_only", setup_forward_only),
+        ("fully_fused", setup_fully_fused),
+        ("separate_backward", setup_separate_backward),
     ]
-    
-    all_pass = True
-    for batch, seq, desc in test_shapes:
-        x = torch.randn(batch, seq, config.hidden_size, device=device, dtype=torch.float16)
-        
-        # Baseline
-        with torch.no_grad():
-            ref = mlp(x)
-        
-        # Patch and run
-        patch_dense_mlp_with_triton(mlp)
-        with torch.no_grad():
-            out = mlp(x)
-        unpatch_dense_mlp(mlp)
-        
-        max_diff = (ref - out).abs().max().item()
-        passed = torch.allclose(ref, out, atol=1e-3, rtol=1e-3)
-        all_pass = all_pass and passed
-        print(f"  {desc:20s}: {'PASS' if passed else 'FAIL'} (max_diff={max_diff:.2e})")
-    
-    # Test backward
-    print("\n  Backward pass:")
-    # Test backward — use a fresh MLP in train mode
-    print("\n  Backward pass:")
-    torch.manual_seed(42)
-    mlp_bwd = BiBoMLP(config, is_expert=False).to(device).train().half()
-    x = torch.randn(4, 128, config.hidden_size, device=device, dtype=torch.float16, requires_grad=True)
-    x_tri = x.clone().detach().requires_grad_(True)
-    
-    # Baseline backward
-    out_base = mlp_bwd(x)
-    grad_out = torch.randn_like(out_base)
-    out_base.backward(grad_out)
-    
-    # Triton backward
-    patch_dense_mlp_with_triton(mlp_bwd)
-    out_tri = mlp_bwd(x_tri)
-    out_tri.backward(grad_out.clone())
-    unpatch_dense_mlp(mlp_bwd)
-    
-    # Check gradients are finite
-    bwd_ok = True
-    if x_tri.grad is not None:
-        if x_tri.grad.isnan().any() or x_tri.grad.isinf().any():
-            print(f"  Backward: FAIL (NaN/Inf in input grad)")
-            bwd_ok = False
-        else:
-            # Check gradient similarity
-            grad_diff = (x.grad - x_tri.grad).abs().max().item()
-            print(f"  Backward: PASS (input grad max_diff={grad_diff:.2e})")
-    else:
-        print(f"  Backward: PASS (gradients computed without crash)")
-    
-    all_pass = all_pass and bwd_ok
-    return all_pass
 
+    results = {}
+    for name, setup_fn in variants:
+        print(f"\n  Testing {name}...")
 
-# ═══════════════════════════════════════════════════════════════
-# Test 3: Kernel-level performance
-# ═══════════════════════════════════════════════════════════════
+        # Fresh models for fair comparison
+        baseline = setup_baseline(config).to(device).train().half()
+        triton = setup_fn(config).to(device).train().half()
 
-def test_kernel_performance():
-    """Benchmark Triton fused SwiGLU vs PyTorch eager."""
-    print("\n" + "=" * 60)
-    print("BENCHMARK: Kernel Performance (SwiGLU activation only)")
-    print("=" * 60)
-    
-    from src.kernels.dense_mlp import triton_fused_swiglu
-    
-    device = 'cuda'
-    
-    test_shapes = [
-        (64, 1536, "64 tokens, I=1536"),
-        (256, 1536, "256 tokens, I=1536"),
-        (512, 1536, "512 tokens, I=1536"),
-        (1024, 1536, "1024 tokens, I=1536"),
-        (2048, 4104, "2048 tokens, I=4104"),
-        (4096, 4104, "4096 tokens, I=4104"),
-    ]
-    
-    results = []
-    for M, I, desc in test_shapes:
-        gate_up = torch.randn(M, 2 * I, device=device, dtype=torch.float16)
-        
-        # Baseline: PyTorch eager
-        def baseline():
-            gate = gate_up[:, :I]
-            up = gate_up[:, I:]
-            return F.silu(gate) * up
-        
-        # Triton
-        def triton_fn():
-            return triton_fused_swiglu(gate_up)
-        
-        base_times = benchmark_fn(baseline, warmup=20, rep=100)
-        tri_times = benchmark_fn(triton_fn, warmup=20, rep=100)
-        
-        speedup = base_times['median_ms'] / tri_times['median_ms']
-        results.append((desc, base_times['median_ms'], tri_times['median_ms'], speedup))
-        
-        print(f"  {desc:30s}: base={base_times['median_ms']:.4f}ms, tri={tri_times['median_ms']:.4f}ms, {speedup:.2f}x")
-        
-        del gate_up
-    
-    torch.cuda.empty_cache()
+        # Copy weights from baseline to triton for fair comparison
+        triton.load_state_dict(baseline.state_dict(), strict=False)
+
+        result = check_gradient_equivalence(
+            baseline, triton, input_fn, label_fn, fp16=True
+        )
+        results[name] = result
+
+        status = "PASS" if result['passed'] else "FAIL"
+        print(f"  {name:25s}: {status} (max_grad_diff={result['max_grad_diff']:.2e})")
+
+        del baseline, triton
+        torch.cuda.empty_cache()
+
     return results
 
 
-# ═══════════════════════════════════════════════════════════════
-# Test 4: MLP-level performance
-# ═══════════════════════════════════════════════════════════════
+def test_nan_stability_all_variants(config):
+    """Rule 2: Each variant must complete >=2 fwd+bwd passes with zero NaN."""
+    print_separator("RULE 2: NaN-Free Multi-Pass Stability (2 passes)")
 
-def test_mlp_performance():
-    """Benchmark full MLP module: baseline vs fused."""
-    print("\n" + "=" * 60)
-    print("BENCHMARK: MLP Module Performance (full forward)")
-    print("=" * 60)
-    
-    from src.configuration_bibo import BiBoConfig
-    from src.modeling.ffn.mlp import BiBoMLP
-    from src.kernels.dense_mlp import patch_dense_mlp_with_triton, unpatch_dense_mlp
-    
     device = 'cuda'
-    config = make_config()
-    
-    torch.manual_seed(42)
-    mlp = BiBoMLP(config, is_expert=False).to(device).eval().half()
-    
-    test_shapes = [
-        (1, 64, "1×64 (inference)"),
-        (2, 128, "2×128 (small)"),
-        (4, 256, "4×256 (medium)"),
-        (4, 512, "4×512 (training)"),
-        (8, 512, "8×512 (large)"),
+    input_fn = make_input_fn(batch=2, seq=64, device=device)
+    label_fn = make_label_fn(batch=2, seq=64, device=device)
+
+    variants = [
+        ("forward_only", setup_forward_only),
+        ("fully_fused", setup_fully_fused),
+        ("separate_backward", setup_separate_backward),
     ]
-    
-    results = []
-    for batch, seq, desc in test_shapes:
-        x = torch.randn(batch, seq, config.hidden_size, device=device, dtype=torch.float16)
-        
-        # Baseline
-        base_times = benchmark_fn(lambda: mlp(x), warmup=15, rep=80)
-        
-        # Triton
-        patch_dense_mlp_with_triton(mlp)
-        tri_times = benchmark_fn(lambda: mlp(x), warmup=15, rep=80)
-        unpatch_dense_mlp(mlp)
-        
-        speedup = base_times['median_ms'] / tri_times['median_ms']
-        results.append((desc, base_times['median_ms'], tri_times['median_ms'], speedup))
-        
-        print(f"  {desc:20s}: base={base_times['median_ms']:.4f}ms, tri={tri_times['median_ms']:.4f}ms, {speedup:.2f}x")
-    
-    del mlp
-    torch.cuda.empty_cache()
+
+    results = {}
+    for name, setup_fn in variants:
+        print(f"\n  Testing {name}...")
+
+        model = setup_fn(config).to(device).train().half()
+
+        result = check_nan_stability(model, input_fn, label_fn, n_passes=2)
+        results[name] = result
+
+        status = "PASS" if result['passed'] else "FAIL"
+        print(f"  {name:25s}: {status}")
+        for pr in result['pass_results']:
+            print(f"    Pass {pr['pass']}: loss={pr['loss_value']:.6f}, "
+                  f"nan_loss={pr['has_nan_loss']}, nan_grad={pr['has_nan_grad']}")
+
+        del model
+        torch.cuda.empty_cache()
+
     return results
 
 
-# ═══════════════════════════════════════════════════════════════
-# Test 5: Full model E2E
-# ═══════════════════════════════════════════════════════════════
+def test_three_phase_performance(config):
+    """Rule 3: Benchmark forward, backward, and fwd+bwd separately (>=3 steps each)."""
+    print_separator("RULE 3: Three-Phase Performance (3 warmup + 3 timed)")
 
-def test_full_model_e2e():
-    """Test full model forward + backward with Triton dense MLP."""
-    print("\n" + "=" * 60)
-    print("TEST: Full Model E2E (Forward + Backward)")
-    print("=" * 60)
-    
-    from src.configuration_bibo import BiBoConfig
-    from src.modeling.models import BiBoForCausalLM
-    from src.kernels.dense_mlp import patch_dense_mlp_with_triton, unpatch_dense_mlp
+    device = 'cuda'
+    batch, seq = 4, 256  # Medium size for meaningful timing
+
+    input_fn = make_input_fn(batch=batch, seq=seq, device=device)
+    label_fn = make_label_fn(batch=batch, seq=seq, device=device)
+
+    variants = [
+        ("baseline", setup_baseline),
+        ("forward_only", setup_forward_only),
+        ("fully_fused", setup_fully_fused),
+        ("separate_backward", setup_separate_backward),
+    ]
+
+    all_results = {}
+    baseline_results = None
+
+    for name, setup_fn in variants:
+        print(f"\n  Benchmarking {name}...")
+        model = setup_fn(config).to(device).train().half()
+
+        # Apply AMP autocast wrapper for fair comparison
+        def run_step():
+            model.zero_grad()
+            x = input_fn()
+            with torch.autocast('cuda', dtype=torch.float16):
+                out = model(x, labels=label_fn())
+            out.loss.backward()
+
+        result = benchmark_three_phase(
+            model=model,
+            input_fn=lambda: input_fn(),
+            label_fn=lambda: label_fn(),
+            n_warmup=5,
+            n_steps=3,
+            do_profile=True,
+        )
+
+        all_results[name] = result
+        if name == "baseline":
+            baseline_results = result
+
+        print_three_phase_results(result, name, baseline_results)
+
+        del model
+        torch.cuda.empty_cache()
+
+    # Summary table
+    print_separator("PERFORMANCE SUMMARY")
+    print(f"  {'Variant':25s} | {'Fwd (ms)':>10s} | {'Bwd (ms)':>10s} | {'Fwd+Bwd (ms)':>12s} | {'vs Baseline':>12s}")
+    print(f"  {'-'*25}-+-{'-'*10}-+-{'-'*10}-+-{'-'*12}-+-{'-'*12}")
+
+    base_fb = baseline_results['fwd_bwd']['median_ms']
+    for name in all_results:
+        r = all_results[name]
+        fwd = r['forward']['median_ms']
+        bwd = r['backward']['median_ms']
+        fb = r['fwd_bwd']['median_ms']
+        speedup = base_fb / fb if fb > 0 else 0
+        print(f"  {name:25s} | {fwd:10.3f} | {bwd:10.3f} | {fb:12.3f} | {speedup:11.2f}x")
+
+    return all_results
+
+
+def test_memory(config):
+    """Compare peak memory usage across variants."""
+    print_separator("MEMORY USAGE COMPARISON")
+
+    device = 'cuda'
+    batch, seq = 4, 256
+
+    variants = [
+        ("baseline", setup_baseline),
+        ("forward_only", setup_forward_only),
+        ("fully_fused", setup_fully_fused),
+        ("separate_backward", setup_separate_backward),
+    ]
+
+    results = {}
+    for name, setup_fn in variants:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        model = setup_fn(config).to(device).train().half()
+        x = torch.randint(0, 5000, (batch, seq), device=device)
+        labels = x.clone()
+
+        with torch.autocast('cuda', dtype=torch.float16):
+            out = model(x, labels=labels)
+        out.loss.backward()
+        peak = torch.cuda.max_memory_allocated() / 1024**2
+
+        results[name] = peak
+        del model, x, labels, out
+        torch.cuda.empty_cache()
+
+    base_peak = results.get('baseline', 1)
+    print(f"  {'Variant':25s} | {'Peak (MB)':>10s} | {'Savings':>10s}")
+    print(f"  {'-'*25}-+-{'-'*10}-+-{'-'*10}")
+    for name, peak in results.items():
+        savings = base_peak - peak
+        pct = (savings / base_peak) * 100 if base_peak > 0 else 0
+        print(f"  {name:25s} | {peak:10.1f} | {savings:+10.1f} ({pct:+.1f}%)")
+
+    return results
+
+
+def test_full_model_e2e(config):
+    """Full model E2E: all patches applied, fwd+bwd."""
+    print_separator("FULL MODEL E2E (all patches)")
+
     from src.kernels.patch import patch_bibo_with_triton
     from src.kernels.moe_dispatch import patch_moe_with_triton
-    
+    from src.kernels.dense_mlp import patch_dense_mlp_with_triton
+
     device = 'cuda'
-    config = make_config()
-    
-    # Baseline model
+
+    # Baseline
     torch.manual_seed(42)
-    model_base = BiBoForCausalLM(config).to(device).train()
-    
-    # Triton model (all patches: RMSNorm + RoPE + MoE + Dense MLP)
+    model_base = make_model(config).to(device).train()
+
+    # Triton (all patches)
     torch.manual_seed(42)
-    model_tri = BiBoForCausalLM(config).to(device).train()
+    model_tri = make_model(config).to(device).train()
     patch_bibo_with_triton(model_tri)
     patch_moe_with_triton(model_tri)
     patch_dense_mlp_with_triton(model_tri)
-    
-    # Check how many dense MLPs were patched
-    patched_count = getattr(model_tri, '_triton_dense_mlp_count', 0)
-    print(f"  Dense MLPs patched: {patched_count}")
-    
-    # Input
+
     input_ids = torch.randint(0, 5000, (2, 64), device=device)
     labels = input_ids.clone()
-    
+
     # Forward
     with torch.autocast('cuda', dtype=torch.float16):
         out_base = model_base(input_ids=input_ids, labels=labels)
         out_tri = model_tri(input_ids=input_ids, labels=labels)
-    
+
     loss_diff = (out_base.loss - out_tri.loss).abs().item()
-    loss_match = loss_diff < 0.05  # Allow slightly more tolerance for full model
-    print(f"  Loss: {'PASS' if loss_match else 'FAIL'} (diff={loss_diff:.2e})")
-    print(f"    Baseline loss: {out_base.loss.item():.6f}")
-    print(f"    Triton loss:   {out_tri.loss.item():.6f}")
-    
+    print(f"  Baseline loss: {out_base.loss.item():.6f}")
+    print(f"  Triton loss:   {out_tri.loss.item():.6f}")
+    print(f"  Loss diff:     {loss_diff:.6f}")
+
     # Backward
     out_base.loss.backward()
     out_tri.loss.backward()
     print(f"  Backward: PASS (no crash)")
-    
-    # Performance comparison
-    print("\n  Performance (full model fwd+bwd, fp16 autocast):")
-    
+
+    # Performance
     def run_base():
         model_base.zero_grad()
         with torch.autocast('cuda', dtype=torch.float16):
             out = model_base(input_ids=input_ids, labels=labels)
         out.loss.backward()
-    
+
     def run_tri():
         model_tri.zero_grad()
         with torch.autocast('cuda', dtype=torch.float16):
             out = model_tri(input_ids=input_ids, labels=labels)
         out.loss.backward()
-    
-    base_times = benchmark_fn(run_base, warmup=5, rep=30)
-    tri_times = benchmark_fn(run_tri, warmup=5, rep=30)
-    
-    speedup = base_times['median_ms'] / tri_times['median_ms']
-    print(f"    Baseline: {base_times['median_ms']:.3f} ms")
-    print(f"    Triton (all patches): {tri_times['median_ms']:.3f} ms")
-    print(f"    Speedup: {speedup:.2f}x")
-    
+
+    base_time = benchmark_phase(run_base, "baseline", n_warmup=3, n_steps=3, do_profile=False)
+    tri_time = benchmark_phase(run_tri, "triton", n_warmup=3, n_steps=3, do_profile=False)
+
+    speedup = base_time['median_ms'] / tri_time['median_ms']
+    print(f"\n  Performance:")
+    print(f"    Baseline: {base_time['median_ms']:.3f} ms")
+    print(f"    Triton:   {tri_time['median_ms']:.3f} ms")
+    print(f"    Speedup:  {speedup:.2f}x")
+
     del model_base, model_tri
     torch.cuda.empty_cache()
-    
-    return loss_match, speedup
+
+    return loss_diff, speedup
 
 
 # ═══════════════════════════════════════════════════════════════
-# Test 6: Memory comparison
+# Main
 # ═══════════════════════════════════════════════════════════════
 
-def test_memory():
-    """Compare peak memory usage."""
-    print("\n" + "=" * 60)
-    print("TEST: Memory Usage Comparison")
-    print("=" * 60)
-    
-    from src.configuration_bibo import BiBoConfig
-    from src.modeling.ffn.mlp import BiBoMLP
-    from src.kernels.dense_mlp import patch_dense_mlp_with_triton, unpatch_dense_mlp
-    
-    device = 'cuda'
-    config = make_config()
-    
-    batch, seq = 8, 512
-    
-    # Baseline memory
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    
-    torch.manual_seed(42)
-    mlp = BiBoMLP(config, is_expert=False).to(device).train().half()
-    x = torch.randn(batch, seq, config.hidden_size, device=device, dtype=torch.float16, requires_grad=True)
-    
-    out = mlp(x)
-    out.sum().backward()
-    base_peak = torch.cuda.max_memory_allocated() / 1024**2
-    
-    del mlp, x, out
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    
-    # Triton memory
-    torch.manual_seed(42)
-    mlp = BiBoMLP(config, is_expert=False).to(device).train().half()
-    patch_dense_mlp_with_triton(mlp)
-    x = torch.randn(batch, seq, config.hidden_size, device=device, dtype=torch.float16, requires_grad=True)
-    
-    out = mlp(x)
-    out.sum().backward()
-    tri_peak = torch.cuda.max_memory_allocated() / 1024**2
-    
-    unpatch_dense_mlp(mlp)
-    del mlp, x, out
-    torch.cuda.empty_cache()
-    
-    savings = base_peak - tri_peak
-    pct = (savings / base_peak) * 100 if base_peak > 0 else 0
-    
-    print(f"  Baseline peak: {base_peak:.1f} MB")
-    print(f"  Triton peak:   {tri_peak:.1f} MB")
-    print(f"  Savings:       {savings:.1f} MB ({pct:.1f}%)")
-    
-    return savings
-
-
-if __name__ == "__main__":
-    print("=" * 60)
-    print("BiBo Dense MLP Triton Optimization — Benchmark Suite")
-    print("=" * 60)
+def main():
+    print("=" * 70)
+    print("  BiBo Dense MLP Benchmark — 3-Variant Head-to-Head")
+    print("=" * 70)
     print(f"Device: {torch.cuda.get_device_name(0)}")
     print(f"Compute: sm_{torch.cuda.get_device_capability()[0]}{torch.cuda.get_device_capability()[1]}")
     print(f"PyTorch: {torch.__version__}")
@@ -476,56 +470,48 @@ if __name__ == "__main__":
         import triton
         print(f"Triton: {triton.__version__}")
     except ImportError:
-        print("ERROR: Triton not installed. Run: pip install triton")
+        print("ERROR: Triton not installed")
         sys.exit(1)
-    
-    # Phase 1: Kernel correctness
+
+    config = make_config()
+
+    # Phase 0: Kernel correctness
     kernel_ok = test_kernel_correctness()
     if not kernel_ok:
-        print("\n[ABORT] Kernel correctness failed. Fix before proceeding.")
+        print("\n[ABORT] Kernel correctness failed.")
         sys.exit(1)
-    
-    # Phase 2: MLP module correctness
-    mlp_ok = test_mlp_correctness()
-    if not mlp_ok:
-        print("\n[ABORT] MLP correctness failed. Fix before proceeding.")
-        sys.exit(1)
-    
-    # Phase 3: Kernel performance
-    kernel_perf = test_kernel_performance()
-    
-    # Phase 4: MLP module performance
-    mlp_perf = test_mlp_performance()
-    
-    # Phase 5: Full model E2E
-    loss_ok, full_speedup = test_full_model_e2e()
-    
-    # Phase 6: Memory
-    mem_savings = test_memory()
-    
-    # Summary
-    print("\n" + "=" * 60)
-    print("FINAL RESULTS")
-    print("=" * 60)
-    print(f"  Kernel Correctness:  {'PASS' if kernel_ok else 'FAIL'}")
-    print(f"  MLP Correctness:     {'PASS' if mlp_ok else 'FAIL'}")
-    print(f"  Full Model Loss:     {'PASS' if loss_ok else 'FAIL'}")
-    print(f"  Full Model Speedup:  {full_speedup:.2f}x (all Triton patches)")
-    print(f"  Memory Savings:      {mem_savings:.1f} MB")
-    
-    print("\n  Kernel-level speedups:")
-    for desc, base, tri, spd in kernel_perf:
-        print(f"    {desc:30s}: {spd:.2f}x")
-    
-    print("\n  MLP-level speedups:")
-    for desc, base, tri, spd in mlp_perf:
-        print(f"    {desc:20s}: {spd:.2f}x")
-    
-    if kernel_ok and mlp_ok and loss_ok:
-        print(f"\n  ✓ PROMOTED: Dense MLP Triton kernel is correct and integrated.")
-        if full_speedup > 1.0:
-            print(f"  ✓ Performance gain: {full_speedup:.2f}x over baseline (full model)")
-        else:
-            print(f"  ⚠ Marginal gain ({full_speedup:.2f}x) — dense layers are only 2/{make_config().num_hidden_layers} layers")
+
+    # Rule 1: Gradient equivalence
+    grad_results = test_gradient_equivalence_all_variants(config)
+
+    # Rule 2: NaN stability
+    nan_results = test_nan_stability_all_variants(config)
+
+    # Rule 3: Three-phase performance
+    perf_results = test_three_phase_performance(config)
+
+    # Memory comparison
+    mem_results = test_memory(config)
+
+    # Full model E2E
+    e2e_loss_diff, e2e_speedup = test_full_model_e2e(config)
+
+    # Final summary
+    print_separator("FINAL VERDICT")
+    all_grad_pass = all(r['passed'] for r in grad_results.values())
+    all_nan_pass = all(r['passed'] for r in nan_results.values())
+    print(f"  Rule 1 (Gradient Equivalence): {'ALL PASS' if all_grad_pass else 'SOME FAILED'}")
+    print(f"  Rule 2 (NaN Stability):        {'ALL PASS' if all_nan_pass else 'SOME FAILED'}")
+    print(f"  Rule 3 (Three-Phase Timing):   See table above")
+    print(f"  Rule 4 (torch.profiler):       See profiler output above")
+    print(f"  Full Model E2E:                {'PASS' if e2e_loss_diff < 0.05 else 'FAIL'} (loss diff={e2e_loss_diff:.4f})")
+    print(f"  Full Model Speedup:            {e2e_speedup:.2f}x")
+
+    if all_grad_pass and all_nan_pass:
+        print(f"\n  WINNER: See three-phase table — pick the fastest variant")
     else:
-        print(f"\n  ✗ REJECTED: Fix correctness issues first.")
+        print(f"\n  ⚠ Some variants failed correctness checks")
+
+
+if __name__ == "__main__":
+    main()

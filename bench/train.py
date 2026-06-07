@@ -52,7 +52,7 @@ from utils import (
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="BiMo Benchmark Training")
+    p = argparse.ArgumentParser(description="BiBo Benchmark Training")
 
     # Training
     p.add_argument("--batch_size", type=int, default=4)
