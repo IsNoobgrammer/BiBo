@@ -24,6 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from liger_kernel.ops.swiglu import LigerSiLUMulFunction
 
 __all__ = [
     'patch_dense_mlp_with_triton', 'unpatch_dense_mlp',
@@ -169,7 +170,7 @@ def triton_fused_swiglu(gate_up: torch.Tensor) -> torch.Tensor:
 # ═══════════════════════════════════════════════════════════════
 
 class _FusedSwiGLUFull(torch.autograd.Function):
-    """Fully fused SwiGLU: Triton forward + Triton backward in single kernel."""
+    """Fully fused SwiGLU: Triton forward + Triton backward."""
 
     @staticmethod
     def forward(ctx, gate_up: torch.Tensor) -> torch.Tensor:
@@ -245,13 +246,20 @@ class _TritonFusedGLUFunction(torch.autograd.Function):
 # ═══════════════════════════════════════════════════════════════
 
 def _triton_dense_mlp_forward(self, x: torch.Tensor) -> torch.Tensor:
-    """Drop-in replacement for BiBoMLP.forward using fully fused SwiGLU."""
+    """Drop-in replacement for BiBoMLP.forward using Liger SwiGLU.
+
+    Liger pattern: keep cuBLAS GEMMs separate, fuse only the activation.
+    Uses LigerSiLUMulFunction for production-grade silu(gate)*up.
+
+    Original: silu(gate_proj(x)) * up_proj(x) → down_proj
+    Optimized: LigerSiLUMul(gate_proj(x), up_proj(x)) → down_proj
+    """
     orig_shape = x.shape[:-1]
     x_2d = x.view(-1, self.hidden_size)
-    fused_weight = torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
-    gate_up = F.linear(x_2d, fused_weight)
-    intermediate = _FusedSwiGLUFull.apply(gate_up)
-    out = self.down_proj(intermediate)
+    gate = self.gate_proj(x_2d)  # cuBLAS GEMM
+    up = self.up_proj(x_2d)      # cuBLAS GEMM
+    intermediate = LigerSiLUMulFunction.apply(gate, up)  # Liger fused activation
+    out = self.down_proj(intermediate)  # cuBLAS GEMM
     return out.view(*orig_shape, self.hidden_size)
 
 
@@ -290,13 +298,13 @@ def unpatch_dense_mlp(model):
 # ═══════════════════════════════════════════════════════════════
 
 def _triton_qwen_mlp_forward(self, x: torch.Tensor) -> torch.Tensor:
-    """Drop-in replacement for Qwen3MLP/Qwen3MoeMLP.forward."""
+    """Drop-in replacement for Qwen3MLP/Qwen3MoeMLP.forward using Liger SwiGLU."""
     orig_shape = x.shape[:-1]
     x_2d = x.view(-1, self.hidden_size)
-    fused_weight = torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
-    gate_up = F.linear(x_2d, fused_weight)
-    intermediate = _FusedSwiGLUFull.apply(gate_up)
-    out = self.down_proj(intermediate)
+    gate = self.gate_proj(x_2d)  # cuBLAS GEMM
+    up = self.up_proj(x_2d)      # cuBLAS GEMM
+    intermediate = LigerSiLUMulFunction.apply(gate, up)  # Liger fused activation
+    out = self.down_proj(intermediate)  # cuBLAS GEMM
     return out.view(*orig_shape, self.hidden_size)
 
 

@@ -1,28 +1,22 @@
 """
 Fused Causal Conv1D Kernels for BiBo.
 
-Two operations optimized:
+Liger pattern: keep cuDNN conv + cuBLAS GEMMs, fuse only intermediates.
+
+Two operations:
 1. Conv Router: (B, S, H) → causal_conv1d → (B*S, E)
-2. Conv Shared Expert gate: (B, S, H) → causal_conv1d + activation → (B, S, I)
+2. Conv Shared Expert: (B, S, H) → causal_conv1d + activation → (B, S, I)
 
-Strategy v2 (after benchmarking v1):
-- cuDNN Conv1d is unbeatable for the raw convolution — don't replace it
-- Instead, fuse the SURROUNDING operations:
-  a) Eliminate explicit pad tensor (use F.conv1d with padding directly)
-  b) Fuse activation into conv output (Triton elementwise on output)
-  c) Eliminate permute intermediates where possible
-  d) For the shared expert: fuse conv_output + activation + gating multiply
+Key finding from benchmarking (RTX 3050, 8 configs):
+- Conv expert Triton kernel (permute+act+gate fuse) is ALWAYS slower (0.41x avg)
+  because the elementwise ops are so cheap that kernel launch overhead dominates
+- Conv router is neutral (0.97x) — not worth optimizing
+- The Triton kernels are kept for reference/future large-model use
 
-Key insight from v1 benchmarks:
-- Naive per-position Triton is 2-20x SLOWER than cuDNN conv
-- But memory savings are real (24-52 MB at 4096 tokens)
-- The win is in fusing activation + eliminating intermediates, not replacing conv
-
-Approach:
-- Router: keep cuDNN conv, fuse the reshape/permute into output
-- Shared Expert: keep cuDNN conv, fuse SiLU activation + gate multiply
-  into a single Triton kernel that reads conv output + up_proj output
-  and writes the final gated result (eliminates 2 intermediate tensors)
+Strategy:
+- Router: keep cuDNN conv + PyTorch reshape (already optimal)
+- Shared Expert: keep cuDNN conv + PyTorch silu*multiply (faster than Triton fuse)
+- Fused kernels available for large models where memory savings matter
 
 Supports: RTX 3050 (sm_86), T4 (sm_75), A100 (sm_80).
 """
@@ -529,14 +523,14 @@ def _triton_conv_router_forward(self, hidden_states: torch.Tensor):
 def _triton_conv_expert_forward(self, x: torch.Tensor) -> torch.Tensor:
     """
     Drop-in replacement for BiBoCausalConv1D.forward.
-    
-    Fuses: conv_output permute + SiLU activation + gate multiply
-    into a single Triton kernel. Eliminates 2 intermediate tensors.
-    
+
+    Liger pattern: keep cuDNN conv + cuBLAS GEMMs, fuse only intermediates.
+    For the conv expert, the intermediates (permute+silu+multiply) are so cheap
+    that Triton kernel launch overhead makes them SLOWER (0.41x avg benchmark).
+    So we use PyTorch ops which are faster for small tensors.
+
     Original: rearrange(b,s,h→b,h,s) → pad → conv → rearrange(b,i,s→b,s,i) → silu → multiply → down_proj
-    Optimized: rearrange(b,s,h→b,h,s) → pad → conv (cuDNN) → fused_permute_act_gate (Triton) → down_proj
-    
-    The key savings: eliminates the (B,S,I) permuted tensor AND the (B,S,I) silu output.
+    Optimized: rearrange(b,s,h→b,h,s) → pad → conv (cuDNN) → silu * up (PyTorch) → down_proj
     """
     bsz, seq_len, hidden_dim = x.shape
     
@@ -549,9 +543,10 @@ def _triton_conv_expert_forward(self, x: torch.Tensor) -> torch.Tensor:
     # up_proj (cuBLAS — keep)
     up_out = self.up_proj(x)  # (B, S, I)
     
-    # Fused: permute(conv_out) + silu + multiply with up_out
-    # Replaces: gate_output = conv_out.permute(0,2,1); output = silu(gate_output) * up_out
-    gated = triton_fused_conv_gate_multiply(conv_out, up_out, act_type=0)  # SiLU
+    # PyTorch ops for intermediate: permute + silu + multiply
+    # Faster than Triton for small tensors (no kernel launch overhead)
+    gate_output = conv_out.permute(0, 2, 1)  # (B, S, I) — zero-copy view
+    gated = F.silu(gate_output) * up_out      # (B, S, I) — 2 elementwise ops
     
     # down_proj (cuBLAS — keep)
     output = self.down_proj(gated)

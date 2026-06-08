@@ -201,6 +201,183 @@ def _fused_router_kernel(
 
 
 # ═══════════════════════════════════════════════════════════════
+# KERNEL 4: Batched GLU Activation (all experts, 1 launch)
+#
+# Instead of launching _fused_glu_act_kernel once per expert (8 launches),
+# concatenate all gate_ups and run ONE kernel with per-row act_type dispatch.
+# Reduces 8 Triton launches → 1 launch.
+# ═══════════════════════════════════════════════════════════════
+
+@triton.jit
+def _batched_glu_act_kernel(
+    GateUp_ptr,      # (N_total, 2*I) — concatenated gate_ups from all experts
+    ActType_ptr,     # (N_total,) — int32 act type per row (0=silu, 1=relu2, 2=tanh)
+    Out_ptr,         # (N_total, I) — activated output
+    N_total, I,
+    stride_gu_m, stride_gu_i,
+    stride_o_m, stride_o_i,
+    BLOCK_M: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+):
+    """
+    Fused: per-row activation dispatch + GLU multiply.
+    Each row can have a different activation type (SiLU/ReLU²/Tanh).
+    Reads act_type from a per-row array instead of constexpr.
+    """
+    pid_m = tl.program_id(0)
+    pid_i = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_i = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
+    mask_m = offs_m < N_total
+    mask_i = offs_i < I
+    mask = mask_m[:, None] & mask_i[None, :]
+
+    # Load gate (first I columns)
+    gate_ptrs = GateUp_ptr + offs_m[:, None] * stride_gu_m + offs_i[None, :] * stride_gu_i
+    gate = tl.load(gate_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # Load up (second I columns)
+    up_ptrs = GateUp_ptr + offs_m[:, None] * stride_gu_m + (I + offs_i)[None, :] * stride_gu_i
+    up = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # Load per-row activation type
+    act_type = tl.load(ActType_ptr + offs_m, mask=mask_m, other=0)
+
+    # Apply activation (branch on runtime act_type)
+    # SiLU: x * sigmoid(x)
+    silu_gate = gate * (1.0 / (1.0 + tl.exp(-gate)))
+    # ReLU²: relu(x)²
+    relu_g = tl.where(gate > 0, gate, tl.zeros_like(gate))
+    relu2_gate = relu_g * relu_g
+    # Tanh: tanh(x)
+    exp2x = tl.exp(2.0 * gate)
+    tanh_gate = (exp2x - 1.0) / (exp2x + 1.0)
+
+    # Select activation based on per-row act_type
+    act_gate = tl.where(act_type[:, None] == 0, silu_gate,
+               tl.where(act_type[:, None] == 1, relu2_gate, tanh_gate))
+
+    # GLU multiply
+    result = act_gate * up
+
+    # Store
+    out_ptrs = Out_ptr + offs_m[:, None] * stride_o_m + offs_i[None, :] * stride_o_i
+    tl.store(out_ptrs, result.to(Out_ptr.dtype.element_ty), mask=mask)
+
+
+def triton_batched_glu_activation(
+    all_gate_ups: torch.Tensor,   # (N_total, 2*I) — concatenated
+    all_act_types: torch.Tensor,  # (N_total,) — int32, per-row act type
+    I: int,
+) -> torch.Tensor:
+    """
+    Batched GLU activation for all experts in a single kernel launch.
+    Replaces N expert calls to _fused_glu_act_kernel with 1 call.
+    """
+    N_total = all_gate_ups.shape[0]
+    out = torch.empty(N_total, I, device=all_gate_ups.device, dtype=all_gate_ups.dtype)
+
+    BLOCK_M = min(64, triton.next_power_of_2(N_total))
+    BLOCK_M = max(16, BLOCK_M)
+    BLOCK_I = min(128, triton.next_power_of_2(I))
+    BLOCK_I = max(16, BLOCK_I)
+
+    grid = (triton.cdiv(N_total, BLOCK_M), triton.cdiv(I, BLOCK_I))
+
+    _batched_glu_act_kernel[grid](
+        all_gate_ups, all_act_types, out,
+        N_total, I,
+        all_gate_ups.stride(0), all_gate_ups.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_I=BLOCK_I,
+    )
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════
+# KERNEL 5: Fused Weight-Multiply + Scatter-Add
+#
+# Replaces: expert_out * weights.unsqueeze(-1) → index_add_
+# Fuses the weight scaling into the scatter-add write.
+# Eliminates 1 intermediate (n, H) tensor per expert per forward.
+# ═══════════════════════════════════════════════════════════════
+
+@triton.jit
+def _fused_weight_scatter_kernel(
+    ExpertOut_ptr,      # (N, H) — expert output
+    Weights_ptr,        # (N,) — per-token routing weights
+    SortedIdx_ptr,      # (N,) — sorted token indices for scatter
+    Out_ptr,            # (M, H) — output buffer (accumulated)
+    N, H, M,
+    stride_eo_n, stride_eo_h,
+    stride_o_m, stride_o_h,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """
+    Fused: out[sorted_idx[n], h] += expert_out[n, h] * weights[n]
+    Eliminates the intermediate tensor from weight scaling.
+    Uses atomic_add for scatter (safe for MoE where expert chunks don't overlap).
+    """
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_n = offs_n < N
+    mask_h = offs_h < H
+    mask = mask_n[:, None] & mask_h[None, :]
+
+    # Load expert output
+    eo_ptrs = ExpertOut_ptr + offs_n[:, None] * stride_eo_n + offs_h[None, :] * stride_eo_h
+    expert_out = tl.load(eo_ptrs, mask=mask, other=0.0)
+
+    # Load weights and scale
+    w = tl.load(Weights_ptr + offs_n, mask=mask_n, other=0.0)
+    scaled = expert_out * w[:, None]
+
+    # Load scatter indices
+    idx = tl.load(SortedIdx_ptr + offs_n, mask=mask_n, other=0).to(tl.int64)
+
+    # Scatter-add: out[idx[n], h] += scaled[n, h]
+    out_ptrs = Out_ptr + idx[:, None] * stride_o_m + offs_h[None, :] * stride_o_h
+    tl.atomic_add(out_ptrs, scaled, mask=mask)
+
+
+def triton_fused_weight_scatter(
+    expert_out: torch.Tensor,      # (N, H) — expert output
+    weights: torch.Tensor,         # (N,) — routing weights
+    sorted_indices: torch.Tensor,  # (N,) — scatter indices
+    output: torch.Tensor,          # (M, H) — output buffer
+):
+    """
+    Fused weight multiply + scatter-add.
+    Replaces: output.index_add_(0, idx, expert_out * weights.unsqueeze(-1))
+    Eliminates 1 intermediate (N, H) tensor.
+    """
+    N, H = expert_out.shape
+    M = output.shape[0]
+
+    BLOCK_N = min(64, triton.next_power_of_2(N))
+    BLOCK_N = max(16, BLOCK_N)
+    BLOCK_H = min(128, triton.next_power_of_2(H))
+    BLOCK_H = max(16, BLOCK_H)
+
+    grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(H, BLOCK_H))
+
+    _fused_weight_scatter_kernel[grid](
+        expert_out, weights, sorted_indices, output,
+        N, H, M,
+        expert_out.stride(0), expert_out.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_N=BLOCK_N,
+        BLOCK_H=BLOCK_H,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
 # Python Wrappers
 # ═══════════════════════════════════════════════════════════════
 
@@ -320,92 +497,75 @@ def triton_moe_experts_forward(
     num_routed_experts: int,
 ) -> torch.Tensor:
     """
-    Optimized MoE dispatch with Triton-fused activation kernels.
-    
-    Approach:
-    - cuBLAS for gate_up GEMM (F.linear — already optimal)
-    - Triton for fused GLU activation via autograd.Function (correct backward)
-    - cuBLAS for down GEMM (F.linear — already optimal)  
-    - Fused weight application during scatter
-    
-    For small chunks (< 8 tokens), falls back to PyTorch eager
-    since kernel launch overhead dominates.
+    MoE dispatch with per-expert Triton GLU activation.
+
+    Per-expert approach (faster for small models):
+    - cuBLAS GEMM → Triton GLU → cuBLAS GEMM → scatter per expert
+    - Skips empty experts (no wasted compute)
+    - No concat/split overhead
+
+    Batched GLU kernel available via triton_batched_glu_activation()
+    for cases where launch overhead dominates (large models).
     """
-    # Import the autograd wrapper from dense_mlp (shared code)
-    from .dense_mlp import _TritonFusedGLUFunction
-    
     num_tokens, hidden_size = hidden_states.shape
-    
+
     # Sort tokens by expert
     flat_expert_indices = top_k_indices.flatten()
     flat_token_indices = torch.arange(
         num_tokens, device=hidden_states.device
     ).unsqueeze(1).expand_as(top_k_indices).flatten()
     flat_weights = top_k_weights.flatten()
-    
+
     sorted_expert_indices, sort_order = flat_expert_indices.sort()
     sorted_token_indices = flat_token_indices[sort_order]
     sorted_weights = flat_weights[sort_order]
-    
+
     # Expert boundaries
     expert_counts = torch.bincount(sorted_expert_indices, minlength=num_routed_experts)
     boundaries = torch.zeros(num_routed_experts + 1, dtype=torch.long, device=hidden_states.device)
     boundaries[1:] = torch.cumsum(expert_counts, dim=0)
-    
+
     # Output buffer
     output = torch.zeros(num_tokens, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
-    
-    MIN_TRITON_CHUNK = 8  # Below this, PyTorch eager is faster
+
+    ACT_MAP = {"silu": 0, "relu2": 1, "tanh": 2}
+    I = gate_up_proj.shape[1] // 2  # intermediate_size
 
     for expert_idx in range(num_routed_experts):
-        start = boundaries[expert_idx].item()
-        end = boundaries[expert_idx + 1].item()
+        start = boundaries[expert_idx]
+        end = boundaries[expert_idx + 1]
         count = end - start
-        
+
         if count == 0:
             continue
-        
+
         token_idx = sorted_token_indices[start:end]
         weights = sorted_weights[start:end]
         current_state = hidden_states[token_idx]
-        
+
         if expert_idx < num_polyglu_experts:
             act_name = expert_activations[expert_idx]
-            act_type = _ACT_MAP[act_name]
-            
-            if count >= MIN_TRITON_CHUNK:
-                # Optimized path:
-                # 1. cuBLAS GEMM for gate_up (already fast)
-                gate_up = F.linear(current_state, gate_up_proj[expert_idx])
-                
-                # 2. Triton fused GLU activation via autograd.Function (correct backward!)
-                intermediate = _TritonFusedGLUFunction.apply(gate_up, act_type)
-                
-                # 3. cuBLAS GEMM for down + weight multiply
-                expert_out = F.linear(intermediate, down_proj[expert_idx])
-                output.index_add_(0, token_idx, expert_out * weights.unsqueeze(-1))
-            else:
-                # PyTorch fallback for tiny chunks
-                gate_up = F.linear(current_state, gate_up_proj[expert_idx])
-                gate, up = gate_up.chunk(2, dim=-1)
-                
-                if act_name == "silu":
-                    activated = F.silu(gate)
-                elif act_name == "relu2":
-                    activated = F.relu(gate).square()
-                else:
-                    activated = torch.tanh(gate)
-                
-                expert_out = F.linear(activated * up, down_proj[expert_idx])
-                output.index_add_(0, token_idx, expert_out * weights.unsqueeze(-1))
-                
+            act_type = ACT_MAP[act_name]
+
+            # cuBLAS GEMM for gate_up
+            gate_up = F.linear(current_state, gate_up_proj[expert_idx])
+
+            # Triton GLU activation
+            intermediate = triton_fused_glu_activation(gate_up, act_type)
+
+            # cuBLAS GEMM for down
+            expert_out = F.linear(intermediate, down_proj[expert_idx])
+
+            # Weight multiply + scatter
+            output.index_add_(0, token_idx, expert_out * weights.unsqueeze(-1))
+
         elif expert_idx < zero_start:
-            # Identity expert
+            # Identity expert: pass through with weight
             output.index_add_(0, token_idx, current_state * weights.unsqueeze(-1))
         else:
             # Zero expert
             output.index_add_(0, token_idx, current_state * (weights.unsqueeze(-1) * 0))
-    
+
     return output
 
 

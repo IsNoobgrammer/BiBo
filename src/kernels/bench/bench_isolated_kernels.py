@@ -198,7 +198,7 @@ def section_dense_mlp():
         return mlp
 
     def setup_sep_bwd(config):
-        from src.kernels.dense_mlp import _FusedSwiGLUSeparateBackward
+        from old_kernels.dense_mlp_fused import _FusedSwiGLUSeparateBackward
         mlp = BiBoMLP(config, is_expert=False).to(device).train().float()
         def _fwd(self, x):
             o = x.shape[:-1]

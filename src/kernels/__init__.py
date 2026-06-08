@@ -7,19 +7,20 @@ Uses linkedin/Liger-Kernel for production-grade Triton ops:
 
 Custom Triton kernels for BiBo-specific ops:
 - Fused MoE GLU activation (eliminates 3 intermediate tensors per expert)
+  In-place backward (Liger pattern): writes gradients to saved gate_up, no allocation
 - Fused router scoring (sigmoid + logit_norm + bias in 1 kernel)
-- Fused conv permute + activation + gate multiply (eliminates 2 intermediates)
-  → 1.34-1.41x training speedup, 8% memory reduction for conv models
-- Fused dense MLP SwiGLU (fused gate_up GEMM + Triton silu*up activation)
-  → Eliminates 2 intermediate tensors per dense layer forward
+- Dense MLP SwiGLU (Triton forward + backward activation fusion)
+- Conv expert: PyTorch ops (Triton kernel overhead makes it 0.41x slower — see benchmark)
+
+Key insight from Liger: NEVER fuse GEMMs. Fuse only the elementwise operations
+(silu, multiply, activation) BETWEEN GEMMs. cuBLAS handles all matrix multiplications.
 
 Patching utilities:
 - patch_bibo_with_triton: Monkey-patch BiBo model (RMSNorm + RoPE)
 - patch_moe_with_triton: Monkey-patch MoE layer (fused GLU activation)
 - patch_dense_mlp_with_triton: Monkey-patch dense MLP layers (fused SwiGLU)
 - patch_conv_router_with_triton: Monkey-patch conv router (optimized projection)
-- patch_conv_expert_with_triton: Monkey-patch conv shared expert (fused gate)
-- patch_qwen3_with_triton: Monkey-patch Qwen3/Qwen3MoE model
+- patch_conv_expert_with_triton: Monkey-patch conv shared expert (PyTorch ops)
 
 Works on any CUDA GPU — Triton compiles for target arch at runtime.
 Kaggle T4 (sm_75), RTX 3050 (sm_86), A100 (sm_80) all supported.
@@ -34,6 +35,8 @@ from .patch import (
 from .moe_dispatch import (
     patch_moe_with_triton,
     unpatch_moe,
+    triton_fused_weight_scatter,
+    triton_batched_glu_activation,
 )
 from .dense_mlp import (
     patch_dense_mlp_with_triton,
