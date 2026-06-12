@@ -8,7 +8,7 @@ from torch.nn import CrossEntropyLoss
 # Fused Linear Cross-Entropy — only use Liger-kernel (Triton, Linux/Kaggle)
 # Our chunked PyTorch fallback was slower than standard CE due to Python loop overhead
 try:
-    from liger_kernel.ops.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
+    from liger_kernel.ops.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyFunction
     HAS_LIGER = True
 except ImportError:
     HAS_LIGER = False
@@ -348,8 +348,13 @@ class BiBoForCausalLM(BiBoPreTrainedModel, GenerationMixin):
             shift_labels = labels[..., 1:].contiguous()
             shift_hidden = shift_hidden.view(-1, hidden_states.shape[-1])
             shift_labels = shift_labels.view(-1).to(shift_hidden.device)
-            fused_ce = LigerFusedLinearCrossEntropyLoss()
-            loss = fused_ce(shift_hidden, self.lm_head.weight, shift_labels)
+            # Cast weight to match input dtype — .to() is no-op if already matching
+            lm_weight = self.lm_head.weight.to(shift_hidden.dtype)
+            # Disable autocast inside Liger kernel — it handles its own dtype
+            with torch.amp.autocast('cuda', enabled=False):
+                loss = LigerFusedLinearCrossEntropyFunction.apply(
+                    shift_hidden.float(), lm_weight.float(), shift_labels
+                )
             logits = None  # Not computed — saves memory
         elif labels is not None:
             # Standard CE — fast, uses one big F.linear + F.cross_entropy

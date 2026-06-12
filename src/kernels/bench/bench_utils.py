@@ -206,23 +206,25 @@ def check_gradient_equivalence(
 
     use_labels = label_fn is not None
 
+    # Generate inputs ONCE — both models must see identical data
+    x = input_fn()
+    labels = label_fn() if use_labels else None
+
     # Baseline forward + backward
     baseline_model.zero_grad()
-    x_base = input_fn()
     if use_labels:
-        out_base = baseline_model(x_base, labels=label_fn())
+        out_base = baseline_model(x, labels=labels)
     else:
-        out_base = baseline_model(x_base)
+        out_base = baseline_model(x)
     loss_base = out_base.loss if hasattr(out_base, 'loss') else out_base.sum()
     loss_base.backward()
 
-    # Triton forward + backward
+    # Triton forward + backward (same inputs)
     triton_model.zero_grad()
-    x_tri = input_fn()
     if use_labels:
-        out_tri = triton_model(x_tri, labels=label_fn())
+        out_tri = triton_model(x, labels=labels)
     else:
-        out_tri = triton_model(x_tri)
+        out_tri = triton_model(x)
     loss_tri = out_tri.loss if hasattr(out_tri, 'loss') else out_tri.sum()
     loss_tri.backward()
 

@@ -1,57 +1,52 @@
 #!/bin/bash
-# BiBo Benchmark — Kaggle Entry Point
-# Usage: bash bench/run.sh [args...]
+# BiBo Benchmark — Unified Entry Point
+#
+# Usage:
+#   bash bench/run.sh bench/configs/bibo.yaml [extra args...]
+#   bash bench/run.sh bench/configs/qwen3moe.yaml --total_steps 3000
+#
+# Dual-GPU comparison (1 GPU per model, simultaneous):
+#   CUDA_VISIBLE_DEVICES=0 bash bench/run.sh bench/configs/bibo.yaml &
+#   CUDA_VISIBLE_DEVICES=1 bash bench/run.sh bench/configs/qwen3moe.yaml &
+#   wait
+
 set -e
 
-# ── Environment ────────────────────────────────────────────────
+CONFIG="${1:-bench/configs/bibo.yaml}"
+shift 2>/dev/null || true
+
 export HF_HUB_ENABLE_HF_TRANSFER=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=false
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
-# ── Install dependencies ──────────────────────────────────────
-echo "[run.sh] Installing dependencies..."
-pip install -q hf_transfer wandb datasets transformers
+echo "[run.sh] Config: $CONFIG"
+echo "[run.sh] Extra args: $@"
 
-# Install BiBo from repo root
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
-pip install -e .
 
-# ── Login to WandB (if WANDB_API_KEY is set) ──────────────────
+# Install deps
+pip install -q hf_transfer wandb datasets transformers pyyaml bitsandbytes einops liger-kernel
+
+# WandB login
 if [ -n "$WANDB_API_KEY" ]; then
-    wandb login "$WANDB_API_KEY"
-    echo "[run.sh] WandB logged in"
+    wandb login "$WANDB_API_KEY" 2>/dev/null
 else
-    echo "[run.sh] WARNING: WANDB_API_KEY not set, WandB logging disabled"
+    echo "[run.sh] WANDB_API_KEY not set — WandB disabled"
     export WANDB_MODE=disabled
 fi
 
-# ── Detect GPU count ──────────────────────────────────────────
-GPU_COUNT=$(python -c "import torch; print(torch.cuda.device_count())")
+# Detect GPUs
+GPU_COUNT=$(python -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "1")
 echo "[run.sh] Detected $GPU_COUNT GPU(s)"
 
-# ── Launch training ───────────────────────────────────────────
-cd "$REPO_ROOT"
-
-if [ "$GPU_COUNT" -gt 1 ]; then
-    echo "[run.sh] Multi-GPU mode: torchrun --nproc_per_node=$GPU_COUNT"
+# Launch
+if [ "$GPU_COUNT" -gt 1 ] && [ -z "$CUDA_VISIBLE_DEVICES" ]; then
+    echo "[run.sh] Multi-GPU: torchrun --nproc_per_node=$GPU_COUNT"
     torchrun --nproc_per_node="$GPU_COUNT" bench/train.py \
-        --batch_size 16 \
-        --total_steps 50000 \
-        --warmup_steps 1000 \
-        --eval_every 500 \
-        --sample_every 1000 \
-        --lr 3e-4 \
-        "$@"
+        --config "$CONFIG" "$@"
 else
-    echo "[run.sh] Single-GPU mode"
-    python bench/train.py \
-        --batch_size 32 \
-        --total_steps 50000 \
-        --warmup_steps 1000 \
-        --eval_every 500 \
-        --sample_every 1000 \
-        --lr 3e-4 \
-        "$@"
+    echo "[run.sh] Single-GPU"
+    python bench/train.py --config "$CONFIG" "$@"
 fi

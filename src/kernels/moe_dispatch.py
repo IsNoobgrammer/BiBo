@@ -151,6 +151,186 @@ def _fused_down_weight_kernel(
 
 
 # ═══════════════════════════════════════════════════════════════
+# KERNEL 6: Fused Linear + GLU Activation
+#
+# Fuses: gate_up GEMM (X @ W.T) + GLU activation in one kernel.
+# Eliminates the (M, 2*I) intermediate HBM write+read.
+# Input: X (M, K), W_gate_up (2*I, K)
+# Output: (M, I) = act(gate) * up
+#
+# No autotuning — M varies per expert, causes recompilation.
+# Uses fixed block sizes with triton.next_power_of_2.
+# ═══════════════════════════════════════════════════════════════
+
+@triton.jit
+def _fused_linear_glu_kernel(
+    X_ptr,          # (M, K) — input
+    W_ptr,          # (2*I, K) — fused gate+up weight
+    Out_ptr,        # (M, I) — output
+    GateUp_ptr,     # (M, 2*I) — saved for backward (can be None if not training)
+    M, K, I,
+    stride_xm, stride_xk,
+    stride_wi, stride_wk,
+    stride_om, stride_oi,
+    save_gate_up: tl.constexpr,  # whether to save gate_up for backward
+    ACT_TYPE: tl.constexpr,  # 0=silu, 1=relu2, 2=tanh
+    BLOCK_M: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Fused: gate_up = X @ W.T; intermediate = act(gate) * up
+    Eliminates the (M, 2*I) intermediate HBM write+read.
+    """
+    pid_m = tl.program_id(0)
+    pid_i = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_i = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
+    mask_m = offs_m < M
+    mask_i = offs_i < I
+
+    # Accumulators for gate and up
+    acc_gate = tl.zeros((BLOCK_M, BLOCK_I), dtype=tl.float32)
+    acc_up = tl.zeros((BLOCK_M, BLOCK_I), dtype=tl.float32)
+
+    # Reduce over K dimension
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+
+        # Load X tile: (BLOCK_M, BLOCK_K)
+        x_ptrs = X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+        x_tile = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0).to(tl.float32)
+
+        # Load gate weight tile: (BLOCK_I, BLOCK_K) — first I rows of W
+        w_gate_ptrs = W_ptr + offs_i[:, None] * stride_wi + offs_k[None, :] * stride_wk
+        w_gate_tile = tl.load(w_gate_ptrs, mask=mask_i[:, None] & mask_k[None, :], other=0.0).to(tl.float32)
+
+        # Load up weight tile: (BLOCK_I, BLOCK_K) — second I rows of W
+        w_up_ptrs = W_ptr + (I + offs_i)[:, None] * stride_wi + offs_k[None, :] * stride_wk
+        w_up_tile = tl.load(w_up_ptrs, mask=mask_i[:, None] & mask_k[None, :], other=0.0).to(tl.float32)
+
+        # Accumulate: acc[m, i] += x[m, k] * w[i, k]
+        acc_gate += tl.dot(x_tile, tl.trans(w_gate_tile))
+        acc_up += tl.dot(x_tile, tl.trans(w_up_tile))
+
+    # Apply GLU activation in registers
+    if ACT_TYPE == 0:  # SiLU: gate * sigmoid(gate)
+        act_gate = acc_gate * (1.0 / (1.0 + tl.exp(-acc_gate)))
+    elif ACT_TYPE == 1:  # ReLU²: max(gate, 0)²
+        act_gate = tl.maximum(acc_gate, 0.0) ** 2
+    else:  # Tanh: 2*sigmoid(2*gate) - 1 (fast approximation)
+        act_gate = 2.0 * (1.0 / (1.0 + tl.exp(-2.0 * acc_gate))) - 1.0
+
+    result = act_gate * acc_up
+
+    # Store output
+    out_ptrs = Out_ptr + offs_m[:, None] * stride_om + offs_i[None, :] * stride_oi
+    tl.store(out_ptrs, result.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_i[None, :])
+
+    # Save gate_up for backward if needed
+    if save_gate_up:
+        # Store gate (first I columns)
+        gate_ptrs = GateUp_ptr + offs_m[:, None] * (2 * I) + offs_i[None, :]
+        tl.store(gate_ptrs, acc_gate.to(GateUp_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_i[None, :])
+        # Store up (second I columns)
+        up_ptrs = GateUp_ptr + offs_m[:, None] * (2 * I) + (I + offs_i)[None, :]
+        tl.store(up_ptrs, acc_up.to(GateUp_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_i[None, :])
+
+
+class _FusedLinearGLUFunction(torch.autograd.Function):
+    """Fused Linear + GLU with autograd support.
+    
+    Forward: computes gate_up = X @ W.T AND applies GLU activation.
+    Backward: recomputes gate_up from x and weight, then applies GLU backward + GEMM backward.
+    """
+    
+    @staticmethod
+    def forward(ctx, x, weight, act_type):
+        M, K = x.shape
+        I = weight.shape[0] // 2
+        
+        ctx.save_for_backward(x, weight)
+        ctx.act_type = act_type
+        ctx.M, ctx.K, ctx.I = M, K, I
+        
+        out = torch.empty(M, I, device=x.device, dtype=x.dtype)
+        
+        BLOCK_M = min(64, triton.next_power_of_2(M))
+        BLOCK_M = max(16, BLOCK_M)
+        BLOCK_I = min(128, triton.next_power_of_2(I))
+        BLOCK_I = max(16, BLOCK_I)
+        BLOCK_K = min(64, triton.next_power_of_2(K))
+        BLOCK_K = max(16, BLOCK_K)
+        
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(I, BLOCK_I))
+        
+        # Use save_gate_up=False — backward will recompute
+        _fused_linear_glu_kernel[grid](
+            x, weight, out, out,  # dummy gate_up pointer (not used when save_gate_up=False)
+            M, K, I,
+            x.stride(0), x.stride(1),
+            weight.stride(0), weight.stride(1),
+            out.stride(0), out.stride(1),
+            save_gate_up=False,
+            ACT_TYPE=act_type,
+            BLOCK_M=BLOCK_M, BLOCK_I=BLOCK_I, BLOCK_K=BLOCK_K,
+        )
+        
+        return out
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight = ctx.saved_tensors
+        act_type = ctx.act_type
+        M, K, I = ctx.M, ctx.K, ctx.I
+        
+        # Recompute gate_up from x and weight (avoids saving large tensor)
+        gate_up = F.linear(x.float(), weight.float())  # (M, 2*I) in float32
+        
+        # Allocate output gradient
+        grad_gate_up = torch.empty(M, 2 * I, device=x.device, dtype=x.dtype)
+        
+        BLOCK_M = min(64, triton.next_power_of_2(M))
+        BLOCK_M = max(16, BLOCK_M)
+        BLOCK_I = min(128, triton.next_power_of_2(I))
+        BLOCK_I = max(16, BLOCK_I)
+        
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(I, BLOCK_I))
+        
+        # Launch Triton backward kernel for GLU derivatives
+        _fused_glu_act_backward_kernel[grid](
+            grad_output, gate_up.to(x.dtype), grad_gate_up,
+            M, I,
+            grad_output.stride(0), grad_output.stride(1),
+            gate_up.stride(0), gate_up.stride(1),
+            grad_gate_up.stride(0), grad_gate_up.stride(1),
+            ACT_TYPE=act_type,
+            BLOCK_M=BLOCK_M,
+            BLOCK_I=BLOCK_I,
+        )
+        
+        # GEMM backward in float32 (cuBLAS is optimal for large shapes)
+        grad_x = torch.mm(grad_gate_up.float(), weight.float())
+        grad_weight = torch.mm(grad_gate_up.float().t(), x.float())
+        
+        return grad_x, grad_weight, None
+
+
+def triton_fused_linear_glu(
+    x: torch.Tensor,      # (M, K) — input
+    weight: torch.Tensor,  # (2*I, K) — fused gate+up weight
+    act_type: int,         # 0=silu, 1=relu2, 2=tanh
+) -> torch.Tensor:
+    """
+    Fused Linear + GLU activation.
+    Computes: gate_up = x @ weight.T; out = act(gate) * up
+    Returns (M, I).
+    """
+    return _FusedLinearGLUFunction.apply(x, weight, act_type)
+
+# ═══════════════════════════════════════════════════════════════
 # KERNEL 3: Fused Router (sigmoid + norm + bias)
 # ═══════════════════════════════════════════════════════════════
 
@@ -183,12 +363,12 @@ def _fused_router_kernel(
     
     # Optional z-score normalization
     if USE_LOGIT_NORM:
-        # Compute mean and std over experts
+        # Compute mean and std over experts (match PyTorch: unbiased=True, divides by N-1)
         sum_s = tl.sum(tl.where(mask_e, scores, tl.zeros_like(scores)))
         mean = sum_s / E
         diff = scores - mean
         sum_sq = tl.sum(tl.where(mask_e, diff * diff, tl.zeros_like(diff)))
-        std = tl.sqrt(sum_sq / E + 1e-6)
+        std = tl.sqrt(sum_sq / (E - 1) + 1e-6)
         scores = router_lambda * diff / std
     
     # Store unbiased scores
@@ -346,35 +526,156 @@ def _fused_weight_scatter_kernel(
     tl.atomic_add(out_ptrs, scaled, mask=mask)
 
 
-def triton_fused_weight_scatter(
+# ═══════════════════════════════════════════════════════════════
+# Autograd wrapper for fused weight scatter
+#
+# Forward: atomic_add (fast, fused)
+# Backward: standard index ops (differentiable)
+# ═══════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
+# KERNEL 8: Weight Scatter Backward
+#
+# Backward of fused weight multiply + scatter-add.
+# Forward: out[idx[n]] += expert_out[n] * weights[n]
+# Backward: grad_expert_out[n] = grad_out[idx[n]] * weights[n]
+#           grad_weights[n] = (grad_out[idx[n]] * expert_out[n]).sum()
+#
+# Uses tl.load with gathered indices (differentiable pattern).
+# ═══════════════════════════════════════════════════════════════
+
+@triton.jit
+def _fused_weight_scatter_backward_kernel(
+    GradOut_ptr,      # (M, H) — gradient of output
+    ExpertOut_ptr,    # (N, H) — saved expert output
+    Weights_ptr,      # (N,) — saved routing weights
+    SortedIdx_ptr,    # (N,) — sorted token indices
+    GradExpertOut_ptr,# (N, H) — gradient of expert output
+    GradWeights_ptr,  # (N,) — gradient of weights
+    N, H, M,
+    stride_go_m, stride_go_h,
+    stride_eo_n, stride_eo_h,
+    stride_ge_n, stride_ge_h,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Backward: gather grad_output at sorted positions, scale by weights."""
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_n = offs_n < N
+    mask_h = offs_h < H
+    mask = mask_n[:, None] & mask_h[None, :]
+
+    # Load sorted indices
+    idx = tl.load(SortedIdx_ptr + offs_n, mask=mask_n, other=0).to(tl.int64)
+
+    # Load grad_output at sorted positions: grad_output[idx[n], h]
+    go_ptrs = GradOut_ptr + idx[:, None] * stride_go_m + offs_h[None, :] * stride_go_h
+    grad_out = tl.load(go_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # Load weights
+    w = tl.load(Weights_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
+
+    # Load expert_out
+    eo_ptrs = ExpertOut_ptr + offs_n[:, None] * stride_eo_n + offs_h[None, :] * stride_eo_h
+    expert_out = tl.load(eo_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # Compute grad_expert_out = grad_output[idx] * weights
+    grad_expert_out = grad_out * w[:, None]
+
+    # Store grad_expert_out
+    geo_ptrs = GradExpertOut_ptr + offs_n[:, None] * stride_ge_n + offs_h[None, :] * stride_ge_h
+    tl.store(geo_ptrs, grad_expert_out, mask=mask)
+
+    # Compute grad_weights = (grad_output[idx] * expert_out).sum(dim=-1)
+    # This is a reduction across H — each program handles a chunk of N
+    grad_w_partial = tl.sum(grad_out * expert_out, axis=1)  # (BLOCK_N,)
+    
+    # Atomic add to accumulate across H blocks
+    tl.atomic_add(GradWeights_ptr + offs_n, grad_w_partial, mask=mask_n)
+
+
+class _FusedWeightScatterFunction(torch.autograd.Function):
+    """Fused weight multiply + scatter-add with autograd support.
+    
+    Forward: fuses expert_out * weights → scatter-add via atomic_add
+    Backward: standard index_select for gradient flow
+    """
+    
+    @staticmethod
+    def forward(ctx, expert_out, weights, sorted_indices, M):
+        """Forward: fused weight multiply + scatter-add."""
+        ctx.save_for_backward(expert_out, weights, sorted_indices)
+        ctx.M = M
+        
+        N, H = expert_out.shape
+        output = torch.zeros(M, H, device=expert_out.device, dtype=expert_out.dtype)
+        
+        BLOCK_N = min(64, triton.next_power_of_2(N))
+        BLOCK_N = max(16, BLOCK_N)
+        BLOCK_H = min(128, triton.next_power_of_2(H))
+        BLOCK_H = max(16, BLOCK_H)
+        
+        grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(H, BLOCK_H))
+        
+        _fused_weight_scatter_kernel[grid](
+            expert_out, weights, sorted_indices, output,
+            N, H, M,
+            expert_out.stride(0), expert_out.stride(1),
+            output.stride(0), output.stride(1),
+            BLOCK_N=BLOCK_N,
+            BLOCK_H=BLOCK_H,
+        )
+        return output
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward: Triton gather for gradient flow."""
+        expert_out, weights, sorted_indices = ctx.saved_tensors
+        M = ctx.M
+        N, H = expert_out.shape
+        
+        # Allocate output gradients
+        grad_expert_out = torch.empty(N, H, device=expert_out.device, dtype=expert_out.dtype)
+        grad_weights = torch.zeros(N, device=weights.device, dtype=weights.dtype)
+        
+        BLOCK_N = min(64, triton.next_power_of_2(N))
+        BLOCK_N = max(16, BLOCK_N)
+        BLOCK_H = min(128, triton.next_power_of_2(H))
+        BLOCK_H = max(16, BLOCK_H)
+        
+        grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(H, BLOCK_H))
+        
+        # Launch Triton backward kernel
+        _fused_weight_scatter_backward_kernel[grid](
+            grad_output, expert_out, weights, sorted_indices,
+            grad_expert_out, grad_weights,
+            N, H, M,
+            grad_output.stride(0), grad_output.stride(1),
+            expert_out.stride(0), expert_out.stride(1),
+            grad_expert_out.stride(0), grad_expert_out.stride(1),
+            BLOCK_N=BLOCK_N,
+            BLOCK_H=BLOCK_H,
+        )
+        
+        return grad_expert_out, grad_weights, None, None
+
+
+def triton_fused_weight_scatter_autograd(
     expert_out: torch.Tensor,      # (N, H) — expert output
     weights: torch.Tensor,         # (N,) — routing weights
     sorted_indices: torch.Tensor,  # (N,) — scatter indices
-    output: torch.Tensor,          # (M, H) — output buffer
-):
+    M: int,                        # total number of tokens
+) -> torch.Tensor:
     """
-    Fused weight multiply + scatter-add.
-    Replaces: output.index_add_(0, idx, expert_out * weights.unsqueeze(-1))
-    Eliminates 1 intermediate (N, H) tensor.
+    Differentiable fused weight multiply + scatter-add.
+    Uses autograd.Function for correct gradient flow.
+    Returns (M, H) accumulated output.
     """
-    N, H = expert_out.shape
-    M = output.shape[0]
-
-    BLOCK_N = min(64, triton.next_power_of_2(N))
-    BLOCK_N = max(16, BLOCK_N)
-    BLOCK_H = min(128, triton.next_power_of_2(H))
-    BLOCK_H = max(16, BLOCK_H)
-
-    grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(H, BLOCK_H))
-
-    _fused_weight_scatter_kernel[grid](
-        expert_out, weights, sorted_indices, output,
-        N, H, M,
-        expert_out.stride(0), expert_out.stride(1),
-        output.stride(0), output.stride(1),
-        BLOCK_N=BLOCK_N,
-        BLOCK_H=BLOCK_H,
-    )
+    return _FusedWeightScatterFunction.apply(expert_out, weights, sorted_indices, M)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -384,35 +685,153 @@ def triton_fused_weight_scatter(
 _ACT_MAP = {"silu": 0, "relu2": 1, "tanh": 2}
 
 
+# ═══════════════════════════════════════════════════════════════
+# KERNEL 7: GLU Activation Backward
+#
+# Computes grad_gate_up from grad_output and saved gate_up.
+# grad_gate = grad_output * up * d_act(gate)
+# grad_up = grad_output * act(gate)
+# grad_gate_up = [grad_gate, grad_up]
+#
+# All computed in float32 to prevent overflow in derivatives.
+# ═══════════════════════════════════════════════════════════════
+
+@triton.jit
+def _fused_glu_act_backward_kernel(
+    GradOut_ptr,      # (M, I) — gradient of output
+    GateUp_ptr,       # (M, 2*I) — saved gate_up
+    GradGateUp_ptr,   # (M, 2*I) — output gradient
+    M, I,
+    stride_go_m, stride_go_i,
+    stride_gu_m, stride_gu_i,
+    stride_ggu_m, stride_ggu_i,
+    ACT_TYPE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+):
+    """Backward: compute grad_gate_up from grad_output and gate_up."""
+    pid_m = tl.program_id(0)
+    pid_i = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_i = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
+    mask_m = offs_m < M
+    mask_i = offs_i < I
+    mask = mask_m[:, None] & mask_i[None, :]
+
+    # Load grad_output
+    go_ptrs = GradOut_ptr + offs_m[:, None] * stride_go_m + offs_i[None, :] * stride_go_i
+    grad_out = tl.load(go_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # Load gate (first I columns of gate_up)
+    gate_ptrs = GateUp_ptr + offs_m[:, None] * stride_gu_m + offs_i[None, :] * stride_gu_i
+    gate = tl.load(gate_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # Load up (second I columns of gate_up)
+    up_ptrs = GateUp_ptr + offs_m[:, None] * stride_gu_m + (I + offs_i)[None, :] * stride_gu_i
+    up = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # Compute activation and its derivative in float32
+    if ACT_TYPE == 0:  # SiLU
+        sig_gate = 1.0 / (1.0 + tl.exp(-gate))
+        act_gate = gate * sig_gate
+        dact = sig_gate * (1.0 + gate * (1.0 - sig_gate))
+    elif ACT_TYPE == 1:  # ReLU²
+        relu_gate = tl.maximum(gate, 0.0)
+        act_gate = relu_gate * relu_gate
+        dact = 2.0 * relu_gate
+    else:  # Tanh
+        act_gate = 2.0 * (1.0 / (1.0 + tl.exp(-2.0 * gate))) - 1.0
+        dact = 1.0 - act_gate * act_gate
+
+    # Compute gradients
+    grad_up = grad_out * act_gate
+    grad_gate = grad_out * up * dact
+
+    # Store grad_gate (first I columns)
+    gg_ptrs = GradGateUp_ptr + offs_m[:, None] * stride_ggu_m + offs_i[None, :] * stride_ggu_i
+    tl.store(gg_ptrs, grad_gate, mask=mask)
+
+    # Store grad_up (second I columns)
+    gu_ptrs = GradGateUp_ptr + offs_m[:, None] * stride_ggu_m + (I + offs_i)[None, :] * stride_ggu_i
+    tl.store(gu_ptrs, grad_up, mask=mask)
+
+
+class _TritonMoEGLUFunction(torch.autograd.Function):
+    """Autograd wrapper for MoE GLU activation.
+    
+    Forward: Triton fused GLU (split → activate gate → multiply with up)
+    Backward: PyTorch recompute (correct gradient flow to gate_up_proj)
+    """
+    
+    @staticmethod
+    def forward(ctx, gate_up, act_type):
+        ctx.save_for_backward(gate_up)
+        ctx.act_type = act_type
+        
+        M = gate_up.shape[0]
+        I = gate_up.shape[1] // 2
+        out = torch.empty(M, I, device=gate_up.device, dtype=gate_up.dtype)
+        
+        BLOCK_M = min(64, triton.next_power_of_2(M))
+        BLOCK_M = max(16, BLOCK_M)
+        BLOCK_I = min(128, triton.next_power_of_2(I))
+        BLOCK_I = max(16, BLOCK_I)
+        
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(I, BLOCK_I))
+        
+        _fused_glu_act_kernel[grid](
+            gate_up, out,
+            M, I,
+            gate_up.stride(0), gate_up.stride(1),
+            out.stride(0), out.stride(1),
+            ACT_TYPE=act_type,
+            BLOCK_M=BLOCK_M,
+            BLOCK_I=BLOCK_I,
+        )
+        return out
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        gate_up, = ctx.saved_tensors
+        act_type = ctx.act_type
+        M = gate_up.shape[0]
+        I = gate_up.shape[1] // 2
+        
+        # Allocate output gradient
+        grad_gate_up = torch.empty(M, 2 * I, device=gate_up.device, dtype=gate_up.dtype)
+        
+        BLOCK_M = min(64, triton.next_power_of_2(M))
+        BLOCK_M = max(16, BLOCK_M)
+        BLOCK_I = min(128, triton.next_power_of_2(I))
+        BLOCK_I = max(16, BLOCK_I)
+        
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(I, BLOCK_I))
+        
+        # Launch Triton backward kernel
+        _fused_glu_act_backward_kernel[grid](
+            grad_output, gate_up, grad_gate_up,
+            M, I,
+            grad_output.stride(0), grad_output.stride(1),
+            gate_up.stride(0), gate_up.stride(1),
+            grad_gate_up.stride(0), grad_gate_up.stride(1),
+            ACT_TYPE=act_type,
+            BLOCK_M=BLOCK_M,
+            BLOCK_I=BLOCK_I,
+        )
+        return grad_gate_up, None
+
+
 def triton_fused_glu_activation(
     gate_up: torch.Tensor,  # (M, 2*I)
     act_type: int,          # 0=silu, 1=relu2, 2=tanh
 ) -> torch.Tensor:
     """
-    Fused GLU activation: split → activate gate → multiply with up.
+    Differentiable fused GLU activation: split → activate gate → multiply with up.
+    Uses autograd.Function for correct gradient flow to gate_up_proj.
     Returns (M, I).
     """
-    M = gate_up.shape[0]
-    I = gate_up.shape[1] // 2
-    
-    out = torch.empty(M, I, device=gate_up.device, dtype=gate_up.dtype)
-    
-    BLOCK_M = min(64, triton.next_power_of_2(M))
-    BLOCK_M = max(16, BLOCK_M)
-    BLOCK_I = min(128, triton.next_power_of_2(I))
-    BLOCK_I = max(16, BLOCK_I)
-    
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(I, BLOCK_I))
-    
-    _fused_glu_act_kernel[grid](
-        gate_up, out,
-        M, I,
-        gate_up.stride(0), gate_up.stride(1),
-        out.stride(0), out.stride(1),
-        ACT_TYPE=act_type,
-        BLOCK_M=BLOCK_M,
-        BLOCK_I=BLOCK_I,
-    )
+    return _TritonMoEGLUFunction.apply(gate_up, act_type)
     return out
 
 
@@ -467,7 +886,7 @@ def triton_fused_router(
     selection = torch.empty_like(logits)
     
     BLOCK_E = triton.next_power_of_2(E)
-    BLOCK_E = min(BLOCK_E, 64)  # Keep small for register pressure
+    BLOCK_E = min(BLOCK_E, 64)
     
     grid = (N,)
     _fused_router_kernel[grid](
@@ -563,8 +982,8 @@ def triton_moe_experts_forward(
             # Identity expert: pass through with weight
             output.index_add_(0, token_idx, current_state * weights.unsqueeze(-1))
         else:
-            # Zero expert
-            output.index_add_(0, token_idx, current_state * (weights.unsqueeze(-1) * 0))
+            # Zero expert: multiply by 0, skip entirely (no-op)
+            pass
 
     return output
 

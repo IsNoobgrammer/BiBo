@@ -1,4 +1,1 @@
-"""
-BiBo Benchmark — Language Model Training Benchmark
-"""
-# Lazy imports to avoid segfaults on Windows when importing individual modules
+"""BiBo Benchmark Suite — Unified training for BiBo and Qwen3MoE comparison."""

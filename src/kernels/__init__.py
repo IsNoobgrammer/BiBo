@@ -29,13 +29,14 @@ Kaggle T4 (sm_75), RTX 3050 (sm_86), A100 (sm_80) all supported.
 from .patch import (
     patch_bibo_with_triton,
     patch_qwen3_with_triton,
+    patch_qwen3_fused_ce,
     unpatch_bibo,
     unpatch_qwen3,
 )
 from .moe_dispatch import (
     patch_moe_with_triton,
     unpatch_moe,
-    triton_fused_weight_scatter,
+    triton_fused_weight_scatter_autograd,
     triton_batched_glu_activation,
 )
 from .dense_mlp import (
@@ -70,6 +71,7 @@ __all__ = [
     'patch_qwen_dense_mlp_with_triton',
     'unpatch_qwen_dense_mlp',
     'triton_fused_swiglu',
+    'triton_fused_weight_scatter_autograd',
     'patch_conv_router_with_triton',
     'patch_conv_expert_with_triton',
     'unpatch_conv_router',

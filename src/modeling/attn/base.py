@@ -94,9 +94,6 @@ class BiBoAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
         # SSMax query scaling
         kv_len = key_states.shape[-2]
         q = query_states
@@ -105,17 +102,20 @@ class BiBoAttention(nn.Module):
 
         # Scaled dot-product attention (Flash Attention when available)
         if not output_attentions:
-            # Use F.scaled_dot_product_attention (Flash/MemEfficient backend)
-            # Scale is already applied via SSMax, so we use 1/sqrt(head_dim) as base scale
+            # Use F.scaled_dot_product_attention with native GQA support
+            # No need to repeat_kv — SDPA handles grouped attention internally
             attn_output = nn.functional.scaled_dot_product_attention(
                 q, key_states, value_states,
                 attn_mask=attention_mask[:, :, :, :kv_len] if attention_mask is not None else None,
                 dropout_p=self.attention_dropout if self.training else 0.0,
                 scale=1.0 / math.sqrt(self.head_dim),
+                enable_gqa=True,
             )
             attn_weights = None
         else:
-            # Fallback to manual for output_attentions=True
+            # Fallback to manual for output_attentions=True — repeat_kv needed here
+            key_states = repeat_kv(key_states, self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
             attn_weights = torch.matmul(q, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
             if attention_mask is not None:
                 attn_weights = attn_weights + attention_mask[:, :, :, :kv_len]
@@ -125,7 +125,7 @@ class BiBoAttention(nn.Module):
 
         # Reshape output
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = attn_output.reshape(*input_shape, -1)
         attn_output = self.o_proj(attn_output)
 
         return attn_output, attn_weights, past_key_value

@@ -1,4 +1,5 @@
 """SSMax scaling"""
+import math
 import torch
 
 __all__ = ['apply_ssmax_query_scaling']
@@ -23,10 +24,5 @@ def apply_ssmax_query_scaling(query_states: torch.Tensor, kv_len: int, ssmax_sca
     Returns:
         Scaled query states
     """
-    log_n = torch.log(
-        torch.clamp(
-            torch.tensor(kv_len, device=query_states.device, dtype=ssmax_scale.dtype),
-            min=2.0,
-        )
-    )
+    log_n = math.log(max(kv_len, 2))
     return query_states * ssmax_scale * log_n

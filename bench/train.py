@@ -1,15 +1,13 @@
 """
-BiBo Benchmark — Main Training Script
+BiBo Benchmark — Unified Training Script
+
+Supports BiBo, BiBo variants, and Qwen3MoE via YAML config.
+Both models get Liger kernels (RMSNorm, RoPE, SiLUMul, FusedCE) + dense MLP Triton.
 
 Usage:
-    # Single GPU
-    python bench/train.py
-
-    # Multi-GPU (2×T4)
-    torchrun --nproc_per_node=2 bench/train.py
-
-    # With custom args
-    torchrun --nproc_per_node=2 bench/train.py --batch_size 16 --total_steps 50000
+    python bench/train.py --config bench/configs/bibo.yaml
+    python bench/train.py --config bench/configs/qwen3moe.yaml --batch_size 8
+    torchrun --nproc_per_node=2 bench/train.py --config bench/configs/bibo.yaml
 """
 
 import os
@@ -18,79 +16,97 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import sys
 import math
 import time
+import random
 import argparse
 import logging
+
+import yaml
+import numpy as np
 import torch
 import torch._dynamo
 import torch._logging
 import torch.distributed as dist
 from torch.distributed._composable.fsdp import fully_shard
 
-# ── Suppress torch.compile recompilation warnings ──────────────
-# These are harmless one-shot recompiles (type_id guards for heterogeneous
-# layers, grad_mode changes during eval). They stabilize after 1-2 steps.
 torch._dynamo.config.verbose = False
-torch._dynamo.config.cache_size_limit = 64  # allow more cached compilations
-torch._logging.set_logs(dynamo=logging.ERROR, inductor=logging.ERROR, recompiles=logging.ERROR)
+torch._dynamo.config.cache_size_limit = 64
+torch._logging.set_logs(dynamo=logging.ERROR, inductor=logging.ERROR)
 logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
 logging.getLogger("torch._inductor").setLevel(logging.ERROR)
 
-# Ensure repo root and bench dir are in path
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, BENCH_DIR)
 
-from config import BIBO_50M_BASELINE, build_model, count_params
+from models import build_model_from_config, count_params, apply_triton_kernels, resize_embeddings
 from data import load_benchmark_data, create_dataloader
 from optim import create_optimizer, create_scheduler, HAS_BNB
-from eval import evaluate, generate_samples, get_tokenizer
-from utils import (
-    init_wandb, log_train_metrics, log_val_metrics, log_samples,
+from eval import evaluate, generate_samples, get_tokenizer, run_all_evals
+from metrics import (
+    init_wandb, log_train_metrics, log_eval_metrics, log_samples,
     save_checkpoint, load_checkpoint, ThroughputMeter, format_time,
+    MetricsCollector, estimate_mfu,
 )
+
+
+def set_deterministic(seed):
+    """Make training fully deterministic for fair comparison."""
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="BiBo Benchmark Training")
-
-    # Training
-    p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps (effective batch = batch_size * grad_accum)")
-    p.add_argument("--total_steps", type=int, default=50000)
-    p.add_argument("--warmup_steps", type=int, default=1000)
-    p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--weight_decay", type=float, default=0.1)
-    p.add_argument("--grad_clip", type=float, default=1.0)
-    p.add_argument("--seed", type=int, default=42)
-
-    # Data
-    p.add_argument("--seq_len", type=int, default=1024)
-    p.add_argument("--val_split", type=float, default=0.05)
-
-    # Eval & Logging
-    p.add_argument("--eval_every", type=int, default=500)
-    p.add_argument("--sample_every", type=int, default=1000)
-    p.add_argument("--ckpt_every", type=int, default=5000)
-    p.add_argument("--log_every", type=int, default=10)
-
-    # Checkpointing
-    p.add_argument("--ckpt_dir", type=str, default="bench/checkpoints")
-    p.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
-
-    # WandB
-    p.add_argument("--wandb_project", type=str, default="bibo-bench")
-    p.add_argument("--wandb_name", type=str, default="bibo")
-    p.add_argument("--wandb_notes", type=str, default="BiBo ~50M baseline, 2×T4, QTK-81K")
-
-    # Mode
-    p.add_argument("--eval_only", action="store_true", help="Run eval only, no training")
-    p.add_argument("--no_compile", action="store_true", help="Skip torch.compile")
-    p.add_argument("--no_wandb", action="store_true", help="Disable WandB logging")
-    p.add_argument("--grad_checkpoint", action="store_true", help="Enable gradient checkpointing (disabled by default for MFU)")
-    p.add_argument("--no_triton", action="store_true", help="Disable Triton fused RMSNorm kernel (use PyTorch eager)")
-
+    p.add_argument("--config", type=str, required=True, help="Path to YAML config file")
+    p.add_argument("--batch_size", type=int, default=None)
+    p.add_argument("--grad_accum", type=int, default=None)
+    p.add_argument("--total_steps", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--muon_lr", type=float, default=None)
+    p.add_argument("--seq_len", type=int, default=None)
+    p.add_argument("--eval_every", type=int, default=None)
+    p.add_argument("--wandb_name", type=str, default=None)
+    p.add_argument("--no_compile", action="store_true")
+    p.add_argument("--no_triton", action="store_true")
+    p.add_argument("--no_wandb", action="store_true")
+    p.add_argument("--eval_only", action="store_true")
+    p.add_argument("--grad_checkpoint", action="store_true")
+    p.add_argument("--resume", type=str, default=None)
     return p.parse_args()
+
+
+def load_config(args):
+    """Load YAML config, apply CLI overrides."""
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+
+    t = cfg["training"]
+    if args.batch_size is not None:
+        t["batch_size"] = args.batch_size
+    if args.grad_accum is not None:
+        t["grad_accum"] = args.grad_accum
+    if args.total_steps is not None:
+        t["total_steps"] = args.total_steps
+    if args.lr is not None:
+        t["lr"] = args.lr
+    if args.muon_lr is not None:
+        t["muon_lr"] = args.muon_lr
+    if args.seq_len is not None:
+        t["seq_len"] = args.seq_len
+    if args.eval_every is not None:
+        cfg["eval"]["eval_every"] = args.eval_every
+    if args.wandb_name is not None:
+        cfg["logging"]["wandb_name"] = args.wandb_name
+
+    return cfg
 
 
 def setup_distributed():
@@ -99,12 +115,10 @@ def setup_distributed():
         return False, 0, 1, "cpu"
 
     if "RANK" not in os.environ:
-        # Single GPU
         if torch.cuda.is_available():
             return False, 0, 1, "cuda:0"
         return False, 0, 1, "cpu"
 
-    # Multi-GPU via torchrun
     dist.init_process_group("nccl")
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -123,224 +137,166 @@ def wrap_fsdp(model, device):
 
 
 def compile_model(model):
-    """Apply torch.compile to the whole model.
-    
-    Uses mode='default' (Triton fusion WITHOUT CUDA graphs).
-    fullgraph=False allows graph breaks at @dynamo.disable boundaries
-    (MoE expert dispatch) without failing compilation.
-    
-    The MoE expert dispatch has @torch._dynamo.disable which creates a
-    graph break — torch.compile handles this gracefully with fullgraph=False,
-    compiling everything around it while leaving the dynamic dispatch in eager.
-    
-    Dynamo warnings are suppressed at module level (top of file).
-    """
+    """Apply torch.compile with fullgraph=False for MoE graph breaks."""
     return torch.compile(model, mode="default", fullgraph=False)
 
 
 def train(args):
-    """Main training loop."""
-    TAG = "[bibo]"
-    # ── Setup ──────────────────────────────────────────────────
+    TAG = "[bench]"
+
     is_distributed, rank, world_size, device = setup_distributed()
     is_main = rank == 0
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(args.seed)
+
+    cfg = load_config(args)
+    train_cfg = cfg["training"]
+    eval_cfg = cfg["eval"]
+    log_cfg = cfg["logging"]
+    hw_cfg = cfg["hardware"]
+
+    if train_cfg.get("deterministic", True):
+        set_deterministic(train_cfg.get("seed", 42))
+
+    model_type = cfg["model"]["type"]
 
     if is_main:
         print(f"{TAG} " + "=" * 60)
-        print(f"{TAG} BiBo Benchmark Training")
+        print(f"{TAG} BiBo Benchmark — {model_type.upper()}")
         print(f"{TAG} " + "=" * 60)
         print(f"{TAG}   Device: {device} (world_size={world_size})")
-        print(f"{TAG}   bitsandbytes: {HAS_BNB}")
-        print(f"{TAG}   Batch size: {args.batch_size}")
-        print(f"{TAG}   Total steps: {args.total_steps}")
-        print(f"{TAG}   Seq len: {args.seq_len}")
-        print(f"{TAG}   LR: {args.lr}")
+        print(f"{TAG}   Batch: {train_cfg['batch_size']} x {train_cfg['grad_accum']} accum")
+        print(f"{TAG}   Steps: {train_cfg['total_steps']}")
+        print(f"{TAG}   Optimizer: {train_cfg.get('optimizer', 'muon_adamw8bit')}")
         print(f"{TAG} " + "=" * 60)
 
-    # ── Data (load first — need max token ID for vocab sizing) ───
+    # ── Data ──────────────────────────────────────────────────
     if is_main:
-        print(f"{TAG} [train] Loading dataset...")
-    train_ds, val_ds = load_benchmark_data(seq_len=args.seq_len, val_split=args.val_split)
+        print(f"{TAG} Loading dataset...")
+    train_ds, val_ds = load_benchmark_data(
+        seq_len=train_cfg.get("seq_len", 1024),
+        val_split=train_cfg.get("val_split", 0.05),
+        seed=train_cfg.get("seed", 42),
+    )
 
-    # ── Tokenizer ───────────────────────────────────────────────
-    if is_main:
-        print(f"{TAG} [train] Loading tokenizer...")
+    # ── Tokenizer ─────────────────────────────────────────────
     tokenizer = get_tokenizer()
-    actual_vocab_size = len(tokenizer)  # includes added tokens, not just base BPE
+    actual_vocab_size = len(tokenizer)
 
-    # Quick sanity check — 1 batch, just to verify data loads
     _peek_loader = create_dataloader(train_ds, batch_size=1, shuffle=False)
     _peek_batch = next(iter(_peek_loader))
     _max_id = _peek_batch["input_ids"].max().item()
     del _peek_loader, _peek_batch
     _safe_vocab = max(actual_vocab_size, _max_id + 1)
+
     if is_main:
-        print(f"{TAG} [train] Tokenizer: vocab_size={tokenizer.vocab_size}, len={actual_vocab_size}")
-        print(f"{TAG} [train] Dataset max token ID: {_max_id}, safe vocab: {_safe_vocab}")
+        print(f"{TAG} Tokenizer vocab: {actual_vocab_size}, safe: {_safe_vocab}")
 
-    # ── Model ──────────────────────────────────────────────────
+    # ── Model ─────────────────────────────────────────────────
     if is_main:
-        print(f"{TAG} [train] Building model...")
-    model, config = build_model()
+        print(f"{TAG} Building {model_type} model...")
+    model, config = build_model_from_config(cfg)
 
-    # Resize embeddings to cover all token IDs
-    if _safe_vocab != config.vocab_size:
-        if is_main:
-            print(f"{TAG} [train] Resizing embeddings: {config.vocab_size} -> {_safe_vocab}")
-        model.resize_token_embeddings(_safe_vocab)
-        config.vocab_size = _safe_vocab
+    resize_embeddings(model, config, _safe_vocab)
 
-    stats = count_params(config)
+    stats = count_params(model, config)
     if is_main:
-        print(f"{TAG} [train] Model params: {stats['total_m']:.2f}M total, {stats['active_m']:.2f}M active, ratio={stats['ratio']:.2f}x")
-        print(f"{TAG} [train] Experts: {config.num_routed_experts} routed + {config.num_shared_experts} shared, top-{config.num_experts_per_tok}")
-        print(f"{TAG} [train] Layers: {config.num_hidden_layers} ({stats['num_moe_layers']} MoE + {stats['num_dense_layers']} dense)")
+        print(f"{TAG} Params: {stats['total_m']:.2f}M total, {stats['active_m']:.2f}M active")
+        print(f"{TAG} MoE layers: {stats['num_moe_layers']}, Dense: {stats['num_dense_layers']}")
 
-    # Gradient checkpointing — DISABLED by default for MFU
-    # With fused CE saving ~1.3GB, 50M model fits on T4 16GB without checkpointing.
-    # Enable only if OOM occurs (pass --grad_checkpoint flag).
+    # ── Gradient Checkpointing ────────────────────────────────
     if getattr(args, 'grad_checkpoint', False):
         if is_main:
-            print(f"{TAG} [train] Enabling gradient checkpointing (use_reentrant=True for MoE)...")
+            print(f"{TAG} Gradient checkpointing ENABLED")
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": True}
         )
-    else:
-        if is_main:
-            print(f"{TAG} [train] Gradient checkpointing DISABLED (fused CE saves enough memory)")
-    config.use_cache = False  # incompatible with training
+    config.use_cache = False
 
     model = model.to(device)
 
-    # ── Triton Fused Kernels (default ON) ──────────────────────
+    # ── Triton Kernels (Liger + Dense MLP for BOTH models) ────
     if not args.no_triton:
-        try:
-            from src.kernels.patch import patch_bibo_with_triton
-            from src.kernels.moe_dispatch import patch_moe_with_triton
-            from src.kernels.dense_mlp import patch_dense_mlp_with_triton
-            from src.kernels.conv_fused import patch_conv_router_with_triton, patch_conv_expert_with_triton
-            patch_bibo_with_triton(model)
-            patch_moe_with_triton(model)
-            patch_dense_mlp_with_triton(model)
-            patch_conv_router_with_triton(model)
-            patch_conv_expert_with_triton(model)
-            dense_count = getattr(model, '_triton_dense_mlp_count', 0)
-            if is_main:
-                print(f"{TAG} [train] Triton kernels: ENABLED (RMSNorm + RoPE + MoE GLU + Dense MLP×{dense_count} + Conv fusion)")
-        except Exception as e:
-            if is_main:
-                print(f"{TAG} [train] Triton kernels: FAILED ({e}), using PyTorch eager")
+        if is_main:
+            print(f"{TAG} Applying Triton kernels...")
+        apply_triton_kernels(model, config, no_triton=False)
     else:
         if is_main:
-            print(f"{TAG} [train] Triton kernels: DISABLED (--no_triton)")
+            print(f"{TAG} Triton DISABLED (--no_triton)")
 
-    # FSDP2 for multi-GPU
+    # ── FSDP2 ─────────────────────────────────────────────────
     if is_distributed:
         if is_main:
-            print(f"{TAG} [train] Wrapping with FSDP2...")
+            print(f"{TAG} Wrapping with FSDP2...")
         model = wrap_fsdp(model, device)
 
-    # torch.compile
+    # ── torch.compile ─────────────────────────────────────────
     if not args.no_compile:
         if is_main:
-            print(f"{TAG} [train] Compiling model with torch.compile...")
+            print(f"{TAG} Compiling model...")
         try:
             model = compile_model(model)
             if is_main:
-                print(f"{TAG} [train] torch.compile OK")
+                print(f"{TAG} torch.compile OK")
         except Exception as e:
             if is_main:
-                print(f"{TAG} [train] torch.compile failed: {e}, continuing in eager mode")
+                print(f"{TAG} torch.compile failed: {e}")
 
-    # ── Optimizer & Scheduler ──────────────────────────────────
-    optimizer = create_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = create_scheduler(optimizer, args.warmup_steps, args.total_steps)
+    # ── Optimizer ─────────────────────────────────────────────
+    optimizer, optim_name = create_optimizer(model, cfg)
+    scheduler = create_scheduler(
+        optimizer,
+        train_cfg.get("warmup_steps", 1000),
+        train_cfg.get("total_steps", 50000),
+    )
 
-    # ── DataLoader ───────────────────────────────────────────────
-    train_loader = create_dataloader(train_ds, batch_size=args.batch_size)
+    # ── DataLoader ────────────────────────────────────────────
+    train_loader = create_dataloader(
+        train_ds,
+        batch_size=train_cfg["batch_size"],
+        seed=train_cfg.get("seed", 42),
+    )
 
-    # ── WandB ──────────────────────────────────────────────────
+    # ── Metrics Collector ─────────────────────────────────────
+    collector = MetricsCollector(model, enabled=log_cfg.get("log_internal_metrics", True))
+
+    # ── WandB ─────────────────────────────────────────────────
     if not args.no_wandb and is_main:
         wandb_config = {
-            "model": "BiBo-baseline",
-            # Training
-            "batch_size": args.batch_size,
-            "grad_accum": args.grad_accum,
-            "effective_batch": args.batch_size * args.grad_accum,
-            "total_steps": args.total_steps,
-            "warmup_steps": args.warmup_steps,
-            "lr": args.lr,
-            "weight_decay": args.weight_decay,
-            "grad_clip": args.grad_clip,
-            "seq_len": args.seq_len,
-            "seed": args.seed,
-            # Hardware
+            "model": model_type,
+            "optimizer": optim_name,
+            "batch_size": train_cfg["batch_size"],
+            "grad_accum": train_cfg["grad_accum"],
+            "total_steps": train_cfg["total_steps"],
+            "lr": train_cfg["lr"],
+            "seq_len": train_cfg.get("seq_len", 1024),
+            "seed": train_cfg.get("seed", 42),
             "world_size": world_size,
-            "has_bnb": HAS_BNB,
-            "compiled": not args.no_compile,
-            # Architecture
-            "vocab_size": config.vocab_size,
-            "hidden_size": config.hidden_size,
-            "intermediate_size": config.intermediate_size,
-            "num_hidden_layers": config.num_hidden_layers,
-            "num_attention_heads": config.num_attention_heads,
-            "num_key_value_heads": config.num_key_value_heads,
-            "moe_layers": stats["num_moe_layers"],
-            "dense_layers": stats["num_dense_layers"],
-            "num_routed_experts": config.num_routed_experts,
-            "num_shared_experts": config.num_shared_experts,
-            "num_experts_per_tok": config.num_experts_per_tok,
-            "polyglu_expert_multiplier": config.polyglu_expert_multiplier,
-            "special_expert_pairs": config.special_expert_pairs,
-            "moe_intermediate_size": config.moe_intermediate_size,
-            "shared_expert_type": config.shared_expert_type,
-            "router_type": config.router_type,
-            "router_lambda": config.router_lambda,
-            "use_ssmax": config.use_ssmax,
-            # Param counts
             "total_params": stats["total"],
-            "total_params_m": stats["total_m"],
             "active_params": stats["active"],
-            "active_params_m": stats["active_m"],
-            "param_ratio": stats["ratio"],
-            "embed_params": stats["embed"],
-            "attn_params": stats["attn"],
-            "dense_params": stats["dense"],
-            "moe_routed_params": stats["moe_routed"],
-            "moe_shared_params": stats["moe_shared"],
         }
-        init_wandb(wandb_config, project=args.wandb_project, name=args.wandb_name, notes=args.wandb_notes)
+        init_wandb(wandb_config, project=log_cfg["wandb_project"],
+                    name=log_cfg["wandb_name"], notes=f"{model_type} training")
 
-    # ── Resume ─────────────────────────────────────────────────
+    # ── Resume ────────────────────────────────────────────────
     start_step = 0
     if args.resume:
         start_step = load_checkpoint(model, optimizer, scheduler, args.resume)
 
-    # ── Eval Only ──────────────────────────────────────────────
+    # ── Eval Only ─────────────────────────────────────────────
     if args.eval_only:
         if is_main:
-            val_loss, val_ppl = evaluate(
-                model, val_ds,
-                batch_size=args.batch_size,
-                device=device,
-            )
-            print(f"{TAG} [eval] Val loss: {val_loss:.4f}, Perplexity: {val_ppl:.2f}")
-
-            samples = generate_samples(model, device=device)
-            for s in samples:
-                print(f"{TAG} \n  Prompt: {s['prompt']}")
-                print(f"{TAG}   Generated: {s['generated'][:200]}...")
+            results = run_all_evals(model, tokenizer, val_ds, device,
+                                    eval_cfg.get("benchmarks", []))
+            print(f"{TAG} Val loss: {results['val_loss']:.4f}, PPL: {results['val_ppl']:.2f}")
+            if "hellaswag" in results:
+                print(f"{TAG} HellaSwag: {results['hellaswag']['accuracy']:.4f}")
+            if "arc_challenge" in results:
+                print(f"{TAG} ARC-Challenge: {results['arc_challenge']['accuracy']:.4f}")
         return
 
-    # ── Training Loop ──────────────────────────────────────────
+    # ── Training Loop ─────────────────────────────────────────
     if is_main:
-        print(f"{TAG} \n[train] Starting training from step {start_step}...")
-        print(f"{TAG} [train] {len(train_ds)} train samples, {len(val_ds)} val samples")
-        print(f"{TAG} [train] {len(train_loader)} batches per epoch")
-        print()
+        print(f"\n{TAG} Starting training from step {start_step}...")
+        print(f"{TAG} {len(train_ds)} train, {len(val_ds)} val samples")
 
     scaler = torch.amp.GradScaler()
     throughput = ThroughputMeter(warmup=3)
@@ -348,18 +304,21 @@ def train(args):
     epoch = 0
     step = start_step
     data_iter = iter(train_loader)
-    accum_steps = args.grad_accum
-    micro_step = 0  # tracks micro-steps within an accumulation window
+    accum_steps = train_cfg["grad_accum"]
+    micro_step = 0
     optimizer.zero_grad(set_to_none=True)
 
-    while step < args.total_steps:
-        # Refill dataloader when exhausted
+    total_steps = train_cfg.get("total_steps", 50000)
+    log_every = log_cfg.get("log_every", 10)
+    eval_every = eval_cfg.get("eval_every", 500)
+    sample_every = eval_cfg.get("sample_every", 1000)
+    grad_clip = train_cfg.get("grad_clip", 1.0)
+
+    while step < total_steps:
         try:
             batch = next(data_iter)
         except StopIteration:
             epoch += 1
-            if is_main:
-                print(f"{TAG} [train] Epoch {epoch} complete, restarting dataloader")
             data_iter = iter(train_loader)
             batch = next(data_iter)
 
@@ -367,19 +326,16 @@ def train(args):
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
 
-        # Forward — use_cache=False for training (no KV cache needed)
         with torch.autocast("cuda", dtype=torch.float16):
             outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
-            loss = outputs.loss / accum_steps  # scale for accumulation
+            loss = outputs.loss / accum_steps
 
-        # Backward (accumulate gradients) — scaled for fp16 stability
         scaler.scale(loss).backward()
         micro_step += 1
 
-        # Only step optimizer every accum_steps micro-batches
         if micro_step % accum_steps == 0:
             scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -388,100 +344,91 @@ def train(args):
             step += 1
             step_time = time.time() - t0
 
-            # Throughput
             n_tokens = input_ids.numel() * accum_steps
             throughput.update(n_tokens)
-
-            # Unscale loss for logging
             unscaled_loss = loss.item() * accum_steps
 
-            # ── Logging (main rank only) ───────────────────────
-            if is_main and (step % args.log_every == 0 or step == 1):
+            # ── Logging ───────────────────────────────────────
+            if is_main and (step % log_every == 0 or step == 1):
                 lr_now = scheduler.get_last_lr()[0]
                 tps = throughput.tokens_per_sec()
                 gn = grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm
-                log_train_metrics(step, unscaled_loss, lr_now, gn, tps, step_time)
 
-                pct = step / args.total_steps * 100
-                eta_steps = args.total_steps - step
-                eta_sec = eta_steps * step_time
+                # Collect internal metrics
+                internal = collector.compute() if collector.enabled else {}
+                collector.reset()
+
+                log_train_metrics(step, unscaled_loss, lr_now, gn, tps, step_time, extra=internal)
+
+                pct = step / total_steps * 100
+                eta = (total_steps - step) * step_time
                 print(
-                    f"  step {step:>6d}/{args.total_steps} ({pct:5.1f}%) | "
+                    f"  step {step:>6d}/{total_steps} ({pct:5.1f}%) | "
                     f"loss={unscaled_loss:.4f} | lr={lr_now:.2e} | "
-                    f"tps={tps:.0f} | time={step_time:.3f}s | "
-                    f"grad={gn:.4f} | "
-                    f"ETA={format_time(eta_sec)}"
+                    f"tps={tps:.0f} | {step_time:.3f}s | "
+                    f"grad={gn:.4f} | ETA={format_time(eta)}"
                 )
 
-            # ── Validation ─────────────────────────────────────
-            if is_main and step % args.eval_every == 0:
+            # ── Validation + Benchmarks ───────────────────────
+            if is_main and step % eval_every == 0:
                 try:
-                    val_loss, val_ppl = evaluate(
-                        model, val_ds,
-                        batch_size=max(args.batch_size, 8),
-                        device=device,
-                        max_batches=100,
-                    )
-                    log_val_metrics(step, val_loss, val_ppl)
-                    print(f"{TAG}   [VAL] step={step} | val_loss={val_loss:.4f} | val_ppl={val_ppl:.2f}")
-
+                    with collector.track():
+                        results = run_all_evals(
+                            model, tokenizer, val_ds, device,
+                            eval_cfg.get("benchmarks", []),
+                            max_batches=100,
+                        )
+                    log_eval_metrics(step, results)
+                    print(f"    [VAL] loss={results['val_loss']:.4f} ppl={results['val_ppl']:.2f}")
+                    if "hellaswag" in results:
+                        print(f"    [BENCH] HellaSwag={results['hellaswag']['accuracy']:.4f}")
+                    if "arc_challenge" in results:
+                        print(f"    [BENCH] ARC={results['arc_challenge']['accuracy']:.4f}")
                 except torch.cuda.OutOfMemoryError:
-                    print(f"{TAG}   [VAL] step={step} | OOM — skipping")
+                    print(f"    [VAL] OOM — skipping")
                     torch.cuda.empty_cache()
 
-                if val_loss < 2.8:
-                    print(f"{TAG}   *** TARGET REACHED: val_loss={val_loss:.4f} < 2.8 at step {step} ***")
+            # ── Sample Generation ─────────────────────────────
+            if is_main and step % sample_every == 0:
+                try:
+                    samples = generate_samples(model, device=device,
+                                               prompts=["The meaning of life is"],
+                                               max_new_tokens=50)
+                    log_samples(step, samples)
+                    print(f"    [SAMPLE] {samples[0]['generated'][:100]}...")
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
 
-            # ── Sample Generation ──────────────────────────────
-            if is_main and step % args.sample_every == 0:
-                samples = generate_samples(model, device=device)
-                log_samples(step, samples)
-                print(f"{TAG}   [SAMPLES] step={step}:")
-                for s in samples[:2]:
-                    gen_preview = s["generated"][:150].replace("\n", " ")
-                    print(f"{TAG}     '{s['prompt']}' -> '{gen_preview}...'")
-
-            # ── Checkpointing ──────────────────────────────────
-            if is_main and step % (args.eval_every * 5) == 0:
-                ckpt_path = os.path.join(REPO_ROOT, "bench", "checkpoints", f"step_{step}.pt")
+            # ── Checkpointing ─────────────────────────────────
+            if is_main and step % (eval_every * 5) == 0:
+                ckpt_path = os.path.join(REPO_ROOT, "bench", "checkpoints",
+                                         f"{model_type}_step_{step}.pt")
                 save_checkpoint(model, optimizer, scheduler, step, ckpt_path)
 
-    # ── Final Summary ──────────────────────────────────────────
+    # ── Final Summary ─────────────────────────────────────────
     if is_main:
-        print(f"{TAG} \n" + "=" * 60)
-        print(f"{TAG} Training Complete!")
-        print(f"{TAG}   Total steps: {step}")
-        print(f"{TAG}   Epochs: {epoch + 1}")
+        print(f"\n{TAG} " + "=" * 60)
+        print(f"{TAG} Training Complete! ({step} steps, {epoch + 1} epochs)")
 
-        # Final eval (use larger batch — no gradients, just forward)
         try:
-            val_loss, val_ppl = evaluate(
-                model, val_ds,
-                batch_size=max(args.batch_size, 8),
-                device=device,
-                max_batches=100,
-            )
-            log_val_metrics(step, val_loss, val_ppl)
-            print(f"{TAG}   Final val loss: {val_loss:.4f}")
-            print(f"{TAG}   Final val perplexity: {val_ppl:.2f}")
-            print(f"{TAG}   Target (<2.8): {'HIT' if val_loss < 2.8 else 'MISSED'}")
-
+            results = run_all_evals(model, tokenizer, val_ds, device,
+                                    eval_cfg.get("benchmarks", []), max_batches=100)
+            log_eval_metrics(step, results)
+            print(f"{TAG} Final val loss: {results['val_loss']:.4f}")
+            print(f"{TAG} Final perplexity: {results['val_ppl']:.2f}")
+            if "hellaswag" in results:
+                print(f"{TAG} HellaSwag: {results['hellaswag']['accuracy']:.4f}")
+            if "arc_challenge" in results:
+                print(f"{TAG} ARC-Challenge: {results['arc_challenge']['accuracy']:.4f}")
         except torch.cuda.OutOfMemoryError:
-            print(f"{TAG}   [WARN] Final eval OOM — skipping, using last training loss")
-            torch.cuda.empty_cache()
-        print(f"{TAG} =" * 60)
+            print(f"{TAG} Final eval OOM")
 
-        # Final samples (quick — just 2 prompts)
-        samples = generate_samples(model, device=device, prompts=["The meaning of life is"], max_new_tokens=50)
-        log_samples(step, samples)
-        print(f"{TAG} \nFinal samples:")
-        for s in samples:
-            print(f"{TAG} \n  Prompt: {s['prompt']}")
-            print(f"{TAG}   Generated: {s['generated'][:200]}")
+        print(f"{TAG} " + "=" * 60)
 
-        # Save final checkpoint
-        ckpt_path = os.path.join(REPO_ROOT, "bench", "checkpoints", "final.pt")
+        ckpt_path = os.path.join(REPO_ROOT, "bench", "checkpoints", f"{model_type}_final.pt")
         save_checkpoint(model, optimizer, scheduler, step, ckpt_path)
+
+        collector.remove_hooks()
 
         if not args.no_wandb:
             import wandb

@@ -1,73 +1,59 @@
-# BiBo Benchmark — Language Model Training
+# BiBo Benchmark — Unified Training Suite
+
+Trains BiBo and Qwen3MoE with identical data pipelines for fair comparison.
 
 ## Quick Start
 
 ```bash
-# Single GPU (local dev)
-python bench/train.py
+# BiBo baseline
+bash bench/run.sh bench/configs/bibo.yaml
 
-# Multi-GPU (Kaggle 2×T4)
-torchrun --nproc_per_node=2 bench/train.py
+# Qwen3MoE baseline
+bash bench/run.sh bench/configs/qwen3moe.yaml
 
-# Or use the Kaggle entry point
-bash bench/run.sh
+# Ablation: no SSMax
+bash bench/run.sh bench/configs/bibo_no_ssmax.yaml
+
+# Dual-GPU comparison (1 GPU per model)
+CUDA_VISIBLE_DEVICES=0 bash bench/run.sh bench/configs/bibo.yaml &
+CUDA_VISIBLE_DEVICES=1 bash bench/run.sh bench/configs/qwen3moe.yaml &
+wait
 ```
 
-## What This Does
+## Configs
 
-Trains a ~50M parameter baseline BiBo (MLP router, shared expert, uniform SwiGLU experts) on language modeling using the QTK-81K tokenizer dataset. Target: < 2.8 val loss.
+| Config | Model | Params | Description |
+|--------|-------|--------|-------------|
+| `bibo.yaml` | BiBo | ~95M | PolyGLU (6 weighted + 2 special), GQA 4:2, SSMax |
+| `bibo_no_ssmax.yaml` | BiBo | ~95M | Same but without SSMax attention |
+| `qwen3moe.yaml` | Qwen3MoE | ~115M | 8 homogeneous SwiGLU experts, GQA 4:2 |
 
-## Key Settings
+## What Gets Applied
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `--batch_size` | 32 | Per-GPU batch size |
-| `--total_steps` | 50000 | Total training steps |
-| `--warmup_steps` | 1000 | Linear warmup steps |
-| `--lr` | 3e-4 | Learning rate (AdamW) |
-| `--muon_lr` | 0.02 | Learning rate (Muon) |
-| `--seq_len` | 1024 | Sequence length (truncated from 2048) |
-| `--eval_every` | 500 | Steps between validation |
-| `--sample_every` | 1000 | Steps between sample generation |
-| `--no_compile` | false | Skip torch.compile |
-| `--no_wandb` | false | Disable WandB logging |
+Both models receive identical optimizations:
+- **Liger RMSNorm** (8-9x faster)
+- **Liger RoPE** (2-3x faster)
+- **Liger Fused CrossEntropy** (at training loop level)
+- **Dense MLP Triton** (fused SwiGLU forward + backward)
+- **BiBo-only**: MoE fused GLU + weight scatter kernels
+
+## Metrics Logged (WandB)
+
+- **Training**: loss, lr, grad_norm, tokens/sec, step_time, GPU memory
+- **Validation**: val_loss, perplexity
+- **Benchmarks**: HellaSwag accuracy, ARC-Challenge accuracy
+- **MoE internals**: router entropy, expert utilization, hidden norms
+- **MFU**: Model FLOPs Utilization estimate
+
+## Deterministic Training
+
+Same seed + same data = same training curves. Required for fair comparison.
+Uses `CUBLAS_WORKSPACE_CONFIG=:4096:8` and seeded data loaders.
 
 ## Dependencies
 
 ```
-torch>=2.6.0
-transformers>=4.50.0
-datasets>=3.0.0
-wandb>=0.18.0
-hf_transfer>=0.1.0
-```
-
-Optional: `modded-nanogpt` for Muon optimizer (falls back to AdamW)
-
-## Expected Results
-
-- **Val loss target:** < 2.8
-- **Time:** ~3-4 hours on Kaggle 2×T4
-- **WandB dashboard:** loss curves, perplexity, throughput, generated samples
-
-## Architecture
-
-- ~50M params: hidden=320, 10 layers, 5 attention heads (GQA 5:1)
-- 3 uniform SwiGLU routed experts + 1 shared SwiGLU expert per MoE layer
-- MLP router with sigmoid gating (DeepSeek-V3 style)
-- SSMax attention scaling
-- First and last layers are dense MLP (not MoE)
-
-## File Structure
-
-```
-bench/
-├── config.py      # Model config (BiBoConfig ~50M)
-├── data.py        # Dataset loading + truncation
-├── optim.py       # Muon + AdamW optimizer
-├── eval.py        # Eval + sample generation
-├── utils.py       # WandB, checkpointing, helpers
-├── train.py       # Main training loop
-├── run.sh         # Kaggle entry point
-└── README.md      # This file
+torch>=2.6.0, transformers>=4.50.0, datasets>=3.0.0
+wandb>=0.18.0, hf_transfer>=0.1.0, bitsandbytes>=0.44.0
+pyyaml>=6.0, liger-kernel, einops
 ```

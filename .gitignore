@@ -12,3 +12,7 @@ researcher/
 postmortem/
 skills/
 logs/
+.mimocode/
+profile_bibo.py
+bench/checkpoints/
+bench/configs/_tmp_*.yaml

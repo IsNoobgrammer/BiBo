@@ -198,6 +198,20 @@ BiBoForCausalLM
 7. **Conv router** — gives router local context (sees previous `kernel_size-1` tokens). Novel — no other MoE paper uses convolutional routing.
 8. **Logit norm prevents expert waste** — when top_k > 1, normalization ensures all selected experts contribute meaningfully (not just top-1 dominating).
 
+### Kernel Design Decisions (June 2026)
+
+9. **Triton kernels have custom backward** — all MoE Triton kernels use custom Triton backward kernels, not PyTorch fallback. Gold standard: `_FusedSwiGLUFull` in dense_mlp.py (matched forward+backward Triton kernels with autotune).
+
+10. **GQA native in SDPA** — `F.scaled_dot_product_attention(q, k, v, enable_gqa=True)` eliminates repeat_kv materialization. K/V passed with original (fewer) heads directly to Flash Attention.
+
+11. **No autotuning for MoE kernels** — M varies per expert per step, causing recompilation overhead. Use fixed block sizes with `triton.next_power_of_2()` clamped to ranges. Dense MLP, attention, conv kernels CAN use autotuning.
+
+12. **Float32 in backward** — all backward computations use float32 intermediates to prevent overflow in GLU derivatives (`sig * (1 + g * (1-sig))` can overflow float16).
+
+13. **Scatter → Gather pattern** — Forward uses `atomic_add` for scatter (non-differentiable). Backward uses `tl.load` with gathered indices (differentiable). This is the standard pattern for non-overlapping scatter-add.
+
+14. **Recompute vs save for backward** — For small M (MoE experts), saving gate_up is preferred (low memory cost). For large M, recomputation saves memory. Decision: save for MoE, recompute for dense.
+
 ---
 
 ## Common Tasks
@@ -247,6 +261,9 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 - Qwen baseline requires real `transformers` package (not stubs)
 - CausalConv1D needs halo exchange for sequence parallelism (future work)
 - MoE dispatch loop is fine for ≤16 experts on single GPU; needs grouped GEMM for 64+ experts with EP
+- All MoE Triton kernels now have custom Triton backward kernels (not PyTorch fallback)
+- GQA uses native SDPA `enable_gqa=True` — no repeat_kv materialization needed
+- Conv kernels (conv_fused.py) intentionally not used — 0.41x slower due to kernel launch overhead on small tensors
 
 ---
 
@@ -278,6 +295,67 @@ old_kernels/                  # Retired variants (kept for re-benchmarking)
 ├── dense_mlp.py             # Forward-only (Triton fwd, PyTorch bwd)
 └── dense_mlp_fused.py       # Fully fused fwd+bwd single kernel
 ```
+
+### Kernel Inventory (June 2026)
+
+| Kernel | File | Forward | Backward | Status |
+|--------|------|---------|----------|--------|
+| `_fused_glu_act_kernel` | moe_dispatch.py | Triton | **Triton** (`_TritonMoEGLUFunction`) | Production |
+| `_fused_linear_glu_kernel` | moe_dispatch.py | Triton | **Triton** (recomputes gate_up) | Production |
+| `_fused_down_weight_kernel` | moe_dispatch.py | Triton | **Triton** (integrated) | Production |
+| `_fused_weight_scatter_kernel` | moe_dispatch.py | Triton | **Triton** (scatter→gather) | Production |
+| `_fused_router_kernel` | moe_dispatch.py | Triton | N/A (detached) | Production |
+| `_batched_glu_act_kernel` | moe_dispatch.py | Triton | **Triton** (`_TritonFusedGLUFunction`) | Production |
+| `_fused_swiglu_*_kernel` | dense_mlp.py | Triton | **Triton** (`_FusedSwiGLUFull`) | Gold standard |
+| `_fused_permute_act_gate_kernel` | conv_fused.py | Triton | **Triton** (`_TritonConvGateMultiplyFunction`) | Production |
+| `_fused_permute_act_kernel` | conv_fused.py | Triton | **Triton** (`_TritonPermuteActFunction`) | Production |
+| Liger RMSNorm | patch.py | Triton | Triton (Liger) | Production |
+| Liger RoPE | patch.py | Triton | Triton (Liger) | Production |
+| Liger SiLUMul | patch.py | Triton | Triton (Liger) | Production |
+| Liger Fused CE | models.py | Triton | Triton (Liger) | Production |
+
+### Backward Kernel Pattern (from dense_mlp.py gold standard)
+
+```python
+class _FusedXxxFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, act_type):
+        ctx.save_for_backward(x, weight)
+        ctx.act_type = act_type
+        # Launch Triton forward kernel
+        out = torch.empty(...)
+        _fused_xxx_forward_kernel[grid](x, weight, out, ...)
+        return out
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight = ctx.saved_tensors
+        # Launch Triton backward kernel for activation derivatives
+        grad_gate_up = torch.empty(...)
+        _fused_xxx_backward_kernel[grid](grad_output, x, weight, grad_gate_up, ...)
+        # GEMM backward via cuBLAS (optimal for large shapes)
+        grad_x = F.linear(grad_gate_up, weight)
+        grad_weight = torch.mm(grad_gate_up.t(), x.float())
+        return grad_x, grad_weight, None
+```
+
+### Backward Kernel Reference (from tritonify)
+
+**GLU activation backward** (from glu-kernels.md):
+- SiLU: `dact = sig * (1 + g * (1 - sig))`
+- ReLU²: `dact = 2 * relu(g)`
+- Tanh: `dact = 1 - tanh(g)²`
+- All computed in float32 to prevent overflow
+
+**Weight scatter backward** (from moe-kernels.md):
+- Forward: `out[idx[n]] += expert_out[n] * weights[n]` (atomic_add)
+- Backward: `grad_expert_out[n] = grad_out[idx[n]] * weights[n]` (gather)
+- Backward: `grad_weights[n] = (grad_out[idx[n]] * expert_out[n]).sum()` (reduce)
+
+**GEMM backward** (from llm-optimizations.md):
+- `grad_x = grad_output @ weight` (cuBLAS)
+- `grad_weight = grad_output.T @ x` (cuBLAS)
+- Always use float32 for the GEMM to prevent overflow
 
 ### 4 Mandatory Rules for All Triton Kernels
 

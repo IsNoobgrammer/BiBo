@@ -228,6 +228,147 @@ def _fused_permute_act_gate_kernel(
 # PyTorch backward for correct gradient flow.
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# KERNEL 4: Conv Gate Multiply Backward
+#
+# Backward of fused permute + activation + gate multiply.
+# Forward: out[b,s,i] = act(conv_out[b,i,s]) * up_out[b,s,i]
+# Backward:
+#   grad_up_out[b,s,i] = grad_out[b,s,i] * act(conv_out[b,i,s])
+#   grad_conv_out[b,i,s] = grad_out[b,s,i] * up_out[b,s,i] * d_act(conv_out[b,i,s])
+#
+# Fuses: activation derivative + two multiplies + permute-back in one kernel.
+# All in float32 to prevent overflow.
+# ═══════════════════════════════════════════════════════════════
+
+@triton.jit
+def _fused_permute_act_gate_backward_kernel(
+    GradOut_ptr,      # (B, S, I) — gradient of output
+    ConvOut_ptr,      # (B, I, S) — saved conv output
+    UpOut_ptr,        # (B, S, I) — saved up output
+    GradConvOut_ptr,  # (B, I, S) — gradient of conv output
+    GradUpOut_ptr,    # (B, S, I) — gradient of up output
+    B, S, I,
+    stride_go_b, stride_go_s, stride_go_i,
+    stride_co_b, stride_co_i, stride_co_s,
+    stride_uo_b, stride_uo_s, stride_uo_i,
+    stride_gco_b, stride_gco_i, stride_gco_s,
+    stride_guo_b, stride_guo_s, stride_guo_i,
+    ACT_TYPE: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+):
+    """Backward: compute grad_conv_out and grad_up_out."""
+    pid_b = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    pid_i = tl.program_id(2)
+
+    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    offs_i = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
+    mask_s = offs_s < S
+    mask_i = offs_i < I
+    mask = mask_s[:, None] & mask_i[None, :]
+
+    # Load grad_output from (B, S, I)
+    go_ptrs = GradOut_ptr + pid_b * stride_go_b + offs_s[:, None] * stride_go_s + offs_i[None, :] * stride_go_i
+    grad_out = tl.load(go_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # Load conv_out from (B, I, S) — permuted to (B, S, I) for activation
+    co_ptrs = ConvOut_ptr + pid_b * stride_co_b + offs_i[None, :] * stride_co_i + offs_s[:, None] * stride_co_s
+    conv_val = tl.load(co_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # Load up_out from (B, S, I)
+    uo_ptrs = UpOut_ptr + pid_b * stride_uo_b + offs_s[:, None] * stride_uo_s + offs_i[None, :] * stride_uo_i
+    up_val = tl.load(uo_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # Compute activation and derivative in float32
+    if ACT_TYPE == 0:  # SiLU
+        sig_gate = 1.0 / (1.0 + tl.exp(-conv_val))
+        act_gate = conv_val * sig_gate
+        dact = sig_gate * (1.0 + conv_val * (1.0 - sig_gate))
+    elif ACT_TYPE == 1:  # ReLU²
+        relu_gate = tl.maximum(conv_val, 0.0)
+        act_gate = relu_gate * relu_gate
+        dact = 2.0 * relu_gate
+    elif ACT_TYPE == 2:  # Tanh
+        act_gate = 2.0 * (1.0 / (1.0 + tl.exp(-2.0 * conv_val))) - 1.0
+        dact = 1.0 - act_gate * act_gate
+    else:  # None
+        act_gate = conv_val
+        dact = 1.0
+
+    # Compute grad_up_out = grad_output * act_gate
+    grad_up_out = grad_out * act_gate
+    guo_ptrs = GradUpOut_ptr + pid_b * stride_guo_b + offs_s[:, None] * stride_guo_s + offs_i[None, :] * stride_guo_i
+    tl.store(guo_ptrs, grad_up_out, mask=mask)
+
+    # Compute grad_conv_out = grad_output * up_val * dact (write to (B, I, S) layout)
+    grad_conv = grad_out * up_val * dact
+    gco_ptrs = GradConvOut_ptr + pid_b * stride_gco_b + offs_i[None, :] * stride_gco_i + offs_s[:, None] * stride_gco_s
+    tl.store(gco_ptrs, grad_conv, mask=mask)
+
+
+# ═══════════════════════════════════════════════════════════════
+# KERNEL 5: Conv Permute+Act Backward
+#
+# Backward of fused permute + activation.
+# Forward: out[b,s,i] = act(conv_out[b,i,s])
+# Backward: grad_conv_out[b,i,s] = grad_out[b,s,i] * d_act(conv_out[b,i,s])
+#
+# Fuses: activation derivative + multiply + permute-back in one kernel.
+# ═══════════════════════════════════════════════════════════════
+
+@triton.jit
+def _fused_permute_act_backward_kernel(
+    GradOut_ptr,      # (B, S, I) — gradient of output
+    ConvOut_ptr,      # (B, I, S) — saved conv output
+    GradConvOut_ptr,  # (B, I, S) — gradient of conv output
+    B, S, I,
+    stride_go_b, stride_go_s, stride_go_i,
+    stride_co_b, stride_co_i, stride_co_s,
+    stride_gco_b, stride_gco_i, stride_gco_s,
+    ACT_TYPE: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+):
+    """Backward: compute grad_conv_out."""
+    pid_b = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    pid_i = tl.program_id(2)
+
+    offs_s = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    offs_i = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
+    mask_s = offs_s < S
+    mask_i = offs_i < I
+    mask = mask_s[:, None] & mask_i[None, :]
+
+    # Load grad_output from (B, S, I)
+    go_ptrs = GradOut_ptr + pid_b * stride_go_b + offs_s[:, None] * stride_go_s + offs_i[None, :] * stride_go_i
+    grad_out = tl.load(go_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # Load conv_out from (B, I, S) — permuted to (B, S, I) for activation
+    co_ptrs = ConvOut_ptr + pid_b * stride_co_b + offs_i[None, :] * stride_co_i + offs_s[:, None] * stride_co_s
+    conv_val = tl.load(co_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # Compute activation derivative in float32
+    if ACT_TYPE == 0:  # SiLU
+        sig_gate = 1.0 / (1.0 + tl.exp(-conv_val))
+        dact = sig_gate * (1.0 + conv_val * (1.0 - sig_gate))
+    elif ACT_TYPE == 1:  # ReLU²
+        relu_gate = tl.maximum(conv_val, 0.0)
+        dact = 2.0 * relu_gate
+    elif ACT_TYPE == 2:  # Tanh
+        act_gate = 2.0 * (1.0 / (1.0 + tl.exp(-2.0 * conv_val))) - 1.0
+        dact = 1.0 - act_gate * act_gate
+    else:  # None
+        dact = 1.0
+
+    # Compute grad_conv_out = grad_output * dact (write to (B, I, S) layout)
+    grad_conv = grad_out * dact
+    gco_ptrs = GradConvOut_ptr + pid_b * stride_gco_b + offs_i[None, :] * stride_gco_i + offs_s[:, None] * stride_gco_s
+    tl.store(gco_ptrs, grad_conv, mask=mask)
+
+
 class _TritonConvGateMultiplyFunction(torch.autograd.Function):
     """Autograd wrapper for fused permute + activation + gate multiply."""
     
@@ -255,44 +396,33 @@ class _TritonConvGateMultiplyFunction(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        """
-        Backward: recompute from saved tensors.
-        
-        Forward: out = act(permute(conv_out)) * up_out
-        where permute(conv_out) transposes (B,I,S) → (B,S,I)
-        
-        grad_conv_out: grad_output * up_out * d(act)/d(gate), then permute back (B,S,I)→(B,I,S)
-        grad_up_out: grad_output * act(permute(conv_out))
-        """
+        """Backward: Triton kernel for fused activation + multiply + permute."""
         conv_out, up_out = ctx.saved_tensors
         act_type = ctx.act_type
+        B, I, S = conv_out.shape
         
-        # Recompute gate = permute(conv_out) → (B, S, I)
-        gate = conv_out.permute(0, 2, 1)
+        # Allocate output gradients
+        grad_conv_out = torch.empty(B, I, S, device=conv_out.device, dtype=conv_out.dtype)
+        grad_up_out = torch.empty(B, S, I, device=up_out.device, dtype=up_out.dtype)
         
-        if act_type == 0:  # SiLU
-            sig_gate = torch.sigmoid(gate)
-            act_gate = gate * sig_gate
-            dact = sig_gate * (1.0 + gate * (1.0 - sig_gate))
-        elif act_type == 1:  # ReLU²
-            relu_gate = F.relu(gate)
-            act_gate = relu_gate * relu_gate
-            dact = 2.0 * relu_gate
-        elif act_type == 2:  # Tanh
-            act_gate = torch.tanh(gate)
-            dact = 1.0 - act_gate * act_gate
-        else:  # None
-            act_gate = gate
-            dact = torch.ones_like(gate)
+        BLOCK_S = min(32, triton.next_power_of_2(S))
+        BLOCK_I = min(64, triton.next_power_of_2(I))
+        grid = (B, triton.cdiv(S, BLOCK_S), triton.cdiv(I, BLOCK_I))
         
-        # grad_up_out = grad_output * act(gate)
-        grad_up_out = grad_output * act_gate
-        
-        # grad_gate = grad_output * up_out * d(act)/d(gate)
-        grad_gate = grad_output * up_out * dact
-        
-        # grad_conv_out: permute grad_gate (B,S,I) → (B,I,S)
-        grad_conv_out = grad_gate.permute(0, 2, 1)
+        # Launch Triton backward kernel
+        _fused_permute_act_gate_backward_kernel[grid](
+            grad_output, conv_out, up_out,
+            grad_conv_out, grad_up_out,
+            B, S, I,
+            grad_output.stride(0), grad_output.stride(1), grad_output.stride(2),
+            conv_out.stride(0), conv_out.stride(1), conv_out.stride(2),
+            up_out.stride(0), up_out.stride(1), up_out.stride(2),
+            grad_conv_out.stride(0), grad_conv_out.stride(1), grad_conv_out.stride(2),
+            grad_up_out.stride(0), grad_up_out.stride(1), grad_up_out.stride(2),
+            ACT_TYPE=act_type,
+            BLOCK_S=BLOCK_S,
+            BLOCK_I=BLOCK_I,
+        )
         
         return grad_conv_out, grad_up_out, None  # None for act_type
 
@@ -322,30 +452,29 @@ class _TritonPermuteActFunction(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        """
-        Backward: grad through permute + activation.
-        Forward: out = act(permute(conv_out))
-        grad_conv_out = permute_back(grad_output * d(act)/d(gate))
-        """
+        """Backward: Triton kernel for activation derivative + permute-back."""
         conv_out, = ctx.saved_tensors
         act_type = ctx.act_type
+        B, I, S = conv_out.shape
         
-        gate = conv_out.permute(0, 2, 1)  # (B, S, I)
+        # Allocate output gradient
+        grad_conv_out = torch.empty(B, I, S, device=conv_out.device, dtype=conv_out.dtype)
         
-        if act_type == 0:  # SiLU
-            sig_gate = torch.sigmoid(gate)
-            dact = sig_gate * (1.0 + gate * (1.0 - sig_gate))
-        elif act_type == 1:  # ReLU²
-            relu_gate = F.relu(gate)
-            dact = 2.0 * relu_gate
-        elif act_type == 2:  # Tanh
-            tanh_gate = torch.tanh(gate)
-            dact = 1.0 - tanh_gate * tanh_gate
-        else:  # None
-            dact = torch.ones_like(gate)
+        BLOCK_S = min(32, triton.next_power_of_2(S))
+        BLOCK_I = min(64, triton.next_power_of_2(I))
+        grid = (B, triton.cdiv(S, BLOCK_S), triton.cdiv(I, BLOCK_I))
         
-        grad_gate = grad_output * dact
-        grad_conv_out = grad_gate.permute(0, 2, 1)  # (B, I, S)
+        # Launch Triton backward kernel
+        _fused_permute_act_backward_kernel[grid](
+            grad_output, conv_out, grad_conv_out,
+            B, S, I,
+            grad_output.stride(0), grad_output.stride(1), grad_output.stride(2),
+            conv_out.stride(0), conv_out.stride(1), conv_out.stride(2),
+            grad_conv_out.stride(0), grad_conv_out.stride(1), grad_conv_out.stride(2),
+            ACT_TYPE=act_type,
+            BLOCK_S=BLOCK_S,
+            BLOCK_I=BLOCK_I,
+        )
         
         return grad_conv_out, None  # None for act_type
 

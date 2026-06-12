@@ -139,8 +139,8 @@ class BiBoFusedExperts(nn.Module):
                 output.index_add_(0, token_idx, current_state * weights)
                 
             else:
-                # Zero expert: multiply by 0 (keeps graph alive for router gradients)
-                output.index_add_(0, token_idx, current_state * (weights * 0))
+                # Zero expert: skip (output is zero, router gradients don't depend on expert output)
+                pass
 
         return output
 

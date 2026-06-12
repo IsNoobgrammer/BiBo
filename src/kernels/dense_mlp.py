@@ -222,22 +222,30 @@ class _TritonFusedGLUFunction(torch.autograd.Function):
         act_type = ctx.act_type
         M = gate_up.shape[0]
         I = gate_up.shape[1] // 2
-        gate = gate_up[:, :I]
-        up = gate_up[:, I:]
-        if act_type == 0:  # SiLU
-            sig_gate = torch.sigmoid(gate)
-            act_gate = gate * sig_gate
-            dact = sig_gate * (1.0 + gate * (1.0 - sig_gate))
-        elif act_type == 1:  # ReLU²
-            relu_gate = F.relu(gate)
-            act_gate = relu_gate * relu_gate
-            dact = 2.0 * relu_gate
-        else:  # Tanh
-            act_gate = torch.tanh(gate)
-            dact = 1.0 - act_gate * act_gate
-        grad_up = grad_output * act_gate
-        grad_gate = grad_output * up * dact
-        grad_gate_up = torch.cat([grad_gate, grad_up], dim=-1)
+        
+        # Use Triton backward kernel
+        grad_gate_up = torch.empty(M, 2 * I, device=gate_up.device, dtype=gate_up.dtype)
+        
+        import triton
+        from .moe_dispatch import _fused_glu_act_backward_kernel
+        
+        BLOCK_M = min(64, triton.next_power_of_2(M))
+        BLOCK_M = max(16, BLOCK_M)
+        BLOCK_I = min(128, triton.next_power_of_2(I))
+        BLOCK_I = max(16, BLOCK_I)
+        
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(I, BLOCK_I))
+        
+        _fused_glu_act_backward_kernel[grid](
+            grad_output, gate_up, grad_gate_up,
+            M, I,
+            grad_output.stride(0), grad_output.stride(1),
+            gate_up.stride(0), gate_up.stride(1),
+            grad_gate_up.stride(0), grad_gate_up.stride(1),
+            ACT_TYPE=act_type,
+            BLOCK_M=BLOCK_M,
+            BLOCK_I=BLOCK_I,
+        )
         return grad_gate_up, None
 
 

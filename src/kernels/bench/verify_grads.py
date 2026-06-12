@@ -18,6 +18,11 @@ import sys
 import torch
 import torch.nn.functional as F
 
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.insert(0, REPO_ROOT)
 
@@ -80,12 +85,14 @@ def test_gradient_equivalence_fp32():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
 
     # Build reference model
     _, model_ref = make_test_model(device)
 
     # Build patched model (same weights)
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     _, model_tri = make_test_model(device)
     model_tri.load_state_dict(model_ref.state_dict())
 
@@ -96,7 +103,7 @@ def test_gradient_equivalence_fp32():
 
     # Same input
     torch.manual_seed(123)
-    input_ids = torch.randint(0, 1000, (2, 64), device=device)
+    input_ids = torch.randint(0, 1000, (2, 64)).to(device)
 
     # Forward + backward (reference)
     out_ref = model_ref(input_ids=input_ids, labels=input_ids)
@@ -177,9 +184,11 @@ def test_gradient_equivalence_fp16():
         return True
 
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     _, model_ref = make_test_model(device)
 
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     _, model_tri = make_test_model(device)
     model_tri.load_state_dict(model_ref.state_dict())
 
@@ -188,7 +197,7 @@ def test_gradient_equivalence_fp16():
     patch_dense_mlp_with_triton(model_tri)
 
     torch.manual_seed(123)
-    input_ids = torch.randint(0, 1000, (2, 64), device=device)
+    input_ids = torch.randint(0, 1000, (2, 64)).to(device)
 
     # Reference with autocast
     with torch.autocast('cuda', dtype=torch.float16):
@@ -252,13 +261,15 @@ def test_no_frozen_params():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     _, model = make_test_model(device)
 
     patch_bibo_with_triton(model)
     patch_moe_with_triton(model)
     patch_dense_mlp_with_triton(model)
 
-    input_ids = torch.randint(0, 1000, (4, 64), device=device)
+    torch.manual_seed(123)
+    input_ids = torch.randint(0, 1000, (4, 64)).to(device)
     out = model(input_ids=input_ids, labels=input_ids)
     out.loss.backward()
 
@@ -308,6 +319,7 @@ def test_no_stale_buffers():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     _, model = make_test_model(device)
 
     patch_bibo_with_triton(model)
@@ -337,11 +349,13 @@ def test_multi_step_convergence():
 
     # Reference model
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     _, model_ref = make_test_model(device)
     opt_ref = torch.optim.AdamW(model_ref.parameters(), lr=1e-3)
 
     # Patched model (same init)
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     _, model_tri = make_test_model(device)
     model_tri.load_state_dict(model_ref.state_dict())
     patch_bibo_with_triton(model_tri)
@@ -351,7 +365,7 @@ def test_multi_step_convergence():
 
     # Fixed data for overfitting
     torch.manual_seed(999)
-    input_ids = torch.randint(0, 1000, (4, 32), device=device)
+    input_ids = torch.randint(0, 1000, (4, 32)).to(device)
 
     losses_ref = []
     losses_tri = []
@@ -403,12 +417,14 @@ def test_conv_gradient_flow():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
 
     # Reference (unpatched conv model)
     _, model_ref = make_conv_test_model(device)
 
     # Patched conv model (same weights)
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     _, model_tri = make_conv_test_model(device)
     model_tri.load_state_dict(model_ref.state_dict())
 
@@ -421,7 +437,7 @@ def test_conv_gradient_flow():
 
     # Same input
     torch.manual_seed(123)
-    input_ids = torch.randint(0, 1000, (2, 64), device=device)
+    input_ids = torch.randint(0, 1000, (2, 64)).to(device)
 
     # Forward + backward (reference)
     out_ref = model_ref(input_ids=input_ids, labels=input_ids)

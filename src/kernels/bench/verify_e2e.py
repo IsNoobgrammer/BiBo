@@ -17,6 +17,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirna
 import torch
 import torch.nn as nn
 
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 from src.configuration_bibo import BiBoConfig
 from src.modeling.models import BiBoForCausalLM
 from src.kernels.patch import patch_bibo_with_triton, unpatch_bibo
@@ -82,11 +87,13 @@ def test_forward_fp32():
 
     device = 'cuda'
     config = make_small_config()
-    input_ids = torch.randint(0, 1000, (2, 64), device=device)
+    torch.manual_seed(123)
+    input_ids = torch.randint(0, 1000, (2, 64)).to(device)
     labels = input_ids.clone()
 
     # Original
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     model_orig = BiBoForCausalLM(config).to(device).eval()
 
     with torch.no_grad():
@@ -117,11 +124,13 @@ def test_backward_fp32():
 
     device = 'cuda'
     config = make_small_config()
-    input_ids = torch.randint(0, 1000, (2, 64), device=device)
+    torch.manual_seed(123)
+    input_ids = torch.randint(0, 1000, (2, 64)).to(device)
     labels = input_ids.clone()
 
     # Original
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     model_orig = BiBoForCausalLM(config).to(device).train()
     out_orig = model_orig(input_ids=input_ids, labels=labels)
     out_orig.loss.backward()
@@ -129,6 +138,7 @@ def test_backward_fp32():
 
     # Triton
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     model_tri = BiBoForCausalLM(config).to(device).train()
     patch_bibo_with_triton(model_tri)
     out_tri = model_tri(input_ids=input_ids, labels=labels)
@@ -175,11 +185,13 @@ def test_autocast():
 
     device = 'cuda'
     config = make_small_config()
-    input_ids = torch.randint(0, 1000, (2, 64), device=device)
+    torch.manual_seed(123)
+    input_ids = torch.randint(0, 1000, (2, 64)).to(device)
     labels = input_ids.clone()
 
     # Original
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     model_orig = BiBoForCausalLM(config).to(device).train()
     with torch.amp.autocast('cuda'):
         out_orig = model_orig(input_ids=input_ids, labels=labels)
@@ -188,6 +200,7 @@ def test_autocast():
 
     # Triton
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     model_tri = BiBoForCausalLM(config).to(device).train()
     patch_bibo_with_triton(model_tri)
     with torch.amp.autocast('cuda'):
@@ -230,11 +243,13 @@ def test_multi_step():
 
     device = 'cuda'
     config = make_small_config()
-    input_ids = torch.randint(0, 1000, (2, 64), device=device)
+    torch.manual_seed(123)
+    input_ids = torch.randint(0, 1000, (2, 64)).to(device)
     labels = input_ids.clone()
 
     # Original
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     model_orig = BiBoForCausalLM(config).to(device).train()
     opt_orig = torch.optim.AdamW(model_orig.parameters(), lr=1e-3)
     scaler_orig = torch.amp.GradScaler('cuda')
@@ -251,6 +266,7 @@ def test_multi_step():
 
     # Triton
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     model_tri = BiBoForCausalLM(config).to(device).train()
     patch_bibo_with_triton(model_tri)
     opt_tri = torch.optim.AdamW(model_tri.parameters(), lr=1e-3)
