@@ -328,7 +328,13 @@ def train(args):
 
         with torch.autocast("cuda", dtype=torch.float16):
             outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
-            loss = outputs.loss / accum_steps
+            # Handle both object and tuple returns (torch.compile may change return type)
+            if hasattr(outputs, "loss"):
+                loss = outputs.loss / accum_steps
+            elif isinstance(outputs, tuple) and len(outputs) > 0:
+                loss = outputs[0] / accum_steps
+            else:
+                raise RuntimeError(f"Unexpected model output type: {type(outputs)}")
 
         scaler.scale(loss).backward()
         micro_step += 1
