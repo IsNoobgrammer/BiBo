@@ -328,13 +328,16 @@ def train(args):
 
         with torch.autocast("cuda", dtype=torch.float16):
             outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
-            # Handle both object and tuple returns (torch.compile may change return type)
+            # Extract loss — handle tuple, scalar, or nested returns
             if hasattr(outputs, "loss"):
-                loss = outputs.loss / accum_steps
+                loss_val = outputs.loss
             elif isinstance(outputs, tuple) and len(outputs) > 0:
-                loss = outputs[0] / accum_steps
+                loss_val = outputs[0]
             else:
-                raise RuntimeError(f"Unexpected model output type: {type(outputs)}")
+                raise RuntimeError(f"Unexpected model output: {type(outputs)}")
+            if isinstance(loss_val, tuple):
+                loss_val = loss_val[0]
+            loss = loss_val / accum_steps
 
         scaler.scale(loss).backward()
         micro_step += 1
