@@ -85,6 +85,8 @@ def build_model_from_config(cfg: dict):
             use_sliding_window=model_cfg.get("use_sliding_window", False),
             mlp_only_layers=model_cfg.get("mlp_only_layers", None),
         )
+        # Enable SDPA with GQA (same as BiBo's native SDPA)
+        config._attn_implementation = "sdpa"
         model = Qwen3MoeForCausalLM(config)
 
     else:
