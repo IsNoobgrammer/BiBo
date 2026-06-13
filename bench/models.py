@@ -189,12 +189,15 @@ def apply_triton_kernels(model, config, no_triton=False):
             from src.kernels.patch import patch_bibo_with_triton
             from src.kernels.moe_dispatch import patch_moe_with_triton
             from src.kernels.dense_mlp import patch_dense_mlp_with_triton
+            from src.kernels.conv_fused import patch_conv_router_with_triton, patch_conv_expert_with_triton
 
             patch_bibo_with_triton(model)
             patch_moe_with_triton(model)
             patch_dense_mlp_with_triton(model)
+            patch_conv_router_with_triton(model)
+            patch_conv_expert_with_triton(model)
             dense_count = getattr(model, '_triton_dense_mlp_count', 0)
-            print(f"  Triton: RMSNorm + RoPE + MoE GLU + Dense MLP x{dense_count}")
+            print(f"  Triton: RMSNorm + RoPE + MoE GLU + Dense MLP x{dense_count} + Conv")
 
         else:
             from src.kernels.patch import patch_qwen3_with_triton, patch_qwen3_fused_ce

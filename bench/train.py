@@ -137,8 +137,8 @@ def wrap_fsdp(model, device):
 
 
 def compile_model(model):
-    """Apply torch.compile — uses reduce-overhead mode to avoid OOM from buffer pre-allocation."""
-    return torch.compile(model, mode="reduce-overhead", fullgraph=False)
+    """Apply torch.compile — mode=default for Triton inductor fusion (same as old bench)."""
+    return torch.compile(model, mode="default", fullgraph=False)
 
 
 def train(args):
