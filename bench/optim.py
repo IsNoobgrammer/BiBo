@@ -133,42 +133,40 @@ def create_optimizer(model, cfg):
     muon_lr = train_cfg.get("muon_lr", 0.02)
     weight_decay = train_decay if (train_decay := train_cfg.get("weight_decay", 0.1)) else 0.1
 
-    # Separate 2D vs 1D params
-    decay_params = []
-    no_decay_params = []
+    # Separate params by name:
+    #   Muon: 2D weight matrices in attention projections + MLP/expert weights (NOT embeddings/lm_head)
+    #   AdamW: everything else (embeddings, lm_head, norms, biases, scalars)
+    muon_params = []
+    adamw_params = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.ndim <= 1 or "norm" in name or "bias" in name:
-            no_decay_params.append(param)
-        else:
-            decay_params.append(param)
+        # Embeddings, lm_head, norms, biases → AdamW
+        is_embedding = "embed" in name or "lm_head" in name
+        is_norm_bias = param.ndim <= 1 or "norm" in name or "bias" in name
+        is_small = param.ndim == 2 and param.numel() <= 10000
 
-    # Embeddings + lm_head always use AdamW (not Muon)
-    embed_params = []
-    other_2d_params = []
-    for p in decay_params:
-        if p.ndim == 2 and p.numel() > 10000:
-            other_2d_params.append(p)
+        if is_embedding or is_norm_bias or is_small:
+            adamw_params.append(param)
+        elif param.ndim == 2:
+            muon_params.append(param)
         else:
-            embed_params.append(p)
+            adamw_params.append(param)
 
     if optim_type == "muon_adamw8bit":
         if HAS_BNB:
             adamw = AdamW8bit(
-                [{"params": no_decay_params, "weight_decay": 0.0},
-                 {"params": embed_params, "weight_decay": weight_decay}],
+                [{"params": adamw_params, "weight_decay": weight_decay}],
                 lr=lr, betas=(0.9, 0.95),
             )
         else:
             adamw = optim.AdamW(
-                [{"params": no_decay_params, "weight_decay": 0.0},
-                 {"params": embed_params, "weight_decay": weight_decay}],
+                [{"params": adamw_params, "weight_decay": weight_decay}],
                 lr=lr, betas=(0.9, 0.95),
             )
 
         muon = Muon(
-            other_2d_params,
+            muon_params,
             lr=muon_lr,
             momentum=0.95,
             weight_decay=weight_decay,
@@ -179,25 +177,24 @@ def create_optimizer(model, cfg):
         name = "Muon+AdamW8bit" if HAS_BNB else "Muon+AdamW"
 
     elif optim_type == "adamw8bit":
+        all_params = muon_params + adamw_params
         if HAS_BNB:
             optimizer = AdamW8bit(
-                [{"params": decay_params, "weight_decay": weight_decay},
-                 {"params": no_decay_params, "weight_decay": 0.0}],
+                [{"params": all_params, "weight_decay": weight_decay}],
                 lr=lr, betas=(0.9, 0.95),
             )
             name = "AdamW8bit"
         else:
             optimizer = optim.AdamW(
-                [{"params": decay_params, "weight_decay": weight_decay},
-                 {"params": no_decay_params, "weight_decay": 0.0}],
+                [{"params": all_params, "weight_decay": weight_decay}],
                 lr=lr, betas=(0.9, 0.95),
             )
             name = "AdamW"
 
     else:
+        all_params = muon_params + adamw_params
         optimizer = optim.AdamW(
-            [{"params": decay_params, "weight_decay": weight_decay},
-             {"params": no_decay_params, "weight_decay": 0.0}],
+            [{"params": all_params, "weight_decay": weight_decay}],
             lr=lr, betas=(0.9, 0.95),
         )
         name = "AdamW"
