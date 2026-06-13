@@ -24,10 +24,10 @@ model:
 
 training:
   batch_size: 16
-  grad_accum: 4
+  grad_accum: 1
   total_steps: 50000
-  warmup_steps: 1000
-  lr: 3.0e-4
+  warmup_steps: 100
+  lr: 5.0e-4
   weight_decay: 0.1
   grad_clip: 1.0
   seq_len: 1024
