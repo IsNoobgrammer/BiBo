@@ -112,13 +112,15 @@ def unpatch_bibo(model):
 
 def patch_qwen3_fused_ce(model):
     """
-    Patch Qwen3MoeForCausalLM to use Liger FusedLinearCrossEntropyLoss.
+    Patch Qwen3MoeForCausalLM to use BiBo's OWN fused-linear-CE Triton kernel
+    (src/kernels/fused_ce.py) — NOT Liger's chunked CE (3-4x slower at vocab<=81k).
 
-    Replaces standard logits+CE with fused kernel that skips logits materialization.
-    Saves ~40% memory on the loss computation.
+    Replaces standard logits+CE with the fused kernel that never materializes the (N,V) logits:
+    forward 2.1x, comparable-to-faster fwd+bwd, ~0.1-0.5x memory, enabling at the 16k step.
+    fp16 (matches autocast); the kernel does fp32 accumulation internally.
     """
     import torch
-    from liger_kernel.ops.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyFunction
+    from src.kernels.fused_ce import fused_linear_cross_entropy
 
     def _fused_ce_forward(self, input_ids=None, attention_mask=None, position_ids=None,
                           past_key_values=None, inputs_embeds=None, labels=None,
@@ -150,11 +152,9 @@ def patch_qwen3_fused_ce(model):
             shift_labels = labels[..., 1:].contiguous()
             shift_hidden = shift_hidden.view(-1, hidden_states.shape[-1])
             shift_labels = shift_labels.view(-1).to(shift_hidden.device)
+            # weight cast to hidden dtype (fp16 under autocast); our kernel does fp32 accum inside.
             lm_weight = self.lm_head.weight.to(shift_hidden.dtype)
-            with torch.amp.autocast('cuda', enabled=False):
-                loss = LigerFusedLinearCrossEntropyFunction.apply(
-                    shift_hidden.float(), lm_weight.float(), shift_labels
-                )
+            loss = fused_linear_cross_entropy(shift_hidden, lm_weight, shift_labels)
         elif logits_to_keep > 0:
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
             logits = self.lm_head(hidden_states[:, slice_indices, :])

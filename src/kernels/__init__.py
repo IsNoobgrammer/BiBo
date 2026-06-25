@@ -39,6 +39,12 @@ from .moe_dispatch import (
     triton_fused_weight_scatter_autograd,
     triton_batched_glu_activation,
 )
+from .moe_grouped import (
+    patch_moe_grouped,
+    unpatch_moe_grouped,
+    patch_moe_auto,
+    unpatch_moe_auto,
+)
 from .dense_mlp import (
     patch_dense_mlp_with_triton,
     unpatch_dense_mlp,
@@ -66,6 +72,10 @@ __all__ = [
     'unpatch_qwen3',
     'patch_moe_with_triton',
     'unpatch_moe',
+    'patch_moe_grouped',
+    'unpatch_moe_grouped',
+    'patch_moe_auto',
+    'unpatch_moe_auto',
     'patch_dense_mlp_with_triton',
     'unpatch_dense_mlp',
     'patch_qwen_dense_mlp_with_triton',

@@ -57,7 +57,7 @@ class BiBoConfig(PretrainedConfig):
         use_router_logit_norm=False,  # z-score normalize logits before softmax
         # Load balancing strategy: "none", "bias" (heuristic bias updates), "aux_loss" (Switch Transformer / Qwen style)
         load_balance_strategy="bias",
-        aux_loss_coef=0.001,  # Coefficient for auxiliary load-balancing loss (when strategy="aux_loss")
+        aux_loss_coef=0.01,  # aux load-balancing loss coef (when strategy="aux_loss"); 1e-2 = ablated consensus (Switch-T, ST-MoE, OLMoE)
         # Router activation: applied to raw logits before softmax/selection
         # "none" (standard softmax), "relu" (DECO-style), "silu"
         router_activation="none",
@@ -187,8 +187,11 @@ class BiBoConfig(PretrainedConfig):
             except Exception as e:
                 print(f"[BiBoConfig] Could not auto-set moe_shared_scaling: {e}")
 
+        # Dynamic NTK-aware RoPE on by default: identity within the trained window
+        # (seq_len <= max_position_embeddings), smooth base growth beyond it. Set
+        # type="none" for plain RoPE. factor scales extension aggressiveness (1.0 = pure dynamic).
         if self.rope_scaling is None:
-            self.rope_scaling = {"type": "linear", "factor": 1.0}
+            self.rope_scaling = {"type": "dynamic", "factor": 1.0}
 
         if self.layer_norm_type != "rms":
             raise ValueError(f"Only 'rms' layer_norm_type is supported. Got: {self.layer_norm_type}")
@@ -243,6 +246,10 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError(f"load_balance_strategy must be 'none', 'bias', or 'aux_loss', got '{self.load_balance_strategy}'")
         if self.router_activation not in ("none", "relu", "silu"):
             raise ValueError(f"router_activation must be 'none', 'relu', or 'silu', got '{self.router_activation}'")
+        if self.rope_scaling.get("type") not in ("none", "dynamic"):
+            raise ValueError(f"rope_scaling['type'] must be 'none' or 'dynamic', got {self.rope_scaling.get('type')!r}")
+        if self.rope_scaling.get("factor", 1.0) <= 0:
+            raise ValueError("rope_scaling['factor'] must be positive")
         for idx in self.mlp_only_layers:
             if not (0 <= idx < self.num_hidden_layers):
                 raise ValueError(f"mlp_only_layers index {idx} is out of range for {self.num_hidden_layers} layers")

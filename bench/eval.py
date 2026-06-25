@@ -38,13 +38,22 @@ def get_tokenizer(name="fhai50032/QTK-81K"):
 # ─────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def evaluate(model, val_ds, batch_size=32, device="cuda", max_batches=None):
-    """Compute validation loss and perplexity."""
+def evaluate(model, val_ds, batch_size=32, device="cuda", max_batches=None,
+             tokenizer=None):
+    """Compute validation loss, perplexity, and bits-per-byte.
+
+    bits-per-byte (bpb) is tokenizer-independent: total NLL in bits divided by
+    the UTF-8 byte length of the decoded text. Needs the tokenizer to map the
+    predicted token ids back to bytes; if None, bpb is returned as None.
+    NLL is accumulated from the model's pure-CE loss (works even when Liger
+    returns logits=None).
+    """
     model.eval()
     loader = create_dataloader(val_ds, batch_size=batch_size, shuffle=False)
 
-    total_loss = 0.0
+    total_loss = 0.0      # sum of NLL in nats
     total_tokens = 0
+    total_bytes = 0
     n_batches = 0
 
     for batch in loader:
@@ -52,25 +61,38 @@ def evaluate(model, val_ds, batch_size=32, device="cuda", max_batches=None):
         labels = batch["labels"].to(device)
 
         with torch.autocast("cuda", dtype=torch.float16):
+            # output_router_logits omitted -> pure LM cross-entropy for BiBo and Qwen alike
             outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
             loss = outputs.loss
 
-        valid_tokens = (labels != -100).sum().item()
+        valid_mask = labels != -100
+        valid_tokens = valid_mask.sum().item()
         total_loss += loss.item() * valid_tokens
         total_tokens += valid_tokens
-        n_batches += 1
 
+        if tokenizer is not None:
+            # bytes of the predicted tokens, decoded jointly per sequence
+            ids_cpu = input_ids.cpu()
+            mask_cpu = valid_mask.cpu()
+            for row, m in zip(ids_cpu, mask_cpu):
+                pred_ids = row[m].tolist()
+                if pred_ids:
+                    text = tokenizer.decode(pred_ids, skip_special_tokens=False)
+                    total_bytes += len(text.encode("utf-8"))
+
+        n_batches += 1
         if max_batches is not None and n_batches >= max_batches:
             break
 
     model.train()
 
     if total_tokens == 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, None
 
     avg_loss = total_loss / total_tokens
     perplexity = math.exp(min(avg_loss, 20))
-    return avg_loss, perplexity
+    bpb = (total_loss / math.log(2)) / total_bytes if total_bytes > 0 else None
+    return avg_loss, perplexity, bpb
 
 
 # ─────────────────────────────────────────────────────────────
@@ -179,10 +201,12 @@ def run_all_evals(model, tokenizer, val_ds, device, benchmarks, batch_size=8,
     """
     results = {}
 
-    val_loss, val_ppl = evaluate(model, val_ds, batch_size=batch_size,
-                                 device=device, max_batches=max_batches)
+    val_loss, val_ppl, val_bpb = evaluate(model, val_ds, batch_size=batch_size,
+                                           device=device, max_batches=max_batches,
+                                           tokenizer=tokenizer)
     results["val_loss"] = val_loss
     results["val_ppl"] = val_ppl
+    results["val_bpb"] = val_bpb
 
     for bench in benchmarks:
         if bench == "hellaswag":

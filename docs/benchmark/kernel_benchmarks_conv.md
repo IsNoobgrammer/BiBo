@@ -153,10 +153,10 @@ long sequences in VRAM alongside the KV cache.
 
 ```bash
 # Full benchmark suite (correctness + performance + scaling)
-.\venv\Scripts\python src/kernels/bench_conv.py
+.\.venv\Scripts\python src/kernels/bench_conv.py
 
 # Quick correctness test
-.\venv\Scripts\python -c "
+.\.venv\Scripts\python -c "
 import torch, sys; sys.path.insert(0,'.')
 from src.kernels.conv_fused import triton_fused_conv_gate_multiply
 B, S, I = 4, 256, 384

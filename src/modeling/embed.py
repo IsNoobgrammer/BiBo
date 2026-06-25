@@ -30,20 +30,46 @@ class BiBoRotaryEmbedding(nn.Module):
     """
     inv_freq: torch.Tensor
 
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None,
+                 rope_type="none", scaling_factor=1.0):
         super().__init__()
         self.max_seq_len_cached = max_position_embeddings
         self.original_max_seq_len = max_position_embeddings
         self.dim = dim
         self.base = base
-        
-        # Compute inv_freq
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
-        )
+        self.rope_type = rope_type            # "none" | "dynamic" (NTK-aware)
+        self.scaling_factor = scaling_factor
+
+        inv_freq = self._compute_inv_freq(base, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
         self.attention_scaling = 1.0
+
+    def _compute_inv_freq(self, base, device):
+        return 1.0 / (
+            base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / self.dim)
+        )
+
+    def _ntk_base(self, seq_len):
+        """Dynamic NTK base. Clamp seq_len to the trained window so seq_len <= L_orig
+        is exactly identity (scale=1 -> base unchanged)."""
+        seq_len = max(seq_len, self.original_max_seq_len)
+        f = self.scaling_factor
+        scale = (f * seq_len / self.original_max_seq_len) - (f - 1)
+        return self.base * scale ** (self.dim / (self.dim - 2))
+
+    @torch.no_grad()
+    def _maybe_update_inv_freq(self, position_ids, device):
+        # ponytail: position_ids.max() forces one CPU<-GPU sync per forward. Negligible,
+        # and it's exactly what HF dynamic-NTK does. In-window (training) this only no-ops.
+        seq_len = int(position_ids.max()) + 1
+        if seq_len > self.max_seq_len_cached:                       # grow
+            inv_freq = self._compute_inv_freq(self._ntk_base(seq_len), device)
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+            self.max_seq_len_cached = seq_len
+        elif self.max_seq_len_cached > self.original_max_seq_len and seq_len <= self.original_max_seq_len:  # reset
+            self.register_buffer("inv_freq", self.original_inv_freq.to(device), persistent=False)
+            self.max_seq_len_cached = self.original_max_seq_len
 
     @torch.no_grad()
     def forward(self, x, position_ids):
@@ -54,6 +80,9 @@ class BiBoRotaryEmbedding(nn.Module):
         Returns:
             (cos, sin) with shape (batch, seq_len, dim)
         """
+        if self.rope_type == "dynamic":
+            self._maybe_update_inv_freq(position_ids, x.device)
+
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
 

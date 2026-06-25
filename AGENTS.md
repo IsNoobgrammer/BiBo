@@ -80,7 +80,7 @@ legacy/                            # Old monolithic code (DO NOT USE for new wor
 ## Environment
 
 - **OS**: Windows (local dev), Linux (Kaggle)
-- **Python**: Use `.\venv\Scripts\python` ALWAYS (never system python)
+- **Python**: Use `.\.venv\Scripts\python` ALWAYS (never system python)
 - **PyTorch**: 2.6.0+cu124 (CUDA 12.4)
 - **GPU (local)**: RTX 3050 Laptop 4GB — compute capability 8.6 (supports Flash Attention)
 - **GPU (Kaggle)**: 2×T4 16GB
@@ -89,7 +89,7 @@ legacy/                            # Old monolithic code (DO NOT USE for new wor
 
 ### Quick smoke test
 ```bash
-.\venv\Scripts\python -c "from src.modeling_bibo import BiBoForCausalLM; print('OK')"
+.\.venv\Scripts\python -c "from src.modeling_bibo import BiBoForCausalLM; print('OK')"
 ```
 
 ---
@@ -264,6 +264,46 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 - All MoE Triton kernels now have custom Triton backward kernels (not PyTorch fallback)
 - GQA uses native SDPA `enable_gqa=True` — no repeat_kv materialization needed
 - Conv kernels (conv_fused.py) intentionally not used — 0.41x slower due to kernel launch overhead on small tensors
+- **(June 24 2026) Benchmark in fp16, not fp32** — T4 (training GPU) is fp16-only. The old fp32 numbers in `docs/kernel_benchmark_report.md` are unreliable (see correction header there). Use `triton.testing.do_bench`, never the hand-rolled 3-sample timer.
+- **(June 24 2026) MoE dispatch sync fix** — `triton_moe_experts_forward` now builds expert boundaries as CPU ints (was comparing CUDA scalar tensors per expert → implicit GPU sync per iter). Took the per-expert path from 0.84x regression → 1.40x vs eager (fp16).
+- **(June 24 2026) Grouped-GEMM MoE** (`moe_grouped.py`, opt-in via `patch_moe_grouped`) — forward ~2–2.5x, fwd+bwd ~2x at 4k–8k tokens vs eager (fp16). **Certify the 16384-tok training shape on T4** — the 4GB RTX 3050 can't measure it (thermal + allocator pressure). Cert harness: `src/kernels/.autoresearch/bench_real.py`. Stays opt-in until T4-verified; per-expert path remains default.
+- **(June 24 2026) CE default = standard non-chunked fused CE** — `models.py` now defaults to
+  `logits = lm_head(x)` + `F.cross_entropy` (aten-fused, non-chunked). Liger's chunked CE was REMOVED.
+- **(June 25 2026) Opt-in CE = BiBo's OWN fused-linear-CE Triton kernel** (`src/kernels/fused_ce.py`),
+  via `config.use_fused_linear_ce=True`. Cut-cross-entropy style: online-softmax forward (never
+  materializes (N,V) logits, saves only lse) + chunked-cuBLAS backward with a fused in-place
+  grad-logits kernel. **fwd 2.1× vs standard everywhere; fwd+bwd ~1.05-1.26× at small N, 5-23× at
+  mid N, and the ONLY viable path at the 16k step (standard OOMs); memory flat ~0.5-1GB (0.06-0.49×
+  standard).** Grad-exact (fp16 gH ~2e-7). Adaptive backward CHUNK (`_BWD_LOGITS_BUDGET`=384MiB →
+  ~2485 rows) = reconfirmed 1.18-1.25× backward (repeated interleaved do_bench). Forward kernel tile
+  (32,128,64) is the reliable optimum — a sweep "1.17×" winner was noise (reconfirmed 0.94×); the
+  kernel is at ~37% SoL, capped by the online-softmax reduce/exp/gather, not the tile. NOTE: caller
+  must cast lm_head.weight to hidden dtype (fp16 under autocast) — the kernel's tl.dot needs matching
+  operand dtypes; `models.py` + `patch_qwen3_fused_ce` do this.
+- **(June 25 2026) CE wired into model patching** — `apply_triton_kernels(model, config,
+  use_fused_ce=True)` now enables the fused CE by default: BiBo sets `config.use_fused_linear_ce`;
+  `patch_qwen3_fused_ce` swaps Qwen's loss to OUR kernel (was Liger's chunked CE). Pass
+  `use_fused_ce=False` for the standard-CE baseline. E2E matrix bench: `bench/e2e_ce_matrix.py`.
+  Verified: BiBo loss/gradnorm match std CE under autocast; Qwen routes through our kernel
+  (`uses_our_kernel=True`); the Kaggle bench (`bench/train.py`, `bench/_compare_final.py`) gives
+  BOTH models the fused CE by default.
+- **(June 25 2026) fused-linear-CE measured results** (vs standard `F.cross_entropy`, H=320 V=81000
+  fp16, locked clock): forward **2.1–2.2× at all N**; fwd+bwd **1.05–1.26× at N≤2048**, **5.7× at
+  4096**, **20× at 8192**, and **enabling at 16384** (std CE OOMs needing ~10.6 GB; ours 547 ms /
+  489 MB). Memory **flat ~0.5 GB** (0.06–0.49× std). Grad-exact (fp16 gH 2e-7). Adaptive CHUNK
+  (mem-budgeted) reconfirmed **1.18–1.25× backward** by repeated interleaved do_bench; forward tile
+  (32,128,64) is the reliable optimum (a sweep "1.17×" was reconfirmed as 0.94× — sweep noise).
+- **(June 25 2026) full-model E2E matrix** (BiBo, `bench/e2e_ce_matrix.py`, subprocess-isolated per
+  cell — single-process runs accumulate allocator fragmentation that poisons later cells). Clean
+  ≤2048-tok on the 3050 (≥4096 swaps on 4 GB → run on T4): all-kernels = **~1.27–1.29× full-step**
+  over baseline (Liger-only ~1.1×); biggest small-scale win is removing eager-MoE per-expert
+  `.item()` syncs (53.5 ms→9 ms at 1024 tok). Fused-CE is ~break-even on time at small N (loss is a
+  small slice; its 3-GEMM backward recomputes logits) but cuts step memory to **0.66–0.74×**; its
+  time win + OOM-enabling are at ≥4096 tok. **Recommended training config: all-kernels + fused-CE.**
+- **(June 24 2026) Conv router fused** (`conv_fused.py`, `patch_conv_router_with_triton`) — real
+  Triton kernel now (was fake PyTorch): native-(B,S,H)-read forward + transpose-free Triton backward.
+  Full router fwd+bwd ~2.5x vs eager at large batch; projection ~5x fwd. fp16 grad-correct.
+- **(June 24 2026) `patch_moe_auto` (recommended MoE patch)** — per-call dispatch: grouped path for `n_tokens >= GROUPED_MIN_TOKENS` (default 4096), else the fixed per-expert path. Beats PyTorch eager across all token regimes by construction (both branches grad-verified). Tune `GROUPED_MIN_TOKENS` after T4 cert.
 
 ---
 
@@ -306,6 +346,8 @@ old_kernels/                  # Retired variants (kept for re-benchmarking)
 | `_fused_weight_scatter_kernel` | moe_dispatch.py | Triton | **Triton** (scatter→gather) | Production |
 | `_fused_router_kernel` | moe_dispatch.py | Triton | N/A (detached) | Production |
 | `_batched_glu_act_kernel` | moe_dispatch.py | Triton | **Triton** (`_TritonFusedGLUFunction`) | Production |
+| `_grouped_mm_kernel` | moe_grouped.py | Triton | **Triton** (`_GroupedMoE`, transposed via strides) | Opt-in (large-seq) |
+| `_grouped_wgrad_kernel` | moe_grouped.py | N/A | **Triton** (per-expert weight grads) | Opt-in (large-seq) |
 | `_fused_swiglu_*_kernel` | dense_mlp.py | Triton | **Triton** (`_FusedSwiGLUFull`) | Gold standard |
 | `_fused_permute_act_gate_kernel` | conv_fused.py | Triton | **Triton** (`_TritonConvGateMultiplyFunction`) | Production |
 | `_fused_permute_act_kernel` | conv_fused.py | Triton | **Triton** (`_TritonPermuteActFunction`) | Production |
@@ -431,13 +473,13 @@ Triton GEMM that replaces cuBLAS without fusion rarely wins.
 ### Running Benchmarks
 
 ```bash
-.\\venv\\Scripts\\python src/kernels/bench/bench_dense_mlp.py   # Dense MLP (3-variant head-to-head)
-.\\venv\\Scripts\\python src/kernels/bench/bench_moe.py         # MoE layer
-.\\venv\\Scripts\\python src/kernels/bench/bench_conv.py        # Conv fusion
-.\\venv\\Scripts\\python src/kernels/bench/bench_moe_fwdbwd.py  # Full fwd+bwd
-.\\venv\\Scripts\\python src/kernels/bench/verify_e2e.py        # E2E correctness
-.\\venv\\Scripts\\python src/kernels/bench/verify_grads.py      # Gradient verification
-.\\venv\\Scripts\\python src/kernels/bench/profile_benchmark.py # torch.profiler 4-way
+.\\.venv\\Scripts\\python src/kernels/bench/bench_dense_mlp.py   # Dense MLP (3-variant head-to-head)
+.\\.venv\\Scripts\\python src/kernels/bench/bench_moe.py         # MoE layer
+.\\.venv\\Scripts\\python src/kernels/bench/bench_conv.py        # Conv fusion
+.\\.venv\\Scripts\\python src/kernels/bench/bench_moe_fwdbwd.py  # Full fwd+bwd
+.\\.venv\\Scripts\\python src/kernels/bench/verify_e2e.py        # E2E correctness
+.\\.venv\\Scripts\\python src/kernels/bench/verify_grads.py      # Gradient verification
+.\\.venv\\Scripts\\python src/kernels/bench/profile_benchmark.py # torch.profiler 4-way
 ```
 
 ---
@@ -463,7 +505,7 @@ Triton GEMM that replaces cuBLAS without fusion rarely wins.
 ## Git Conventions
 
 - Push to main and revert to old commit hash when user asks for it.
-- `logs/`, `bugs/`, `shaurya_notes.md`, `venv/`, `wandb/`, `research_on_activations/` are all gitignored
+- `logs/`, `bugs/`, `shaurya_notes.md`, `.venv/`, `wandb/`, `research_on_activations/` are all gitignored
 
 ---
 

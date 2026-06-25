@@ -2,7 +2,79 @@
 
 > Generated: June 2026 | Device: RTX 3050 Laptop (4GB, sm_86) | PyTorch 2.6.0+cu124 | Triton 3.7.0
 
-## Executive Summary
+## ⚠️ CORRECTION (June 24, 2026) — read this before trusting numbers below
+
+The fp32/speedup tables in the rest of this doc were measured with a **broken harness**
+and should not be trusted. Three bugs:
+1. Timed in **fp32**, but the T4 training target runs **fp16** (Turing has no bf16).
+   cuBLAS-vs-Triton tradeoffs invert between fp32 and fp16 (tensor cores).
+2. **3-sample median** — far too few for a stable measurement.
+3. A **profiler-wrapped iteration was included in the timed samples**, polluting them.
+These produce the 0.17x / 15.91x / 6.35x anomalies — they are noise, not signal.
+
+Re-measured in **fp16** with `triton.testing.do_bench` (L2 flush + warmup + median),
+harness in `src/kernels/.autoresearch/`:
+
+| Component | vs PyTorch eager (fp16) | Notes |
+|-----------|-------------------------|-------|
+| **MoE experts** | **1.42x fwd / 1.40x fwd+bwd** (7–8 of 9 cases) | was a **0.84x regression** before the fix |
+| Dense MLP (Liger SwiGLU) | 1.19x fwd / 1.23x fwd+bwd (9/9 fwd) | already shipping; it *is* Liger |
+
+**MoE fix (the real change):** the live dispatch wrapper compared CUDA *scalar* tensors
+every expert iteration (`start = boundaries[i]; if end - start == 0`), forcing an implicit
+GPU→CPU sync per expert that serialized the pipeline. Pulling boundaries to CPU ints once
+(loop with Python ints) removed it — ~15 lines, no new kernel. Grad-equivalent to eager
+(fp32 ~1e-7, fp16 in-tolerance, NaN-free).
+
+**E2E (full model):** unmeasurable on the RTX 3050 — 50M-model step times bounce 3–4x
+within a single run (thermal/clock throttle), and the model is CPU-launch-bound at this
+scale. Validate E2E on the T4. See `src/kernels/.autoresearch/FINDINGS.md`.
+
+---
+
+## (June 25, 2026) Custom fused-linear cross-entropy + full-model E2E matrix
+
+**Fused-linear-CE** (`src/kernels/fused_ce.py`) — cut-cross-entropy style: online-softmax forward
+(never materializes the (N,V) logits, saves only `lse`) + chunked-cuBLAS backward with a fused
+in-place grad-logits kernel. Replaces Liger's chunked CE (removed). Default in `apply_triton_kernels`
+(`use_fused_ce=True`); also opt-in via `config.use_fused_linear_ce=True`. Measured vs standard
+`F.cross_entropy` (H=320, V=81000, fp16, locked clock 1200 MHz):
+
+| N (tok) | forward | fwd+bwd | peak mem (ours/std) |
+|---------|---------|---------|----------------------|
+| 1024  | 2.11x | 1.05–1.16x | 0.42x (465 vs 1118 MB) |
+| 2048  | 2.16x | 1.06–1.26x | 0.22x (469 vs 2115 MB) |
+| 4096  | 2.18x | 5.71x      | 0.11x (472 vs 4110 MB) |
+| 8192  | 18.8x | 20.4x      | 0.06x (480 vs 8097 MB) |
+| 16384 | std OOMs | std OOMs (ours 547 ms) | **enabling** (489 MB; std needs ~10.6 GB) |
+
+- Memory is **flat ~0.5 GB regardless of N**; standard CE grows linearly → OOMs at the 16k step.
+- Adaptive backward CHUNK (mem-budgeted, ~2485 rows) = **1.18–1.25x backward** (reconfirmed by
+  repeated interleaved `do_bench`). Forward tile `(32,128,64)` is the reliable optimum — a sweep
+  flagged `(64,128,64)` as 1.17x but 7 reconfirmation rounds showed it 0.94x (sweep noise).
+- Grad-exact: fp16 gH ~2e-7, gW ~1e-7. Wired into **both BiBo and Qwen** (Qwen patch now uses our
+  kernel, not Liger's).
+
+**Full-model E2E matrix** (BiBo, subprocess-isolated per cell, fwd+bwd step ms; `bench/e2e_ce_matrix.py`).
+Clean ≤2048-tok on the 3050 (≥4096 swaps on 4 GB → run on T4):
+
+| tok | base/std | liger/std | all/std | all/fusedCE | all/std vs base |
+|-----|----------|-----------|---------|-------------|------------------|
+| 1024 | 254 | 232 | **197** | 253 | **1.29x** |
+| 2048 | 394 | 349 | **310** | 374 | **1.27x** |
+
+- **Kernels (`all` vs baseline) = ~1.27–1.29x** full-step speedup (Liger-only ~1.1x; custom MoE/conv
+  adds the rest). The biggest small-scale win is killing the eager-MoE per-expert `.item()` syncs
+  (profiler: 53.5 ms → 9 ms at 1024 tok).
+- **Fused-CE is ~break-even on time at small N** (the loss is a small slice and its 3-GEMM backward
+  recomputes logits) but cuts step memory to **0.66–0.74x**. The fused-CE *time* win and its
+  OOM-enabling appear at ≥4096 tok (standard CE OOMs) — the regime the 4 GB card can't measure.
+- **Recommended training config: `all + fused-CE`** — kernels give ~1.3x and fused-CE is what lets
+  the real 16k step run at all.
+
+---
+
+## Executive Summary (original — fp32, unreliable; kept for history)
 
 Implemented and benchmarked Triton kernel optimizations for BiBo's MoE transformer, following Liger-Kernel's pattern: **fuse elementwise operations BETWEEN GEMMs, never fuse the GEMMs themselves**.
 
@@ -188,15 +260,15 @@ xlarge   | bs8_sl128  | 75.5MB | 18.7MB    | 147.1MB | 196.6MB
 
 ### Isolated kernel benchmark
 ```bash
-.\venv\Scripts\python src\kernels\bench\bench_isolated_kernels.py
-.\venv\Scripts\python src\kernels\bench\bench_isolated_kernels.py --section dense_mlp
-.\venv\Scripts\python src\kernels\bench\bench_isolated_kernels.py --section moe
+.\.venv\Scripts\python src\kernels\bench\bench_isolated_kernels.py
+.\.venv\Scripts\python src\kernels\bench\bench_isolated_kernels.py --section dense_mlp
+.\.venv\Scripts\python src\kernels\bench\bench_isolated_kernels.py --section moe
 ```
 
 ### Full-model benchmark
 ```bash
-.\venv\Scripts\python src\kernels\bench\profile_benchmark.py          # Full sweep (192 runs)
-.\venv\Scripts\python src\kernels\bench\profile_benchmark.py --quick  # Quick (48 runs)
+.\.venv\Scripts\python src\kernels\bench\profile_benchmark.py          # Full sweep (192 runs)
+.\.venv\Scripts\python src\kernels\bench\profile_benchmark.py --quick  # Quick (48 runs)
 ```
 
 ---

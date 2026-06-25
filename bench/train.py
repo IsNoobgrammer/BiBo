@@ -50,8 +50,19 @@ from metrics import (
 )
 
 
-def set_deterministic(seed):
-    """Make training fully deterministic for fair comparison."""
+# Training precision. T4 (Turing) has no bf16, so fp16 is the only AMP option
+# on the target hardware — kept explicit so a run never silently drifts to fp32/bf16.
+AMP_DTYPE = torch.float16
+
+
+def set_deterministic(seed, strict=False):
+    """Make training reproducible: identical config + seed -> identical loss curve.
+
+    strict=False (default): warn on ops with no deterministic CUDA impl but keep
+      running. Curves are reproducible except for custom Triton atomic kernels.
+    strict=True: hard-error on any non-deterministic op (use to hunt what breaks
+      bit-exact reproducibility; will crash on custom atomic kernels).
+    """
     os.environ["PYTHONHASHSEED"] = str(seed)
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     random.seed(seed)
@@ -61,6 +72,11 @@ def set_deterministic(seed):
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    # TF32 is non-deterministic vs fp32 and varies run-to-run on Ampere; off for
+    # bit-stable fp32 master-weight/optimizer math (no effect on the fp16 matmuls).
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.use_deterministic_algorithms(True, warn_only=not strict)
 
 
 def parse_args():
@@ -154,7 +170,8 @@ def train(args):
     hw_cfg = cfg["hardware"]
 
     if train_cfg.get("deterministic", True):
-        set_deterministic(train_cfg.get("seed", 42))
+        set_deterministic(train_cfg.get("seed", 42),
+                          strict=train_cfg.get("strict_deterministic", False))
 
     model_type = cfg["model"]["type"]
 
@@ -166,6 +183,14 @@ def train(args):
         print(f"{TAG}   Batch: {train_cfg['batch_size']} x {train_cfg['grad_accum']} accum")
         print(f"{TAG}   Steps: {train_cfg['total_steps']}")
         print(f"{TAG}   Optimizer: {train_cfg.get('optimizer', 'muon_adamw8bit')}")
+        print(f"{TAG}   Precision: AMP {str(AMP_DTYPE).replace('torch.', '')} (fp32 master weights)")
+        if train_cfg.get("deterministic", True):
+            _strict = train_cfg.get("strict_deterministic", False)
+            print(f"{TAG}   Deterministic: ON (seed={train_cfg.get('seed', 42)}, "
+                  f"strict={_strict}) — identical config => identical curve")
+            if not _strict:
+                print(f"{TAG}     note: custom Triton atomic kernels remain non-bit-exact; "
+                      f"use --no_triton for a bit-exact reference curve")
         print(f"{TAG} " + "=" * 60)
 
     # ── Data ──────────────────────────────────────────────────
@@ -181,11 +206,10 @@ def train(args):
     tokenizer = get_tokenizer()
     actual_vocab_size = len(tokenizer)
 
-    _peek_loader = create_dataloader(train_ds, batch_size=1, shuffle=False)
-    _peek_batch = next(iter(_peek_loader))
-    _max_id = _peek_batch["input_ids"].max().item()
-    del _peek_loader, _peek_batch
-    _safe_vocab = max(actual_vocab_size, _max_id + 1)
+    # The dataset is pre-tokenized with this tokenizer, so every id < vocab.
+    # Size to max(config, tokenizer); the old 1-batch peek under-sized the
+    # embedding whenever a later sample held a higher id (-> CUDA index assert).
+    _safe_vocab = max(actual_vocab_size, cfg["model"]["vocab_size"])
 
     if is_main:
         print(f"{TAG} Tokenizer vocab: {actual_vocab_size}, safe: {_safe_vocab}")
@@ -272,6 +296,14 @@ def train(args):
             "world_size": world_size,
             "total_params": stats["total"],
             "active_params": stats["active"],
+            "amp_dtype": str(AMP_DTYPE).replace("torch.", ""),
+            "deterministic": train_cfg.get("deterministic", True),
+            "strict_deterministic": train_cfg.get("strict_deterministic", False),
+            "compile": not args.no_compile,
+            "triton": not args.no_triton,
+            "warmup_steps": train_cfg.get("warmup_steps", 1000),
+            "weight_decay": train_cfg.get("weight_decay", 0.1),
+            "grad_clip": train_cfg.get("grad_clip", 1.0),
         }
         init_wandb(wandb_config, project=log_cfg["wandb_project"],
                     name=log_cfg["wandb_name"], notes=f"{model_type} training")
@@ -286,7 +318,9 @@ def train(args):
         if is_main:
             results = run_all_evals(model, tokenizer, val_ds, device,
                                     eval_cfg.get("benchmarks", []))
-            print(f"{TAG} Val loss: {results['val_loss']:.4f}, PPL: {results['val_ppl']:.2f}")
+            bpb = results.get("val_bpb")
+            bpb_str = f", bpb: {bpb:.4f}" if bpb is not None else ""
+            print(f"{TAG} Val loss: {results['val_loss']:.4f}, PPL: {results['val_ppl']:.2f}{bpb_str}")
             if "hellaswag" in results:
                 print(f"{TAG} HellaSwag: {results['hellaswag']['accuracy']:.4f}")
             if "arc_challenge" in results:
@@ -308,6 +342,21 @@ def train(args):
     micro_step = 0
     optimizer.zero_grad(set_to_none=True)
 
+    # ── Fairness: Qwen gets its Switch-Transformer aux load-balancing loss.
+    #    BiBo uses its own router-bias heuristic (no loss term). We log the
+    #    pure LM loss for both so the loss curves stay apples-to-apples.
+    is_qwen = model_type in ("qwen3moe", "qwen3_moe")
+    aux_coef = cfg["model"].get("router_aux_loss_coef", 0.001)
+    fwd_kwargs = {"output_router_logits": True} if is_qwen else {}
+    active_params = stats["active"]
+    step_times = []      # wall step times within the current log window (stall/recompile proxy)
+    tokens_seen = 0      # cumulative tokens processed (for token-budget x-axis in WandB)
+
+    # Router-entropy / hidden-norm hooks add per-step cost, so only run them when
+    # log_internal_metrics is on. compute() then returns real values each log step.
+    if collector.enabled:
+        collector._active = True
+
     total_steps = train_cfg.get("total_steps", 50000)
     log_every = log_cfg.get("log_every", 10)
     eval_every = eval_cfg.get("eval_every", 500)
@@ -326,8 +375,9 @@ def train(args):
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
 
-        with torch.autocast("cuda", dtype=torch.float16):
-            outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
+        with torch.autocast("cuda", dtype=AMP_DTYPE):
+            outputs = model(input_ids=input_ids, labels=labels, use_cache=False,
+                            **fwd_kwargs)
             # Extract loss — handle tuple, scalar, or nested returns
             if hasattr(outputs, "loss"):
                 loss_val = outputs.loss
@@ -337,6 +387,10 @@ def train(args):
                 raise RuntimeError(f"Unexpected model output: {type(outputs)}")
             if isinstance(loss_val, tuple):
                 loss_val = loss_val[0]
+            # loss_val = total (LM + coef*aux for Qwen). Backprop the total so
+            # Qwen actually gets load balancing; log LM-only loss separately.
+            aux = getattr(outputs, "aux_loss", None)
+            lm_loss_val = (loss_val - aux_coef * aux) if aux is not None else loss_val
             loss = loss_val / accum_steps
 
         scaler.scale(loss).backward()
@@ -352,31 +406,65 @@ def train(args):
 
             step += 1
             step_time = time.time() - t0
+            step_times.append(step_time)
 
             n_tokens = input_ids.numel() * accum_steps
+            tokens_seen += n_tokens
             throughput.update(n_tokens)
-            unscaled_loss = loss.item() * accum_steps
+            lm_loss = lm_loss_val.item()           # pure LM loss (comparable across models)
+            total_loss = loss.item() * accum_steps  # LM + aux (what's actually optimized)
 
             # ── Logging ───────────────────────────────────────
             if is_main and (step % log_every == 0 or step == 1):
-                lr_now = scheduler.get_last_lr()[0]
+                lrs = scheduler.get_last_lr()  # one per param group (Muon + AdamW differ)
+                lr_now = lrs[0]
                 tps = throughput.tokens_per_sec()
                 gn = grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm
 
-                # Collect internal metrics
+                # Collect internal metrics (router entropy, hidden norms)
                 internal = collector.compute() if collector.enabled else {}
                 collector.reset()
 
-                log_train_metrics(step, unscaled_loss, lr_now, gn, tps, step_time, extra=internal)
+                # ── Perf diagnostics (answers the "why is TPS low" question) ──
+                mfu = estimate_mfu(active_params, tps, device)
+                peak_mem = torch.cuda.max_memory_allocated() / 1e9
+                # stall/recompile proxy: steps in window far above the median
+                med = sorted(step_times)[len(step_times) // 2]
+                step_time_max = max(step_times)
+                slow_steps = sum(1 for t in step_times if t > 3 * med)
+                internal.update({
+                    "mfu": mfu,
+                    "peak_mem_gb": peak_mem,
+                    "step_time_max": step_time_max,
+                    "slow_steps": slow_steps,
+                    "loss_total": total_loss,
+                    "perplexity": math.exp(min(lm_loss, 20)),
+                    "tokens_seen": tokens_seen,
+                    "epoch": epoch,
+                    "samples_per_sec": tps / train_cfg.get("seq_len", 1024),
+                    "loss_scale": scaler.get_scale(),   # fp16 health: drops on overflow
+                    "lr_max": max(lrs),
+                    "lr_min": min(lrs),
+                })
+                if aux is not None:
+                    internal["aux_loss"] = aux.item()
+
+                log_train_metrics(step, lm_loss, lr_now, gn, tps, step_time, extra=internal)
+                step_times.clear()
+                torch.cuda.reset_peak_memory_stats()
 
                 pct = step / total_steps * 100
                 eta = (total_steps - step) * step_time
                 print(
                     f"  step {step:>6d}/{total_steps} ({pct:5.1f}%) | "
-                    f"loss={unscaled_loss:.4f} | lr={lr_now:.2e} | "
-                    f"tps={tps:.0f} | {step_time:.3f}s | "
-                    f"grad={gn:.4f} | ETA={format_time(eta)}"
+                    f"loss={lm_loss:.4f} | lr={lr_now:.2e} | "
+                    f"tps={tps:.0f} | mfu={mfu*100:.1f}% | mem={peak_mem:.1f}G | "
+                    f"{step_time:.3f}s | grad={gn:.4f} | ETA={format_time(eta)}"
                 )
+                if slow_steps:
+                    print(f"    [perf] {slow_steps} stall(s) this window "
+                          f"(max step {step_time_max:.2f}s) "
+                          f"— likely recompile/launch-bound")
 
             # ── Validation + Benchmarks ───────────────────────
             if is_main and step % eval_every == 0:
@@ -388,7 +476,9 @@ def train(args):
                             max_batches=100,
                         )
                     log_eval_metrics(step, results)
-                    print(f"    [VAL] loss={results['val_loss']:.4f} ppl={results['val_ppl']:.2f}")
+                    _bpb = results.get("val_bpb")
+                    _bpb_s = f" bpb={_bpb:.4f}" if _bpb is not None else ""
+                    print(f"    [VAL] loss={results['val_loss']:.4f} ppl={results['val_ppl']:.2f}{_bpb_s}")
                     if "hellaswag" in results:
                         print(f"    [BENCH] HellaSwag={results['hellaswag']['accuracy']:.4f}")
                     if "arc_challenge" in results:
@@ -425,6 +515,8 @@ def train(args):
             log_eval_metrics(step, results)
             print(f"{TAG} Final val loss: {results['val_loss']:.4f}")
             print(f"{TAG} Final perplexity: {results['val_ppl']:.2f}")
+            if results.get("val_bpb") is not None:
+                print(f"{TAG} Final bits-per-byte: {results['val_bpb']:.4f}")
             if "hellaswag" in results:
                 print(f"{TAG} HellaSwag: {results['hellaswag']['accuracy']:.4f}")
             if "arc_challenge" in results:

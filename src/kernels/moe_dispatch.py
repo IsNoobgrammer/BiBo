@@ -939,23 +939,26 @@ def triton_moe_experts_forward(
     sorted_token_indices = flat_token_indices[sort_order]
     sorted_weights = flat_weights[sort_order]
 
-    # Expert boundaries
-    expert_counts = torch.bincount(sorted_expert_indices, minlength=num_routed_experts)
-    boundaries = torch.zeros(num_routed_experts + 1, dtype=torch.long, device=hidden_states.device)
-    boundaries[1:] = torch.cumsum(expert_counts, dim=0)
+    # Expert boundaries — pulled to CPU ints with ONE sync, then the loop below
+    # uses Python ints. Comparing/slicing with CUDA *scalar* tensors (the old
+    # `start = boundaries[i]; if end - start == 0`) forces an implicit GPU sync
+    # EVERY iteration, serializing the whole dispatch. That alone made this path
+    # ~1.6x slower and lose to PyTorch eager in fp16 (measured, RTX 3050).
+    expert_counts = torch.bincount(sorted_expert_indices, minlength=num_routed_experts).tolist()
+    boundaries = [0]
+    for _c in expert_counts:
+        boundaries.append(boundaries[-1] + _c)
 
     # Output buffer
     output = torch.zeros(num_tokens, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
 
     ACT_MAP = {"silu": 0, "relu2": 1, "tanh": 2}
-    I = gate_up_proj.shape[1] // 2  # intermediate_size
 
     for expert_idx in range(num_routed_experts):
         start = boundaries[expert_idx]
         end = boundaries[expert_idx + 1]
-        count = end - start
 
-        if count == 0:
+        if end == start:
             continue
 
         token_idx = sorted_token_indices[start:end]

@@ -24,7 +24,7 @@ Verify BiBo loads and runs a forward pass:
 
 ```python
 # Local (Windows)
-.\venv\Scripts\python -c "from src.modeling_bibo import BiBoForCausalLM; print('OK')"
+.\.venv\Scripts\python -c "from src.modeling_bibo import BiBoForCausalLM; print('OK')"
 
 # Or from repo root
 python -c "
@@ -49,7 +49,7 @@ print(f'Params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M')
 ### Check Param Count of Baseline Config
 
 ```python
-.\venv\Scripts\python bench/config.py
+.\.venv\Scripts\python bench/config.py
 ```
 
 Expected output:
@@ -95,13 +95,13 @@ The `bench/` directory is a self-contained training benchmark:
 # From repo root: C:\Users\shaur\OneDrive\Documents\BiBo
 
 # Quick test — 100 steps, no WandB
-.\venv\Scripts\python bench/train.py --batch_size 4 --total_steps 100 --no_wandb --no_compile
+.\.venv\Scripts\python bench/train.py --batch_size 4 --total_steps 100 --no_wandb --no_compile
 
 # With torch.compile (slower startup, faster training)
-.\venv\Scripts\python bench/train.py --batch_size 4 --total_steps 500 --no_wandb
+.\.venv\Scripts\python bench/train.py --batch_size 4 --total_steps 500 --no_wandb
 
 # Eval only (load checkpoint, run val, generate samples)
-.\venv\Scripts\python bench/train.py --eval_only --resume bench/checkpoints/final.pt
+.\.venv\Scripts\python bench/train.py --eval_only --resume bench/checkpoints/final.pt
 ```
 
 ### Kaggle 2×T4 (full run)

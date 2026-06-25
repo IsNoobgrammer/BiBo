@@ -1,4 +1,6 @@
-# BiBo ~72M baseline (matches old bench config that got 25K TPS)
+# BiBo ~72M total / ~39M active (10L, H320, PolyGLU 6+2 special, shared MLP expert, GQA 5:1, SSMax).
+# Load balancing = router-bias heuristic (no aux loss term). Pure-CE loss.
+# Training hyperparams kept identical to qwen3moe.yaml for a fair comparison.
 model:
   type: "bibo"
   vocab_size: 81000

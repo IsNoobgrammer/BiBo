@@ -99,13 +99,13 @@ The GLU activation kernel is the primary contributor. It handles all three BiBo 
 
 ```bash
 # MoE layer correctness + forward-only benchmark
-.\venv\Scripts\python src/kernels/bench_moe.py
+.\.venv\Scripts\python src/kernels/bench_moe.py
 
 # Full forward + backward benchmark (the one that matters for training)
-.\venv\Scripts\python src/kernels/bench_moe_fwdbwd.py
+.\.venv\Scripts\python src/kernels/bench_moe_fwdbwd.py
 
 # E2E model verification (RMSNorm + RoPE patches)
-.\venv\Scripts\python src/kernels/verify_e2e.py
+.\.venv\Scripts\python src/kernels/verify_e2e.py
 ```
 
 ---

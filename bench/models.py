@@ -76,7 +76,7 @@ def build_model_from_config(cfg: dict):
             moe_intermediate_size=model_cfg.get("moe_intermediate_size", 768),
             decoder_sparse_step=model_cfg.get("decoder_sparse_step", 1),
             norm_topk_prob=model_cfg.get("norm_topk_prob", False),
-            router_aux_loss_coef=model_cfg.get("router_aux_loss_coef", 0.001),
+            router_aux_loss_coef=model_cfg.get("router_aux_loss_coef", 0.01),
             tie_word_embeddings=model_cfg.get("tie_word_embeddings", True),
             rope_theta=model_cfg.get("rope_theta", 10000.0),
             rms_norm_eps=model_cfg.get("rms_norm_eps", 1e-6),
@@ -159,7 +159,7 @@ def count_params(model, config) -> dict:
     }
 
 
-def apply_triton_kernels(model, config, no_triton=False):
+def apply_triton_kernels(model, config, no_triton=False, use_fused_ce=True):
     """
     Apply Liger-Kernel + Triton patches to BOTH BiBo and Qwen3MoE.
 
@@ -196,18 +196,24 @@ def apply_triton_kernels(model, config, no_triton=False):
             patch_dense_mlp_with_triton(model)
             patch_conv_router_with_triton(model)
             patch_conv_expert_with_triton(model)
+            # CE: BiBo routes through our fused-linear-CE via an instance config flag.
+            if use_fused_ce:
+                model.config.use_fused_linear_ce = True
             dense_count = getattr(model, '_triton_dense_mlp_count', 0)
-            print(f"  Triton: RMSNorm + RoPE + MoE GLU + Dense MLP x{dense_count} + Conv")
+            ce_tag = " + FusedCE" if use_fused_ce else ""
+            print(f"  Triton: RMSNorm + RoPE + MoE GLU + Dense MLP x{dense_count} + Conv{ce_tag}")
 
         else:
             from src.kernels.patch import patch_qwen3_with_triton, patch_qwen3_fused_ce
             from src.kernels.dense_mlp import patch_qwen_dense_mlp_with_triton
 
             patch_qwen3_with_triton(model)
-            patch_qwen3_fused_ce(model)
+            if use_fused_ce:
+                patch_qwen3_fused_ce(model)   # our kernel (not Liger's chunked CE)
             patch_qwen_dense_mlp_with_triton(model)
             dense_count = getattr(model, '_triton_qwen_dense_mlp_count', 0)
-            print(f"  Triton: RMSNorm + RoPE + FusedCE + Dense MLP x{dense_count}")
+            ce_tag = " + FusedCE" if use_fused_ce else ""
+            print(f"  Triton: RMSNorm + RoPE{ce_tag} + Dense MLP x{dense_count}")
 
     except Exception as e:
         print(f"  Triton FAILED: {e} — using PyTorch eager")

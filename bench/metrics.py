@@ -44,9 +44,9 @@ class MetricsCollector:
     def _register_hooks(self, model):
         """Register forward hooks on router, attention, and norm layers."""
         try:
-            from src.modeling.ffn.router import BiMoERouter
+            from src.modeling.ffn.router import BiBoMoERouter
             for name, module in model.named_modules():
-                if isinstance(module, BiMoERouter):
+                if isinstance(module, BiBoMoERouter):
                     h = module.register_forward_hook(self._make_router_hook(name))
                     self._hooks.append(h)
         except ImportError:
@@ -182,6 +182,8 @@ def log_eval_metrics(step, eval_results):
         "val/loss": eval_results.get("val_loss", 0),
         "val/perplexity": eval_results.get("val_ppl", 0),
     }
+    if eval_results.get("val_bpb") is not None:
+        d["val/bits_per_byte"] = eval_results["val_bpb"]
     if "hellaswag" in eval_results:
         d["bench/hellaswag_acc"] = eval_results["hellaswag"]["accuracy"]
     if "arc_challenge" in eval_results:
@@ -253,17 +255,19 @@ def estimate_mfu(active_params, tokens_per_sec, device):
     flops_per_token = 6 * active_params
     achieved_flops = tokens_per_sec * flops_per_token
 
+    # fp16 tensor-core peak (training runs in fp16 autocast). Using the fp32
+    # peak here would understate MFU by ~8x on Turing/Ampere.
     gpu_name = torch.cuda.get_device_name(device) if torch.cuda.is_available() and "cuda" in str(device) else "cpu"
     if "T4" in gpu_name:
-        peak_tflops = 8.1
+        peak_tflops = 65.0       # T4 fp16 tensor cores
     elif "3050" in gpu_name:
-        peak_tflops = 7.8
+        peak_tflops = 18.0       # RTX 3050 laptop fp16 tensor cores
     elif "A100" in gpu_name:
-        peak_tflops = 312.0
+        peak_tflops = 312.0      # A100 fp16 tensor cores
     elif "4090" in gpu_name:
-        peak_tflops = 165.0
+        peak_tflops = 330.0      # RTX 4090 fp16 tensor cores
     else:
-        peak_tflops = 8.1
+        peak_tflops = 65.0
 
     return achieved_flops / (peak_tflops * 1e12)
 

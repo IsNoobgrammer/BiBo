@@ -5,13 +5,9 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple, Union
 from torch.nn import CrossEntropyLoss
 
-# Fused Linear Cross-Entropy — only use Liger-kernel (Triton, Linux/Kaggle)
-# Our chunked PyTorch fallback was slower than standard CE due to Python loop overhead
-try:
-    from liger_kernel.ops.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyFunction
-    HAS_LIGER = True
-except ImportError:
-    HAS_LIGER = False
+# Cross-entropy: default = standard F.cross_entropy; opt-in (config.use_fused_linear_ce=True) =
+# BiBo's own fused-linear-CE Triton kernel (src/kernels/fused_ce.py). Liger's chunked CE removed
+# (it was 3-4x slower than standard at vocab<=81k; ours is comparable at small N, faster at large).
 
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
@@ -74,6 +70,8 @@ class BiBoModel(BiBoPreTrainedModel):
             config.hidden_size // config.num_attention_heads,
             max_position_embeddings=config.max_position_embeddings,
             base=config.rope_theta,
+            rope_type=config.rope_scaling["type"],
+            scaling_factor=config.rope_scaling.get("factor", 1.0),
         )
         self.gradient_checkpointing = False
         self.post_init()
@@ -342,20 +340,20 @@ class BiBoForCausalLM(BiBoPreTrainedModel, GenerationMixin):
         hidden_states = outputs.last_hidden_state
 
         loss = None
-        if labels is not None and HAS_LIGER:
-            # Liger fused linear cross-entropy (fastest — Triton kernel on Linux)
-            shift_hidden = hidden_states[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            shift_hidden = shift_hidden.view(-1, hidden_states.shape[-1])
-            shift_labels = shift_labels.view(-1).to(shift_hidden.device)
-            # Cast weight to match input dtype — .to() is no-op if already matching
-            lm_weight = self.lm_head.weight.to(shift_hidden.dtype)
-            # Disable autocast inside Liger kernel — it handles its own dtype
-            with torch.amp.autocast('cuda', enabled=False):
-                loss = LigerFusedLinearCrossEntropyFunction.apply(
-                    shift_hidden.float(), lm_weight.float(), shift_labels
-                )
-            logits = None  # Not computed — saves memory
+        # Default: standard (non-chunked) fused CE — `logits = lm_head(x)` + F.cross_entropy.
+        # Opt-in `config.use_fused_linear_ce=True` → BiBo's own fused-linear-CE Triton kernel
+        # (cut-cross-entropy style): never materializes (N,V) logits, ~comparable to standard at
+        # small N and far faster + leaner at large N (the only viable path at the real 16k-token
+        # step, where standard OOMs). Replaces the old Liger chunked CE (which was 3-4x slower).
+        if labels is not None and getattr(self.config, "use_fused_linear_ce", False):
+            from src.kernels.fused_ce import fused_linear_cross_entropy
+            shift_hidden = hidden_states[..., :-1, :].reshape(-1, hidden_states.shape[-1])
+            shift_labels = labels[..., 1:].reshape(-1).to(shift_hidden.device)
+            # match weight dtype to hidden (autocast keeps params fp32; the kernel's tl.dot needs
+            # matching operand dtypes). Autograd chains the cast back to the fp32 param grad.
+            lm_w = self.lm_head.weight.to(shift_hidden.dtype)
+            loss = fused_linear_cross_entropy(shift_hidden, lm_w, shift_labels)
+            logits = None  # not materialized
         elif labels is not None:
             # Standard CE — fast, uses one big F.linear + F.cross_entropy
             logits = self.lm_head(hidden_states)
