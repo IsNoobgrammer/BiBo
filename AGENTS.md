@@ -300,6 +300,24 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   `.item()` syncs (53.5 ms→9 ms at 1024 tok). Fused-CE is ~break-even on time at small N (loss is a
   small slice; its 3-GEMM backward recomputes logits) but cuts step memory to **0.66–0.74×**; its
   time win + OOM-enabling are at ≥4096 tok. **Recommended training config: all-kernels + fused-CE.**
+- **(June 25 2026) BiBo-vs-Qwen bench framing: LOSS is the primary metric** (MFU/tps are secondary
+  supporting evidence). Qwen is **deliberately handicapped larger** so a BiBo loss win is conservative:
+  experts kept equal at 8 each (but 2 of BiBo's 8 are Identity/Zero specials → Qwen's 8 full GLU
+  experts are bigger by construction: 6.88M vs 4.42M routed/layer), and Qwen widened
+  (`moe_intermediate_size` 768→896, `intermediate_size` 1024→1280) to **85.9M total / 44.6M active**
+  vs BiBo **71.7M / 39.2M** (+20% total, +14% active, active capped ≤45M). Clean conclusion only in
+  the BiBo-wins direction (a Qwen win is size-confounded); the larger Qwen must get enough steps to
+  converge or it's just undertrained. torch.compile is used **on T4 only** (broken locally) — verify
+  both runs log "torch.compile OK". Both models get the fused CE.
+- **(June 25 2026) Gradient checkpointing verified safe with the full kernel stack** — ckpt ON vs OFF
+  (all kernels + fused CE, `use_reentrant=True`): gradients **BIT-IDENTICAL** (max|Δgrad| 0.00e+00,
+  Δloss 0, 146 tensors). Kernels are autograd.Functions so the layer recompute participates normally;
+  deterministic forward (router noise commented out, dropout=0) makes recompute bit-exact. Tradeoff
+  (`bench/ckpt_compare.py`): memory **0.65×→0.34×** (more saving at larger seq/batch), time **+23–38%**
+  recompute tax at shapes that fit without ckpt (≥4096-tok "speedups" on the 3050 are 4 GB swap
+  artifacts; expect the ~1.2–1.4× tax everywhere on T4). Router noise injection in `router.py` is
+  **commented out (DEPRECATED, do not remove)** — we run `router_noise=0`; forward-time randomness
+  would break checkpointing without RNG preservation.
 - **(June 24 2026) Conv router fused** (`conv_fused.py`, `patch_conv_router_with_triton`) — real
   Triton kernel now (was fake PyTorch): native-(B,S,H)-read forward + transpose-free Triton backward.
   Full router fwd+bwd ~2.5x vs eager at large batch; projection ~5x fwd. fp16 grad-correct.

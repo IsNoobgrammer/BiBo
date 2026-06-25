@@ -74,6 +74,36 @@ Clean ≤2048-tok on the 3050 (≥4096 swaps on 4 GB → run on T4):
 
 ---
 
+## (June 25, 2026) Gradient checkpointing — exactness + time/memory tradeoff
+
+Full BiBo model (all kernels + fused CE), `use_reentrant=True`, checkpointing ON vs OFF
+(`bench/ckpt_compare.py`, subprocess-isolated, RTX 3050).
+
+**Gradient equivalence: BIT-IDENTICAL.** `loss off=11.36270 on=11.36270` (Δloss 0), **max|Δgrad| =
+0.00e+00** across 146 param tensors. Our kernels are `autograd.Function`s, so the per-layer recompute
+participates normally; with router noise commented out + `attention_dropout=0` the forward is
+deterministic → the recompute is bit-exact (not just within-tolerance). **Checkpointing is safe with
+the full kernel stack.**
+
+| tokens (B×S) | off ms | on ms | time × | off MB | on MB | mem × |
+|---|---|---|---|---|---|---|
+| 1024 (2×512)  | 253   | 350  | 1.38  | 1328 | 866  | 0.65 |
+| 2048 (2×1024) | 376   | 462  | 1.23  | 2249 | 1218 | 0.54 |
+| 4096 (2×2048) | 6100* | 1142 | swap* | 4776 | 1823 | 0.38 |
+| 4096 (4×1024) | 1657* | 839  | swap* | 3935 | 1807 | 0.46 |
+| 8192 (8×1024) | 24845*| 1612 | swap* | 6392 | 2160 | 0.34 |
+
+- **Memory: real monotonic saving 0.65× → 0.34×** (more at larger seq/batch — more layer activations
+  to drop). The genuine benefit.
+- **Time: +23–38% at clean shapes** (those that fit without ckpt) = the recompute tax, one extra
+  forward per layer. **The `*` ≥4096 rows where ckpt looks "faster" are a 4 GB swap artifact** —
+  without ckpt those balloon to 4.8–6.4 GB → host-memory swap (6 s / 25 s steps). On a 16 GB T4 where
+  the no-ckpt case fits, expect the ~1.2–1.4× tax everywhere. (`expandable_segments` is unsupported on
+  this Windows build, sharpening the swap cliff.)
+- **Use checkpointing when memory-bound** (large effective batch/seq); off when you're not.
+
+---
+
 ## Executive Summary (original — fp32, unreliable; kept for history)
 
 Implemented and benchmarked Triton kernel optimizations for BiBo's MoE transformer, following Liger-Kernel's pattern: **fuse elementwise operations BETWEEN GEMMs, never fuse the GEMMs themselves**.

@@ -6,7 +6,7 @@ model:
   type: "qwen3moe"
   vocab_size: 81000
   hidden_size: 320
-  intermediate_size: 1024
+  intermediate_size: 1280       # widened (loss is primary metric; Qwen handicapped wider)
   num_hidden_layers: 10
   num_attention_heads: 5
   num_key_value_heads: 1
@@ -14,7 +14,7 @@ model:
   mlp_only_layers: [0, 9]
   num_experts: 8
   num_experts_per_tok: 2
-  moe_intermediate_size: 768
+  moe_intermediate_size: 896    # widened; experts kept at 8 (= BiBo's 8, but 2 of BiBo's are Identity/Zero specials, so Qwen's 8 full experts are already bigger). Target active ~45M max.
   decoder_sparse_step: 1
   norm_topk_prob: false
   router_aux_loss_coef: 0.01   # ablated consensus (Switch-T, ST-MoE, OLMoE all use 1e-2); HF's 0.001 was never ablated

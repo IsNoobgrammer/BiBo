@@ -22,7 +22,7 @@ class BiBoMoERouter(nn.Module):
     
     Pipeline:
         1. raw_logits = W @ x  (MLP or Conv)
-        2. raw_logits += noise  (if training and router_noise > 0)
+        2. raw_logits += noise  (DEPRECATED — commented out; we use router_noise=0)
         3. scores = sigmoid(raw_logits)  — independent per-expert scores
         4. if use_router_logit_norm: scores = lambda * (scores - mean) / std
         5. selection_scores = scores + bias  — for top-k selection ONLY
@@ -88,11 +88,14 @@ class BiBoMoERouter(nn.Module):
             conv_out = self.gate_conv(x_padded)
             router_logits = rearrange(conv_out, 'b e s -> (b s) e').float()
 
-        # Step 2: exploration noise (training only)
-        if self.training and self.router_noise > 0:
-            noise_stddev = math.sqrt(self.router_noise)
-            noise = torch.randn_like(router_logits) * noise_stddev
-            router_logits = router_logits + noise.detach()
+        # Step 2: exploration noise (training only) — DEPRECATED, DO NOT REMOVE.
+        # We do not use router noise (router_noise=0). Commented out because forward-time
+        # randomness breaks gradient checkpointing unless RNG state is preserved on recompute.
+        # Kept (not deleted) so it can be re-enabled if exploration noise is ever needed again.
+        # if self.training and self.router_noise > 0:
+        #     noise_stddev = math.sqrt(self.router_noise)
+        #     noise = torch.randn_like(router_logits) * noise_stddev
+        #     router_logits = router_logits + noise.detach()
 
         # Step 3: router activation (ReLU/SiLU/none)
         router_logits = self._apply_router_activation(router_logits)
