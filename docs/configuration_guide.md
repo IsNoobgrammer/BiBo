@@ -9,9 +9,10 @@ Complete reference for all BiBo model configuration parameters with implementati
 1. [Router Configuration](#router-configuration)
 2. [MoE Architecture](#moe-architecture)
 3. [Shared Expert Scaling](#shared-expert-scaling)
-4. [Bias Update Mechanism](#bias-update-mechanism)
-5. [RoPE Scaling](#rope-scaling)
-6. [Quick Reference Table](#quick-reference-table)
+4. [RoPE Scaling](#rope-scaling)
+5. [Attention Configuration](#attention-configuration)
+6. [Additional Router / MoE Parameters](#additional-router--moe-parameters)
+7. [Quick Reference Table](#quick-reference-table)
 
 ---
 
@@ -211,40 +212,27 @@ Section 4.1 "Gating Logit Normalization" - This technique prevents high-entropy 
 
 ### `router_noise`
 
-**Default:** `0.5`
+**Default:** `0` (disabled)
 
-**Location:** `src/configuration_bibo.py:68`
+**Location:** `src/configuration_bibo.py:55`
 
 **What it does:**
-Adds Gaussian noise to router logits during training for exploration and load balancing.
+Would add Gaussian noise to router logits during training for exploration. **Currently run at 0 and the
+noise-injection code in `router.py` is commented out (DEPRECATED, do not remove)** — forward-time
+randomness breaks gradient checkpointing's recompute without RNG preservation, and we train with
+`router_noise=0`. Kept for compat / future re-enable.
 
-**Implementation:**
+**Implementation (DEPRECATED, commented out in `router.py`):**
 ```python
-# src/modeling/ffn/router.py:38-41
-if self.training and self.router_noise > 0:
-    noise_stddev = math.sqrt(self.router_noise)
-    noise = torch.randn_like(router_logits) * noise_stddev
-    router_logits = router_logits + noise.detach()
+# if self.training and self.router_noise > 0:
+#     noise_stddev = math.sqrt(self.router_noise)
+#     noise = torch.randn_like(router_logits) * noise_stddev
+#     router_logits = router_logits + noise.detach()
 ```
 
-**How it works:**
-- Noise ~ N(0, √router_noise)
-- Only applied during training
-- Encourages exploration of different expert combinations
-
 **Tuning guidance:**
-- **0.0:** No noise, deterministic routing
-- **0.5:** Default, good exploration
-- **1.0:** High noise, aggressive exploration
-
-**Pros:**
-- Prevents premature expert specialization
-- Improves load balancing
-- Acts as regularization
-
-**Cons:**
-- Too much noise can hurt convergence
-- Adds randomness to training
+- **0 (default):** No noise, deterministic routing (required for gradient checkpointing exactness).
+- Re-enabling requires uncommenting the block and preserving RNG state across checkpoint recompute.
 
 ---
 
@@ -295,9 +283,9 @@ self.gate_conv = nn.Conv1d(config.hidden_size, self.num_routed_experts,
 
 ### `bias_update_threshold`
 
-**Default:** `100_000`
+**Default:** `8000`
 
-**Location:** `src/configuration_bibo.py:68`
+**Location:** `src/configuration_bibo.py:57`
 
 **What it does:**
 Number of tokens (batch_size × seq_len) to process before updating router bias for **load balancing**.
@@ -360,11 +348,11 @@ def update_bias(self, tokens_per_expert: torch.Tensor):
 - `bias_update_*` = "Am I picking all experts fairly?" (fairness)
 
 **Tuning guidance:**
-- **100,000 (default):** Update every ~100k tokens
-  - With batch_size=8, seq_len=2048: ~6 batches
-  - With batch_size=32, seq_len=4096: ~1 batch
-- **Lower (10,000-50,000):** More frequent updates, faster load balancing response
-- **Higher (200,000-500,000):** Less frequent updates, more stable routing
+- **8000 (default):** Update every ~8k tokens
+  - With batch_size=8, seq_len=2048 (16,384 tok/batch): about every batch
+  - With batch_size=2, seq_len=2048 (4,096 tok/batch): ~2 batches
+- **Lower (2,000-4,000):** More frequent updates, faster load balancing response
+- **Higher (16,000-50,000):** Less frequent updates, more stable routing
 
 **Pros:**
 - Lower threshold: Faster adaptation to load imbalance
@@ -376,20 +364,21 @@ def update_bias(self, tokens_per_expert: torch.Tensor):
 
 **Example calculation:**
 ```
-batch_size = 16
+batch_size = 2
 seq_len = 2048
-tokens_per_batch = 16 × 2048 = 32,768
+tokens_per_batch = 2 × 2048 = 4,096
 
-batches_until_update = 100,000 / 32,768 ≈ 3 batches
+batches_until_update = 8,000 / 4,096 ≈ 2 batches
 ```
 
 ---
 
 ### `bias_update_factor`
 
-**Default:** `1e-2` (0.01)
+**Default:** `None` → **auto-computed** as a Hill function of `num_routed_experts`
+(`(1 - exp(-n/48)) * 0.5`); pass an explicit float (e.g. `1e-2`) to override.
 
-**Location:** `src/configuration_bibo.py:67`
+**Location:** `src/configuration_bibo.py:56`
 
 **What it does:**
 Step size for router bias updates. Controls how aggressively the bias is adjusted to **balance load across experts**.
@@ -438,15 +427,15 @@ These two parameters work together:
 **Recommended combinations:**
 ```python
 # Conservative (stable training)
-bias_update_threshold = 200_000
+bias_update_threshold = 16_000
 bias_update_factor = 5e-3
 
-# Balanced (default)
-bias_update_threshold = 100_000
-bias_update_factor = 1e-2
+# Balanced (default — factor auto-computed if left as None)
+bias_update_threshold = 8_000
+bias_update_factor = None   # auto
 
 # Aggressive (fast load balancing)
-bias_update_threshold = 50_000
+bias_update_threshold = 4_000
 bias_update_factor = 2e-2
 ```
 
@@ -480,9 +469,9 @@ final_output = final_routed + (getattr(self, 'moe_shared_scaling', 1.0) * shared
 if moe_shared_scaling == 1.0:
     try:
         import numpy as np
-        def softmax(x):
-            p = np.exp(x)
-            return p / p.sum()
+        def softmax(x):                  # numerically stable (matches the code)
+            e = np.exp(x - x.max())
+            return e / e.sum()
         
         n = self.num_routed_experts  # e.g., 16
         k = self.num_experts_per_tok  # e.g., 6
@@ -590,18 +579,18 @@ The shared expert acts as a "baseline" that all tokens pass through, while route
 
 ### `rope_scaling`
 
-**Default:** `{"type": "linear", "factor": 1.0}` (auto-set if None)
+**Default:** `{"type": "dynamic", "factor": 1.0}` (auto-set if None — dynamic NTK-aware, identity within the trained window)
 
-**Location:** `src/configuration_bibo.py:154-155`
+**Location:** `src/configuration_bibo.py:208-209`
 
 **What it does:**
 Configures Rotary Position Embedding (RoPE) scaling for handling sequences longer than the model was trained on.
 
 **Implementation:**
 ```python
-# src/configuration_bibo.py:154-155
+# src/configuration_bibo.py:208-209
 if self.rope_scaling is None:
-    self.rope_scaling = {"type": "linear", "factor": 1.0}
+    self.rope_scaling = {"type": "dynamic", "factor": 1.0}
 ```
 
 **How it works:**
@@ -626,10 +615,11 @@ RoPE encodes position information by rotating embeddings. When extending to long
 
 **Tuning guidance:**
 
-**Default (no scaling):**
+**Default (dynamic NTK, identity within trained window):**
 ```python
-rope_scaling = {"type": "linear", "factor": 1.0}
-# Use for sequences ≤ max_position_embeddings (32768)
+rope_scaling = {"type": "dynamic", "factor": 1.0}
+# Identity for sequences ≤ max_position_embeddings (32768); smooth base growth beyond.
+# Set {"type": "none"} for plain RoPE.
 ```
 
 **Extending context (2× longer):**
@@ -665,6 +655,75 @@ rope_scaling = {"type": "dynamic", "factor": 2.0}
 
 ---
 
+## Attention Configuration
+
+### `use_xsa`
+
+**Default:** `True` · **Location:** `src/configuration_bibo.py:29`
+
+Enables **Exclusive Self Attention** — a parameter-free step that rejects each token's attention
+output from its own value vector: `z = y − (y·v̂)v̂` (applied after value-aggregation, before
+`o_proj`). Forces the output to be orthogonal to the self-value direction. Full details, the GQA
+in-kernel broadcast, and the fused Triton kernel: **[docs/xsa.md](xsa.md)**.
+
+### `use_ssmax`
+
+**Default:** `True` · **Location:** `src/configuration_bibo.py:31`
+
+Enables **SSMax** (scalable-softmax) learnable per-head query scaling (`scale · log(kv_len)`) to
+prevent attention fading at long context. Details: **[docs/ssmax.md](ssmax.md)**.
+
+---
+
+## Additional Router / MoE Parameters
+
+### `load_balance_strategy`
+
+**Default:** `"bias"` · **Location:** `src/configuration_bibo.py:62`
+
+How load balancing is enforced across experts:
+- `"none"` — no balancing.
+- `"bias"` — heuristic router-bias updates (see `bias_update_*`). The BiBo default.
+- `"aux_loss"` — Switch-Transformer / Qwen-style auxiliary load-balancing loss (uses `aux_loss_coef`).
+
+### `aux_loss_coef`
+
+**Default:** `0.01` · **Location:** `src/configuration_bibo.py:63`
+
+Coefficient on the auxiliary load-balancing loss. **Only used when `load_balance_strategy="aux_loss"`.**
+`1e-2` is the ablated consensus (Switch-T, ST-MoE, OLMoE).
+
+### `use_router_logit_norm`
+
+**Default:** `False` · **Location:** `src/configuration_bibo.py:60`
+
+z-score normalize router logits before softmax (Skywork-MoE style). Note `router_lambda` scaling is
+applied on top of this normalization in the router.
+
+### `router_activation`
+
+**Default:** `"none"` · **Location:** `src/configuration_bibo.py:66`
+
+Activation applied to raw router logits before softmax/selection: `"none"` (standard softmax),
+`"relu"` (DECO-style), or `"silu"`.
+
+### `gate_type`
+
+**Default:** `"sigmoid"` · **Location:** `src/configuration_bibo.py:71`
+
+Gating mechanism: `"sigmoid"` (DeepSeek-V3, independent per-expert gates) or `"softmax"` (legacy,
+competitive across experts).
+
+### `use_shared_expert`
+
+**Default:** `False` · **Location:** `src/configuration_bibo.py:44`
+
+Whether the always-on shared expert is enabled. Off by default to **match Qwen3MoE** (no shared
+expert). `shared_expert_type` (`"mlp"` SwiGLU / `"conv"` CausalConv1D) and `moe_shared_scaling`
+only take effect when this is `True`.
+
+---
+
 ## Quick Reference Table
 
 ### Router Mechanisms Summary
@@ -678,17 +737,27 @@ rope_scaling = {"type": "dynamic", "factor": 2.0}
 
 ### All Parameters
 
-| Parameter | Default | Location | Purpose | Tuning Range |
-|-----------|---------|----------|---------|--------------|
-| `router_lambda` | 1.0 | config:69 | **Routing confidence (entropy control)** | 0.5-2.0 |
-| `bias_update_threshold` | 100,000 | config:68 | **Load balancing frequency** | 10k-500k |
-| `bias_update_factor` | 0.01 | config:67 | **Load balancing step size** | 1e-3 to 5e-2 |
-| `router_temperature` | 1.3 | config:68 | Legacy parameter (not actively used) | 0.8-2.0 |
-| `router_noise` | 0.5 | config:68 | Exploration noise during training | 0.0-1.0 |
-| `router_type` | "mlp" | config:68 | Router architecture | "mlp" or "conv" |
-| `kernel_size` | 3 | config:68 | Conv router kernel size | 3-7 (odd) |
-| `moe_shared_scaling` | 1.0 (auto) | config:70 | Shared expert output scaling | 0.3-1.5 |
-| `rope_scaling` | {"type": "linear", "factor": 1.0} | config:154 | Position embedding scaling | factor: 1.0-4.0 |
+| Parameter | Default | Purpose | Tuning Range |
+|-----------|---------|---------|--------------|
+| `router_lambda` | 1.0 | **Routing confidence (entropy control)** | 0.5-2.0 |
+| `bias_update_threshold` | 8000 | **Load balancing frequency** (tokens between updates) | 2k-50k |
+| `bias_update_factor` | None (auto) | **Load balancing step size** (auto: Hill fn of n) | 1e-3 to 5e-2 |
+| `load_balance_strategy` | "bias" | How load is balanced | "none" / "bias" / "aux_loss" |
+| `aux_loss_coef` | 0.01 | Aux load-balance loss coef (only if strategy="aux_loss") | 1e-3 to 1e-2 |
+| `use_router_logit_norm` | False | z-score normalize logits before softmax (Skywork) | bool |
+| `router_activation` | "none" | Activation on raw logits before softmax | "none"/"relu"/"silu" |
+| `gate_type` | "sigmoid" | Gating mechanism | "sigmoid" / "softmax" |
+| `router_temperature` | 1.3 | Legacy parameter (not actively used) | 0.8-2.0 |
+| `router_noise` | 0 | Exploration noise (DEPRECATED, code commented out) | 0 |
+| `router_type` | "mlp" | Router architecture | "mlp" or "conv" |
+| `kernel_size` | 3 | Conv router kernel size (sees prev kernel_size-1 tokens) | 3-7 (odd) |
+| `moe_shared_scaling` | 1.0 (auto) | Shared expert output scaling | 0.3-1.5 |
+| `use_shared_expert` | False | Enable the always-on shared expert (off = match Qwen3MoE) | bool |
+| `shared_expert_type` | "mlp" | Shared expert kind (only if `use_shared_expert`) | "mlp" / "conv" |
+| `mlp_only_layers` | [0, N-1] | Layers using dense MLP instead of MoE (first + last) | list of layer indices |
+| `use_xsa` | True | Exclusive Self Attention rejection (see `docs/xsa.md`) | bool |
+| `use_ssmax` | True | SSMax scalable-softmax query scaling (see `docs/ssmax.md`) | bool |
+| `rope_scaling` | {"type": "dynamic", "factor": 1.0} | Position embedding scaling (NTK-aware) | factor: 1.0-4.0 |
 
 ---
 
@@ -698,8 +767,7 @@ rope_scaling = {"type": "dynamic", "factor": 2.0}
 ```python
 config = BiBoConfig(
     router_lambda=0.8,           # Softer routing
-    router_noise=0.3,            # Less exploration
-    bias_update_threshold=200_000,  # Infrequent updates
+    bias_update_threshold=16_000,  # Infrequent updates
     bias_update_factor=5e-3,     # Small steps
     moe_shared_scaling=1.0,      # Auto (or 0.6 for more shared influence)
 )
@@ -709,9 +777,8 @@ config = BiBoConfig(
 ```python
 config = BiBoConfig(
     router_lambda=1.0,           # Standard normalization
-    router_noise=0.5,            # Moderate exploration
-    bias_update_threshold=100_000,  # Regular updates
-    bias_update_factor=1e-2,     # Moderate steps
+    bias_update_threshold=8_000,    # Regular updates (default)
+    bias_update_factor=None,     # Auto-computed (Hill fn of num_routed_experts)
     moe_shared_scaling=1.0,      # Auto-computed
 )
 ```
@@ -720,12 +787,13 @@ config = BiBoConfig(
 ```python
 config = BiBoConfig(
     router_lambda=1.5,           # Sharper routing
-    router_noise=0.7,            # More exploration
-    bias_update_threshold=50_000,   # Frequent updates
+    bias_update_threshold=4_000,    # Frequent updates
     bias_update_factor=2e-2,     # Large steps
     moe_shared_scaling=1.0,      # Auto (or 0.3 for more specialization)
 )
 ```
+
+> `router_noise` is omitted from these presets — it is DEPRECATED and run at 0 (see its section).
 
 ### Long Context (Extended Sequences)
 ```python
@@ -779,8 +847,7 @@ ratio = shared_norm / routed_norm
 - **Symptom:** Some experts have near-zero token counts
 - **Solution:** 
   - Decrease `router_lambda` (0.5-0.8)
-  - Increase `router_noise` (0.7-1.0)
-  - Decrease `bias_update_threshold` (50k)
+  - Decrease `bias_update_threshold` (~4000 — more frequent rebalancing; default 8000)
   - Increase `bias_update_factor` (2e-2)
 
 **Issue: Poor expert specialization**
@@ -794,8 +861,7 @@ ratio = shared_norm / routed_norm
 - **Symptom:** Loss spikes, gradient explosions
 - **Solution:**
   - Decrease `router_lambda` (0.8)
-  - Decrease `router_noise` (0.3)
-  - Increase `bias_update_threshold` (200k)
+  - Increase `bias_update_threshold` (~16000 — gentler rebalancing; default 8000)
   - Decrease `bias_update_factor` (5e-3)
 
 **Issue: Shared expert dominates**
@@ -946,4 +1012,4 @@ Quick links:
 
 ---
 
-*Last updated: 2026-05-27*
+*Last updated: 2026-06-25*

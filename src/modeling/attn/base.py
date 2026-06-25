@@ -9,6 +9,7 @@ from ..norm import BiBoRMSNorm
 from ..embed import BiBoRotaryEmbedding, apply_rotary_pos_emb
 from .utils import repeat_kv
 from .ssmax import apply_ssmax_query_scaling
+from .xsa import apply_xsa
 
 __all__ = ['BiBoAttention']
 
@@ -32,6 +33,7 @@ class BiBoAttention(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.layer_idx = layer_idx
         self.use_ssmax = config.use_ssmax
+        self.use_xsa = config.use_xsa
         self.attention_dropout = config.attention_dropout
 
         if self.use_ssmax:
@@ -122,6 +124,10 @@ class BiBoAttention(nn.Module):
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
             attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
             attn_output = torch.matmul(attn_weights, value_states)
+
+        # XSA: enable_gqa broadcasts V across the query group (no repeat_kv copy).
+        if self.use_xsa:
+            attn_output = apply_xsa(attn_output, value_states, enable_gqa=True)
 
         # Reshape output
         attn_output = attn_output.transpose(1, 2).contiguous()

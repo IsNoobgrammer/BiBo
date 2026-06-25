@@ -27,8 +27,10 @@ Kaggle T4 (sm_75), RTX 3050 (sm_86), A100 (sm_80) all supported.
 """
 
 from .patch import (
-    patch_bibo_with_triton,
-    patch_qwen3_with_triton,
+    patch_bibo_with_liger,
+    patch_qwen3_with_liger,
+    patch_bibo_with_triton,   # deprecated alias of patch_bibo_with_liger
+    patch_qwen3_with_triton,  # deprecated alias of patch_qwen3_with_liger
     patch_qwen3_fused_ce,
     unpatch_bibo,
     unpatch_qwen3,
@@ -54,6 +56,11 @@ from .dense_mlp import (
     _FusedSwiGLUFull,
     _TritonFusedGLUFunction,
 )
+from .xsa_fused import (
+    fused_xsa,
+    patch_xsa_with_triton,
+    unpatch_xsa,
+)
 from .conv_fused import (
     patch_conv_router_with_triton,
     patch_conv_expert_with_triton,
@@ -66,6 +73,8 @@ from .conv_fused import (
 )
 
 __all__ = [
+    'patch_bibo_with_liger',
+    'patch_qwen3_with_liger',
     'patch_bibo_with_triton',
     'patch_qwen3_with_triton',
     'unpatch_bibo',
@@ -90,4 +99,7 @@ __all__ = [
     'triton_causal_conv1d_gated',
     'triton_fused_conv_gate_multiply',
     'triton_fused_permute_act',
+    'fused_xsa',
+    'patch_xsa_with_triton',
+    'unpatch_xsa',
 ]

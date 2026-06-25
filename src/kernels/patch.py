@@ -5,10 +5,14 @@ Uses linkedin/Liger-Kernel (production-grade, battle-tested):
 - LigerRMSNormFunction: Fused RMSNorm (fp32 intermediate, output in input dtype)
 - LigerRopeFunction: Fused RoPE (eliminates rotate_half intermediate)
 
+These patches apply ONLY Liger ops (RMSNorm + RoPE) — BiBo's custom Triton kernels (MoE, dense
+MLP, conv router, XSA, fused-CE) are applied by their own patch functions.
+
 Usage:
-    from src.kernels.patch import patch_bibo_with_triton
+    from src.kernels.patch import patch_bibo_with_liger
     model = BiBoForCausalLM(config).cuda()
-    patch_bibo_with_triton(model)  # Done — 8-9x faster norms, 2-3x faster RoPE
+    patch_bibo_with_liger(model)  # Done — 8-9x faster norms, 2-3x faster RoPE
+    # (patch_bibo_with_triton is a deprecated alias of patch_bibo_with_liger)
 
 Disable with --no_triton flag in bench scripts.
 """
@@ -16,7 +20,11 @@ Disable with --no_triton flag in bench scripts.
 from liger_kernel.ops.rms_norm import LigerRMSNormFunction
 from liger_kernel.ops.rope import LigerRopeFunction
 
-__all__ = ['patch_bibo_with_triton', 'patch_qwen3_with_triton', 'unpatch_bibo', 'unpatch_qwen3']
+__all__ = [
+    'patch_bibo_with_liger', 'patch_qwen3_with_liger',
+    'patch_bibo_with_triton', 'patch_qwen3_with_triton',  # deprecated aliases (Liger only)
+    'unpatch_bibo', 'unpatch_qwen3',
+]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -44,7 +52,7 @@ def _liger_rope_apply(q, k, cos, sin, unsqueeze_dim=1):
 # BiBo patching
 # ─────────────────────────────────────────────────────────────
 
-def patch_bibo_with_triton(model):
+def patch_bibo_with_liger(model):
     """
     Patch a BiBoForCausalLM to use Liger-Kernel Triton ops.
 
@@ -191,7 +199,7 @@ def patch_qwen3_fused_ce(model):
 # Qwen3 / Qwen3MoE patching
 # ─────────────────────────────────────────────────────────────
 
-def patch_qwen3_with_triton(model):
+def patch_qwen3_with_liger(model):
     """
     Patch Qwen3ForCausalLM or Qwen3MoeForCausalLM to use Liger-Kernel.
 
@@ -280,3 +288,12 @@ def unpatch_qwen3(model):
 
     model._triton_patched = False
     return model
+
+
+# ─────────────────────────────────────────────────────────────
+# Deprecated aliases — these patches apply ONLY Liger ops (RMSNorm + RoPE),
+# not BiBo's custom Triton kernels. Renamed to *_with_liger for honesty;
+# old *_with_triton names kept for back-compat. Prefer the new names.
+# ─────────────────────────────────────────────────────────────
+patch_bibo_with_triton = patch_bibo_with_liger
+patch_qwen3_with_triton = patch_qwen3_with_liger

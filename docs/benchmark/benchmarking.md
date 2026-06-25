@@ -616,4 +616,4 @@ routed_experts = polyglu_expert_multiplier × 3 + special_expert_pairs × 2
 
 ---
 
-*Last updated: 2026-05-27*
+*Last updated: 2026-06-25*

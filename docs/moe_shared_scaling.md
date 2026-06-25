@@ -47,18 +47,22 @@ Since `p` depends on random router logits at initialization, we estimate `λ` by
 ```python
 import numpy as np
 
-def softmax(x):
-    p = np.exp(x)
-    return p / p.sum()
+def softmax(x):                       # numerically stable (matches the code)
+    e = np.exp(x - x.max())
+    return e / e.sum()
 
-n = num_routed_experts      # e.g., 16
-k = num_experts_per_tok     # e.g., 6
-s = num_shared_experts      # e.g., 1
+n   = num_routed_experts      # e.g., 16
+k   = num_experts_per_tok     # e.g., 6
+s   = num_shared_experts      # e.g., 1
+lam = router_lambda           # e.g., 1.0  (logit-norm scaling, Skywork-MoE)
 
 factors = []
 for _ in range(10000):
     # Random router logits at init (weights are ~N(0,1))
     logits = np.random.randn(n - s)
+    # Router logit normalization, THEN router_lambda scaling (must match router.py)
+    logits = (logits - logits.mean()) / (logits.std() + 1e-6)
+    logits = lam * logits
     # Top-k routing probabilities
     p = np.sort(softmax(logits))[::-1][:k - s]
     # Compute scaling factor
@@ -66,6 +70,10 @@ for _ in range(10000):
 
 lambda_scaling = round(np.mean(factors), 2)
 ```
+
+> The MC sim **accounts for `router_lambda`** (the z-score logit normalization + λ scaling applied
+> in the router) — sharper routing (higher λ) concentrates `p`, which changes `‖p‖₂` and hence the
+> scaling. The softmax is the numerically stable `exp(x − max)` form, matching `configuration_bibo.py`.
 
 ---
 

@@ -186,28 +186,29 @@ def apply_triton_kernels(model, config, no_triton=False, use_fused_ce=True):
 
     try:
         if not is_qwen:
-            from src.kernels.patch import patch_bibo_with_triton
+            from src.kernels.patch import patch_bibo_with_liger
             from src.kernels.moe_dispatch import patch_moe_with_triton
             from src.kernels.dense_mlp import patch_dense_mlp_with_triton
-            from src.kernels.conv_fused import patch_conv_router_with_triton, patch_conv_expert_with_triton
+            from src.kernels.conv_fused import patch_conv_router_with_triton
 
-            patch_bibo_with_triton(model)
+            patch_bibo_with_liger(model)
             patch_moe_with_triton(model)
             patch_dense_mlp_with_triton(model)
             patch_conv_router_with_triton(model)
-            patch_conv_expert_with_triton(model)
+            # NOTE: conv shared-expert kernel intentionally NOT applied — 0.41x (slower than
+            # PyTorch ops; launch overhead dominates the cheap elementwise op). See docs/triton_kernels.md.
             # CE: BiBo routes through our fused-linear-CE via an instance config flag.
             if use_fused_ce:
                 model.config.use_fused_linear_ce = True
             dense_count = getattr(model, '_triton_dense_mlp_count', 0)
             ce_tag = " + FusedCE" if use_fused_ce else ""
-            print(f"  Triton: RMSNorm + RoPE + MoE GLU + Dense MLP x{dense_count} + Conv{ce_tag}")
+            print(f"  Triton: RMSNorm + RoPE + MoE GLU + Dense MLP x{dense_count} + ConvRouter{ce_tag}")
 
         else:
-            from src.kernels.patch import patch_qwen3_with_triton, patch_qwen3_fused_ce
+            from src.kernels.patch import patch_qwen3_with_liger, patch_qwen3_fused_ce
             from src.kernels.dense_mlp import patch_qwen_dense_mlp_with_triton
 
-            patch_qwen3_with_triton(model)
+            patch_qwen3_with_liger(model)
             if use_fused_ce:
                 patch_qwen3_fused_ce(model)   # our kernel (not Liger's chunked CE)
             patch_qwen_dense_mlp_with_triton(model)
