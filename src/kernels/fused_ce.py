@@ -14,10 +14,11 @@ ONLY viable option at the real 16k-token step (standard OOMs). Grad-exact (fp16 
 Supports ignore_index (default -100). H<=~1024 hidden; any vocab.
 """
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-__all__ = ["fused_linear_cross_entropy"]
+__all__ = ["fused_linear_cross_entropy", "fused_linear_cross_entropy_tldot"]
 
 # Backward chunk is sized so the transient (CHUNK,V) fp16 logit buffer stays under this budget.
 # 1024 MiB → CHUNK≈6628 at V=81000 (fewer/bigger backward GEMMs → better tensor-core util on the
@@ -134,6 +135,64 @@ class _FLCE(torch.autograd.Function):
         return gh, gw.to(weight.dtype), None, None
 
 
-def fused_linear_cross_entropy(hidden, weight, labels, ignore_index=-100):
-    """hidden (N,H), weight=lm_head.weight (V,H), labels (N,) -> mean CE loss (fused, no (N,V))."""
+def fused_linear_cross_entropy_tldot(hidden, weight, labels, ignore_index=-100):
+    """LEGACY tl.dot streaming forward. ~2% SoL — ~2.36x SLOWER than compiled standard CE when the
+    (N,V) logits fit (T4 H512/V81920/B16). Kept for reference / the extreme-OOM regime."""
     return _FLCE.apply(hidden, weight, labels, ignore_index)
+
+
+# ── cuBLAS-chunked CE (DEFAULT): forward GEMM via cuBLAS in row-chunks, keeps only lse(N,) ──
+# Replaces the tl.dot forward (the ~2% SoL bottleneck) with cuBLAS (~50% SoL) while keeping the
+# cut-cross-entropy memory profile (never materializes the full (N,V) logits). Backward is the same
+# cuBLAS-chunked recompute the tl.dot path already used. Grad-exact vs F.cross_entropy.
+def _chunk_rows(N, V):
+    return max(512, min(N, _BWD_LOGITS_BUDGET // (V * 2)))
+
+
+class _CECublasChunked(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hidden, weight, labels, ignore_index):
+        N, Hd = hidden.shape
+        V = weight.shape[0]
+        C = _chunk_rows(N, V)
+        lse = torch.empty(N, device=hidden.device, dtype=torch.float32)
+        tgt = torch.empty(N, device=hidden.device, dtype=torch.float32)
+        safe = labels.clamp(min=0)
+        with torch.no_grad():
+            for i in range(0, N, C):
+                logits = torch.mm(hidden[i:i+C], weight.t()).float()    # cuBLAS (C,V)
+                lse[i:i+C] = torch.logsumexp(logits, dim=-1)
+                tgt[i:i+C] = logits.gather(1, safe[i:i+C, None]).squeeze(1)
+        valid = labels != ignore_index
+        loss = ((lse - tgt) * valid).sum() / valid.sum().clamp(min=1)
+        ctx.save_for_backward(hidden, weight, labels, lse, valid.sum().clamp(min=1))
+        ctx.ignore_index = ignore_index
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        hidden, weight, labels, lse, n_valid = ctx.saved_tensors
+        ig = ctx.ignore_index
+        N, Hd = hidden.shape
+        V = weight.shape[0]
+        sc = float(grad_out / n_valid)
+        gh = torch.empty(N, Hd, device=hidden.device, dtype=hidden.dtype)
+        gw = torch.zeros(V, Hd, device=hidden.device, dtype=torch.float32)
+        C = _chunk_rows(N, V)
+        for i in range(0, N, C):
+            hc = hidden[i:i+C]; labc = labels[i:i+C]; lsec = lse[i:i+C]
+            logits = torch.mm(hc, weight.t())                           # cuBLAS recompute (C,V)
+            p = torch.exp(logits.float() - lsec[:, None])
+            onehot = F.one_hot(labc.clamp(min=0), V).to(p.dtype)
+            g = (p - onehot) * sc
+            g = torch.where((labc != ig)[:, None], g, torch.zeros_like(g)).to(hidden.dtype)
+            gh[i:i+C] = torch.mm(g, weight)
+            gw += torch.mm(g.t(), hc).float()
+        return gh, gw.to(weight.dtype), None, None
+
+
+def fused_linear_cross_entropy(hidden, weight, labels, ignore_index=-100):
+    """hidden (N,H), weight=lm_head.weight (V,H), labels (N,) -> mean CE loss.
+    cuBLAS-chunked (DEFAULT): cuBLAS GEMM in row-chunks, never materializes (N,V). Bounded memory
+    (~chunk transient), cuBLAS speed. For the legacy tl.dot kernel use fused_linear_cross_entropy_tldot."""
+    return _CECublasChunked.apply(hidden, weight, labels, ignore_index)

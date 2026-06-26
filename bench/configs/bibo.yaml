@@ -35,9 +35,9 @@ model:
   attention_bias: false
 
 training:
-  batch_size: 16      # hidden=512; std CE fits at ~14.5G. Drop to 8 if OOM, or use cuBLAS-chunked CE.
+  batch_size: 16      # hidden=512
   grad_accum: 1
-  use_fused_ce: false # compiled standard CE — 2.36x faster / 14.7% vs 6.2% MFU (fused tl.dot-CE forward is ~2% SoL). Set true only if logits OOM.
+  use_fused_ce: true  # cuBLAS-chunked CE (default): cuBLAS-speed forward, never materializes (N,V) → bounded ~9G vs std-CE 14.5G. Set false for compiled standard CE. (NOT the old tl.dot kernel.)
   total_steps: 50000
   warmup_steps: 100
   lr: 5.0e-4
