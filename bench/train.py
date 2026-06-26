@@ -178,14 +178,32 @@ def wrap_ddp(model, local_rank):
     all-gather overhead for ~zero memory benefit. DDP replicates + all-reduces grads once
     per step, and keeps params as plain tensors (FSDP's DTensor breaks bitsandbytes AdamW8bit).
     """
-    # find_unused_parameters: Zero/Identity special experts + NoPE heads can leave some params
-    # without grad on a given step → DDP would hang at all-reduce without this.
-    return DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    # find_unused_parameters=False: at 16384 tokens/step every MoE expert gets tokens (verified —
+    # DDP reported "no unused parameters found"), so all params get grad and True only buys an
+    # extra autograd-graph traversal per iter (~20% per-GPU slowdown). Zero expert grads to zeros
+    # (a real tensor, not None) and Identity/NoPE have no extra params, so nothing goes unused.
+    # ponytail: False is safe at this batch; a tiny-batch run where an expert gets 0 tokens would
+    # hang here — flip back to True (or static_graph) if you ever shrink batch×seq below ~num_experts.
+    return DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
 
 def compile_model(model):
     """Apply torch.compile — mode=default for Triton inductor fusion (same as old bench)."""
     return torch.compile(model, mode="default", fullgraph=False)
+
+
+def unwrap_model(model):
+    """Strip torch.compile (_orig_mod) and DDP (.module) to the raw eager module.
+    Eval runs on this: single-rank no_grad doesn't need DDP grad-sync, and eager handles any
+    seq length — the compiled+DDP graph CAN'T recompile for a new shape (DDPOptimizer splits the
+    graph at bucket boundaries → 'int has no attribute meta' when length-extrap hits seq 2048)."""
+    inner = model
+    for _ in range(3):
+        nxt = getattr(inner, "_orig_mod", None) or getattr(inner, "module", None)
+        if nxt is None:
+            break
+        inner = nxt
+    return inner
 
 
 def train(args):
@@ -301,6 +319,10 @@ def train(args):
             if is_main:
                 print(f"{TAG} torch.compile failed: {e}")
 
+    # Eager, unwrapped view for eval (shares params with `model` — no copy). Avoids the
+    # DDPOptimizer recompile crash at new seq lengths and skips needless DDP grad-sync in eval.
+    eval_model = unwrap_model(model)
+
     # ── Optimizer ─────────────────────────────────────────────
     optimizer, optim_name = create_optimizer(model, cfg)
     scheduler = create_scheduler(
@@ -355,7 +377,7 @@ def train(args):
     # ── Eval Only ─────────────────────────────────────────────
     if args.eval_only:
         if is_main:
-            results = run_all_evals(model, tokenizer, val_ds, device,
+            results = run_all_evals(eval_model, tokenizer, val_ds, device,
                                     eval_cfg.get("benchmarks", []),
                                     batch_size=train_cfg["batch_size"],
                                     max_examples=eval_cfg.get("max_eval_examples", 500))
@@ -449,9 +471,9 @@ def train(args):
             step_time = time.time() - t0
             step_times.append(step_time)
 
-            n_tokens = input_ids.numel() * accum_steps
-            tokens_seen += n_tokens
-            throughput.update(n_tokens)
+            n_tokens = input_ids.numel() * accum_steps          # this rank's tokens this step
+            tokens_seen += n_tokens * world_size                 # GLOBAL tokens trained (each rank = different shard)
+            throughput.update(n_tokens * world_size)
             lm_loss = lm_loss_val.item()           # pure LM loss (comparable across models)
             total_loss = loss.item() * accum_steps  # LM + aux (what's actually optimized)
 
@@ -464,7 +486,8 @@ def train(args):
                 # and eval wall-time, making tps/mfu "drop" after every eval (a metric artifact,
                 # not a real slowdown). Window = tokens this window / wall time this window.
                 win_t = sum(step_times)
-                tps = (n_tokens * len(step_times) / win_t) if win_t > 0 else 0.0
+                tps_per_gpu = (n_tokens * len(step_times) / win_t) if win_t > 0 else 0.0
+                tps = tps_per_gpu * world_size       # global throughput (all GPUs) — what's displayed
                 gn = grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm
 
                 # Collect internal metrics (router entropy, hidden norms)
@@ -472,7 +495,8 @@ def train(args):
                 collector.reset()
 
                 # ── Perf diagnostics (answers the "why is TPS low" question) ──
-                mfu = estimate_mfu(active_params, tps, device)
+                # MFU is per-GPU efficiency → use per-GPU tps (peak_tflops in estimate_mfu is per-device).
+                mfu = estimate_mfu(active_params, tps_per_gpu, device)
                 peak_mem = torch.cuda.max_memory_allocated() / 1e9
                 # stall/recompile proxy: steps in window far above the median
                 med = sorted(step_times)[len(step_times) // 2]
@@ -502,10 +526,13 @@ def train(args):
 
                 pct = step / total_steps * 100
                 eta = (total_steps - step) * step_time
+                # tps is GLOBAL (all GPUs); show per-GPU breakdown + mfu(per-GPU) so multi-GPU is legible
+                tps_s = (f"tps={tps:.0f} ({tps_per_gpu:.0f}/gpu×{world_size})"
+                         if world_size > 1 else f"tps={tps:.0f}")
                 print(
                     f"  step {step:>6d}/{total_steps} ({pct:5.1f}%) | "
                     f"loss={lm_loss:.4f} | lr={lr_now:.2e} | tok={format_count(tokens_seen)} | "
-                    f"tps={tps:.0f} | mfu={mfu*100:.1f}% | mem={peak_mem:.1f}G | "
+                    f"{tps_s} | mfu={mfu*100:.1f}%/gpu | mem={peak_mem:.1f}G | "
                     f"{step_time:.3f}s | grad={gn:.4f} | ETA={format_time(eta)}"
                 )
                 if slow_steps:
@@ -518,7 +545,7 @@ def train(args):
                 try:
                     with collector.track():
                         results = run_all_evals(
-                            model, tokenizer, val_ds, device,
+                            eval_model, tokenizer, val_ds, device,
                             eval_cfg.get("benchmarks", []),
                             batch_size=train_cfg["batch_size"],
                             max_batches=100,
@@ -531,7 +558,7 @@ def train(args):
                         le_lengths = eval_cfg.get("eval_lengths") or [_sl, 2 * _sl]
                         try:
                             results["length_extrap"] = evaluate_length_extrapolation(
-                                model, le_lengths, train_cfg.get("val_split", 0.05),
+                                eval_model, le_lengths, train_cfg.get("val_split", 0.05),
                                 train_cfg.get("seed", 42), train_cfg["batch_size"], device,
                                 max_batches=20, tokenizer=tokenizer)
                         except torch.cuda.OutOfMemoryError:
@@ -556,7 +583,7 @@ def train(args):
             # ── Sample Generation ─────────────────────────────
             if is_main and step % sample_every == 0:
                 try:
-                    samples = generate_samples(model, device=device,
+                    samples = generate_samples(eval_model, device=device,
                                                prompts=["The meaning of life is"],
                                                max_new_tokens=50)
                     log_samples(step, samples)
@@ -576,7 +603,7 @@ def train(args):
         print(f"{TAG} Training Complete! ({step} steps, {epoch + 1} epochs)")
 
         try:
-            results = run_all_evals(model, tokenizer, val_ds, device,
+            results = run_all_evals(eval_model, tokenizer, val_ds, device,
                                     eval_cfg.get("benchmarks", []),
                                     batch_size=train_cfg["batch_size"], max_batches=100,
                                     max_examples=eval_cfg.get("max_eval_examples", 1024))
@@ -585,7 +612,7 @@ def train(args):
             le_lengths = eval_cfg.get("eval_lengths") or [_sl, 2 * _sl]
             try:
                 results["length_extrap"] = evaluate_length_extrapolation(
-                    model, le_lengths, train_cfg.get("val_split", 0.05),
+                    eval_model, le_lengths, train_cfg.get("val_split", 0.05),
                     train_cfg.get("seed", 42), train_cfg["batch_size"], device, tokenizer=tokenizer)
             except torch.cuda.OutOfMemoryError:
                 print(f"{TAG} length-extrap OOM — skipping"); torch.cuda.empty_cache()
