@@ -45,7 +45,7 @@ from optim import create_optimizer, create_scheduler, HAS_BNB
 from eval import evaluate, generate_samples, get_tokenizer, run_all_evals
 from metrics import (
     init_wandb, log_train_metrics, log_eval_metrics, log_samples,
-    save_checkpoint, load_checkpoint, ThroughputMeter, format_time,
+    save_checkpoint, load_checkpoint, ThroughputMeter, format_time, format_count,
     MetricsCollector, estimate_mfu,
 )
 
@@ -424,7 +424,12 @@ def train(args):
             if is_main and (step % log_every == 0 or step == 1):
                 lrs = scheduler.get_last_lr()  # one per param group (Muon + AdamW differ)
                 lr_now = lrs[0]
-                tps = throughput.tokens_per_sec()
+                # Windowed (instantaneous) tps over the current log window — NOT cumulative.
+                # Cumulative avg (throughput.tokens_per_sec) gets polluted by the compile step
+                # and eval wall-time, making tps/mfu "drop" after every eval (a metric artifact,
+                # not a real slowdown). Window = tokens this window / wall time this window.
+                win_t = sum(step_times)
+                tps = (n_tokens * len(step_times) / win_t) if win_t > 0 else 0.0
                 gn = grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm
 
                 # Collect internal metrics (router entropy, hidden norms)
@@ -446,6 +451,7 @@ def train(args):
                     "loss_total": total_loss,
                     "perplexity": math.exp(min(lm_loss, 20)),
                     "tokens_seen": tokens_seen,
+                    "tokens_trained": tokens_seen,   # numeric for WandB x-axis (UI auto-scales to K/M/B)
                     "epoch": epoch,
                     "samples_per_sec": tps / train_cfg.get("seq_len", 1024),
                     "loss_scale": scaler.get_scale(),   # fp16 health: drops on overflow
@@ -463,7 +469,7 @@ def train(args):
                 eta = (total_steps - step) * step_time
                 print(
                     f"  step {step:>6d}/{total_steps} ({pct:5.1f}%) | "
-                    f"loss={lm_loss:.4f} | lr={lr_now:.2e} | "
+                    f"loss={lm_loss:.4f} | lr={lr_now:.2e} | tok={format_count(tokens_seen)} | "
                     f"tps={tps:.0f} | mfu={mfu*100:.1f}% | mem={peak_mem:.1f}G | "
                     f"{step_time:.3f}s | grad={gn:.4f} | ETA={format_time(eta)}"
                 )

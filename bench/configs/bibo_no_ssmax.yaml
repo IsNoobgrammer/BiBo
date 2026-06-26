@@ -48,7 +48,7 @@ eval:
   benchmarks: ["hellaswag", "arc_challenge"]
   eval_every: 500
   sample_every: 1000
-  max_eval_examples: 500   # cap HellaSwag/ARC per eval (keeps eval fast)
+  max_eval_examples: 1024   # cap HellaSwag/ARC per eval (keeps eval fast)
 
 logging:
   wandb_project: "bibo-bench"

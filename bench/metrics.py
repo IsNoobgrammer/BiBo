@@ -317,3 +317,15 @@ def format_time(seconds):
         return f"{seconds / 60:.1f}m"
     else:
         return f"{seconds / 3600:.1f}h"
+
+
+def format_count(n):
+    """Format a token count with K/M/B suffix (e.g. 1234567 -> '1.23M')."""
+    n = float(n)
+    if n >= 1e9:
+        return f"{n / 1e9:.2f}B"
+    if n >= 1e6:
+        return f"{n / 1e6:.2f}M"
+    if n >= 1e3:
+        return f"{n / 1e3:.2f}K"
+    return f"{int(n)}"
