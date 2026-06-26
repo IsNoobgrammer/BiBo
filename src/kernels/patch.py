@@ -163,9 +163,14 @@ def patch_qwen3_fused_ce(model):
             # weight cast to hidden dtype (fp16 under autocast); our kernel does fp32 accum inside.
             lm_weight = self.lm_head.weight.to(shift_hidden.dtype)
             loss = fused_linear_cross_entropy(shift_hidden, lm_weight, shift_labels)
-        elif logits_to_keep > 0:
-            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-            logits = self.lm_head(hidden_states[:, slice_indices, :])
+        else:
+            # No labels → eval/inference: must materialize logits (fused CE only runs WITH labels).
+            # logits_to_keep>0 = generation (last-k); else full-sequence scoring (HellaSwag/eval).
+            if logits_to_keep and (not isinstance(logits_to_keep, int) or logits_to_keep > 0):
+                slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+                logits = self.lm_head(hidden_states[:, slice_indices, :])
+            else:
+                logits = self.lm_head(hidden_states)
 
         aux_loss = None
         if output_router_logits:
