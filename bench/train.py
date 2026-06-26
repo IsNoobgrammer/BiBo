@@ -101,6 +101,15 @@ def parse_args():
     p.add_argument("--eval_only", action="store_true")
     p.add_argument("--grad_checkpoint", action="store_true")
     p.add_argument("--resume", type=str, default=None)
+    # BiBo feature ablations (override the config; ignored for qwen). Accept hyphen or underscore.
+    p.add_argument("--no-xsa", "--no_xsa", dest="no_xsa", action="store_true",
+                   help="BiBo: disable Exclusive Self Attention (use_xsa=False)")
+    p.add_argument("--no-ssmax", "--no_ssmax", dest="no_ssmax", action="store_true",
+                   help="BiBo: disable SSMax query scaling (use_ssmax=False)")
+    p.add_argument("--no-partial-rope", "--no_partial_rope", dest="no_partial_rope", action="store_true",
+                   help="BiBo: disable partial RoPE / NoPE heads (rope_nope_ratio=0.0 → all-RoPE)")
+    p.add_argument("--no-conv-router", "--no_conv_router", dest="no_conv_router", action="store_true",
+                   help="BiBo: use the MLP router instead of the conv router (router_type='mlp')")
     return p.parse_args()
 
 
@@ -128,6 +137,16 @@ def load_config(args):
         cfg["eval"]["max_eval_examples"] = args.max_eval_examples
     if args.wandb_name is not None:
         cfg["logging"]["wandb_name"] = args.wandb_name
+
+    # BiBo feature ablations (override model config; the qwen builder ignores these keys)
+    m = cfg["model"]
+    ablated = []
+    if args.no_xsa:          m["use_xsa"] = False;        ablated.append("xsa")
+    if args.no_ssmax:        m["use_ssmax"] = False;      ablated.append("ssmax")
+    if args.no_partial_rope: m["rope_nope_ratio"] = 0.0;  ablated.append("partial-rope")
+    if args.no_conv_router:  m["router_type"] = "mlp";    ablated.append("conv-router")
+    if ablated:
+        cfg["_ablated"] = ablated   # surfaced in the startup banner
 
     return cfg
 
@@ -191,6 +210,8 @@ def train(args):
         print(f"{TAG}   Steps: {train_cfg['total_steps']}")
         print(f"{TAG}   Optimizer: {train_cfg.get('optimizer', 'muon_adamw8bit')}")
         print(f"{TAG}   Precision: AMP {str(AMP_DTYPE).replace('torch.', '')} (fp32 master weights)")
+        if cfg.get("_ablated"):
+            print(f"{TAG}   ⚠ ABLATED: {', '.join(cfg['_ablated'])} (disabled via CLI)")
         if train_cfg.get("deterministic", True):
             _strict = train_cfg.get("strict_deterministic", False)
             print(f"{TAG}   Deterministic: ON (seed={train_cfg.get('seed', 42)}, "
