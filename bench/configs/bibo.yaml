@@ -48,7 +48,8 @@ training:
   val_split: 0.05
   seed: 42
   deterministic: true
-  optimizer: "adamw8bit"
+  optimizer: "muon_adamw8bit"   # Muon (Newton-Schulz orthogonalized) for 2D weights, AdamW8bit for embeds/norms/scalars — industry-standard split
+  muon_lr: 0.02                 # Muon LR for 2D matrices (AdamW lr above = embeds/norms/shared-scaling); 0.02 is the modded-nanogpt default
 
 eval:
   benchmarks: ["hellaswag"]
