@@ -1,5 +1,5 @@
 # BiBo 118.6M total / 66.7M active (10L, H512, 4h/2kv GQA, PolyGLU 6+2 special, shared MLP expert, SSMax+XSA+partial-RoPE).
-# Deliberately SMALLER than qwen3moe.yaml (141.4M/75.3M) so a BiBo loss win is conservative.
+# Deliberately SMALLER than qwen3moe.yaml (128.0M/71.4M; same expert+dense widths, Qwen just has 2 more real experts) so a BiBo loss win is conservative.
 # Load balancing = router-bias heuristic (no aux loss term). Pure-CE loss.
 # Training hyperparams kept identical to qwen3moe.yaml for a fair comparison.
 model:
