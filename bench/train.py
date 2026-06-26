@@ -94,6 +94,9 @@ def parse_args():
     p.add_argument("--wandb_name", type=str, default=None)
     p.add_argument("--no_compile", action="store_true")
     p.add_argument("--no_triton", action="store_true")
+    p.add_argument("--no_fused_ce", action="store_true",
+                   help="Keep Triton body kernels but use standard (compiled) CE instead of the "
+                        "fused-linear-CE kernel. Faster when the (N,V) logits fit in memory.")
     p.add_argument("--no_wandb", action="store_true")
     p.add_argument("--eval_only", action="store_true")
     p.add_argument("--grad_checkpoint", action="store_true")
@@ -244,8 +247,8 @@ def train(args):
     # ── Triton Kernels (Liger + Dense MLP for BOTH models) ────
     if not args.no_triton:
         if is_main:
-            print(f"{TAG} Applying Triton kernels...")
-        apply_triton_kernels(model, config, no_triton=False)
+            print(f"{TAG} Applying Triton kernels...{' (fused CE OFF — standard CE)' if args.no_fused_ce else ''}")
+        apply_triton_kernels(model, config, no_triton=False, use_fused_ce=not args.no_fused_ce)
     else:
         if is_main:
             print(f"{TAG} Triton DISABLED (--no_triton)")

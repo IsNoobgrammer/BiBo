@@ -29,6 +29,8 @@ def main():
     ap.add_argument("--batch", type=int, default=None, help="override config batch_size")
     ap.add_argument("--seq", type=int, default=None, help="override config seq_len")
     ap.add_argument("--baseline", action="store_true", help="eager (no Triton kernels, standard CE)")
+    ap.add_argument("--no-fused-ce", dest="no_fused_ce", action="store_true",
+                    help="all Triton body kernels ON but standard (compiled) CE instead of fused-CE kernel")
     ap.add_argument("--compile", action="store_true", help="torch.compile the model (real wall-time)")
     ap.add_argument("--warmup", type=int, default=8)
     ap.add_argument("--timed", type=int, default=10)
@@ -47,7 +49,7 @@ def main():
     p = count_params(m, c)
 
     if not args.baseline:
-        apply_triton_kernels(m, c, no_triton=False, use_fused_ce=True)   # the real training path
+        apply_triton_kernels(m, c, no_triton=False, use_fused_ce=not args.no_fused_ce)   # real training path
     m = m.cuda().train()
     if args.compile:
         m = torch.compile(m)
@@ -65,7 +67,11 @@ def main():
         loss.backward()
         return loss
 
-    tag = f"{'baseline-eager' if args.baseline else 'all+fusedCE'}{'+compile' if args.compile else ''}"
+    if args.baseline:
+        tag = "baseline-eager"
+    else:
+        tag = "all+stdCE" if args.no_fused_ce else "all+fusedCE"
+    tag += "+compile" if args.compile else ""
     print(f"\n===== {os.path.basename(args.config)} | {tag} | B{B} x S{S} = {B*S} tok/step | fwd+bwd =====")
     print(f"params: {p['total_m']:.1f}M total / {p['active_m']:.1f}M active | "
           f"hidden={c.hidden_size} heads={c.num_attention_heads} head_dim={c.hidden_size//c.num_attention_heads}")
