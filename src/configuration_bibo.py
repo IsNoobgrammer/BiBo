@@ -20,7 +20,7 @@ class BiBoConfig(PretrainedConfig):
         intermediate_size=4104,  # 2nd Ramanujan-Hardy number (4104 = 16³+2³ = 15³+9³)
         num_hidden_layers=8,
         num_attention_heads=12,
-        num_key_value_heads=4,
+        num_key_value_heads=2,
         hidden_act="silu",
         max_position_embeddings=32768,
         initializer_range=0.02,
@@ -29,7 +29,7 @@ class BiBoConfig(PretrainedConfig):
         use_xsa=True,  # Exclusive Self Attention (https://arxiv.org/abs/2603.09078)
         use_cache=True,
         use_ssmax=True,  # SSMax: scaling softmax for long context
-        rope_nope_ratio=0.75,  # Fraction of heads that are NoPE (no positional encoding). 0.75 = 1R+3N (25% RoPE, 75% NoPE). 0.0 = all RoPE. Must align with KV group boundaries.
+        rope_nope_ratio=0.5,  # Fraction of heads that are NoPE (no positional encoding). 0.5 = 2:2 (6 RoPE+NTK heads, 6 NoPE content heads at 12h/2kv). 0.0 = all RoPE (original behavior).
         pad_token_id=None,
         bos_token_id=0,
         eos_token_id=0,
