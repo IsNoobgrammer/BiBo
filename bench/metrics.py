@@ -220,24 +220,41 @@ def log_samples(step, samples):
 # Checkpointing
 # ─────────────────────────────────────────────────────────────
 
-def save_checkpoint(model, optimizer, scheduler, step, path):
-    """Save training checkpoint."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    # Unwrap torch.compile (_orig_mod) AND DDP (.module) in any nesting order, else keys get
-    # a `module.`/`_orig_mod.` prefix and a strict=False load silently leaves random init.
-    inner = model
-    for _ in range(3):
-        inner = getattr(inner, "_orig_mod", None) or getattr(inner, "module", None) or inner
-        if inner is model or not (hasattr(inner, "_orig_mod") or hasattr(inner, "module")):
-            break
-    state_dict = inner.state_dict()
-    torch.save({
-        "model": state_dict,
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict() if scheduler else None,
-        "step": step,
-    }, path)
-    print(f"    Checkpoint saved at step {step}")
+def save_checkpoint(model, optimizer, scheduler, step, path, save_optimizer=False):
+    """Save a checkpoint.
+
+    MODEL-ONLY by default: compare.py and eval only load weights, so the optimizer state
+    (fused fp32 Adam + Muon momentum) is dead weight that ~doubled the file (1.23GB -> ~0.44GB
+    here) and helped fill /kaggle/working -> the torch.save iostream/ENOSPC crash. Pass
+    save_optimizer=True only when you need to RESUME training.
+
+    Atomic (write .tmp then os.replace) so a crash never leaves a half-written .pt, and
+    NON-FATAL (a full disk warns + continues training instead of killing a long run)."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Unwrap torch.compile (_orig_mod) AND DDP (.module) in any nesting order, else keys get
+        # a `module.`/`_orig_mod.` prefix and a strict=False load silently leaves random init.
+        inner = model
+        for _ in range(3):
+            nxt = getattr(inner, "_orig_mod", None) or getattr(inner, "module", None)
+            if nxt is None:
+                break
+            inner = nxt
+        blob = {"model": inner.state_dict(), "step": step}
+        if save_optimizer:
+            blob["optimizer"] = optimizer.state_dict()
+            blob["scheduler"] = scheduler.state_dict() if scheduler else None
+        tmp = path + ".tmp"
+        torch.save(blob, tmp)
+        os.replace(tmp, path)   # atomic; never leaves a partial .pt on crash
+        print(f"    Checkpoint saved at step {step} ({'model+optim' if save_optimizer else 'model-only'})")
+    except Exception as e:
+        print(f"    [WARN] checkpoint save failed at step {step}: {e} — continuing training")
+        try:
+            if os.path.exists(path + ".tmp"):
+                os.remove(path + ".tmp")
+        except OSError:
+            pass
 
 
 def load_checkpoint(model, optimizer, scheduler, path):
