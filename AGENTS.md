@@ -206,6 +206,17 @@ BiBoForCausalLM
 
 9. **Triton kernels have custom backward** — all MoE Triton kernels use custom Triton backward kernels, not PyTorch fallback. Gold standard: `_FusedSwiGLUFull` in dense_mlp.py (matched forward+backward Triton kernels with autotune).
 
+9b. **`is_causal=True` SDPA, no precomputed mask (June 26 2026)** — the model no longer builds an
+    explicit additive triangular mask; attention passes `is_causal=q_len>1, attn_mask=None`. An
+    explicit float mask makes the mem-efficient cutlass FMHA compute all S² blocks; `is_causal`
+    lets it SKIP the upper triangle — **confirmed on T4 sm_75: attention backward 100ms→47ms**,
+    step 727→599ms, MFU 13.9%→16.8%. Bit-equivalent (is_causal vs manual-causal logits Δ3e-6).
+    `_update_causal_mask` removed; `masks.py` dormant (re-exported only). ⚠️ **No padded-batch
+    support** in this path — the pipeline is packed (no pad); revisit if padding is ever needed.
+    **optmaxx arc (T4, B16/H512): morning 2.4s/~5% MFU → now 599ms/16.8%** (hidden 320→512+head_dim
+    128, tl.dot-CE→cuBLAS-chunked-CE, additive-mask→is_causal). Now GEMM-bound (~69% cuBLAS); near
+    the practical T4 ceiling for this size. Next lever = flash-attention-turing (attention 8%→~4%).
+
 10. **GQA via repeat_kv, NOT `enable_gqa` (reversed Jun 25 2026)** — the SDPA attention call uses
     `repeat_kv` to full MHA and does **NOT** pass `enable_gqa=True`. Measured: `enable_gqa=True`
     silently forces SDPA onto the **MATH backend** (materializes the O(n²) scores → ~10–25× slower,
