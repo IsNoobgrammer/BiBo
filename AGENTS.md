@@ -176,7 +176,7 @@ BiBoForCausalLM
 
 11. **Identified P0 issues for distributed training:**
     - Sequential expert loop (code issue, not architectural)
-    - Unsynchronized bias buffers across DDP ranks
+    - ~~Unsynchronized bias buffers across DDP ranks~~ **FIXED (Jun 27 2026)**: `moe.py` all-reduces (SUM) the per-expert token counts at the bias-update threshold so load-balancing sees GLOBAL load, not just rank 0's shard; the sign()-based update is then identical on every rank → bias stays bit-synced (verified: 2-rank gloo, max|Δbias|=0). `wrap_ddp` sets `broadcast_buffers=False` so per-rank accumulation isn't clobbered each forward. All ranks hit the threshold the same step (identical per-step token count) → the collective stays in lockstep; eval (training=False) skips it, no deadlock.
     - CausalConv1D incompatible with sequence parallelism (needs halo exchange)
     - SSMax uses local kv_len (needs global seq_len under SP)
     - MC simulation non-deterministic (needs seed)

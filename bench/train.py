@@ -187,7 +187,15 @@ def wrap_ddp(model, local_rank):
     # (a real tensor, not None) and Identity/NoPE have no extra params, so nothing goes unused.
     # ponytail: False is safe at this batch; a tiny-batch run where an expert gets 0 tokens would
     # hang here — flip back to True (or static_graph) if you ever shrink batch×seq below ~num_experts.
-    return DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    #
+    # broadcast_buffers=False: the MoE router-bias buffer is updated heuristically (not via grad), and
+    # the default per-forward buffer broadcast from rank 0 would (a) clobber each rank's local token
+    # accumulation and (b) make load-balancing see only rank 0's shard. Instead each rank accumulates
+    # its own counts, moe.py all-reduces them at the bias-update threshold (global load), and the
+    # sign()-based update is applied identically on every rank → bias stays in sync without broadcast.
+    # No BatchNorm here; RoPE inv_freq etc. are deterministic, so skipping the broadcast is safe.
+    return DDP(model, device_ids=[local_rank], find_unused_parameters=False,
+               broadcast_buffers=False)
 
 
 def compile_model(model):

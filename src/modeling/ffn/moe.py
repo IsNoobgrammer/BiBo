@@ -2,6 +2,7 @@
 import torch
 import torch._dynamo
 torch._dynamo.config.capture_scalar_outputs = True  # allow .item() in compiled graphs
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -232,6 +233,12 @@ class BiBoMoELayer(nn.Module):
             self.accumulated_tpe += current_tpe.float()
             
             if self.tokens_processed >= self.bias_update_threshold:
+                # DDP: each rank only counts its own data shard. All-reduce the per-expert token
+                # counts so the bias balances on the GLOBAL load (all ranks). sign()-based update
+                # (see update_bias) is scale-invariant, so SUM is fine. All ranks hit the threshold
+                # the same step (identical per-step token count) → this collective stays in lockstep.
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(self.accumulated_tpe, op=dist.ReduceOp.SUM)
                 tokens_per_expert = self.accumulated_tpe.clone()
                 self.tokens_processed.zero_()
                 self.accumulated_tpe.zero_()
