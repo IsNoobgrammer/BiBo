@@ -26,7 +26,8 @@ import torch
 import torch._dynamo
 import torch._logging
 import torch.distributed as dist
-from torch.distributed._composable.fsdp import fully_shard
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DistributedSampler
 
 torch._dynamo.config.verbose = False
 torch._dynamo.config.cache_size_limit = 64
@@ -169,13 +170,17 @@ def setup_distributed():
     return True, rank, world_size, f"cuda:{local_rank}"
 
 
-def wrap_fsdp(model, device):
-    """Wrap model with FSDP2 for multi-GPU."""
-    for layer in model.model.layers:
-        fully_shard(layer)
-    fully_shard(model)
-    model = model.to(device)
-    return model
+def wrap_ddp(model, local_rank):
+    """Wrap model with DDP for multi-GPU.
+
+    DDP (not FSDP) because the model is ~119M params and fits on one T4 — the memory
+    pressure is activations/logits, which FSDP doesn't shard, so FSDP would add per-layer
+    all-gather overhead for ~zero memory benefit. DDP replicates + all-reduces grads once
+    per step, and keeps params as plain tensors (FSDP's DTensor breaks bitsandbytes AdamW8bit).
+    """
+    # find_unused_parameters: Zero/Identity special experts + NoPE heads can leave some params
+    # without grad on a given step → DDP would hang at all-reduce without this.
+    return DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
 
 def compile_model(model):
@@ -278,11 +283,11 @@ def train(args):
         if is_main:
             print(f"{TAG} Triton DISABLED (--no_triton)")
 
-    # ── FSDP2 ─────────────────────────────────────────────────
+    # ── DDP ───────────────────────────────────────────────────
     if is_distributed:
         if is_main:
-            print(f"{TAG} Wrapping with FSDP2...")
-        model = wrap_fsdp(model, device)
+            print(f"{TAG} Wrapping with DDP...")
+        model = wrap_ddp(model, int(os.environ["LOCAL_RANK"]))
 
     # ── torch.compile ─────────────────────────────────────────
     if not args.no_compile:
@@ -309,6 +314,8 @@ def train(args):
         train_ds,
         batch_size=train_cfg["batch_size"],
         seed=train_cfg.get("seed", 42),
+        rank=rank if is_distributed else None,
+        world_size=world_size,
     )
 
     # ── Metrics Collector ─────────────────────────────────────
@@ -400,6 +407,8 @@ def train(args):
             batch = next(data_iter)
         except StopIteration:
             epoch += 1
+            if isinstance(getattr(train_loader, "sampler", None), DistributedSampler):
+                train_loader.sampler.set_epoch(epoch)  # reshuffle this rank's shard per epoch
             data_iter = iter(train_loader)
             batch = next(data_iter)
 
@@ -515,10 +524,27 @@ def train(args):
                             max_batches=100,
                             max_examples=eval_cfg.get("max_eval_examples", 500),
                         )
+                    # Long-range loss: val@train-len + val@2x (gated; cheaper than final run).
+                    # off → eval_length_extrap: false in config. Logs val/bpb_L{L} to WandB.
+                    if eval_cfg.get("eval_length_extrap", True):
+                        _sl = train_cfg.get("seq_len", 1024)
+                        le_lengths = eval_cfg.get("eval_lengths") or [_sl, 2 * _sl]
+                        try:
+                            results["length_extrap"] = evaluate_length_extrapolation(
+                                model, le_lengths, train_cfg.get("val_split", 0.05),
+                                train_cfg.get("seed", 42), train_cfg["batch_size"], device,
+                                max_batches=20, tokenizer=tokenizer)
+                        except torch.cuda.OutOfMemoryError:
+                            torch.cuda.empty_cache()
                     log_eval_metrics(step, results, tokens=tokens_seen)
                     _bpb = results.get("val_bpb")
                     _bpb_s = f" bpb={_bpb:.4f}" if _bpb is not None else ""
                     print(f"    [VAL] loss={results['val_loss']:.4f} ppl={results['val_ppl']:.2f}{_bpb_s}")
+                    if "length_extrap" in results:
+                        le = results["length_extrap"]
+                        row = "  ".join(f"L{L} loss={m['loss']:.4f} bpb={m['bpb']:.4f}"
+                                        for L, m in le["per_len"].items() if m.get("bpb"))
+                        print(f"    [LONG-RANGE] {row}  | degr×={le['ratio']:.3f}")
                     if "hellaswag" in results:
                         hs = results["hellaswag"]
                         print(f"    [BENCH] HellaSwag acc_norm={hs.get('acc_norm',0):.4f} "

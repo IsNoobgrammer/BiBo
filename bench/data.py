@@ -60,8 +60,22 @@ def load_benchmark_data(
     return train_ds, val_ds
 
 
-def create_dataloader(dataset, batch_size, num_workers=0, shuffle=True, seed=42):
-    """Create DataLoader with proper settings for packed sequences."""
+def create_dataloader(dataset, batch_size, num_workers=0, shuffle=True, seed=42,
+                      rank=None, world_size=1):
+    """Create DataLoader with proper settings for packed sequences.
+
+    Under DDP (world_size > 1), uses a DistributedSampler so each rank reads a disjoint
+    shard — without it both ranks read identical batches and the second GPU is wasted.
+    The seed makes the global ordering identical across runs (BiBo vs Qwen comparability).
+    """
+    if world_size > 1 and rank is not None:
+        from torch.utils.data import DistributedSampler
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
+                                     shuffle=shuffle, seed=seed, drop_last=True)
+        return DataLoader(
+            dataset, batch_size=batch_size, sampler=sampler,
+            num_workers=num_workers, pin_memory=True, drop_last=True,
+        )
     generator = torch.Generator().manual_seed(seed) if shuffle else None
     return DataLoader(
         dataset,

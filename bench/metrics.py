@@ -199,6 +199,8 @@ def log_eval_metrics(step, eval_results, tokens=None):
         for L, m in le.get("per_len", {}).items():
             if m.get("bpb") is not None:
                 d[f"val/bpb_L{L}"] = m["bpb"]
+            if m.get("loss") is not None:
+                d[f"val/loss_L{L}"] = m["loss"]
         d["val/length_extrap_ratio"] = le.get("ratio", 0)
     wandb.log(d)
 
@@ -221,7 +223,14 @@ def log_samples(step, samples):
 def save_checkpoint(model, optimizer, scheduler, step, path):
     """Save training checkpoint."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    state_dict = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
+    # Unwrap torch.compile (_orig_mod) AND DDP (.module) in any nesting order, else keys get
+    # a `module.`/`_orig_mod.` prefix and a strict=False load silently leaves random init.
+    inner = model
+    for _ in range(3):
+        inner = getattr(inner, "_orig_mod", None) or getattr(inner, "module", None) or inner
+        if inner is model or not (hasattr(inner, "_orig_mod") or hasattr(inner, "module")):
+            break
+    state_dict = inner.state_dict()
     torch.save({
         "model": state_dict,
         "optimizer": optimizer.state_dict(),
