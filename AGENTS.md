@@ -283,28 +283,29 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   `logits = lm_head(x)` + `F.cross_entropy` (aten-fused, non-chunked). Liger's chunked CE was REMOVED.
 - **(June 25 2026) Opt-in CE = BiBo's OWN fused-linear-CE Triton kernel** (`src/kernels/fused_ce.py`),
   via `config.use_fused_linear_ce=True`. Cut-cross-entropy style: online-softmax forward (never
-  materializes (N,V) logits, saves only lse) + chunked-cuBLAS backward with a fused in-place
-  grad-logits kernel. **fwd 2.1× vs standard everywhere; fwd+bwd ~1.05-1.26× at small N, 5-23× at
-  mid N, and the ONLY viable path at the 16k step (standard OOMs); memory flat ~0.5-1GB (0.06-0.49×
-  standard).** Grad-exact (fp16 gH ~2e-7). Adaptive backward CHUNK (`_BWD_LOGITS_BUDGET`=384MiB →
-  ~2485 rows) = reconfirmed 1.18-1.25× backward (repeated interleaved do_bench). Forward kernel tile
-  (32,128,64) is the reliable optimum — a sweep "1.17×" winner was noise (reconfirmed 0.94×); the
-  kernel is at ~37% SoL, capped by the online-softmax reduce/exp/gather, not the tile. NOTE: caller
-  must cast lm_head.weight to hidden dtype (fp16 under autocast) — the kernel's tl.dot needs matching
-  operand dtypes; `models.py` + `patch_qwen3_fused_ce` do this.
+  materializes (N,V) logits, saves only lse) + chunked-cuBLAS backward.
+  ⚠️ **(June 26 2026) CORRECTION — the "fwd 2.1× / fwd+bwd faster" claims were measured vs EAGER
+  `F.cross_entropy` (torch.compile was broken locally, so the real baseline was never tested).
+  Against the REAL pipeline (torch.compile'd standard CE = cuBLAS GEMM + inductor-fused log_softmax),
+  the fused kernel is ~2.36× SLOWER:** at H512/V81920/B16 on T4, compiled-std-CE = 688ms / 14.7% MFU
+  vs fused-CE = 1625ms / 6.2% MFU; the `_flce_fwd_kernel` alone is 59% of the step (~951ms). Root
+  cause: the tl.dot streaming forward GEMM runs at ~2% SoL vs cuBLAS ~50% (matches the prior
+  "Triton GEMM can't beat cuBLAS" finding). **The fused CE only helps when the (N,V) logits OOM** —
+  it is NOT a speed win when they fit. Default is now compiled standard CE (`use_fused_ce: false`).
+  A cuBLAS-chunked forward candidate (`.autoresearch/ce_cublas_chunked.py`, grad-exact) is the
+  proposed fix for the OOM regime — cuBLAS speed + bounded memory; pending T4 validation.
 - **(June 25 2026) CE wired into model patching** — `apply_triton_kernels(model, config,
   use_fused_ce=True)` now enables the fused CE by default: BiBo sets `config.use_fused_linear_ce`;
   `patch_qwen3_fused_ce` swaps Qwen's loss to OUR kernel (was Liger's chunked CE). Pass
   `use_fused_ce=False` for the standard-CE baseline. E2E matrix bench: `bench/e2e_ce_matrix.py`.
-  Verified: BiBo loss/gradnorm match std CE under autocast; Qwen routes through our kernel
-  (`uses_our_kernel=True`); the Kaggle bench (`bench/train.py`, `bench/_compare_final.py`) gives
-  BOTH models the fused CE by default.
-- **(June 25 2026) fused-linear-CE measured results** (vs standard `F.cross_entropy`, H=320 V=81000
-  fp16, locked clock): forward **2.1–2.2× at all N**; fwd+bwd **1.05–1.26× at N≤2048**, **5.7× at
-  4096**, **20× at 8192**, and **enabling at 16384** (std CE OOMs needing ~10.6 GB; ours 547 ms /
-  489 MB). Memory **flat ~0.5 GB** (0.06–0.49× std). Grad-exact (fp16 gH 2e-7). Adaptive CHUNK
-  (mem-budgeted) reconfirmed **1.18–1.25× backward** by repeated interleaved do_bench; forward tile
-  (32,128,64) is the reliable optimum (a sweep "1.17×" was reconfirmed as 0.94× — sweep noise).
+  Verified: BiBo loss/gradnorm match std CE under autocast; Qwen routes through our kernel.
+  ⚠️ **SUPERSEDED (June 26 2026): both models now default to compiled STANDARD CE (`use_fused_ce:
+  false`)** — see the correction above; fused-CE is 2.36× slower than compiled std CE when logits fit.
+- **(June 25 2026) fused-linear-CE measured results** ⚠️ **MEASURED VS EAGER CE — NOT THE REAL
+  BASELINE. SUPERSEDED, see June 26 correction above.** (vs *eager* `F.cross_entropy`, H=320 V=81000
+  fp16): forward 2.1–2.2×, fwd+bwd 1.05–1.26× at N≤2048, etc. These numbers stand ONLY against
+  un-compiled eager CE; against torch.compile'd standard CE (the real pipeline) the kernel loses
+  ~2.36× because its tl.dot forward is ~2% SoL vs cuBLAS ~50%. Kept for history; do not act on them.
 - **(June 25 2026) full-model E2E matrix** (BiBo, `bench/e2e_ce_matrix.py`, subprocess-isolated per
   cell — single-process runs accumulate allocator fragmentation that poisons later cells). Clean
   ≤2048-tok on the 3050 (≥4096 swaps on 4 GB → run on T4): all-kernels = **~1.27–1.29× full-step**

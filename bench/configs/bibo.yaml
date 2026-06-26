@@ -35,8 +35,9 @@ model:
   attention_bias: false
 
 training:
-  batch_size: 16      # hidden=512 + vocab 81920 needs the headroom (fused CE keeps logits off-HBM)
+  batch_size: 16      # hidden=512; std CE fits at ~14.5G. Drop to 8 if OOM, or use cuBLAS-chunked CE.
   grad_accum: 1
+  use_fused_ce: false # compiled standard CE — 2.36x faster / 14.7% vs 6.2% MFU (fused tl.dot-CE forward is ~2% SoL). Set true only if logits OOM.
   total_steps: 50000
   warmup_steps: 100
   lr: 5.0e-4

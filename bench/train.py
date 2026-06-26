@@ -246,9 +246,13 @@ def train(args):
 
     # ── Triton Kernels (Liger + Dense MLP for BOTH models) ────
     if not args.no_triton:
+        # Standard (compiled) CE is the DEFAULT — measured 2.36x faster / 14.7% vs 6.2% MFU at
+        # H512/V81920/B16 (the fused tl.dot-CE forward runs at ~2% SoL vs cuBLAS ~50%; it only
+        # helps when the (N,V) logits OOM). Opt in with use_fused_ce: true (config) for that regime.
+        use_fused_ce = bool(train_cfg.get("use_fused_ce", False)) and not args.no_fused_ce
         if is_main:
-            print(f"{TAG} Applying Triton kernels...{' (fused CE OFF — standard CE)' if args.no_fused_ce else ''}")
-        apply_triton_kernels(model, config, no_triton=False, use_fused_ce=not args.no_fused_ce)
+            print(f"{TAG} Applying Triton kernels... (CE: {'fused' if use_fused_ce else 'standard/compiled'})")
+        apply_triton_kernels(model, config, no_triton=False, use_fused_ce=use_fused_ce)
     else:
         if is_main:
             print(f"{TAG} Triton DISABLED (--no_triton)")
