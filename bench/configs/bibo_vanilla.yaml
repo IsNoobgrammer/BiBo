@@ -49,7 +49,7 @@ training:
   val_split: 0.05
   seed: 42
   deterministic: true
-  optimizer: "muon_adamw8bit"   # match bibo.yaml — Muon for 2D weights, AdamW8bit for embeds/norms/scalars
+  optimizer: "muon_adamw"       # match bibo.yaml — Muon for 2D weights + fused fp32 AdamW for embeds/norms/scalars
   muon_lr: 0.02
 
 eval:

@@ -176,6 +176,27 @@ def create_optimizer(model, cfg):
         optimizer = _CombinedOptimizer(muon, adamw)
         name = "Muon+AdamW8bit" if HAS_BNB else "Muon+AdamW"
 
+    elif optim_type == "muon_adamw":
+        # Fused fp32 AdamW (single CUDA kernel, no 8-bit quant) for embeds/norms/scalars + Muon for 2D.
+        # Prefer when memory isn't the constraint: more stable fp32 states, no bnb dependency.
+        fused = torch.cuda.is_available()   # fused=True requires CUDA params; falls back to foreach on CPU
+        adamw = optim.AdamW(
+            [{"params": adamw_params, "weight_decay": weight_decay}],
+            lr=lr, betas=(0.9, 0.95), fused=fused,
+        )
+        muon = Muon(muon_params, lr=muon_lr, momentum=0.95, weight_decay=weight_decay)
+        optimizer = _CombinedOptimizer(muon, adamw)
+        name = "Muon+AdamW(fused)" if fused else "Muon+AdamW"
+
+    elif optim_type == "adamw":
+        all_params = muon_params + adamw_params
+        fused = torch.cuda.is_available()
+        optimizer = optim.AdamW(
+            [{"params": all_params, "weight_decay": weight_decay}],
+            lr=lr, betas=(0.9, 0.95), fused=fused,
+        )
+        name = "AdamW(fused)" if fused else "AdamW"
+
     elif optim_type == "adamw8bit":
         all_params = muon_params + adamw_params
         if HAS_BNB:

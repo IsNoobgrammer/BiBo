@@ -48,7 +48,7 @@ training:
   val_split: 0.05
   seed: 42
   deterministic: true
-  optimizer: "muon_adamw8bit"   # Muon (Newton-Schulz orthogonalized) for 2D weights, AdamW8bit for embeds/norms/scalars — industry-standard split
+  optimizer: "muon_adamw"       # Muon (Newton-Schulz orthogonalized) for 2D weights + FUSED fp32 AdamW for embeds/norms/scalars. Fused (not 8bit): T4 has memory to spare, fp32 states are cleaner + no bnb dependency. Use muon_adamw8bit if memory-bound.
   muon_lr: 0.02                 # Muon LR for 2D matrices (AdamW lr above = embeds/norms/shared-scaling); 0.02 is the modded-nanogpt default
 
 eval:
