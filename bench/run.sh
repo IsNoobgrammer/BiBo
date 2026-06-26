@@ -20,6 +20,14 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=false
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
+# Persistent HF cache so datasets/tokenizer don't re-download each session.
+# Honor an existing PERSISTENT_DIR; else default to Kaggle's persistent /kaggle/working
+# (only when it exists — leaves local dev on the default HF cache). data.py/eval.py read this.
+if [ -z "$PERSISTENT_DIR" ] && [ -d /kaggle/working ]; then
+    export PERSISTENT_DIR=/kaggle/working/bibo_cache
+fi
+[ -n "$PERSISTENT_DIR" ] && mkdir -p "$PERSISTENT_DIR" && echo "[run.sh] HF cache: $PERSISTENT_DIR"
+
 echo "[run.sh] Config: $CONFIG"
 echo "[run.sh] Extra args: $@"
 

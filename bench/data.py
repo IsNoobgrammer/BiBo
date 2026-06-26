@@ -9,9 +9,15 @@ Dataset: tinycompany/Instruct-packed-2K-Context-tk-QTK-81K
 Also loads HellaSwag + ARC-Challenge for eval benchmarks.
 """
 
+import os
 from datasets import load_dataset
 import torch
 from torch.utils.data import DataLoader, Dataset
+
+# Persist HF downloads across Kaggle sessions. ~/.cache is wiped between runs → re-download;
+# PERSISTENT_DIR (e.g. /kaggle/working/bibo_cache, exported by run.sh) survives. None locally
+# (env unset) → default HF cache, unchanged behavior.
+CACHE_DIR = os.environ.get("PERSISTENT_DIR") or None
 
 
 class PackedLMDataset(Dataset):
@@ -42,7 +48,7 @@ def load_benchmark_data(
 ):
     """Load dataset, truncate to seq_len, split train/val."""
     print(f"Loading dataset: {dataset_name}")
-    ds = load_dataset(dataset_name, split="train")
+    ds = load_dataset(dataset_name, split="train", cache_dir=CACHE_DIR)
     print(f"  Raw dataset size: {len(ds)}")
 
     ds = PackedLMDataset(ds, seq_len=seq_len)
@@ -99,7 +105,7 @@ def load_hellaswag(max_examples=None):
     Returns list of: {ctx, completions: [str], gold_idx: int}
     Source: Rowan/hellaswag
     """
-    ds = load_dataset("Rowan/hellaswag", split="validation")
+    ds = load_dataset("Rowan/hellaswag", split="validation", cache_dir=CACHE_DIR)
     if max_examples:
         ds = ds.select(range(min(max_examples, len(ds))))
 
@@ -127,7 +133,7 @@ def load_arc_challenge(max_examples=None):
     Returns list of: {question, completions: [str], gold_idx: int}
     Source: allenai/ai2_arc (ARC-Challenge split)
     """
-    ds = load_dataset("allenai/ai2_arc", "ARC-Challenge", split="validation")
+    ds = load_dataset("allenai/ai2_arc", "ARC-Challenge", split="validation", cache_dir=CACHE_DIR)
     if max_examples:
         ds = ds.select(range(min(max_examples, len(ds))))
 

@@ -29,7 +29,8 @@ def get_tokenizer(name="fhai50032/QTK-81K"):
     global _TOKENIZER
     if _TOKENIZER is None:
         print(f"  Loading tokenizer: {name}")
-        _TOKENIZER = AutoTokenizer.from_pretrained(name, use_fast=True)
+        _TOKENIZER = AutoTokenizer.from_pretrained(
+            name, use_fast=True, cache_dir=os.environ.get("PERSISTENT_DIR") or None)
     return _TOKENIZER
 
 

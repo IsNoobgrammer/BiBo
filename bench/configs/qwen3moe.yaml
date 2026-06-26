@@ -1,6 +1,7 @@
-# Qwen3MoE ~78M total / ~42M active baseline (same skeleton as bibo.yaml: 10L, H320, GQA 5:1,
-# 8 homogeneous SwiGLU experts, no shared expert). Switch-Transformer aux load-balancing loss is
-# ON (router_aux_loss_coef below; train.py passes output_router_logits=True for qwen).
+# Qwen3MoE 141.4M total / 75.3M active baseline (same skeleton as bibo.yaml: 10L, H512, 4h/2kv GQA 2:1,
+# 8 homogeneous SwiGLU experts, no shared expert). Deliberately LARGER than BiBo (118.6M/66.7M) —
+# +19% total, +13% active — so a BiBo win is conservative. Switch-Transformer aux load-balancing loss
+# is ON (router_aux_loss_coef below; train.py passes output_router_logits=True for qwen).
 # Training hyperparams identical to bibo.yaml.
 model:
   type: "qwen3moe"
