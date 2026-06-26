@@ -294,10 +294,13 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   dispatches to a cuBLAS-CHUNKED implementation** (`_CECublasChunked` in `fused_ce.py`) — forward
   GEMM via cuBLAS in row-chunks, never materializes (N,V), keeps only lse(N,). Backward unchanged
   (already cuBLAS-chunked). Grad-exact vs `F.cross_entropy` (loss Δ3.8e-6, grad Δ~4e-9). Goal:
-  cuBLAS speed (≈ compiled std CE) at bounded memory (~9G vs std-CE 14.5G at B16). The old tl.dot
-  kernel is preserved as `fused_linear_cross_entropy_tldot`. **Bench default flipped back to
-  `use_fused_ce: true`** (= cuBLAS-chunked, NOT tl.dot). T4 profiler validation pending (run
-  `bench/e2e_profile_1024.py --compile` = cuBLAS-chunked vs `--no-fused-ce` = compiled std CE).
+  cuBLAS speed (≈ compiled std CE) at bounded memory. The old tl.dot kernel is preserved as
+  `fused_linear_cross_entropy_tldot`. Default `use_fused_ce: true` (= cuBLAS-chunked, NOT tl.dot).
+  **✅ T4-VALIDATED (June 26 2026, H512/V81920/B16, --compile):** cuBLAS-chunked **727ms / 13.9% MFU
+  / 13.0 GB** vs compiled-std-CE **725ms / 13.9% / 14.5 GB** vs old tl.dot **1625ms / 6.2% / 8.7 GB**.
+  Ties std CE on speed (both cuBLAS), saves 1.5 GB (only (chunk,V) transients, never full (N,V)) →
+  the one CE path at B16. Memory knob = `_BWD_LOGITS_BUDGET` (1 GiB → chunk ~6710; lower for less
+  peak at a few more launches). tl.dot path is dead, reference only.
 - **(June 25 2026) CE wired into model patching** — `apply_triton_kernels(model, config,
   use_fused_ce=True)` now enables the fused CE by default: BiBo sets `config.use_fused_linear_ce`;
   `patch_qwen3_fused_ce` swaps Qwen's loss to OUR kernel (was Liger's chunked CE). Pass
