@@ -4,7 +4,7 @@
 model:
   type: "bibo"
   vocab_size: 81000
-  hidden_size: 320
+  hidden_size: 512       # 512/4 heads = head_dim 128 (tensor-core sweet spot; raises MFU vs hidden=320)
   intermediate_size: 1024
   num_hidden_layers: 10
   # --- Attention ablation axes (toggle one at a time vs this full-recipe baseline) ---
@@ -35,7 +35,7 @@ model:
   attention_bias: false
 
 training:
-  batch_size: 32      # raised 16->32: mem was 6.1/16G; amortizes per-step overhead -> higher tps+MFU. Try 48 if mem stays <~15G.
+  batch_size: 16      # hidden=512 + vocab 81920 needs the headroom (fused CE keeps logits off-HBM)
   grad_accum: 1
   total_steps: 50000
   warmup_steps: 100

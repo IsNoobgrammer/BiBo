@@ -5,7 +5,7 @@
 model:
   type: "qwen3moe"
   vocab_size: 81000
-  hidden_size: 320
+  hidden_size: 512        # match BiBo (same attention shape, fair). head_dim 128.
   intermediate_size: 1280 # widened (loss is primary metric; Qwen handicapped wider)
   num_hidden_layers: 10
   num_attention_heads: 4
@@ -26,7 +26,7 @@ model:
   use_sliding_window: false
 
 training:
-  batch_size: 32      # kept identical to bibo.yaml (fair comparison). Try 48 if mem allows.
+  batch_size: 16      # identical to bibo.yaml (fair comparison)
   grad_accum: 1
   total_steps: 50000
   warmup_steps: 100

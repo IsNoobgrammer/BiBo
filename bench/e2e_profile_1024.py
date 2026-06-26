@@ -1,45 +1,98 @@
-"""torch.profiler op breakdown of the full BiBo step at B1xS1024 (the small regime where all+CE
-is comparable to baseline/std on TIME but saves memory). Shows WHERE time goes: kernels save on
-attn/MoE/norm; fused CE adds back the loss-path GEMMs (3-GEMM backward) — net ~comparable, less mem.
-Fresh process per config (no fragmentation). CPU+CUDA activities (torch quirk)."""
-import os, sys
-os.environ["WANDB_MODE"] = "disabled"; os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); sys.path.insert(0, _REPO)
+"""torch.profiler op breakdown + timing of a REAL training step (config batch x seq, fwd+bwd).
 
-def prof_one(level, ce):
+Profiles the ACTUAL training path — model built from the YAML, all Triton kernels + fused CE
+applied (or eager via --baseline), at the config's real batch_size x seq_len — so the numbers
+represent the real use case, not a B1 microbench. Reports: model size, per-step median time,
+tokens/sec, MFU, peak memory, and the per-op CUDA-time table (where the time actually goes).
+
+Run on T4 (the training GPU) — batch 16 x hidden 512 will OOM a 4GB local card.
+
+Usage:
+  python bench/e2e_profile_1024.py                          # bibo, real shape, all kernels+CE
+  python bench/e2e_profile_1024.py --config bench/configs/qwen3moe.yaml
+  python bench/e2e_profile_1024.py --baseline               # eager (no kernels, std CE) A/B
+  python bench/e2e_profile_1024.py --batch 8 --compile      # override batch; with torch.compile
+Compile note: with --compile the op table lumps into inductor kernels (less attributable) but
+matches real wall-time; without it (default) ops attribute cleanly (eager fuses fewer elementwise,
+so memory-bound ops read slightly higher than a compiled run).
+"""
+import os, sys, time, argparse
+os.environ["WANDB_MODE"] = "disabled"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO); sys.path.insert(0, os.path.join(_REPO, "bench"))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="bench/configs/bibo.yaml")
+    ap.add_argument("--batch", type=int, default=None, help="override config batch_size")
+    ap.add_argument("--seq", type=int, default=None, help="override config seq_len")
+    ap.add_argument("--baseline", action="store_true", help="eager (no Triton kernels, standard CE)")
+    ap.add_argument("--compile", action="store_true", help="torch.compile the model (real wall-time)")
+    ap.add_argument("--warmup", type=int, default=8)
+    ap.add_argument("--timed", type=int, default=10)
+    ap.add_argument("--rows", type=int, default=20)
+    args = ap.parse_args()
+
     import yaml, torch, torch.profiler as P
-    from bench.models import build_model_from_config
-    cfg = yaml.safe_load(open(os.path.join(_REPO, "bench/configs/bibo.yaml")))
-    torch.manual_seed(0); m, c = build_model_from_config(cfg)
-    if level == "all":
-        from src.kernels.patch import patch_bibo_with_triton
-        from src.kernels.moe_grouped import patch_moe_auto
-        from src.kernels.dense_mlp import patch_dense_mlp_with_triton
-        from src.kernels.conv_fused import patch_conv_router_with_triton, patch_conv_expert_with_triton
-        patch_bibo_with_triton(m); patch_moe_auto(m); patch_dense_mlp_with_triton(m)
-        patch_conv_router_with_triton(m); patch_conv_expert_with_triton(m)
-    m.config.use_fused_linear_ce = bool(ce); m = m.cuda().train()
-    x = torch.randint(0, 81000, (1, 1024), device="cuda"); lab = torch.randint(0, 81000, (1, 1024), device="cuda")
+    from bench.models import build_model_from_config, count_params, apply_triton_kernels
+    from metrics import estimate_mfu, format_count
+
+    cfg = yaml.safe_load(open(os.path.join(_REPO, args.config)))
+    B = args.batch or cfg["training"]["batch_size"]
+    S = args.seq or cfg["training"].get("seq_len", 1024)
+    torch.manual_seed(0)
+    m, c = build_model_from_config(cfg)
+    p = count_params(m, c)
+
+    if not args.baseline:
+        apply_triton_kernels(m, c, no_triton=False, use_fused_ce=True)   # the real training path
+    m = m.cuda().train()
+    if args.compile:
+        m = torch.compile(m)
+
+    V = c.vocab_size
+    x = torch.randint(0, V, (B, S), device="cuda")
+    lab = torch.randint(0, V, (B, S), device="cuda")
+
     def step():
-        for p in m.parameters(): p.grad = None
+        for prm in m.parameters():
+            prm.grad = None
         with torch.autocast("cuda", dtype=torch.float16):
-            out = m(x, labels=lab); loss = out.loss
+            out = m(input_ids=x, labels=lab, use_cache=False)
+            loss = out.loss
         loss.backward()
-    for _ in range(6): step()
+        return loss
+
+    tag = f"{'baseline-eager' if args.baseline else 'all+fusedCE'}{'+compile' if args.compile else ''}"
+    print(f"\n===== {os.path.basename(args.config)} | {tag} | B{B} x S{S} = {B*S} tok/step | fwd+bwd =====")
+    print(f"params: {p['total_m']:.1f}M total / {p['active_m']:.1f}M active | "
+          f"hidden={c.hidden_size} heads={c.num_attention_heads} head_dim={c.hidden_size//c.num_attention_heads}")
+
+    for _ in range(args.warmup):
+        step()
     torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+
+    # timing: median over `timed` steps
+    times = []
+    for _ in range(args.timed):
+        torch.cuda.synchronize(); t0 = time.time()
+        step()
+        torch.cuda.synchronize(); times.append(time.time() - t0)
+    times.sort()
+    med = times[len(times) // 2]
+    tps = B * S / med
+    mfu = estimate_mfu(p["active"], tps, "cuda")
+    peak = torch.cuda.max_memory_allocated() / 1e9
+    print(f"\nstep: median {med*1e3:.1f} ms | tps {format_count(tps)}/s | MFU {mfu*100:.1f}% | peak {peak:.1f} GB")
+
+    # one profiled step
     with P.profile(activities=[P.ProfilerActivity.CPU, P.ProfilerActivity.CUDA]) as pr:
         step(); torch.cuda.synchronize()
-    tag = f"{level}/{'fusedCE' if ce else 'stdCE'}"
-    print(f"\n===== {tag}  B1xS1024  fwd+bwd =====")
-    print(pr.key_averages().table(sort_by="self_cuda_time_total", row_limit=16))
+    print(pr.key_averages().table(sort_by="self_cuda_time_total", row_limit=args.rows))
 
-if len(sys.argv) > 1 and sys.argv[1] == "--one":
-    prof_one(sys.argv[2], int(sys.argv[3])); sys.exit(0)
 
-import subprocess
-for level, ce in (("baseline", 0), ("all", 1)):
-    p = subprocess.run([sys.executable, os.path.abspath(__file__), "--one", level, str(ce)], text=True, capture_output=True)
-    out = "\n".join(l for l in p.stdout.splitlines() if "===" in l or "%" in l or "self_cuda" in l.lower()
-                     or any(k in l for k in ("aten::", "_FLCE", "Self CUDA", "Name", "----")))
-    print(out)
-    if p.returncode != 0: print("ERR:", p.stderr[-800:])
+if __name__ == "__main__":
+    main()
