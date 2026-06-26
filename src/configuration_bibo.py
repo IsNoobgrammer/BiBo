@@ -20,7 +20,7 @@ class BiBoConfig(PretrainedConfig):
         intermediate_size=4104,  # 2nd Ramanujan-Hardy number (4104 = 16³+2³ = 15³+9³)
         num_hidden_layers=8,
         num_attention_heads=12,
-        num_key_value_heads=2,
+        num_key_value_heads=4,
         hidden_act="silu",
         max_position_embeddings=32768,
         initializer_range=0.02,
@@ -29,6 +29,7 @@ class BiBoConfig(PretrainedConfig):
         use_xsa=True,  # Exclusive Self Attention (https://arxiv.org/abs/2603.09078)
         use_cache=True,
         use_ssmax=True,  # SSMax: scaling softmax for long context
+        rope_nope_ratio=0.75,  # Fraction of heads that are NoPE (no positional encoding). 0.75 = 1R+3N (25% RoPE, 75% NoPE). 0.0 = all RoPE. Must align with KV group boundaries.
         pad_token_id=None,
         bos_token_id=0,
         eos_token_id=0,
@@ -86,6 +87,7 @@ class BiBoConfig(PretrainedConfig):
         self.use_xsa = use_xsa
         self.use_cache = use_cache
         self.use_ssmax = use_ssmax
+        self.rope_nope_ratio = rope_nope_ratio
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
@@ -285,6 +287,16 @@ class BiBoConfig(PretrainedConfig):
             )
         if self.rope_scaling.get("factor", 1.0) <= 0:
             raise ValueError("rope_scaling['factor'] must be positive")
+        if not (0.0 <= self.rope_nope_ratio < 1.0):
+            raise ValueError(f"rope_nope_ratio must be in [0, 1), got {self.rope_nope_ratio}")
+        _groups = self.num_attention_heads // self.num_key_value_heads
+        _n_rope = self.num_attention_heads - round(self.num_attention_heads * self.rope_nope_ratio)
+        if _n_rope % _groups != 0:
+            raise ValueError(
+                f"rope_nope_ratio={self.rope_nope_ratio} gives {_n_rope} RoPE heads, which is not divisible by "
+                f"num_key_value_groups={_groups}. The RoPE/NoPE boundary must align with KV groups. "
+                f"Try rope_nope_ratio=0.5 (half heads)."
+            )
         for idx in self.mlp_only_layers:
             if not (0 <= idx < self.num_hidden_layers):
                 raise ValueError(

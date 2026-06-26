@@ -35,6 +35,9 @@ class BiBoAttention(nn.Module):
         self.use_ssmax = config.use_ssmax
         self.use_xsa = config.use_xsa
         self.attention_dropout = config.attention_dropout
+        # Partial RoPE: first num_rope_heads get RoPE, rest are NoPE (position-invariant content heads)
+        self.num_rope_heads = self.num_heads - round(self.num_heads * getattr(config, 'rope_nope_ratio', 0.0))
+        self.num_rope_kv_heads = self.num_rope_heads // self.num_key_value_groups
 
         if self.use_ssmax:
             # SSMax init: scale * log(typical_kv_len) ≈ 1.0 at step 0
@@ -89,7 +92,15 @@ class BiBoAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if self.num_rope_heads < self.num_heads:
+            q_r, k_r = apply_rotary_pos_emb(
+                query_states[:, :self.num_rope_heads],
+                key_states[:, :self.num_rope_kv_heads],
+                cos, sin)
+            query_states = torch.cat([q_r, query_states[:, self.num_rope_heads:]], dim=1)
+            key_states = torch.cat([k_r, key_states[:, self.num_rope_kv_heads:]], dim=1)
+        else:
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         # KV cache
         if past_key_value is not None:

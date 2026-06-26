@@ -138,6 +138,7 @@ BiBoForCausalLM
 | `shared_expert_type` | "mlp" | Shared expert type: `"mlp"` (SwiGLU, like Qwen) or `"conv"` (CausalConv1D) |
 | `moe_shared_scaling` | auto | Shared expert output scaling (auto-computed via Monte Carlo, accounts for router_lambda) |
 | `mlp_only_layers` | [0, N-1] | Which layers use dense MLP instead of MoE (first + last) |
+| `rope_nope_ratio` | 0.75 | Fraction of attention heads that are NoPE (no positional encoding). 0.75 = 1R+3N (25% RoPE+NTK, 75% NoPE). 0.0 = all RoPE. Must align with KV group boundaries (num_rope_heads % groups == 0). |
 
 ---
 
@@ -333,6 +334,7 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   Triton kernel now (was fake PyTorch): native-(B,S,H)-read forward + transpose-free Triton backward.
   Full router fwd+bwd ~2.5x vs eager at large batch; projection ~5x fwd. fp16 grad-correct.
 - **(June 24 2026) `patch_moe_auto` (recommended MoE patch)** — per-call dispatch: grouped path for `n_tokens >= GROUPED_MIN_TOKENS` (default 4096), else the fixed per-expert path. Beats PyTorch eager across all token regimes by construction (both branches grad-verified). Tune `GROUPED_MIN_TOKENS` after T4 cert.
+- **(June 26 2026) Partial RoPE head-split (`rope_nope_ratio=0.75`, DEFAULT)** — first `round(num_heads*(1-ratio))` query heads + corresponding KV heads get full RoPE+NTK; the remaining heads are NoPE (no positional encoding). Empirical: 1R+3N (0.75 NoPE) dominates on both passkey (XG 0.984) and MQAR-4 (XG 0.621 vs 0.325 full-RoPE); pure NoPE achieves perfect 1.000 on both but 0.75 keeps one RoPE head for syntax/local ordering in real LM. Mechanism: NoPE heads are position-invariant content channels (zero rotation-OOD); SSMax provides sharpening; causal mask provides scale-free implicit position. **The boundary must align with KV groups** (config validation enforced) — default config changed to `num_key_value_heads=4` (groups=3) to support 0.75 with 12 Q heads. `rope_nope_ratio=0.0` restores all-RoPE.
 
 ---
 
