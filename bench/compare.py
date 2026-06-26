@@ -23,12 +23,16 @@ import torch.nn.functional as F
 
 
 def load_model(cfg_path, ckpt_path, device):
-    from models import build_model_from_config
+    from models import build_model_from_config, resize_embeddings
     cfg = yaml.safe_load(open(cfg_path))
-    model, _ = build_model_from_config(cfg)
+    model, mcfg = build_model_from_config(cfg)
     if ckpt_path and os.path.exists(ckpt_path):
         sd = torch.load(ckpt_path, map_location="cpu")
         sd = sd.get("model", sd)                              # save_checkpoint wraps in {"model": ...}
+        # Training resized embeddings to the tokenizer vocab (81920); match it before loading,
+        # else embed_tokens/lm_head shape-mismatch (config vocab 81000 != checkpoint 81920).
+        ckpt_vocab = sd.get("model.embed_tokens.weight", sd.get("lm_head.weight")).shape[0]
+        resize_embeddings(model, mcfg, ckpt_vocab)
         missing, unexpected = model.load_state_dict(sd, strict=False)
         if missing or unexpected:
             print(f"  [load] {os.path.basename(ckpt_path)}: {len(missing)} missing, {len(unexpected)} unexpected keys")
