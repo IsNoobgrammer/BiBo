@@ -162,7 +162,6 @@ class BiBoMoELayer(nn.Module):
         self.num_experts_per_tok = config.num_experts_per_tok
         self.bias_update_factor = config.bias_update_factor
         self.bias_update_threshold = config.bias_update_threshold
-        self.moe_shared_scaling = getattr(config, 'moe_shared_scaling', 1.0)
         self.load_balance_strategy = getattr(config, 'load_balance_strategy', 'none')
         self.aux_loss_coef = getattr(config, 'aux_loss_coef', 0.001)
 
@@ -181,6 +180,12 @@ class BiBoMoELayer(nn.Module):
                 self.shared_experts_list.append(BiBoCausalConv1D(config))
             else:
                 self.shared_experts_list.append(BiBoMLP(config, is_expert=True))
+            # LEARNABLE shared-expert scale (LayerScale-style), one scalar per MoE layer. Init from
+            # config.moe_shared_scaling (the magnitude-balance estimate) and let the optimizer tune it,
+            # instead of a fixed constant that's wrong at init and must be re-derived when dims/experts
+            # change. ndim=0 → optim.py routes it to AdamW (not Muon). Only created when shared is on.
+            self.moe_shared_scaling = nn.Parameter(
+                torch.tensor(float(getattr(config, 'moe_shared_scaling', 1.0))))
         self.gate = BiBoMoERouter(config)
 
     @torch.no_grad()

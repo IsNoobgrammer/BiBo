@@ -111,6 +111,8 @@ def parse_args():
                    help="BiBo: disable partial RoPE / NoPE heads (rope_nope_ratio=0.0 → all-RoPE)")
     p.add_argument("--no-conv-router", "--no_conv_router", dest="no_conv_router", action="store_true",
                    help="BiBo: use the MLP router instead of the conv router (router_type='mlp')")
+    p.add_argument("--no-shared-expert", "--no_shared_expert", dest="no_shared_expert", action="store_true",
+                   help="BiBo: disable the always-on shared MLP expert (use_shared_expert=False)")
     return p.parse_args()
 
 
@@ -146,6 +148,7 @@ def load_config(args):
     if args.no_ssmax:        m["use_ssmax"] = False;      ablated.append("ssmax")
     if args.no_partial_rope: m["rope_nope_ratio"] = 0.0;  ablated.append("partial-rope")
     if args.no_conv_router:  m["router_type"] = "mlp";    ablated.append("conv-router")
+    if args.no_shared_expert: m["use_shared_expert"] = False; ablated.append("shared-expert")
     if ablated:
         cfg["_ablated"] = ablated   # surfaced in the startup banner
 

@@ -136,7 +136,7 @@ BiBoForCausalLM
 | `bias_update_factor` | 0.01 | Load balancing step size |
 | `bias_update_threshold` | 100K | Tokens between bias updates |
 | `shared_expert_type` | "mlp" | Shared expert type: `"mlp"` (SwiGLU, like Qwen) or `"conv"` (CausalConv1D) |
-| `moe_shared_scaling` | auto | Shared expert output scaling (auto-computed via Monte Carlo, accounts for router_lambda) |
+| `moe_shared_scaling` | auto | **LEARNABLE scalar** (nn.Parameter, 1 per MoE layer, LayerScale-style). The config value is only the INIT (MC-estimated when 1.0); the optimizer tunes it during training. Only created when `use_shared_expert=True`; routes to AdamW (ndim=0). |
 | `mlp_only_layers` | [0, N-1] | Which layers use dense MLP instead of MoE (first + last) |
 | `rope_nope_ratio` | 0.5 | Fraction of attention heads that are NoPE (no positional encoding). 0.5 = 2:2 (6 RoPE+NTK heads, 6 NoPE content heads at the 12h/2kv default). 0.0 = all RoPE (original). Must align with KV group boundaries. |
 
@@ -278,7 +278,8 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 ## Known Quirks / TODOs
 
 - `router_temperature` param exists in config but is never used (legacy, kept for compat)
-- `moe_shared_scaling=1.0` triggers a 10K-iteration Monte Carlo in config init — pass explicit value to skip
+- `moe_shared_scaling` is a **learnable nn.Parameter** (per MoE layer) as of this session — the config float is only its init. Rationale (from the shared-expert research): no production MoE hardcodes a fixed shared scalar — DeepSeek/Gemma just add (Gemma sizes 3×), Qwen2 used a learnable per-token gate (dropped in Qwen3), Qwen3/MiMo-V2 dropped the shared expert entirely. The old fixed 0.40 was ~7.5× below the measured init-balance (~3.0) AND the MC auto-formula diverges as experts scale; a learnable scalar (LayerScale-style) fixes both. Disable the shared expert with `use_shared_expert=False` / `--no-shared-expert`. ⚠️ The scalar lands in the AdamW group **with weight_decay** (norms/biases do too in this repo) — WD gently pulls it toward 0; acceptable but worth excluding if it underperforms.
+- `moe_shared_scaling=1.0` triggers a 10K-iteration Monte Carlo in config init (now used as the learnable param's INIT) — pass explicit value to skip
 - The `legacy/` folder has the old monolithic code — don't touch it, it's reference only
 - No tests currently exist — they were removed during cleanup. New tests needed.
 - Qwen baseline requires real `transformers` package (not stubs)
