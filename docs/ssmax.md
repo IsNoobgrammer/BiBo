@@ -82,8 +82,12 @@ output = attn_weights @ V
 ### SSMax Attention
 
 ```python
-# Apply SSMax scaling to queries
-log_n = log(kv_len)
+# Apply SSMax scaling to queries — PER CAUSAL POSITION (not a single global kv_len).
+# Query at position t attends to t+1 keys under the causal mask, so n varies along the
+# sequence. n_j = (kv_len - q_len) + j + 1 for query j:
+#   training (q_len==kv_len==L):  n = 1..L   (the real length-adaptive signal)
+#   single-token decode:          n = kv_len (one query)
+log_n = log(n_per_position)          # shape (q_len,), broadcast as (1,1,q_len,1)
 scaled_Q = Q * ssmax_scale * log_n
 
 # Rest is identical to standard attention
@@ -205,6 +209,27 @@ SSMax_fixed(z_i) = n^z_i / Σ n^z_j  # Equivalent to s=1.0
 - ✅ Training from scratch with length generalization goals
 - ⚠️ Can be added mid-training with warmup (partial benefits)
 - ❌ Not needed for fixed short-context tasks
+- ✅ **Full / global causal attention layers** — where the attended key count `n` grows with the
+  sequence. This is where SSMax does real work.
+
+### ⚠️ Do NOT use SSMax on sliding-window-attention (SWA) layers — it's redundant
+
+**Recommendation: disable SSMax on any fixed-window layer (set its per-head `s = 0`, or don't apply
+it there).** With a sliding window of fixed size `W` (e.g. 128, optionally + a few attention-sink
+tokens), every query attends to **at most `W` keys regardless of total sequence length**, so:
+
+1. **No length growth to compensate.** SSMax exists to counter fading *as `n` grows*; the window
+   already caps `n ≤ W`, so fading never occurs at that layer. SWA and SSMax fight the same problem
+   two ways — the window already holds it, SSMax has nothing to compensate (belt-and-suspenders).
+2. **`n` is constant ⇒ SSMax degenerates to a constant temperature.** After the first `W` positions
+   every query has `n = W`, so `s·log(n) = s·log(W)` is a fixed scalar — absorbable into the q/k
+   weight norms, i.e. SSMax provides **zero additional inductive signal** there (same degeneracy as
+   applying a single global `n` in training). It's not harmful, just dead weight.
+
+The only place SSMax earns its keep under windowing is a **hybrid** model (some global layers, some
+SWA): keep SSMax (`s > 0`) on the **global** layers, turn it off (`s = 0`) on the **windowed** ones.
+Per-layer control is the right tool there (see the partial-SSMax research scope). Note: BiBo
+currently uses full causal attention everywhere — this guidance applies if/when SWA is added.
 
 ### Initialization Best Practices
 1. **Use sequence-aware initialization**: `init_val = 1.0 / log(typical_seq_len)`
@@ -214,10 +239,29 @@ SSMax_fixed(z_i) = n^z_i / Σ n^z_j  # Equivalent to s=1.0
 
 ### Integration Checklist
 - [ ] Initialize `ssmax_scale` with `1.0 / log(typical_seq_len)`
-- [ ] Apply scaling in attention: `Q_scaled = Q × ssmax_scale × log(kv_len)`
+- [ ] Apply scaling in attention **per causal position**: `Q_scaled = Q × ssmax_scale × log(n_t)`, `n_t = (kv_len − q_len) + t + 1` (NOT a single global `log(kv_len)` — that collapses to a constant temperature during fixed-length training)
 - [ ] Use standard softmax after scaling (no other changes needed)
 - [ ] Monitor attention entropy during early training
 - [ ] Verify no entropy collapse in first 1000 steps
+
+## QK-norm × SSMax interaction (internal ablation, June 2026)
+
+BiBo applies **QK-norm** (RMSNorm on Q and K) *and* **SSMax**. A 2×2 ablation on a synthetic passkey
+length-generalization probe (tiny model, train @ 128, eval to 32×, dynamic-NTK RoPE, 3 seeds) shows
+the pairing is **necessary, not incidental** — numbers are extrapolation accuracy (mean over 256–4096):
+
+| | no SSMax | SSMax |
+|---|---|---|
+| **no QK-norm** | 0.86 | 0.97 |
+| **QK-norm** | 0.57 | 0.96 |
+
+- **QK-norm alone hurts length generalization** (0.86 → 0.57): bounding the logits removes the model's
+  ability to sharpen attention by growing Q/K magnitude, and gives nothing back.
+- **SSMax restores it** (0.57 → 0.96): with QK-norm on, SSMax is the *only* remaining sharpening lever,
+  so it is far more load-bearing — SSMax's gain is **+0.39 with QK-norm vs +0.11 without**.
+- **Takeaway:** in BiBo, SSMax is not optional decoration — it is the **required compensation** for the
+  sharpening that QK-norm removes. QK-norm is kept for large-model training stability; SSMax is what
+  makes that choice safe for length generalization. The two are a matched pair.
 
 ## Computational Overhead
 

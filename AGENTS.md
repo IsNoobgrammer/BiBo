@@ -16,7 +16,7 @@ The user decides when the code is stable enough to commit. Work freely, stage fi
 BiBo is a **Mixture-of-Experts (MoE) Transformer** for causal language modeling. It's a research model — not a product. The goal is to explore diverse expert architectures and SSMax attention for long-context performance.
 
 **Key differentiators from vanilla MoE (like Qwen3MoE):**
-1. **SSMax** — learnable per-head query scaling (`scale * log(kv_len)`) that prevents attention fading at long sequences
+1. **SSMax** — learnable per-head query scaling (`scale * log(n)`, where `n` is each query's **causal context length** `(kv_len − q_len) + t + 1`, not a global `kv_len`) that prevents attention fading at long sequences
 2. **Diverse experts** — PolyGLU layout: groups of 3 GLU experts with different activations (SiLU, ReLU², Tanh) + Identity/Zero special experts
 3. **Shared Conv1D expert** — always-active causal convolution (gated, SwiGLU-style)
 4. **Router logit normalization** — `router_lambda` scales normalized logits + threshold-based bias heuristics for load balancing
@@ -192,7 +192,7 @@ BiBoForCausalLM
 
 ## Important Design Decisions
 
-1. **No sliding window / recurrent attention** — removed. Only standard softmax + SSMax.
+1. **No sliding window / recurrent attention** — removed. Only standard softmax + SSMax. **If SWA is ever added: do NOT use SSMax on the windowed layers** — a fixed window caps `n`, so SSMax degenerates to a redundant constant temperature there. Keep SSMax only on full/global layers (set windowed layers' `s=0`). See `docs/ssmax.md` § "Do NOT use SSMax on sliding-window-attention layers".
 2. **SSMax init**: `1.0 / log(max_pos_emb / 2)` — ensures attention starts ~neutral, not 6× sharper than standard.
 3. **Shared expert is NOT routed** — it's always active. Only the Conv1D is shared.
 4. **`output_attentions=True`** works (falls back to manual attention).
@@ -205,7 +205,15 @@ BiBoForCausalLM
 
 9. **Triton kernels have custom backward** — all MoE Triton kernels use custom Triton backward kernels, not PyTorch fallback. Gold standard: `_FusedSwiGLUFull` in dense_mlp.py (matched forward+backward Triton kernels with autotune).
 
-10. **GQA native in SDPA** — `F.scaled_dot_product_attention(q, k, v, enable_gqa=True)` eliminates repeat_kv materialization. K/V passed with original (fewer) heads directly to Flash Attention.
+10. **GQA via repeat_kv, NOT `enable_gqa` (reversed Jun 25 2026)** — the SDPA attention call uses
+    `repeat_kv` to full MHA and does **NOT** pass `enable_gqa=True`. Measured: `enable_gqa=True`
+    silently forces SDPA onto the **MATH backend** (materializes the O(n²) scores → ~10–25× slower,
+    O(n²) memory) because the mem-efficient/flash backends don't accept the GQA broadcast on our
+    torch/HW. **T4 (sm_75) has no flash at all → mem-efficient is the production path.** `repeat_kv`
+    (cost O(B·H·S·D), not O(n²)) lets the dispatcher pick mem-efficient (T4) / flash (Ampere+).
+    Verified bit-equivalent (max|Δ| 3.7e-4 fp16) + efficient backend confirmed (no n² materialization).
+    Bench: `src/.autoresearch/bench_topk_attn.py`. **XSA keeps its own `enable_gqa` broadcast (in-module,
+    not SDPA) — that path is unaffected.**
 
 11. **No autotuning for MoE kernels** — M varies per expert per step, causing recompilation overhead. Use fixed block sizes with `triton.next_power_of_2()` clamped to ranges. Dense MLP, attention, conv kernels CAN use autotuning.
 
@@ -265,7 +273,7 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 - CausalConv1D needs halo exchange for sequence parallelism (future work)
 - MoE dispatch loop is fine for ≤16 experts on single GPU; needs grouped GEMM for 64+ experts with EP
 - All MoE Triton kernels now have custom Triton backward kernels (not PyTorch fallback)
-- GQA uses native SDPA `enable_gqa=True` — no repeat_kv materialization needed
+- GQA uses `repeat_kv` + plain SDPA (NOT `enable_gqa` — that hit the slow MATH backend; see design decision #10, reversed Jun 25 2026)
 - Conv kernels (conv_fused.py) intentionally not used — 0.41x slower due to kernel launch overhead on small tensors
 - **(June 24 2026) Benchmark in fp16, not fp32** — T4 (training GPU) is fp16-only. The old fp32 numbers in `docs/kernel_benchmark_report.md` are unreliable (see correction header there). Use `triton.testing.do_bench`, never the hand-rolled 3-sample timer.
 - **(June 24 2026) MoE dispatch sync fix** — `triton_moe_experts_forward` now builds expert boundaries as CPU ints (was comparing CUDA scalar tensors per expert → implicit GPU sync per iter). Took the per-expert path from 0.84x regression → 1.40x vs eager (fp16).

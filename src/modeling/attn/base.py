@@ -102,16 +102,21 @@ class BiBoAttention(nn.Module):
         if self.use_ssmax:
             q = apply_ssmax_query_scaling(q, kv_len, self.ssmax_scale)
 
-        # Scaled dot-product attention (Flash Attention when available)
+        # Scaled dot-product attention. Materialize repeat_kv + DROP enable_gqa:
+        # enable_gqa silently forces SDPA onto the MATH backend (materializes the O(n^2) scores,
+        # ~10x slower + far more memory) because the mem-efficient/flash backends don't accept the
+        # GQA broadcast on our torch/HW (and T4 sm_75 has no flash at all -> mem-efficient is the
+        # production path). Full MHA via repeat_kv lets the dispatcher pick mem-efficient (T4) /
+        # flash (Ampere+). The KV copy is O(B*H*S*D), not O(n^2). value_states stays grouped below
+        # so the XSA call is unchanged.
         if not output_attentions:
-            # Use F.scaled_dot_product_attention with native GQA support
-            # No need to repeat_kv — SDPA handles grouped attention internally
+            k_rep = repeat_kv(key_states, self.num_key_value_groups)
+            v_rep = repeat_kv(value_states, self.num_key_value_groups)
             attn_output = nn.functional.scaled_dot_product_attention(
-                q, key_states, value_states,
+                q, k_rep, v_rep,
                 attn_mask=attention_mask[:, :, :, :kv_len] if attention_mask is not None else None,
                 dropout_p=self.attention_dropout if self.training else 0.0,
                 scale=1.0 / math.sqrt(self.head_dim),
-                enable_gqa=True,
             )
             attn_weights = None
         else:

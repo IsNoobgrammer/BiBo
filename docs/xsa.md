@@ -141,6 +141,25 @@ In the **whole `BiBoAttention`** block (SDPA-dominated, Liger norm on), using fu
 - **End-to-end**: `BiBoAttention` forward+backward runs NaN-free with gradients flowing on
   **both** the SDPA and `output_attentions=True` paths.
 
+## Length-generalization ablation (internal, June 2026)
+
+XSA was ablated on a synthetic **passkey length-generalization** probe (tiny model, train @ 128
+tokens, eval out to 32× train length, dynamic-NTK RoPE, QK-norm + SSMax on, 3 seeds):
+
+| config | extrapolation accuracy (mean over 256–4096) |
+|--------|---------------------------------------------|
+| SSMax, no XSA | 0.96 |
+| SSMax + XSA   | 0.94 |
+
+**XSA is length-generalization neutral** — the on/off difference is within seed noise (per-seed
+accuracy ranges overlap fully at every length; at 32× XSA's *worst*-seed is actually higher). It
+neither helps nor hurts extrapolation.
+
+> NOTE: a pure retrieval probe is **not** a test of XSA's intended benefit (which is
+> *representational* — removing the self-value / attention-sink component). This ablation only
+> establishes that **XSA is safe to keep alongside SSMax + NTK with no length-gen penalty.**
+> Assessing whether XSA *helps* needs a representation/quality probe (out of scope here).
+
 ## Config
 
 | Param | Default | What it does |
