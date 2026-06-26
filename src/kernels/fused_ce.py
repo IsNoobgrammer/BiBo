@@ -20,8 +20,10 @@ import triton.language as tl
 __all__ = ["fused_linear_cross_entropy"]
 
 # Backward chunk is sized so the transient (CHUNK,V) fp16 logit buffer stays under this budget.
-# 384 MiB → CHUNK≈2485 at V=81000 (one chunk for N≤2048; ~7 chunks at the 16k training step).
-_BWD_LOGITS_BUDGET = 384 * 1024 * 1024
+# 1024 MiB → CHUNK≈6628 at V=81000 (fewer/bigger backward GEMMs → better tensor-core util on the
+# CE backward, which is ~half the model's FLOPs at vocab=81k). Transient buffer ~1.07 GB; we have
+# ample T4 headroom. Was 384 MiB (CHUNK≈2485). Revert to 384 if memory-constrained.
+_BWD_LOGITS_BUDGET = 1024 * 1024 * 1024
 
 
 @triton.jit

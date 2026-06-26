@@ -89,6 +89,8 @@ def parse_args():
     p.add_argument("--muon_lr", type=float, default=None)
     p.add_argument("--seq_len", type=int, default=None)
     p.add_argument("--eval_every", type=int, default=None)
+    p.add_argument("--max_eval_examples", type=int, default=None,
+                   help="Cap HellaSwag/ARC examples per eval (default 500 via config). Keeps eval fast.")
     p.add_argument("--wandb_name", type=str, default=None)
     p.add_argument("--no_compile", action="store_true")
     p.add_argument("--no_triton", action="store_true")
@@ -119,6 +121,8 @@ def load_config(args):
         t["seq_len"] = args.seq_len
     if args.eval_every is not None:
         cfg["eval"]["eval_every"] = args.eval_every
+    if args.max_eval_examples is not None:
+        cfg["eval"]["max_eval_examples"] = args.max_eval_examples
     if args.wandb_name is not None:
         cfg["logging"]["wandb_name"] = args.wandb_name
 
@@ -317,14 +321,16 @@ def train(args):
     if args.eval_only:
         if is_main:
             results = run_all_evals(model, tokenizer, val_ds, device,
-                                    eval_cfg.get("benchmarks", []))
+                                    eval_cfg.get("benchmarks", []),
+                                    batch_size=train_cfg["batch_size"],
+                                    max_examples=eval_cfg.get("max_eval_examples", 500))
             bpb = results.get("val_bpb")
             bpb_str = f", bpb: {bpb:.4f}" if bpb is not None else ""
             print(f"{TAG} Val loss: {results['val_loss']:.4f}, PPL: {results['val_ppl']:.2f}{bpb_str}")
             if "hellaswag" in results:
-                print(f"{TAG} HellaSwag: {results['hellaswag']['accuracy']:.4f}")
+                print(f"{TAG} HellaSwag: acc={results['hellaswag']['accuracy']:.4f} acc_norm={results['hellaswag'].get('acc_norm',0):.4f}")
             if "arc_challenge" in results:
-                print(f"{TAG} ARC-Challenge: {results['arc_challenge']['accuracy']:.4f}")
+                print(f"{TAG} ARC-Challenge: acc={results['arc_challenge']['accuracy']:.4f} acc_norm={results['arc_challenge'].get('acc_norm',0):.4f}")
         return
 
     # ── Training Loop ─────────────────────────────────────────
@@ -473,16 +479,18 @@ def train(args):
                         results = run_all_evals(
                             model, tokenizer, val_ds, device,
                             eval_cfg.get("benchmarks", []),
+                            batch_size=train_cfg["batch_size"],
                             max_batches=100,
+                            max_examples=eval_cfg.get("max_eval_examples", 500),
                         )
                     log_eval_metrics(step, results)
                     _bpb = results.get("val_bpb")
                     _bpb_s = f" bpb={_bpb:.4f}" if _bpb is not None else ""
                     print(f"    [VAL] loss={results['val_loss']:.4f} ppl={results['val_ppl']:.2f}{_bpb_s}")
                     if "hellaswag" in results:
-                        print(f"    [BENCH] HellaSwag={results['hellaswag']['accuracy']:.4f}")
+                        print(f"    [BENCH] HellaSwag acc_norm={results['hellaswag'].get('acc_norm',0):.4f}")
                     if "arc_challenge" in results:
-                        print(f"    [BENCH] ARC={results['arc_challenge']['accuracy']:.4f}")
+                        print(f"    [BENCH] ARC acc_norm={results['arc_challenge'].get('acc_norm',0):.4f}")
                 except torch.cuda.OutOfMemoryError:
                     print(f"    [VAL] OOM — skipping")
                     torch.cuda.empty_cache()
@@ -518,9 +526,9 @@ def train(args):
             if results.get("val_bpb") is not None:
                 print(f"{TAG} Final bits-per-byte: {results['val_bpb']:.4f}")
             if "hellaswag" in results:
-                print(f"{TAG} HellaSwag: {results['hellaswag']['accuracy']:.4f}")
+                print(f"{TAG} HellaSwag: acc={results['hellaswag']['accuracy']:.4f} acc_norm={results['hellaswag'].get('acc_norm',0):.4f}")
             if "arc_challenge" in results:
-                print(f"{TAG} ARC-Challenge: {results['arc_challenge']['accuracy']:.4f}")
+                print(f"{TAG} ARC-Challenge: acc={results['arc_challenge']['accuracy']:.4f} acc_norm={results['arc_challenge'].get('acc_norm',0):.4f}")
         except torch.cuda.OutOfMemoryError:
             print(f"{TAG} Final eval OOM")
 

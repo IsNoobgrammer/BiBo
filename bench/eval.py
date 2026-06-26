@@ -96,6 +96,78 @@ def evaluate(model, val_ds, batch_size=32, device="cuda", max_batches=None,
 
 
 # ─────────────────────────────────────────────────────────────
+# Multiple-choice scoring (shared by HellaSwag + ARC)
+# ─────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def _score_multiple_choice(model, tokenizer, device, dataset, ctx_key, batch_size=8, pad_id=0):
+    """Score a multiple-choice dataset by completion log-likelihood — BATCHED on GPU.
+
+    All (context+completion) sequences are flattened and run `batch_size` at a time in a
+    single padded forward (right-pad; causal attention means completion positions never
+    attend to the trailing pad, so no attention mask is needed and pad_id is irrelevant to
+    the scored logprobs). This keeps the GPU busy instead of one batch=1 forward per choice.
+
+    Reports both lm-eval-harness metrics:
+      - acc      = argmax over choices of SUM(token log-probs)
+      - acc_norm = argmax over choices of SUM(token log-probs) / len(choice_text_chars)
+                   (length-normalized — the canonical HellaSwag/ARC headline).
+    Each example: {ctx_key: str, "completions": [str], "gold_idx": int}.
+    """
+    model.eval()
+    # 1. flatten every (example, choice) into one sequence to score
+    seqs = []
+    n_choices = []
+    for ei, ex in enumerate(dataset):
+        ctx_ids = tokenizer.encode(ex[ctx_key])
+        n_choices.append(len(ex["completions"]))
+        for ci, comp in enumerate(ex["completions"]):
+            comp_ids = tokenizer.encode(comp) or [pad_id]
+            seqs.append({"ei": ei, "ci": ci, "ctx_len": len(ctx_ids),
+                         "comp_ids": comp_ids, "full": ctx_ids + comp_ids,
+                         "char_len": max(len(comp), 1)})
+    lp = [[float("-inf")] * c for c in n_choices]
+    cl = [[1.0] * c for c in n_choices]
+
+    # 2. batched forward, batch_size sequences at a time
+    for i in range(0, len(seqs), batch_size):
+        chunk = seqs[i:i + batch_size]
+        maxlen = max(len(s["full"]) for s in chunk)
+        inp = torch.full((len(chunk), maxlen), pad_id, dtype=torch.long)
+        for j, s in enumerate(chunk):
+            inp[j, :len(s["full"])] = torch.tensor(s["full"], dtype=torch.long)
+        inp = inp.to(device)
+        with torch.autocast("cuda", dtype=torch.float16):
+            logits = model(input_ids=inp).logits                 # (b, maxlen, V)
+        logprobs = F.log_softmax(logits.float(), dim=-1)
+        for j, s in enumerate(chunk):
+            c0, clen = s["ctx_len"], len(s["comp_ids"])
+            pos = torch.arange(c0 - 1, c0 + clen - 1, device=device)   # predict comp[t] from pos c0+t-1
+            tok = torch.tensor(s["comp_ids"], device=device)
+            tlp = logprobs[j, pos, :].gather(1, tok.unsqueeze(1)).squeeze(1)
+            lp[s["ei"]][s["ci"]] = tlp.sum().item()
+            cl[s["ei"]][s["ci"]] = s["char_len"]
+
+    # 3. acc + acc_norm per example
+    correct = correct_norm = 0
+    for ei, ex in enumerate(dataset):
+        gold = ex["gold_idx"]
+        rng = range(n_choices[ei])
+        correct += int(max(rng, key=lambda k: lp[ei][k]) == gold)
+        correct_norm += int(max(rng, key=lambda k: lp[ei][k] / cl[ei][k]) == gold)
+    total = len(dataset)
+
+    model.train()
+    return {
+        "accuracy": correct / max(total, 1),
+        "acc_norm": correct_norm / max(total, 1),
+        "correct": correct,
+        "correct_norm": correct_norm,
+        "total": total,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
 # HellaSwag Benchmark
 # ─────────────────────────────────────────────────────────────
 
@@ -108,38 +180,10 @@ def evaluate_hellaswag(model, tokenizer, device, max_examples=None, batch_size=8
     """
     from data import load_hellaswag
     dataset = load_hellaswag(max_examples)
-
-    model.eval()
-    correct = 0
-    total = 0
-
-    for i in range(0, len(dataset), batch_size):
-        batch = dataset[i:i + batch_size]
-        for example in batch:
-            ctx_ids = tokenizer.encode(example["ctx"], return_tensors="pt").to(device)
-            ctx_len = ctx_ids.shape[1]
-
-            log_probs = []
-            for completion in example["completions"]:
-                comp_ids = tokenizer.encode(completion, return_tensors="pt").to(device)
-                full_ids = torch.cat([ctx_ids, comp_ids], dim=-1)
-
-                with torch.autocast("cuda", dtype=torch.float16):
-                    outputs = model(input_ids=full_ids)
-                    logits = outputs.logits
-
-                comp_logits = logits[0, ctx_len - 1: ctx_len + comp_ids.shape[1] - 1, :]
-                comp_logprobs = F.log_softmax(comp_logits, dim=-1)
-                token_logprobs = comp_logprobs.gather(1, comp_ids[0].unsqueeze(1)).squeeze(1)
-                log_probs.append(token_logprobs.sum().item())
-
-            predicted = max(range(len(log_probs)), key=lambda i: log_probs[i])
-            if predicted == example["gold_idx"]:
-                correct += 1
-            total += 1
-
-    model.train()
-    return {"accuracy": correct / max(total, 1), "correct": correct, "total": total}
+    res = _score_multiple_choice(
+        model, tokenizer, device, dataset,
+        ctx_key="ctx", batch_size=batch_size)
+    return res
 
 
 # ─────────────────────────────────────────────────────────────
@@ -155,38 +199,10 @@ def evaluate_arc_challenge(model, tokenizer, device, max_examples=None, batch_si
     """
     from data import load_arc_challenge
     dataset = load_arc_challenge(max_examples)
-
-    model.eval()
-    correct = 0
-    total = 0
-
-    for i in range(0, len(dataset), batch_size):
-        batch = dataset[i:i + batch_size]
-        for example in batch:
-            question_ids = tokenizer.encode(example["question"], return_tensors="pt").to(device)
-            q_len = question_ids.shape[1]
-
-            log_probs = []
-            for choice in example["completions"]:
-                choice_ids = tokenizer.encode(choice, return_tensors="pt").to(device)
-                full_ids = torch.cat([question_ids, choice_ids], dim=-1)
-
-                with torch.autocast("cuda", dtype=torch.float16):
-                    outputs = model(input_ids=full_ids)
-                    logits = outputs.logits
-
-                choice_logits = logits[0, q_len - 1: q_len + choice_ids.shape[1] - 1, :]
-                choice_logprobs = F.log_softmax(choice_logits, dim=-1)
-                token_logprobs = choice_logprobs.gather(1, choice_ids[0].unsqueeze(1)).squeeze(1)
-                log_probs.append(token_logprobs.sum().item())
-
-            predicted = max(range(len(log_probs)), key=lambda i: log_probs[i])
-            if predicted == example["gold_idx"]:
-                correct += 1
-            total += 1
-
-    model.train()
-    return {"accuracy": correct / max(total, 1), "correct": correct, "total": total}
+    res = _score_multiple_choice(
+        model, tokenizer, device, dataset,
+        ctx_key="question", batch_size=batch_size)
+    return res
 
 
 # ─────────────────────────────────────────────────────────────

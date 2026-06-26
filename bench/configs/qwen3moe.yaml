@@ -26,7 +26,7 @@ model:
   use_sliding_window: false
 
 training:
-  batch_size: 16
+  batch_size: 32      # kept identical to bibo.yaml (fair comparison). Try 48 if mem allows.
   grad_accum: 1
   total_steps: 50000
   warmup_steps: 100
@@ -43,6 +43,7 @@ eval:
   benchmarks: ["hellaswag", "arc_challenge"]
   eval_every: 500
   sample_every: 1000
+  max_eval_examples: 500   # cap HellaSwag/ARC per eval (keeps eval fast; identical to bibo.yaml)
 
 logging:
   wandb_project: "bibo-bench"

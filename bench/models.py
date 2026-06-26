@@ -39,6 +39,8 @@ def build_model_from_config(cfg: dict):
             max_position_embeddings=model_cfg["max_position_embeddings"],
             mlp_only_layers=model_cfg.get("mlp_only_layers", None),
             use_ssmax=model_cfg.get("use_ssmax", True),
+            use_xsa=model_cfg.get("use_xsa", True),
+            rope_nope_ratio=model_cfg.get("rope_nope_ratio", 0.5),
             polyglu_expert_multiplier=model_cfg.get("polyglu_expert_multiplier", 2),
             special_expert_pairs=model_cfg.get("special_expert_pairs", 1),
             num_experts_per_tok=model_cfg.get("num_experts_per_tok", 2),

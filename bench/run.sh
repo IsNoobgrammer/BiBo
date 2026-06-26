@@ -29,11 +29,13 @@ cd "$REPO_ROOT"
 # Install deps
 pip install -q hf_transfer wandb datasets transformers pyyaml bitsandbytes einops liger-kernel
 
-# WandB login
+# WandB login. Respect either WANDB_API_KEY or a prior `wandb login` (~/.netrc).
 if [ -n "$WANDB_API_KEY" ]; then
     wandb login "$WANDB_API_KEY" 2>/dev/null
+elif grep -qs "api.wandb.ai" "${HOME}/.netrc" 2>/dev/null; then
+    echo "[run.sh] Using existing wandb login (~/.netrc)"
 else
-    echo "[run.sh] WANDB_API_KEY not set — WandB disabled"
+    echo "[run.sh] WANDB not configured (no WANDB_API_KEY, no prior 'wandb login') — WandB disabled"
     export WANDB_MODE=disabled
 fi
 
