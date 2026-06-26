@@ -287,6 +287,21 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 - All MoE Triton kernels now have custom Triton backward kernels (not PyTorch fallback)
 - GQA uses `repeat_kv` + plain SDPA (NOT `enable_gqa` — that hit the slow MATH backend; see design decision #10, reversed Jun 25 2026)
 - Conv kernels (conv_fused.py) intentionally not used — 0.41x slower due to kernel launch overhead on small tensors
+- **(June 26 2026) FlashAttention-Turing — PLANNED attention lever for seq ≥ 2k (scoped, NOT integrated).**
+  Repo: `ssiu/flash-attention-turing` (https://github.com/ssiu/flash-attention-turing) — a from-scratch
+  FlashAttention for **sm_75 / T4** (Dao's official flash-attn refuses Turing). Fits BiBo: **head_dim
+  64/128** (we use 128 ✅), **fwd+bwd** (training), **causal + GQA + varlen** ✅; no dropout / KV-cache /
+  local-mask (all fine — training is full-causal, attn_dropout=0). Benchmarks vs PyTorch mem-efficient
+  (xformers, our current backend) on T4: **fwd causal 1.95×, bwd causal 1.51×, "for long sequences"**
+  (forward 66% SoL; win shrinks at short S). **ROI: ~4% at S=1024 (NOT worth it — `is_causal` already
+  captured the causal skip; design decision 9b). But attention is O(S²): at seq 2048 its share roughly
+  quadruples → flash-turing's speed + O(S) memory become the real lever, and the win grows with S.**
+  This is BiBo's regime (length-gen: SSMax/NoPE are about long context). **Integrate when we move to
+  2k**: gate `flash_attn_func` behind a config flag with an **SDPA fallback** (so local/non-T4 still
+  runs) + a **grad-exactness gate vs SDPA** before trusting it (Rules 1–2). API args differ from stock
+  flash-attn (see `flash_attention_interface.py`). XSA (post-attn on V) + SSMax (pre-scales q) are both
+  unaffected — drops in cleanly. **Build risk:** `pip install -v .` from source (CUDA 12.4, ~10–20 min);
+  tested on torch 2.5.1/2.8 but we're on 2.6 — may need a build fix. Verify the build + grads on T4 first.
 - **(June 24 2026) Benchmark in fp16, not fp32** — T4 (training GPU) is fp16-only. The old fp32 numbers in `docs/kernel_benchmark_report.md` are unreliable (see correction header there). Use `triton.testing.do_bench`, never the hand-rolled 3-sample timer.
 - **(June 24 2026) MoE dispatch sync fix** — `triton_moe_experts_forward` now builds expert boundaries as CPU ints (was comparing CUDA scalar tensors per expert → implicit GPU sync per iter). Took the per-expert path from 0.84x regression → 1.40x vs eager (fp16).
 - **(June 24 2026) Grouped-GEMM MoE** (`moe_grouped.py`, opt-in via `patch_moe_grouped`) — forward ~2–2.5x, fwd+bwd ~2x at 4k–8k tokens vs eager (fp16). **Certify the 16384-tok training shape on T4** — the 4GB RTX 3050 can't measure it (thermal + allocator pressure). Cert harness: `src/kernels/.autoresearch/bench_real.py`. Stays opt-in until T4-verified; per-expert path remains default.
