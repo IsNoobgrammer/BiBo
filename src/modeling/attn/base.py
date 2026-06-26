@@ -113,30 +113,34 @@ class BiBoAttention(nn.Module):
         if self.use_ssmax:
             q = apply_ssmax_query_scaling(q, kv_len, self.ssmax_scale)
 
-        # Scaled dot-product attention. Materialize repeat_kv + DROP enable_gqa:
-        # enable_gqa silently forces SDPA onto the MATH backend (materializes the O(n^2) scores,
-        # ~10x slower + far more memory) because the mem-efficient/flash backends don't accept the
-        # GQA broadcast on our torch/HW (and T4 sm_75 has no flash at all -> mem-efficient is the
-        # production path). Full MHA via repeat_kv lets the dispatcher pick mem-efficient (T4) /
-        # flash (Ampere+). The KV copy is O(B*H*S*D), not O(n^2). value_states stays grouped below
-        # so the XSA call is unchanged.
+        # Scaled dot-product attention. is_causal=True (no precomputed additive mask) lets the SDPA
+        # backend SKIP the upper-triangular blocks — on T4 (sm_75, no flash) the mem-efficient cutlass
+        # FMHA still honors the causal skip, ~halving attention work vs an explicit float mask. Packed
+        # training has no padding, so causal is the whole mask. q_len==1 (single-token decode) -> attend
+        # to all past keys (is_causal=False). NOTE: this path does NOT support padded batches — the
+        # research/training pipeline is packed (no pad). repeat_kv -> full MHA + DROP enable_gqa
+        # (enable_gqa forces the slow MATH backend; see AGENTS.md design decision #10).
+        q_len = q.shape[-2]
         if not output_attentions:
             k_rep = repeat_kv(key_states, self.num_key_value_groups)
             v_rep = repeat_kv(value_states, self.num_key_value_groups)
             attn_output = nn.functional.scaled_dot_product_attention(
                 q, k_rep, v_rep,
-                attn_mask=attention_mask[:, :, :, :kv_len] if attention_mask is not None else None,
+                attn_mask=None,
+                is_causal=q_len > 1,
                 dropout_p=self.attention_dropout if self.training else 0.0,
                 scale=1.0 / math.sqrt(self.head_dim),
             )
             attn_weights = None
         else:
-            # Fallback to manual for output_attentions=True — repeat_kv needed here
+            # Manual path (output_attentions=True) — build the causal mask inline (no precomputed one).
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
             attn_weights = torch.matmul(q, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-            if attention_mask is not None:
-                attn_weights = attn_weights + attention_mask[:, :, :, :kv_len]
+            if q_len > 1:
+                causal = torch.full((q_len, kv_len), float("-inf"), device=q.device, dtype=attn_weights.dtype)
+                causal = torch.triu(causal, diagonal=kv_len - q_len + 1)   # bottom-right aligned
+                attn_weights = attn_weights + causal
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
             attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
             attn_output = torch.matmul(attn_weights, value_states)

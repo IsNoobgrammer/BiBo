@@ -16,14 +16,12 @@ from transformers.modeling_outputs import (
 from transformers.modeling_utils import PreTrainedModel
 from transformers.generation.utils import GenerationMixin
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
-from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.utils import logging
 
 from src.configuration_bibo import BiBoConfig
 from .norm import BiBoRMSNorm
 from .embed import BiBoRotaryEmbedding
 from .layers import BiBoDecoderLayer
-from .masks import make_causal_mask, expand_mask, prepare_4d_causal_attention_mask
 
 logger = logging.get_logger(__name__)
 
@@ -135,11 +133,9 @@ class BiBoModel(BiBoPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        # Attention mask
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-        )
-
+        # No precomputed causal mask: attention uses is_causal=True (packed training, no padding).
+        # See BiBoAttention — the SDPA backend does the causal skip itself; building an explicit
+        # additive mask here both costs time and defeats that skip.
         hidden_states = inputs_embeds
 
         # Position embeddings (Qwen-style: use position_ids)
@@ -159,7 +155,7 @@ class BiBoModel(BiBoPreTrainedModel):
                     decoder_layer.__call__,
                     hidden_states,
                     position_embeddings,
-                    causal_mask,
+                    None,                       # attention_mask: is_causal handled in attention
                     None,
                     cache_position,
                     output_attentions,
@@ -169,7 +165,7 @@ class BiBoModel(BiBoPreTrainedModel):
                 layer_outputs = decoder_layer(
                     hidden_states,
                     position_embeddings=position_embeddings,
-                    attention_mask=causal_mask,
+                    attention_mask=None,        # is_causal handled in attention (packed, no padding)
                     past_key_value=past_key_values,
                     cache_position=cache_position,
                     output_attentions=output_attentions,
@@ -209,57 +205,6 @@ class BiBoModel(BiBoPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
-
-    def _update_causal_mask(
-        self,
-        attention_mask: Optional[torch.Tensor],
-        input_tensor: torch.Tensor,
-        cache_position: torch.Tensor,
-        past_key_values: Optional[Cache],
-        output_attentions: bool,
-    ):
-        """Update causal mask for current forward pass"""
-        if self.config._attn_implementation == "flash_attention_2":
-            if attention_mask is not None and 0.0 in attention_mask:
-                return attention_mask
-            return None
-
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        using_static_cache = isinstance(past_key_values, StaticCache)
-
-        dtype, device = input_tensor.dtype, input_tensor.device
-        min_dtype = torch.finfo(dtype).min
-        sequence_length = input_tensor.shape[1]
-        if using_static_cache:
-            target_length = past_key_values.get_max_length()
-        else:
-            target_length = (
-                attention_mask.shape[-1]
-                if isinstance(attention_mask, torch.Tensor)
-                else past_seen_tokens + sequence_length + 1
-            )
-
-        causal_mask = torch.full(
-            (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
-        )
-        if sequence_length != 1:
-            causal_mask = torch.triu(causal_mask, diagonal=1)
-        causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
-        causal_mask = causal_mask[None, None, :, :].expand(input_tensor.shape[0], 1, -1, -1)
-        if attention_mask is not None:
-            causal_mask = causal_mask.clone()
-            mask_length = attention_mask.shape[-1]
-            padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
-            padding_mask = padding_mask == 0
-            causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                padding_mask, min_dtype
-            )
-
-        if output_attentions:
-            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
-
-        return causal_mask
-
 
 class BiBoForCausalLM(BiBoPreTrainedModel, GenerationMixin):
     """
