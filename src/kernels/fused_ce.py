@@ -21,10 +21,12 @@ import triton.language as tl
 __all__ = ["fused_linear_cross_entropy", "fused_linear_cross_entropy_tldot"]
 
 # Backward chunk is sized so the transient (CHUNK,V) fp16 logit buffer stays under this budget.
-# 1024 MiB → CHUNK≈6628 at V=81000 (fewer/bigger backward GEMMs → better tensor-core util on the
-# CE backward, which is ~half the model's FLOPs at vocab=81k). Transient buffer ~1.07 GB; we have
-# ample T4 headroom. Was 384 MiB (CHUNK≈2485). Revert to 384 if memory-constrained.
-_BWD_LOGITS_BUDGET = 1024 * 1024 * 1024
+# 384 MiB → CHUNK≈2485 at V=81000. Sets the (CHUNK,V) fp16 transient in both the cuBLAS-chunked
+# forward and backward (logits chunk + its transpose for the gw GEMM). Lowered 1024→384 MiB: at
+# 1 GiB the bigger Qwen (141.9M) OOM'd on the 1 GB chunk transient on a 16 GB T4. 384 MiB keeps the
+# transient ~0.27 GB with negligible speed cost (a few more cuBLAS GEMM launches). Raise if you have
+# headroom and want fewer launches; lower further if still memory-pressured.
+_BWD_LOGITS_BUDGET = 384 * 1024 * 1024
 
 
 @triton.jit
@@ -182,10 +184,7 @@ class _CECublasChunked(torch.autograd.Function):
         for i in range(0, N, C):
             hc = hidden[i:i+C]; labc = labels[i:i+C]; lsec = lse[i:i+C]
             logits = torch.mm(hc, weight.t())                           # cuBLAS recompute (C,V)
-            p = torch.exp(logits.float() - lsec[:, None])
-            onehot = F.one_hot(labc.clamp(min=0), V).to(p.dtype)
-            g = (p - onehot) * sc
-            g = torch.where((labc != ig)[:, None], g, torch.zeros_like(g)).to(hidden.dtype)
+            g = _grad_logits_inplace(logits, lsec, labc, sc, ig)        # in-place fp16 (softmax-onehot)*sc
             gh[i:i+C] = torch.mm(g, weight)
             gw += torch.mm(g.t(), hc).float()
         return gh, gw.to(weight.dtype), None, None

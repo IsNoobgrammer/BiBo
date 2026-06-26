@@ -532,7 +532,9 @@ def train(args):
 
         try:
             results = run_all_evals(model, tokenizer, val_ds, device,
-                                    eval_cfg.get("benchmarks", []), max_batches=100)
+                                    eval_cfg.get("benchmarks", []),
+                                    batch_size=train_cfg["batch_size"], max_batches=100,
+                                    max_examples=eval_cfg.get("max_eval_examples", 1024))
             log_eval_metrics(step, results)
             print(f"{TAG} Final val loss: {results['val_loss']:.4f}")
             print(f"{TAG} Final perplexity: {results['val_ppl']:.2f}")
