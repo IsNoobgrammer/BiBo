@@ -96,6 +96,30 @@ def evaluate(model, val_ds, batch_size=32, device="cuda", max_batches=None,
 
 
 # ─────────────────────────────────────────────────────────────
+# Length-extrapolation bpb (#3) — the real long-range test on natural data
+# ─────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def evaluate_length_extrapolation(model, lengths, val_split, seed,
+                                  batch_size, device, max_batches=40, tokenizer=None):
+    """Val bpb at each seq length (train length + extrapolation). The data is packed-2K so 2048 is
+    real text. BiBo (SSMax+NTK+partial-NoPE) should hold bpb as length grows where plain RoPE
+    degrades. Same seed → identical val sequences, just truncated to each L.
+    Returns {'per_len': {L: {loss,ppl,bpb}}, 'ratio': bpb(maxL)/bpb(trainL)}."""
+    from data import load_benchmark_data
+    per_len = {}
+    base_len = min(lengths)
+    for L in sorted(lengths):
+        _, val_ds = load_benchmark_data(seq_len=L, val_split=val_split, seed=seed)
+        bs = max(1, batch_size * base_len // L)          # ~constant tokens/batch as L grows
+        loss, ppl, bpb = evaluate(model, val_ds, batch_size=bs, device=device,
+                                  max_batches=max_batches, tokenizer=tokenizer)
+        per_len[L] = {"loss": loss, "ppl": ppl, "bpb": bpb}
+    lo = per_len[base_len].get("bpb"); hi = per_len[max(lengths)].get("bpb")
+    return {"per_len": per_len, "ratio": (hi / lo) if (lo and hi) else 0.0}
+
+
+# ─────────────────────────────────────────────────────────────
 # Multiple-choice scoring (shared by HellaSwag + ARC)
 # ─────────────────────────────────────────────────────────────
 
@@ -148,19 +172,30 @@ def _score_multiple_choice(model, tokenizer, device, dataset, ctx_key, batch_siz
             lp[s["ei"]][s["ci"]] = tlp.sum().item()
             cl[s["ei"]][s["ci"]] = s["char_len"]
 
-    # 3. acc + acc_norm per example
+    # 3. acc + acc_norm + CONTINUOUS metrics per example.
+    # margin/auc use length-normalized logprobs (lp/charlen) — they lift off 0 / 0.5 long before
+    # accuracy leaves chance, so a weak model produces an ordered, moving signal where acc is noise.
     correct = correct_norm = 0
+    margins, aucs = [], []
     for ei, ex in enumerate(dataset):
         gold = ex["gold_idx"]
-        rng = range(n_choices[ei])
-        correct += int(max(rng, key=lambda k: lp[ei][k]) == gold)
-        correct_norm += int(max(rng, key=lambda k: lp[ei][k] / cl[ei][k]) == gold)
+        nc = n_choices[ei]
+        correct += int(max(range(nc), key=lambda k: lp[ei][k]) == gold)
+        correct_norm += int(max(range(nc), key=lambda k: lp[ei][k] / cl[ei][k]) == gold)
+        norm = [lp[ei][k] / cl[ei][k] for k in range(nc)]
+        others = [norm[k] for k in range(nc) if k != gold]
+        if others:
+            margins.append(norm[gold] - sum(others) / len(others))   # >0 ⇒ prefers gold
+            aucs.append(sum(norm[gold] > o for o in others) / len(others))  # P(gold > random distractor); 0.5=chance
     total = len(dataset)
+    _mean = lambda xs: sum(xs) / len(xs) if xs else 0.0
 
     model.train()
     return {
         "accuracy": correct / max(total, 1),
         "acc_norm": correct_norm / max(total, 1),
+        "margin": _mean(margins),     # length-norm Δ-logprob (gold − mean distractor)
+        "auc": _mean(aucs),           # ranking AUC, 0.5 = chance
         "correct": correct,
         "correct_norm": correct_norm,
         "total": total,

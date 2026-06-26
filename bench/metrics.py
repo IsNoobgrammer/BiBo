@@ -175,18 +175,31 @@ def log_train_metrics(step, loss, lr, grad_norm, tokens_per_sec, step_time, extr
     wandb.log(d)
 
 
-def log_eval_metrics(step, eval_results):
-    """Log eval results (val_loss, val_ppl, benchmarks)."""
+def log_eval_metrics(step, eval_results, tokens=None):
+    """Log eval results (val_loss, val_ppl, benchmarks). `tokens` = tokens_trained so far,
+    logged as val/tokens_trained for the loss-vs-tokens (sample-efficiency) curve (#2)."""
     d = {
         "val/step": step,
         "val/loss": eval_results.get("val_loss", 0),
         "val/perplexity": eval_results.get("val_ppl", 0),
     }
+    if tokens is not None:
+        d["val/tokens_trained"] = tokens
     if eval_results.get("val_bpb") is not None:
         d["val/bits_per_byte"] = eval_results["val_bpb"]
     if "hellaswag" in eval_results:
-        d["bench/hellaswag_acc"] = eval_results["hellaswag"]["accuracy"]
-        d["bench/hellaswag_acc_norm"] = eval_results["hellaswag"].get("acc_norm", 0)
+        hs = eval_results["hellaswag"]
+        d["bench/hellaswag_acc"] = hs["accuracy"]
+        d["bench/hellaswag_acc_norm"] = hs.get("acc_norm", 0)
+        d["bench/hellaswag_margin"] = hs.get("margin", 0)   # continuous signal (>0 prefers gold)
+        d["bench/hellaswag_auc"] = hs.get("auc", 0)         # ranking AUC, 0.5 = chance
+    # length-extrapolation bpb (#3): bench/bpb_L{len} + the degradation ratio vs train length
+    if "length_extrap" in eval_results:
+        le = eval_results["length_extrap"]
+        for L, m in le.get("per_len", {}).items():
+            if m.get("bpb") is not None:
+                d[f"val/bpb_L{L}"] = m["bpb"]
+        d["val/length_extrap_ratio"] = le.get("ratio", 0)
     wandb.log(d)
 
 

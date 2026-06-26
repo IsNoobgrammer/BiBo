@@ -42,7 +42,7 @@ sys.path.insert(0, BENCH_DIR)
 from models import build_model_from_config, count_params, apply_triton_kernels, resize_embeddings
 from data import load_benchmark_data, create_dataloader
 from optim import create_optimizer, create_scheduler, HAS_BNB
-from eval import evaluate, generate_samples, get_tokenizer, run_all_evals
+from eval import evaluate, generate_samples, get_tokenizer, run_all_evals, evaluate_length_extrapolation
 from metrics import (
     init_wandb, log_train_metrics, log_eval_metrics, log_samples,
     save_checkpoint, load_checkpoint, ThroughputMeter, format_time, format_count,
@@ -494,12 +494,14 @@ def train(args):
                             max_batches=100,
                             max_examples=eval_cfg.get("max_eval_examples", 500),
                         )
-                    log_eval_metrics(step, results)
+                    log_eval_metrics(step, results, tokens=tokens_seen)
                     _bpb = results.get("val_bpb")
                     _bpb_s = f" bpb={_bpb:.4f}" if _bpb is not None else ""
                     print(f"    [VAL] loss={results['val_loss']:.4f} ppl={results['val_ppl']:.2f}{_bpb_s}")
                     if "hellaswag" in results:
-                        print(f"    [BENCH] HellaSwag acc_norm={results['hellaswag'].get('acc_norm',0):.4f}")
+                        hs = results["hellaswag"]
+                        print(f"    [BENCH] HellaSwag acc_norm={hs.get('acc_norm',0):.4f} "
+                              f"margin={hs.get('margin',0):+.3f} auc={hs.get('auc',0):.3f}")
                 except torch.cuda.OutOfMemoryError:
                     print(f"    [VAL] OOM — skipping")
                     torch.cuda.empty_cache()
@@ -531,13 +533,28 @@ def train(args):
                                     eval_cfg.get("benchmarks", []),
                                     batch_size=train_cfg["batch_size"], max_batches=100,
                                     max_examples=eval_cfg.get("max_eval_examples", 1024))
-            log_eval_metrics(step, results)
+            # #3 length-extrapolation bpb (real-data long-range): default = train len + 2x
+            _sl = train_cfg.get("seq_len", 1024)
+            le_lengths = eval_cfg.get("eval_lengths") or [_sl, 2 * _sl]
+            try:
+                results["length_extrap"] = evaluate_length_extrapolation(
+                    model, le_lengths, train_cfg.get("val_split", 0.05),
+                    train_cfg.get("seed", 42), train_cfg["batch_size"], device, tokenizer=tokenizer)
+            except torch.cuda.OutOfMemoryError:
+                print(f"{TAG} length-extrap OOM — skipping"); torch.cuda.empty_cache()
+            log_eval_metrics(step, results, tokens=tokens_seen)
             print(f"{TAG} Final val loss: {results['val_loss']:.4f}")
             print(f"{TAG} Final perplexity: {results['val_ppl']:.2f}")
             if results.get("val_bpb") is not None:
                 print(f"{TAG} Final bits-per-byte: {results['val_bpb']:.4f}")
             if "hellaswag" in results:
-                print(f"{TAG} HellaSwag: acc={results['hellaswag']['accuracy']:.4f} acc_norm={results['hellaswag'].get('acc_norm',0):.4f}")
+                hs = results["hellaswag"]
+                print(f"{TAG} HellaSwag: acc_norm={hs.get('acc_norm',0):.4f} "
+                      f"margin={hs.get('margin',0):+.3f} auc={hs.get('auc',0):.3f}")
+            if "length_extrap" in results:
+                le = results["length_extrap"]
+                row = "  ".join(f"L{L}={m['bpb']:.4f}" for L, m in le["per_len"].items() if m.get("bpb"))
+                print(f"{TAG} Length-extrap bpb: {row}  | degradation×={le['ratio']:.3f}")
         except torch.cuda.OutOfMemoryError:
             print(f"{TAG} Final eval OOM")
 
