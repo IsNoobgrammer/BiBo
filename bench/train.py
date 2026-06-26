@@ -336,8 +336,6 @@ def train(args):
             print(f"{TAG} Val loss: {results['val_loss']:.4f}, PPL: {results['val_ppl']:.2f}{bpb_str}")
             if "hellaswag" in results:
                 print(f"{TAG} HellaSwag: acc={results['hellaswag']['accuracy']:.4f} acc_norm={results['hellaswag'].get('acc_norm',0):.4f}")
-            if "arc_challenge" in results:
-                print(f"{TAG} ARC-Challenge: acc={results['arc_challenge']['accuracy']:.4f} acc_norm={results['arc_challenge'].get('acc_norm',0):.4f}")
         return
 
     # ── Training Loop ─────────────────────────────────────────
@@ -502,8 +500,6 @@ def train(args):
                     print(f"    [VAL] loss={results['val_loss']:.4f} ppl={results['val_ppl']:.2f}{_bpb_s}")
                     if "hellaswag" in results:
                         print(f"    [BENCH] HellaSwag acc_norm={results['hellaswag'].get('acc_norm',0):.4f}")
-                    if "arc_challenge" in results:
-                        print(f"    [BENCH] ARC acc_norm={results['arc_challenge'].get('acc_norm',0):.4f}")
                 except torch.cuda.OutOfMemoryError:
                     print(f"    [VAL] OOM — skipping")
                     torch.cuda.empty_cache()
@@ -542,8 +538,6 @@ def train(args):
                 print(f"{TAG} Final bits-per-byte: {results['val_bpb']:.4f}")
             if "hellaswag" in results:
                 print(f"{TAG} HellaSwag: acc={results['hellaswag']['accuracy']:.4f} acc_norm={results['hellaswag'].get('acc_norm',0):.4f}")
-            if "arc_challenge" in results:
-                print(f"{TAG} ARC-Challenge: acc={results['arc_challenge']['accuracy']:.4f} acc_norm={results['arc_challenge'].get('acc_norm',0):.4f}")
         except torch.cuda.OutOfMemoryError:
             print(f"{TAG} Final eval OOM")
 

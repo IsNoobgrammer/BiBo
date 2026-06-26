@@ -50,7 +50,7 @@ training:
   optimizer: "adamw8bit"
 
 eval:
-  benchmarks: ["hellaswag", "arc_challenge"]
+  benchmarks: ["hellaswag"]
   eval_every: 500
   sample_every: 1000
   max_eval_examples: 1024   # cap HellaSwag/ARC per eval (full sets are ~10k/~1.2k, scored 1-example-at-a-time → slow, GPU-idle). Keeps eval fast.

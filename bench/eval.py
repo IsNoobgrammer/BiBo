@@ -187,26 +187,9 @@ def evaluate_hellaswag(model, tokenizer, device, max_examples=None, batch_size=8
 
 
 # ─────────────────────────────────────────────────────────────
-# ARC-Challenge Benchmark
-# ─────────────────────────────────────────────────────────────
-
-@torch.no_grad()
-def evaluate_arc_challenge(model, tokenizer, device, max_examples=None, batch_size=8):
-    """
-    Evaluate on ARC-Challenge.
-    Multiple choice by log-prob sum.
-    Returns {accuracy, correct, total}.
-    """
-    from data import load_arc_challenge
-    dataset = load_arc_challenge(max_examples)
-    res = _score_multiple_choice(
-        model, tokenizer, device, dataset,
-        ctx_key="question", batch_size=batch_size)
-    return res
-
-
-# ─────────────────────────────────────────────────────────────
 # Run All Evaluations
+# (ARC-Challenge removed 2026-06-26 — pure noise at 119M/8M-tokens; HellaSwag kept as a
+#  weak sanity signal, val_loss/bpb is the real discriminator.)
 # ─────────────────────────────────────────────────────────────
 
 def run_all_evals(model, tokenizer, val_ds, device, benchmarks, batch_size=8,
@@ -227,9 +210,6 @@ def run_all_evals(model, tokenizer, val_ds, device, benchmarks, batch_size=8,
     for bench in benchmarks:
         if bench == "hellaswag":
             results["hellaswag"] = evaluate_hellaswag(
-                model, tokenizer, device, max_examples=max_examples, batch_size=batch_size)
-        elif bench == "arc_challenge":
-            results["arc_challenge"] = evaluate_arc_challenge(
                 model, tokenizer, device, max_examples=max_examples, batch_size=batch_size)
 
     return results

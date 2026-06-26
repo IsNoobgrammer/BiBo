@@ -187,9 +187,6 @@ def log_eval_metrics(step, eval_results):
     if "hellaswag" in eval_results:
         d["bench/hellaswag_acc"] = eval_results["hellaswag"]["accuracy"]
         d["bench/hellaswag_acc_norm"] = eval_results["hellaswag"].get("acc_norm", 0)
-    if "arc_challenge" in eval_results:
-        d["bench/arc_acc"] = eval_results["arc_challenge"]["accuracy"]
-        d["bench/arc_acc_norm"] = eval_results["arc_challenge"].get("acc_norm", 0)
     wandb.log(d)
 
 

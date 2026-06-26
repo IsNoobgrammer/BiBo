@@ -41,7 +41,7 @@ training:
   optimizer: "adamw8bit"
 
 eval:
-  benchmarks: ["hellaswag", "arc_challenge"]
+  benchmarks: ["hellaswag"]
   eval_every: 500
   sample_every: 1000
   max_eval_examples: 1024   # cap HellaSwag/ARC per eval (keeps eval fast; identical to bibo.yaml)
