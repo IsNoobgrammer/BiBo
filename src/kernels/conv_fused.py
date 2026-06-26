@@ -30,6 +30,7 @@ from typing import Optional
 
 __all__ = [
     'triton_causal_conv1d_router',
+    'fused_conv_router_full',
     'triton_causal_conv1d_gated',
     'triton_fused_conv_gate_multiply',
     'patch_conv_router_with_triton',
@@ -552,6 +553,7 @@ def _causal_conv_router_fwd_kernel(
     stride_om, stride_oe,
     K: tl.constexpr, E: tl.constexpr, BLOCK_E: tl.constexpr,
     BLOCK_S: tl.constexpr, BLOCK_H: tl.constexpr,
+    APPLY_SIGMOID: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_s = tl.program_id(1)
@@ -571,15 +573,19 @@ def _causal_conv_router_fwd_kernel(
             wptr = W_ptr + offs_e[:, None] * stride_we + offs_h[None, :] * stride_wh + k * stride_wk
             wv = tl.load(wptr, mask=mask_e[:, None] & mask_h[None, :], other=0.0)
             acc += tl.dot(xv, tl.trans(wv))
+    # Epilogue: optionally fuse the sigmoid gate so we never round-trip raw logits through HBM
+    # + a separate sigmoid kernel. acc is fp32 (matches eager's logits.float() before sigmoid).
+    if APPLY_SIGMOID:
+        acc = 1.0 / (1.0 + tl.exp(-acc))
     out_row = pid_b * S + offs_s
     optr = Out_ptr + out_row[:, None] * stride_om + offs_e[None, :] * stride_oe
     tl.store(optr, acc.to(Out_ptr.dtype.element_ty), mask=mask_s[:, None] & mask_e[None, :])
 
 
-def _fused_conv_router_fwd(x, weight):
+def _fused_conv_router_fwd(x, weight, apply_sigmoid=False, out_dtype=None):
     B, S, Hd = x.shape
     E, _, K = weight.shape
-    out = torch.empty(B * S, E, device=x.device, dtype=x.dtype)
+    out = torch.empty(B * S, E, device=x.device, dtype=out_dtype or x.dtype)
     grid = lambda meta: (B, triton.cdiv(S, meta['BLOCK_S']))
     _causal_conv_router_fwd_kernel[grid](
         x, weight, out, B, S, Hd,
@@ -587,6 +593,7 @@ def _fused_conv_router_fwd(x, weight):
         weight.stride(0), weight.stride(1), weight.stride(2),
         out.stride(0), out.stride(1),
         K=K, E=E, BLOCK_E=max(16, triton.next_power_of_2(E)),
+        APPLY_SIGMOID=apply_sigmoid,
     )
     return out
 
@@ -697,6 +704,73 @@ def triton_causal_conv1d_router(
     return _FusedConvRouterFunction.apply(x, weight)
 
 
+class _FusedConvRouterFull(torch.autograd.Function):
+    """
+    WHOLE conv router fused into one autograd.Function (forward + manual backward).
+
+    Folds the entire eager pipeline — conv projection, sigmoid gate, +bias selection,
+    top-k, and unbiased weight gather — behind a single graph node, so autograd sees
+    one op instead of a chain of ~6 tiny elementwise/transpose launches.
+
+    forward:
+        scores  = sigmoid(causal_conv(x))           # Triton conv + fused-sigmoid epilogue, fp32
+        sel     = scores + bias                      # bias = selection only (DeepSeek-V3)
+        idx     = topk(sel, k)                       # torch.topk (robust tie-break, grad-free)
+        weights = scores.gather(idx)                 # UNBIASED weights, differentiable
+
+    backward (only `weights` carries grad; idx is discrete):
+        grad_scores = scatter_add(grad_weights @ idx)            # gather^T
+        grad_logits = grad_scores * scores * (1 - scores)        # sigmoid'
+        grad_x, grad_w = conv_backward(grad_logits)              # existing dx/dw Triton kernels
+
+    GEMM budget: 1 matmul-launch fwd (conv tl.dot), 2 bwd (dx, dw) — identical to eager's
+    cuDNN conv; everything else is fused away. Never more GEMMs than eager.
+
+    Scope: gate_type='sigmoid', router_activation='none', logit-norm OFF (deprecated).
+    norm_topk_prob is applied by the caller in eager so autograd handles its Jacobian.
+    """
+    @staticmethod
+    def forward(ctx, x, weight, bias, top_k):
+        # Triton conv with sigmoid fused into the store epilogue -> fp32 scores (B*S, E)
+        scores = _fused_conv_router_fwd(x, weight, apply_sigmoid=True, out_dtype=torch.float32)
+        # Selection uses scores + bias (load-balancing bias, selection ONLY). bias is fp32.
+        sel = scores + bias if bias is not None else scores
+        _, idx = torch.topk(sel, top_k, dim=-1)
+        weights = scores.gather(-1, idx)
+        ctx.save_for_backward(x, weight, scores, idx)
+        return idx, weights
+
+    @staticmethod
+    def backward(ctx, grad_idx, grad_weights):
+        x, weight, scores, idx = ctx.saved_tensors
+        B, S, Hd = x.shape
+        E, _, K = weight.shape
+        # gather^T: scatter grad into the selected score positions (idx unique per row -> add == set)
+        grad_scores = torch.zeros_like(scores)
+        grad_scores.scatter_add_(-1, idx, grad_weights.float())
+        # sigmoid': scores*(1-scores) (scores are already the sigmoid output) — fp32
+        grad_logits = grad_scores * scores * (1.0 - scores)
+        go = grad_logits.to(x.dtype).contiguous()       # match conv-bwd kernel dtype (param dtype)
+        BE = max(16, triton.next_power_of_2(E))
+        gx = torch.empty(B, S, Hd, device=x.device, dtype=x.dtype)
+        gw = torch.empty(E, Hd, K, device=x.device, dtype=x.dtype)
+        gridx = lambda m: (B, triton.cdiv(S, m['BLOCK_S']), triton.cdiv(Hd, m['BLOCK_H']))
+        _conv_router_dx_kernel[gridx](go, weight, gx, B, S, Hd,
+            go.stride(0), go.stride(1), weight.stride(0), weight.stride(1), weight.stride(2),
+            gx.stride(0), gx.stride(1), gx.stride(2), K=K, E=E, BLOCK_E=BE)
+        gridw = lambda m: (K, triton.cdiv(Hd, m['BLOCK_H']))
+        _conv_router_dw_kernel[gridw](go, x, gw, B, S, Hd,
+            go.stride(0), go.stride(1), x.stride(0), x.stride(1), x.stride(2),
+            gw.stride(0), gw.stride(1), gw.stride(2), K=K, E=E, BLOCK_E=BE)
+        return gx, gw, None, None  # x, weight, bias (no grad), top_k
+
+
+def fused_conv_router_full(x, weight, bias, top_k):
+    """Whole conv router (conv+sigmoid+bias+topk+gather) as one fused autograd op.
+    Returns (top_k_indices (B*S,k) long, top_k_weights (B*S,k) fp32-unbiased)."""
+    return _FusedConvRouterFull.apply(x, weight, bias, top_k)
+
+
 def triton_causal_conv1d_gated(
     x: torch.Tensor,        # (B, S, H)
     weight: torch.Tensor,   # (I, H, K) — nn.Conv1d weight
@@ -734,60 +808,40 @@ def triton_causal_conv1d_gated(
 def _triton_conv_router_forward(self, hidden_states: torch.Tensor):
     """
     Drop-in replacement for BiBoMoERouter.forward when router_type="conv".
-    Uses cuDNN conv + optimized permute/reshape.
+
+    Fully fused: conv projection + sigmoid + bias-selection + top-k + unbiased-weight gather
+    all collapse into one autograd node (_FusedConvRouterFull). The only ops left in eager
+    are the optional norm_topk_prob (kept in eager so autograd handles its Jacobian) and the
+    final reshape.
+
+    Supported config (the conv-router default): gate_type='sigmoid', router_activation='none'.
+    Router logit-norm is DEPRECATED and intentionally NOT applied here (see router.py).
+    Other gate/activation combos fall back to the original eager forward.
     """
-    import math
     from einops import rearrange
-    
-    batch_size, seq_len, hidden_dim = hidden_states.shape
-    
-    # Step 1: Conv projection (cuDNN + fused permute)
-    if self.router_type == "conv":
-        router_logits = triton_causal_conv1d_router(
-            hidden_states, self.gate_conv.weight,
-            self.num_routed_experts, self.kernel_size
-        ).float()
-    else:
-        flat_hidden = rearrange(hidden_states, 'b s h -> (b s) h')
-        router_logits = self.gate_proj(flat_hidden).float()
-    
-    # Step 2: exploration noise (training only)
-    if self.training and self.router_noise > 0:
-        noise_stddev = math.sqrt(self.router_noise)
-        noise = torch.randn_like(router_logits) * noise_stddev
-        router_logits = router_logits + noise.detach()
 
-    # Step 3: router activation
-    router_logits = self._apply_router_activation(router_logits)
+    # Fused path only covers the default conv-router math. Anything else -> eager original.
+    if (self.router_type != "conv"
+            or self.gate_type != "sigmoid"
+            or self.router_activation != "none"
+            or (self.training and self.router_noise > 0)):
+        return self._original_forward(hidden_states)
 
-    # Step 4: gating
-    if self.gate_type == "sigmoid":
-        scores = torch.sigmoid(router_logits)
-    else:
-        scores = F.softmax(router_logits, dim=1)
+    batch_size, seq_len, _ = hidden_states.shape
 
-    # Step 5: optional logit normalization
-    if self.use_router_logit_norm:
-        mean = scores.mean(dim=1, keepdim=True)
-        std = scores.std(dim=1, keepdim=True) + 1e-6
-        scores = self.router_lambda * (scores - mean) / std
+    # conv + sigmoid + (+bias) + topk + gather, fused into a single autograd op.
+    top_k_indices, top_k_weights = fused_conv_router_full(
+        hidden_states, self.gate_conv.weight, self.bias, self.top_k,
+    )
 
-    # Step 6: selection with bias
-    selection_scores = scores + self.bias
-
-    # Step 7: top-k
-    _, top_k_indices = torch.topk(selection_scores, self.top_k, dim=-1)
-
-    # Step 8: gather unbiased weights
-    top_k_weights = scores.gather(-1, top_k_indices)
+    # norm_topk_prob in eager: autograd carries its Jacobian back into top_k_weights, then
+    # _FusedConvRouterFull.backward maps that to grad_x / grad_w. Default off (no-op).
     if self.norm_topk_prob:
-        norm_weights = top_k_weights / (top_k_weights.sum(-1, keepdim=True) + 1e-6)
-    else:
-        norm_weights = top_k_weights
+        top_k_weights = top_k_weights / (top_k_weights.sum(-1, keepdim=True) + 1e-6)
 
     top_k_indices = rearrange(top_k_indices, '(b s) k -> b s k', b=batch_size)
-    norm_weights = rearrange(norm_weights, '(b s) k -> b s k', b=batch_size)
-    return top_k_indices.long(), norm_weights.to(hidden_states.dtype)
+    top_k_weights = rearrange(top_k_weights, '(b s) k -> b s k', b=batch_size)
+    return top_k_indices.long(), top_k_weights.to(hidden_states.dtype)
 
 
 def _triton_conv_expert_forward(self, x: torch.Tensor) -> torch.Tensor:

@@ -108,11 +108,14 @@ class BiBoMoERouter(nn.Module):
             # Softmax: competitive normalization (legacy)
             scores = F.softmax(router_logits, dim=1)
 
-        # Step 5: optional logit normalization (Skywork-MoE style)
-        if self.use_router_logit_norm:
-            mean = scores.mean(dim=1, keepdim=True)
-            std = scores.std(dim=1, keepdim=True) + 1e-6
-            scores = self.router_lambda * (scores - mean) / std
+        # Step 5: router logit normalization (Skywork-MoE style) — DEPRECATED (2026-06-27).
+        # Disabled everywhere (use_router_logit_norm=False in all configs) and removed from the
+        # hot path: it adds a mean/std reduction + scale per token for no measured benefit, and
+        # the fused conv router does not implement it. Kept commented (not deleted) for reference.
+        # if self.use_router_logit_norm:
+        #     mean = scores.mean(dim=1, keepdim=True)
+        #     std = scores.std(dim=1, keepdim=True) + 1e-6
+        #     scores = self.router_lambda * (scores - mean) / std
 
         # Step 6: selection uses scores + bias (bias for load balancing ONLY)
         # DeepSeek-V3: bias affects selection, NOT output weights

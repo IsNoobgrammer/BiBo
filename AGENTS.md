@@ -368,6 +368,29 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 - **(June 24 2026) Conv router fused** (`conv_fused.py`, `patch_conv_router_with_triton`) — real
   Triton kernel now (was fake PyTorch): native-(B,S,H)-read forward + transpose-free Triton backward.
   Full router fwd+bwd ~2.5x vs eager at large batch; projection ~5x fwd. fp16 grad-correct.
+- **(June 27 2026) Conv router FULLY fused** (`_FusedConvRouterFull` in `conv_fused.py`) — the WHOLE
+  router (conv projection → **sigmoid fused into the conv store epilogue** → +bias selection →
+  top-k → unbiased-weight gather) now collapses into ONE autograd node. Backward is manual:
+  scatter grad into selected scores → ×sigmoid′ (`scores*(1−scores)`) → reuse the existing
+  transpose-free `_conv_router_dx_kernel`/`_conv_router_dw_kernel`. `torch.topk` is kept in eager
+  (robust tie-break, grad-free); `norm_topk_prob` is applied in eager so autograd carries its
+  Jacobian. **Bench `src/kernels/bench/bench_conv_router.py`** (RTX 3050, fp16): fwd ~1.95×,
+  **fwd+bwd 2.83× at the training shape (B16/S1024)** (1.4× at small B8/S512 — launch-bound, the
+  dx/dw bwd doesn't amortize). **GEMM/launch count: matmul-conv 7→3, total launches 128→59** — the
+  fused router never issues more matmuls than eager's cuDNN conv (1 fwd + 2 bwd) and collapses the
+  ~6 glue launches (permute×2, pad, cast, sigmoid, bias, gather) into the conv kernel. Grad-exact
+  vs an eager reference holding the conv path fixed (fp32: idx-agree 1.0, w Δ1.2e-7, gx Δ8e-6; gw
+  Δ4e-4 rides the dw-kernel's documented TF32 long-reduction caveat). fp16 routing diverges from
+  true cuDNN-conv eager by ~0.03% because the fused path sigmoids fp32 logits (MORE precise than
+  eager's fp16-rounded logits) — expected, not a bug. E2E-verified (full model trains, no NaN).
+  Fused path covers the conv-router default (gate_type=sigmoid, router_activation=none); other
+  combos fall back to `_original_forward`. ⚠️ Only active when `router_type="conv"` (all current
+  bench configs use `"mlp"`).
+- **(June 27 2026) Router logit-norm DEPRECATED** — the Skywork-MoE z-score logit normalization
+  (`use_router_logit_norm`, Step 5 in `router.py`) is commented out (kept for reference, not
+  deleted). It was `False` in every config, added a per-token mean/std reduction + scale for no
+  measured benefit, and the fused conv router does not implement it. `router_lambda` is now unused
+  by the router hot path (still referenced by the config-init MC for `moe_shared_scaling`).
 - **(June 24 2026) `patch_moe_auto` (recommended MoE patch)** — per-call dispatch: grouped path for `n_tokens >= GROUPED_MIN_TOKENS` (default 4096), else the fixed per-expert path. Beats PyTorch eager across all token regimes by construction (both branches grad-verified). Tune `GROUPED_MIN_TOKENS` after T4 cert.
 - **(June 26 2026) Partial RoPE head-split (`rope_nope_ratio=0.5` = 2:2, DEFAULT)** — first `round(num_heads*(1-ratio))` query heads + corresponding KV heads get full RoPE+NTK; the remaining heads are NoPE (no positional encoding). At the **12h/2kv default**: 6 RoPE+NTK heads (1 RoPE KV group) + 6 NoPE content heads (1 NoPE KV group) — clean KV-group split, no GQA geometry change needed (group size 6; 6%6=0). Empirical (synthetic passkey + MQAR length-gen, train@128, eval to 32×, 3 seeds): more NoPE monotonically improves extrapolation — pure NoPE hits XG=1.000 on both tasks vs full-RoPE+NTK 0.93 (passkey) / 0.33 (MQAR); 2:2 gets 0.99 (passkey) / 0.50 (MQAR). **2:2 chosen as the default** (not higher NoPE): our retrieval evals treat position as *noise* (RoPE's worst case), so they overstate NoPE's value for a general LM where position is signal — 2:2 keeps half the heads positional, and is the only partial ratio that's KV-aligned at 12h/2kv without changing GQA. Mechanism: RoPE position-encodes key tokens by *where* they're planted → breaks key-matching; NoPE heads match position-independently; SSMax sharpens; causal mask gives implicit scale-free position. **The boundary must align with KV groups** (config validation enforced; only {0.0, 0.5} valid at 12h/2kv). `rope_nope_ratio=0.0` restores original all-RoPE. **IID/downstream cost of NoPE is UNMEASURED** (our synthetic evals saturate to 1.00 at train length) — Kaggle ablation on real-LM perplexity needed before pushing the ratio higher (would require changing GQA geometry to unlock 0.25/0.75). See `src/.autoresearch/FINDINGS.md` (2026-06-26 V10 + MQAR).
 
