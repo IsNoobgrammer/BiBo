@@ -121,6 +121,8 @@ def parse_args():
                    help="Use Turbo-Muon NS (AOL + per-iter coeffs, 4 iters) instead of the standard 5-iter quintic. Both models. Keeps Moonlight scaling + muon_lr.")
     p.add_argument("--scheduler", choices=["cosine", "whd"], default=None,
                    help="LR schedule: 'whd' (Warmup-Hold-Decay, Muon goto) or 'cosine' (AdamW). Overrides config. Use 'cosine' for AdamW baselines.")
+    p.add_argument("--exp-post-embed-norm", "--exp_post_embed_norm", dest="exp_post_embed_norm", action="store_true",
+                   help="EXPERIMENTAL (BiBo): add an RMSNorm after the embedding, before block 0 (BLOOM-style). Final pre-LM-head norm is always on regardless.")
     return p.parse_args()
 
 
@@ -164,6 +166,7 @@ def load_config(args):
     if args.no_conv_router:  m["router_type"] = "mlp";    ablated.append("conv-router")
     if args.no_shared_expert: m["use_shared_expert"] = False; ablated.append("shared-expert")
     if args.shared_expert:    m["use_shared_expert"] = True;  cfg["_shared_on"] = True  # opt in (default off)
+    if args.exp_post_embed_norm: m["exp_post_embed_norm"] = True; cfg["_post_embed_norm"] = True  # EXPERIMENTAL (BiBo only)
     if ablated:
         cfg["_ablated"] = ablated   # surfaced in the startup banner
 
@@ -265,6 +268,8 @@ def train(args):
             print(f"{TAG}   ⚠ ABLATED: {', '.join(cfg['_ablated'])} (disabled via CLI)")
         if cfg.get("_shared_on"):
             print(f"{TAG}   + shared expert ENABLED via --shared-expert (use_shared_expert=True)")
+        if cfg.get("_post_embed_norm"):
+            print(f"{TAG}   + EXP post-embedding RMSNorm via --exp-post-embed-norm (final pre-LM-head norm always on)")
         if train_cfg.get("modded_muon"):
             print(f"{TAG}   + Turbo-Muon NS via --modded-muon (AOL + 4-iter Polar coeffs; Moonlight scaling kept)")
         if train_cfg.get("deterministic", True):

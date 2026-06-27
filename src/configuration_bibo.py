@@ -29,6 +29,7 @@ class BiBoConfig(PretrainedConfig):
         use_xsa=True,  # Exclusive Self Attention (https://arxiv.org/abs/2603.09078)
         use_cache=True,
         use_ssmax=True,  # SSMax: scaling softmax for long context
+        exp_post_embed_norm=False,  # EXPERIMENTAL: extra RMSNorm after embeddings, before block 0 (BLOOM-style embedding norm). Final pre-LM-head norm always on regardless.
         rope_nope_ratio=0.5,  # Fraction of heads that are NoPE (no positional encoding). 0.5 = 2:2 (6 RoPE+NTK heads, 6 NoPE content heads at 12h/2kv). 0.0 = all RoPE (original behavior).
         pad_token_id=None,
         bos_token_id=0,
@@ -87,6 +88,7 @@ class BiBoConfig(PretrainedConfig):
         self.use_xsa = use_xsa
         self.use_cache = use_cache
         self.use_ssmax = use_ssmax
+        self.exp_post_embed_norm = exp_post_embed_norm
         self.rope_nope_ratio = rope_nope_ratio
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id

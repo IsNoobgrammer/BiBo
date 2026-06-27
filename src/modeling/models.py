@@ -64,6 +64,12 @@ class BiBoModel(BiBoPreTrainedModel):
             [BiBoDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # EXPERIMENTAL (exp_post_embed_norm): extra RMSNorm on the embeddings before block 0
+        # (BLOOM-style embedding norm — smooths the input to the residual stream). Created only
+        # when enabled so the param count is unchanged otherwise. The final pre-LM-head norm
+        # (self.norm) is always present regardless.
+        self.embed_norm = (BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                           if getattr(config, "exp_post_embed_norm", False) else None)
         self.rotary_emb = BiBoRotaryEmbedding(
             config.hidden_size // config.num_attention_heads,
             max_position_embeddings=config.max_position_embeddings,
@@ -137,6 +143,8 @@ class BiBoModel(BiBoPreTrainedModel):
         # See BiBoAttention — the SDPA backend does the causal skip itself; building an explicit
         # additive mask here both costs time and defeats that skip.
         hidden_states = inputs_embeds
+        if self.embed_norm is not None:          # EXPERIMENTAL post-embedding norm (BLOOM-style)
+            hidden_states = self.embed_norm(hidden_states)
 
         # Position embeddings (Qwen-style: use position_ids)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
