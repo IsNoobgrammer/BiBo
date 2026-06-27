@@ -12,8 +12,10 @@ launch PER EXPERT) with block-scheduled grouped GEMMs over sorted tokens:
 
 Status (RTX 3050, fp16): forward ~2-2.5x vs eager at large seq; fwd+bwd ~2x at
 4k-8k tokens/step. The 16384-tok shape is NOT reliably measurable on a 4GB laptop
-(thermal throttle + allocator pressure) -> certify on T4. Opt-in via patch_moe_grouped;
-the per-expert path (patch_moe_with_triton) remains the stable default.
+(thermal throttle + allocator pressure) -> certify on T4. The auto-dispatch wrapper
+(patch_moe_auto) is the PRODUCTION DEFAULT (bench/models.py): grouped at >=GROUPED_MIN_TOKENS
+(the 16384-tok training shape), per-expert below. patch_moe_grouped forces grouped everywhere;
+patch_moe_with_triton forces the per-expert path.
 
 Perf > memory: intermediates (gate_up/inter/eo) are SAVED for backward, not recomputed.
 """
