@@ -310,18 +310,32 @@ class _CombinedOptimizer(optim.Optimizer):
 # ─────────────────────────────────────────────────────────────
 
 def create_scheduler(optimizer, warmup_steps, total_steps, min_lr_ratio=0.1,
-                     scheduler="cosine", decay_frac=0.05):
-    """LR schedule with linear warmup. scheduler="cosine" (AdamW default) or "whd" (Muon goto).
+                     scheduler="cosine", decay_frac=0.05,
+                     whd5_fracs=(0.1, 0.5, 0.1, 0.2), whd5_mid=0.10):
+    """LR schedule with linear warmup. scheduler = "cosine" | "whd" | "whd5".
 
-    WHD = Warmup-Hold-Decay (Mellum 2 / GLM-4.5 Muon recipe, arXiv:2605.31268): linear warmup →
-    HOLD at peak → sharp LINEAR decay to ZERO over the final `decay_frac` of total_steps. Held flat
-    in between because Muon's update scales 1:1 with LR — cosine's long shallow tail bleeds that
-    lever away early; WHD keeps it at peak, then anneals hard at the very end.
-    ⚠ decay_frac=0.05 is shorter than disclosed Muon runs (Mellum ~15%, Kimi ~35%); IMU-1 found 10%
-    underfits short runs, so a 5% anneal may still leave a little on the table. Tunable.
+    cosine — linear warmup (warmup_steps) → cosine decay to min_lr_ratio*peak (AdamW default).
+    whd    — Warmup-Hold-Decay (Mellum 2 / GLM-4.5, arXiv:2605.31268): warmup → HOLD@peak → sharp
+             LINEAR decay→0 over the final `decay_frac` of total_steps.
+    whd5   — custom 5-phase staircase WHD (the Muon goto / config default). Fractions of total_steps;
+             warmup is FRACTIONAL here (whd5_fracs[0]), so `warmup_steps` is IGNORED for this type:
+               warmup(.1)→hold@peak(.5)→linear decay→whd5_mid over (.1)→hold@whd5_mid(.2)→
+               final linear decay→0 (remainder .1).
+             Long high-LR hold (Muon wants sustained LR) + a mid-training step-down to whd5_mid with a
+             plateau (consolidation) + a final anneal to 0. whd5_mid is the mid-plateau floor (×peak).
     """
 
     def lr_lambda(step):
+        if scheduler == "whd5":
+            w, h1, d1, h2 = whd5_fracs
+            p = step / max(total_steps, 1)
+            b0, b1, b2, b3 = w, w + h1, w + h1 + d1, w + h1 + d1 + h2     # phase boundaries
+            if p < b0:  return p / max(b0, 1e-9)                                   # warmup 0→peak
+            if p < b1:  return 1.0                                                 # hold @ peak
+            if p < b2:  return 1.0 - (1.0 - whd5_mid) * (p - b1) / max(d1, 1e-9)   # peak → mid
+            if p < b3:  return whd5_mid                                            # hold @ mid
+            return whd5_mid * max(1.0 - (p - b3) / max(1.0 - b3, 1e-9), 0.0)       # mid → 0
+
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
         if scheduler == "whd":

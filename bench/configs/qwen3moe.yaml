@@ -43,8 +43,8 @@ training:
   deterministic: true
   optimizer: "muon_adamw"       # identical to bibo.yaml — Muon for 2D weights + fused fp32 AdamW for embeds/norms (fair comparison)
   muon_lr: 3.0e-4               # RMS-matched Muon (Moonlight/Kimi band); identical to bibo.yaml
-  scheduler: "whd"              # Warmup-Hold-Decay (Muon goto); identical to bibo.yaml. Hold peak, sharp linear decay→0 over decay_frac.
-  decay_frac: 0.05              # final fraction of total_steps decaying to 0; identical to bibo.yaml
+  scheduler: "whd5"             # 5-phase staircase WHD (Muon goto); identical to bibo.yaml. warmup.1→hold.5→decay→0.10×peak.1→hold.2→decay→0.1 (fractions of total_steps).
+  decay_frac: 0.05              # only used by scheduler="whd" (ignored by whd5); identical to bibo.yaml
 
 eval:
   benchmarks: ["hellaswag"]

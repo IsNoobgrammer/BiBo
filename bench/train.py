@@ -119,8 +119,8 @@ def parse_args():
                    help="BiBo: force the shared expert off (use_shared_expert=False; already the default). Overrides a config that sets it on.")
     p.add_argument("--modded-muon", "--modded_muon", dest="modded_muon", action="store_true",
                    help="Use Turbo-Muon NS (AOL + per-iter coeffs, 4 iters) instead of the standard 5-iter quintic. Both models. Keeps Moonlight scaling + muon_lr.")
-    p.add_argument("--scheduler", choices=["cosine", "whd"], default=None,
-                   help="LR schedule: 'whd' (Warmup-Hold-Decay, Muon goto) or 'cosine' (AdamW). Overrides config. Use 'cosine' for AdamW baselines.")
+    p.add_argument("--scheduler", choices=["cosine", "whd", "whd5"], default=None,
+                   help="LR schedule: 'whd5' (5-phase staircase WHD, default/Muon goto), 'whd' (simple Warmup-Hold-Decay), or 'cosine' (AdamW). Overrides config. Use 'cosine' for AdamW baselines.")
     p.add_argument("--exp-post-embed-norm", "--exp_post_embed_norm", dest="exp_post_embed_norm", action="store_true",
                    help="EXPERIMENTAL (BiBo): add an RMSNorm after the embedding, before block 0 (BLOOM-style). Final pre-LM-head norm is always on regardless.")
     return p.parse_args()
@@ -262,7 +262,10 @@ def train(args):
         print(f"{TAG}   Steps: {train_cfg['total_steps']}")
         print(f"{TAG}   Optimizer: {train_cfg.get('optimizer', 'muon_adamw8bit')}")
         _sched = train_cfg.get("scheduler", "cosine")
-        print(f"{TAG}   Scheduler: {_sched}" + (f" (hold + linear decay over last {train_cfg.get('decay_frac', 0.05):.0%})" if _sched == "whd" else " (warmup + cosine decay)"))
+        _sdesc = {"whd": f"hold + linear decay over last {train_cfg.get('decay_frac', 0.05):.0%}",
+                  "whd5": "5-phase: warmup→hold→step to 10%→hold→decay to 0",
+                  "cosine": "warmup + cosine decay"}.get(_sched, "")
+        print(f"{TAG}   Scheduler: {_sched} ({_sdesc})")
         print(f"{TAG}   Precision: AMP {str(AMP_DTYPE).replace('torch.', '')} (fp32 master weights)")
         if cfg.get("_ablated"):
             print(f"{TAG}   ⚠ ABLATED: {', '.join(cfg['_ablated'])} (disabled via CLI)")
