@@ -51,9 +51,9 @@ training:
   deterministic: true
   optimizer: "muon_adamw"       # Muon (Newton-Schulz orthogonalized) for 2D weights + FUSED fp32 AdamW for embeds/norms/scalars. Fused (not 8bit): T4 has memory to spare, fp32 states are cleaner + no bnb dependency. Use muon_adamw8bit if memory-bound.
   muon_lr: 3.0e-4               # Muon LR for 2D matrices, RMS-matched (Moonlight/Kimi/Mellum band 2e-4–4.2e-4). NOT raw 0.02 — Muon now applies the 0.2·√max(A,B) consistent-RMS scaling so AdamW-range LRs are correctly attributed.
-  scheduler: "whd5"             # 5-phase staircase WHD (Muon goto): warmup .1 → hold@peak .5 → linear decay→0.10×peak over .1 → hold@0.10×peak .2 → final decay→0 over .1 (fractions of total_steps; warmup_steps IGNORED). Long high-LR hold for Muon + mid-training step-down. Use --scheduler cosine for AdamW baselines, whd for the simple variant.
+  scheduler: "whd"              # WSD (Warmup-Stable-Decay), DEFAULT: 15% warmup → 60% hold@peak → 25% linear decay→0 (fractions of total_steps; warmup_steps + decay_frac IGNORED). Sustained high-LR hold suits Muon. Use --scheduler cosine for AdamW baselines, whd5 for the 5-phase staircase variant.
   muon_ns_steps: 5              # Turbo-Muon Newton-Schulz iters (ONLY active with --modded-muon; 1-5). 5 = full Turbo NS (AOL + all 5 Polar coeffs); 4 = turbo (drops first tuple, ~20% cheaper).
-  decay_frac: 0.05              # only used by scheduler="whd" (ignored by whd5); final-decay fraction for the simple Warmup-Hold-Decay
+  decay_frac: 0.05              # LEGACY — unused (whd is now fractional WSD via wsd_fracs; whd5 has its own fracs; cosine ignores it). Kept only because train.py still passes it.
 
 eval:
   benchmarks: ["hellaswag"]

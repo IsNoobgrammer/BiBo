@@ -43,9 +43,9 @@ training:
   deterministic: true
   optimizer: "muon_adamw"       # identical to bibo.yaml — Muon for 2D weights + fused fp32 AdamW for embeds/norms (fair comparison)
   muon_lr: 3.0e-4               # RMS-matched Muon (Moonlight/Kimi band); identical to bibo.yaml
-  scheduler: "whd5"             # 5-phase staircase WHD (Muon goto); identical to bibo.yaml. warmup.1→hold.5→decay→0.10×peak.1→hold.2→decay→0.1 (fractions of total_steps).
+  scheduler: "whd"              # WSD (Warmup-Stable-Decay), DEFAULT: 15% warmup → 60% hold → 25% linear decay→0 (fractions of total_steps); identical to bibo.yaml.
   muon_ns_steps: 5              # Turbo-Muon NS iters (ONLY active with --modded-muon; 1-5); identical to bibo.yaml. 5 = full Turbo NS, 4 = turbo.
-  decay_frac: 0.05              # only used by scheduler="whd" (ignored by whd5); identical to bibo.yaml
+  decay_frac: 0.05              # LEGACY — unused (whd now fractional WSD); kept only because train.py passes it. Identical to bibo.yaml.
 
 eval:
   benchmarks: ["hellaswag"]
