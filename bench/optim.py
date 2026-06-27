@@ -180,6 +180,9 @@ def create_optimizer(model, cfg):
         from optim_modded import ModdedMuon as MuonClass
     else:
         MuonClass = Muon
+    # Turbo-Muon NS iteration count (modded only; 1-5, the # of Polar-Express coeff tuples).
+    ns_steps = int(train_cfg.get("muon_ns_steps", 4))
+    muon_extra = {"ns_steps": ns_steps} if use_modded else {}
 
     # Separate params by name:
     #   Muon: 2D weight matrices in attention projections + MLP/expert weights (NOT embeddings/lm_head)
@@ -223,6 +226,7 @@ def create_optimizer(model, cfg):
             momentum=0.95,
             weight_decay=weight_decay,
             compile_ns=compile_opt,
+            **muon_extra,
         )
 
         # Combine into a single optimizer-like object
@@ -237,7 +241,7 @@ def create_optimizer(model, cfg):
             [{"params": adamw_params, "weight_decay": weight_decay}],
             lr=lr, betas=(0.9, 0.95), fused=fused,
         )
-        muon = MuonClass(muon_params, lr=muon_lr, momentum=0.95, weight_decay=weight_decay, compile_ns=compile_opt)
+        muon = MuonClass(muon_params, lr=muon_lr, momentum=0.95, weight_decay=weight_decay, compile_ns=compile_opt, **muon_extra)
         optimizer = _CombinedOptimizer(muon, adamw)
         name = "Muon+AdamW(fused)" if fused else "Muon+AdamW"
 
@@ -274,7 +278,7 @@ def create_optimizer(model, cfg):
         name = "AdamW"
 
     if use_modded and "Muon" in name:
-        name += " [Turbo-NS 4it]"
+        name += f" [Turbo-NS {ns_steps}it]"
     print(f"  Optimizer: {name}")
     return optimizer, name
 

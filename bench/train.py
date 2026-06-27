@@ -123,6 +123,8 @@ def parse_args():
                    help="LR schedule: 'whd5' (5-phase staircase WHD, default/Muon goto), 'whd' (simple Warmup-Hold-Decay), or 'cosine' (AdamW). Overrides config. Use 'cosine' for AdamW baselines.")
     p.add_argument("--exp-post-embed-norm", "--exp_post_embed_norm", dest="exp_post_embed_norm", action="store_true",
                    help="EXPERIMENTAL (BiBo): add an RMSNorm after the embedding, before block 0 (BLOOM-style). Final pre-LM-head norm is always on regardless.")
+    p.add_argument("--muon-ns-steps", "--muon_ns_steps", dest="muon_ns_steps", type=int, default=None,
+                   help="Turbo-Muon Newton-Schulz iterations (1-5; only with --modded-muon). 4=turbo, 5=full Turbo NS.")
     return p.parse_args()
 
 
@@ -150,6 +152,8 @@ def load_config(args):
         t["modded_muon"] = True   # create_optimizer swaps in Turbo-Muon NS (bench/optim_modded.py)
     if args.scheduler is not None:
         t["scheduler"] = args.scheduler
+    if args.muon_ns_steps is not None:
+        t["muon_ns_steps"] = args.muon_ns_steps
     if args.eval_every is not None:
         cfg["eval"]["eval_every"] = args.eval_every
     if args.max_eval_examples is not None:

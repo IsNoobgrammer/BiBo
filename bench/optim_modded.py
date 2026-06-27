@@ -45,7 +45,9 @@ def turbo_newton_schulz(G, num_iters=4, eps=1e-7):
     NS converges in one fewer step. Batches over leading dims: 2D weights (unsqueezed) + 3D stacked
     experts (per-slice) — same convention as optim.py's newton_schulz_iteration. fp32 for stability.
     """
-    coeffs = _TURBO_NS_COEFFS[-num_iters:]
+    assert 1 <= num_iters <= len(_TURBO_NS_COEFFS), \
+        f"num_iters must be 1..{len(_TURBO_NS_COEFFS)} (only {len(_TURBO_NS_COEFFS)} coeff tuples); got {num_iters}"
+    coeffs = _TURBO_NS_COEFFS[-num_iters:]   # ns_steps=5 → all 5 (full Turbo NS); 4 → drops the first (turbo)
     X = G.float()
     squeeze = X.ndim == 2
     if squeeze:
