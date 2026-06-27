@@ -51,11 +51,13 @@ training:
   deterministic: true
   optimizer: "muon_adamw"       # Muon (Newton-Schulz orthogonalized) for 2D weights + FUSED fp32 AdamW for embeds/norms/scalars. Fused (not 8bit): T4 has memory to spare, fp32 states are cleaner + no bnb dependency. Use muon_adamw8bit if memory-bound.
   muon_lr: 3.0e-4               # Muon LR for 2D matrices, RMS-matched (Moonlight/Kimi/Mellum band 2e-4–4.2e-4). NOT raw 0.02 — Muon now applies the 0.2·√max(A,B) consistent-RMS scaling so AdamW-range LRs are correctly attributed.
+  scheduler: "whd"              # Warmup-Hold-Decay (Mellum 2 / GLM-4.5 Muon goto): hold peak LR flat, sharp linear decay→0 over the final decay_frac. Muon's step ∝ LR 1:1, so cosine's long tail bleeds its edge; WHD holds it. Use --scheduler cosine for AdamW baselines.
+  decay_frac: 0.05              # final fraction of total_steps spent decaying to 0 (⚠ still short — disclosed Muon runs use ~15-35%; bump toward 0.1 if the tail underfits)
 
 eval:
   benchmarks: ["hellaswag"]
   eval_every: 500
-  sample_every: 1000
+  sample_every: 500
   max_eval_examples: 1024   # cap HellaSwag/ARC per eval (full sets are ~10k/~1.2k, scored 1-example-at-a-time → slow, GPU-idle). Keeps eval fast.
 
 logging:
@@ -66,7 +68,7 @@ logging:
 
 hardware:
   compile: true
-  compile_optimizer: false   # torch.compile the Muon Newton-Schulz (cuBLAS GEMM + fused elementwise + cudagraphs). Kaggle/T4 ONLY — compile is broken locally. A/B vs eager Muon before trusting (bench/bench_muon.py).
+  compile_optimizer: true    # torch.compile the Muon Newton-Schulz (cuBLAS GEMM + fused elementwise + cudagraphs). Kaggle/T4 ONLY — compile is broken locally. ⚠ A/B vs eager Muon (bench/bench_muon.py) MUST pass numerics on T4 before trusting this run.
   triton: true
   grad_checkpoint: false
   fsdp: true

@@ -173,6 +173,14 @@ def create_optimizer(model, cfg):
     compile_opt = bool(cfg.get("hardware", {}).get("compile_optimizer", False))  # Kaggle-only (compile broken locally)
     weight_decay = train_decay if (train_decay := train_cfg.get("weight_decay", 0.1)) else 0.1
 
+    # --modded-muon: swap the standard 5-iter quintic NS for Turbo-Muon (AOL + per-iter coeffs, 4 iters).
+    # Lazy import (avoids circular import; optim_modded imports Muon from here). Default path unchanged.
+    use_modded = bool(train_cfg.get("modded_muon", False))
+    if use_modded:
+        from optim_modded import ModdedMuon as MuonClass
+    else:
+        MuonClass = Muon
+
     # Separate params by name:
     #   Muon: 2D weight matrices in attention projections + MLP/expert weights (NOT embeddings/lm_head)
     #   AdamW: everything else (embeddings, lm_head, norms, biases, scalars)
@@ -209,7 +217,7 @@ def create_optimizer(model, cfg):
                 lr=lr, betas=(0.9, 0.95),
             )
 
-        muon = Muon(
+        muon = MuonClass(
             muon_params,
             lr=muon_lr,
             momentum=0.95,
@@ -229,7 +237,7 @@ def create_optimizer(model, cfg):
             [{"params": adamw_params, "weight_decay": weight_decay}],
             lr=lr, betas=(0.9, 0.95), fused=fused,
         )
-        muon = Muon(muon_params, lr=muon_lr, momentum=0.95, weight_decay=weight_decay, compile_ns=compile_opt)
+        muon = MuonClass(muon_params, lr=muon_lr, momentum=0.95, weight_decay=weight_decay, compile_ns=compile_opt)
         optimizer = _CombinedOptimizer(muon, adamw)
         name = "Muon+AdamW(fused)" if fused else "Muon+AdamW"
 
@@ -265,6 +273,8 @@ def create_optimizer(model, cfg):
         )
         name = "AdamW"
 
+    if use_modded and "Muon" in name:
+        name += " [Turbo-NS 4it]"
     print(f"  Optimizer: {name}")
     return optimizer, name
 
@@ -299,15 +309,28 @@ class _CombinedOptimizer(optim.Optimizer):
 # Scheduler
 # ─────────────────────────────────────────────────────────────
 
-def create_scheduler(optimizer, warmup_steps, total_steps, min_lr_ratio=0.1):
-    """Cosine LR schedule with linear warmup."""
+def create_scheduler(optimizer, warmup_steps, total_steps, min_lr_ratio=0.1,
+                     scheduler="cosine", decay_frac=0.05):
+    """LR schedule with linear warmup. scheduler="cosine" (AdamW default) or "whd" (Muon goto).
+
+    WHD = Warmup-Hold-Decay (Mellum 2 / GLM-4.5 Muon recipe, arXiv:2605.31268): linear warmup →
+    HOLD at peak → sharp LINEAR decay to ZERO over the final `decay_frac` of total_steps. Held flat
+    in between because Muon's update scales 1:1 with LR — cosine's long shallow tail bleeds that
+    lever away early; WHD keeps it at peak, then anneals hard at the very end.
+    ⚠ decay_frac=0.05 is shorter than disclosed Muon runs (Mellum ~15%, Kimi ~35%); IMU-1 found 10%
+    underfits short runs, so a 5% anneal may still leave a little on the table. Tunable.
+    """
 
     def lr_lambda(step):
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
-        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-        progress = min(progress, 1.0)
-        cosine = 0.5 * (1 + math.cos(math.pi * progress))
-        return min_lr_ratio + (1 - min_lr_ratio) * cosine
+        if scheduler == "whd":
+            decay_steps = max(int(decay_frac * total_steps), 1)
+            decay_start = total_steps - decay_steps
+            if step < decay_start:
+                return 1.0                                              # hold at peak
+            return max(1.0 - (step - decay_start) / decay_steps, 0.0)   # linear decay → 0
+        progress = min((step - warmup_steps) / max(total_steps - warmup_steps, 1), 1.0)
+        return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)

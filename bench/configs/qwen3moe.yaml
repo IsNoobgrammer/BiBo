@@ -43,11 +43,13 @@ training:
   deterministic: true
   optimizer: "muon_adamw"       # identical to bibo.yaml — Muon for 2D weights + fused fp32 AdamW for embeds/norms (fair comparison)
   muon_lr: 3.0e-4               # RMS-matched Muon (Moonlight/Kimi band); identical to bibo.yaml
+  scheduler: "whd"              # Warmup-Hold-Decay (Muon goto); identical to bibo.yaml. Hold peak, sharp linear decay→0 over decay_frac.
+  decay_frac: 0.05              # final fraction of total_steps decaying to 0; identical to bibo.yaml
 
 eval:
   benchmarks: ["hellaswag"]
   eval_every: 500
-  sample_every: 1000
+  sample_every: 500
   max_eval_examples: 1024   # cap HellaSwag/ARC per eval (keeps eval fast; identical to bibo.yaml)
 
 logging:
@@ -58,7 +60,7 @@ logging:
 
 hardware:
   compile: true
-  compile_optimizer: false   # torch.compile the Muon Newton-Schulz (Kaggle/T4 only; compile broken locally). Identical to bibo.yaml.
+  compile_optimizer: true    # torch.compile the Muon Newton-Schulz (Kaggle/T4 only; compile broken locally). Identical to bibo.yaml. ⚠ A/B vs eager Muon (bench/bench_muon.py) MUST pass numerics on T4 first.
   triton: true
   grad_checkpoint: false
   fsdp: true

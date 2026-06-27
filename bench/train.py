@@ -117,6 +117,10 @@ def parse_args():
                    help="BiBo: enable the always-on shared MLP expert (use_shared_expert=True). OFF by default.")
     p.add_argument("--no-shared-expert", "--no_shared_expert", dest="no_shared_expert", action="store_true",
                    help="BiBo: force the shared expert off (use_shared_expert=False; already the default). Overrides a config that sets it on.")
+    p.add_argument("--modded-muon", "--modded_muon", dest="modded_muon", action="store_true",
+                   help="Use Turbo-Muon NS (AOL + per-iter coeffs, 4 iters) instead of the standard 5-iter quintic. Both models. Keeps Moonlight scaling + muon_lr.")
+    p.add_argument("--scheduler", choices=["cosine", "whd"], default=None,
+                   help="LR schedule: 'whd' (Warmup-Hold-Decay, Muon goto) or 'cosine' (AdamW). Overrides config. Use 'cosine' for AdamW baselines.")
     return p.parse_args()
 
 
@@ -140,6 +144,10 @@ def load_config(args):
         t["seq_len"] = args.seq_len
     if args.seed is not None:
         t["seed"] = args.seed
+    if args.modded_muon:
+        t["modded_muon"] = True   # create_optimizer swaps in Turbo-Muon NS (bench/optim_modded.py)
+    if args.scheduler is not None:
+        t["scheduler"] = args.scheduler
     if args.eval_every is not None:
         cfg["eval"]["eval_every"] = args.eval_every
     if args.max_eval_examples is not None:
@@ -250,11 +258,15 @@ def train(args):
         print(f"{TAG}   Batch: {train_cfg['batch_size']} x {train_cfg['grad_accum']} accum")
         print(f"{TAG}   Steps: {train_cfg['total_steps']}")
         print(f"{TAG}   Optimizer: {train_cfg.get('optimizer', 'muon_adamw8bit')}")
+        _sched = train_cfg.get("scheduler", "cosine")
+        print(f"{TAG}   Scheduler: {_sched}" + (f" (hold + linear decay over last {train_cfg.get('decay_frac', 0.05):.0%})" if _sched == "whd" else " (warmup + cosine decay)"))
         print(f"{TAG}   Precision: AMP {str(AMP_DTYPE).replace('torch.', '')} (fp32 master weights)")
         if cfg.get("_ablated"):
             print(f"{TAG}   ⚠ ABLATED: {', '.join(cfg['_ablated'])} (disabled via CLI)")
         if cfg.get("_shared_on"):
             print(f"{TAG}   + shared expert ENABLED via --shared-expert (use_shared_expert=True)")
+        if train_cfg.get("modded_muon"):
+            print(f"{TAG}   + Turbo-Muon NS via --modded-muon (AOL + 4-iter Polar coeffs; Moonlight scaling kept)")
         if train_cfg.get("deterministic", True):
             _strict = train_cfg.get("strict_deterministic", False)
             print(f"{TAG}   Deterministic: ON (seed={train_cfg.get('seed', 42)}, "
@@ -349,6 +361,8 @@ def train(args):
         optimizer,
         train_cfg.get("warmup_steps", 1000),
         train_cfg.get("total_steps", 50000),
+        scheduler=train_cfg.get("scheduler", "cosine"),
+        decay_frac=train_cfg.get("decay_frac", 0.02),
     )
 
     # ── DataLoader ────────────────────────────────────────────
