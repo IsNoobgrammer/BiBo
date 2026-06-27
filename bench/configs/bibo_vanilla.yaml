@@ -17,11 +17,11 @@ model:
   rope_nope_ratio: 0.0             # ABLATED (all-RoPE)
   max_position_embeddings: 2048
   mlp_only_layers: [0, 9]
-  polyglu_expert_multiplier: 2
-  special_expert_pairs: 1
+  polyglu_expert_multiplier: 3     # 9 GLU experts — match bibo.yaml (param-matched to Qwen 9)
+  special_expert_pairs: 1          # + 2 param-free specials = 11 routed
   num_experts_per_tok: 2
   moe_intermediate_size: 768
-  use_shared_expert: true
+  use_shared_expert: false         # OFF (default) — match bibo.yaml / Qwen
   shared_expert_type: "mlp"
   router_type: "mlp"               # ABLATED (no conv router; already the default)
   router_lambda: 1.0

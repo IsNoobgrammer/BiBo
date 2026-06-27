@@ -89,6 +89,8 @@ def parse_args():
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--muon_lr", type=float, default=None)
     p.add_argument("--seq_len", type=int, default=None)
+    p.add_argument("--seed", type=int, default=None,
+                   help="Override training.seed (data order, init). Use distinct seeds for multi-seed runs.")
     p.add_argument("--eval_every", type=int, default=None)
     p.add_argument("--max_eval_examples", type=int, default=None,
                    help="Cap HellaSwag/ARC examples per eval (default 500 via config). Keeps eval fast.")
@@ -111,8 +113,10 @@ def parse_args():
                    help="BiBo: disable partial RoPE / NoPE heads (rope_nope_ratio=0.0 → all-RoPE)")
     p.add_argument("--no-conv-router", "--no_conv_router", dest="no_conv_router", action="store_true",
                    help="BiBo: use the MLP router instead of the conv router (router_type='mlp')")
+    p.add_argument("--shared-expert", "--shared_expert", dest="shared_expert", action="store_true",
+                   help="BiBo: enable the always-on shared MLP expert (use_shared_expert=True). OFF by default.")
     p.add_argument("--no-shared-expert", "--no_shared_expert", dest="no_shared_expert", action="store_true",
-                   help="BiBo: disable the always-on shared MLP expert (use_shared_expert=False)")
+                   help="BiBo: force the shared expert off (use_shared_expert=False; already the default). Overrides a config that sets it on.")
     return p.parse_args()
 
 
@@ -134,6 +138,8 @@ def load_config(args):
         t["muon_lr"] = args.muon_lr
     if args.seq_len is not None:
         t["seq_len"] = args.seq_len
+    if args.seed is not None:
+        t["seed"] = args.seed
     if args.eval_every is not None:
         cfg["eval"]["eval_every"] = args.eval_every
     if args.max_eval_examples is not None:
@@ -149,6 +155,7 @@ def load_config(args):
     if args.no_partial_rope: m["rope_nope_ratio"] = 0.0;  ablated.append("partial-rope")
     if args.no_conv_router:  m["router_type"] = "mlp";    ablated.append("conv-router")
     if args.no_shared_expert: m["use_shared_expert"] = False; ablated.append("shared-expert")
+    if args.shared_expert:    m["use_shared_expert"] = True;  cfg["_shared_on"] = True  # opt in (default off)
     if ablated:
         cfg["_ablated"] = ablated   # surfaced in the startup banner
 
@@ -246,6 +253,8 @@ def train(args):
         print(f"{TAG}   Precision: AMP {str(AMP_DTYPE).replace('torch.', '')} (fp32 master weights)")
         if cfg.get("_ablated"):
             print(f"{TAG}   ⚠ ABLATED: {', '.join(cfg['_ablated'])} (disabled via CLI)")
+        if cfg.get("_shared_on"):
+            print(f"{TAG}   + shared expert ENABLED via --shared-expert (use_shared_expert=True)")
         if train_cfg.get("deterministic", True):
             _strict = train_cfg.get("strict_deterministic", False)
             print(f"{TAG}   Deterministic: ON (seed={train_cfg.get('seed', 42)}, "

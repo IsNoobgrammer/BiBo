@@ -174,7 +174,7 @@ class BiBoMoELayer(nn.Module):
         self.experts = BiBoFusedExperts(config)
 
         # Shared expert (always active) — only if enabled
-        self.use_shared_expert = getattr(config, 'use_shared_expert', True)
+        self.use_shared_expert = getattr(config, 'use_shared_expert', False)  # OFF by default (match Qwen)
         self.shared_experts_list = nn.ModuleList()
         if self.use_shared_expert:
             if config.shared_expert_type == "conv":

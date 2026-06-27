@@ -1,7 +1,8 @@
-# BiBo 118.6M total / 66.7M active (10L, H512, 4h/2kv GQA, PolyGLU 6+2 special, shared MLP expert, SSMax+XSA+partial-RoPE).
-# Deliberately SMALLER than qwen3moe.yaml (128.0M/71.4M; same expert+dense widths, Qwen just has 2 more real experts) so a BiBo loss win is conservative.
-# Load balancing = router-bias heuristic (no aux loss term). Pure-CE loss.
-# Training hyperparams kept identical to qwen3moe.yaml for a fair comparison.
+# BiBo 137.5M total / 71.4M active (10L, H512, 4h/2kv GQA, PolyGLU 9 GLU + 2 param-free specials, NO shared expert, SSMax+XSA+partial-RoPE).
+# MATCHED to qwen3moe.yaml on BOTH axes (Qwen 9 experts = 137.5M/71.4M): 9 GLU experts are param-identical to Qwen's 9 SwiGLU,
+# specials (Identity/Zero) are free, shared expert OFF -> no active-param asymmetry. The ONLY architectural difference is
+# diverse PolyGLU activations + param-free special experts vs Qwen's homogeneous SwiGLU. Clean isolation, no size confound either way.
+# Load balancing = router-bias heuristic (no aux loss term). Pure-CE loss. Training hyperparams identical to qwen3moe.yaml.
 model:
   type: "bibo"
   vocab_size: 81000
@@ -16,11 +17,11 @@ model:
   rope_nope_ratio: 0.5             # Partial RoPE: 0.5=2 RoPE+2 NoPE heads; 0.0=all-RoPE (ablate partial-RoPE off)
   max_position_embeddings: 2048
   mlp_only_layers: [0, 9]
-  polyglu_expert_multiplier: 2
-  special_expert_pairs: 1
+  polyglu_expert_multiplier: 3    # 9 GLU experts (3 triplets of SiLU/ReLU²/Tanh) — param-matched to Qwen's 9
+  special_expert_pairs: 1         # + 2 param-free specials (Identity, Zero) = 11 routed
   num_experts_per_tok: 2
   moe_intermediate_size: 768
-  use_shared_expert: true
+  use_shared_expert: false        # OFF (default) — matches Qwen (no shared expert); keeps total+active param-matched
   shared_expert_type: "mlp"
   router_type: "mlp"
   router_lambda: 1.0

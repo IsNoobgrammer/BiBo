@@ -18,7 +18,7 @@ BiBo is a **Mixture-of-Experts (MoE) Transformer** for causal language modeling.
 **Key differentiators from vanilla MoE (like Qwen3MoE):**
 1. **SSMax** — learnable per-head query scaling (`scale * log(n)`, where `n` is each query's **causal context length** `(kv_len − q_len) + t + 1`, not a global `kv_len`) that prevents attention fading at long sequences
 2. **Diverse experts** — PolyGLU layout: groups of 3 GLU experts with different activations (SiLU, ReLU², Tanh) + Identity/Zero special experts
-3. **Shared Conv1D expert** — always-active causal convolution (gated, SwiGLU-style)
+3. **Shared Conv1D expert** — causal convolution (gated, SwiGLU-style), always-active WHEN enabled. **OFF by default (since Jun 27 2026)** so BiBo stays param-matched to a no-shared baseline; opt in with `use_shared_expert=true`.
 4. **Router logit normalization** — `router_lambda` scales normalized logits + threshold-based bias heuristics for load balancing
 5. **Flash Attention (SDPA)** — uses `F.scaled_dot_product_attention` when `output_attentions=False`
 6. **Conv router option** — `router_type="conv"` gives router local context awareness
@@ -117,7 +117,7 @@ BiBoForCausalLM
 
 **MoE**: First and last layers are dense MLP (layers 0 and N-1; `mlp_only_layers=[0, N-1]`). All remaining layers are MoE. Router uses logit normalization. Bias heuristics for load balancing. Router bias is `requires_grad=False` (not optimizer-managed, updated heuristically).
 
-**Expert layout (PolyGLU)**: `polyglu_expert_multiplier` groups of 3 (SiLU-GLU, ReLU²-GLU, Tanh-GLU) + `special_expert_pairs` × (Identity, Zero). Default: 2×3 + 1×2 = 8 routed experts.
+**Expert layout (PolyGLU)**: `polyglu_expert_multiplier` groups of 3 (SiLU-GLU, ReLU²-GLU, Tanh-GLU) + `special_expert_pairs` × (Identity, Zero). Config default: 2×3 + 1×2 = 8 routed. **Bench configs (Jun 27 2026): 3×3 + 1×2 = 9 GLU + 2 specials = 11 routed**, shared expert OFF — param-matched to Qwen's 9 experts on BOTH total (137.5M) and active (71.4M).
 
 ---
 
@@ -195,7 +195,7 @@ BiBoForCausalLM
 
 1. **No sliding window / recurrent attention** — removed. Only standard softmax + SSMax. **If SWA is ever added: do NOT use SSMax on the windowed layers** — a fixed window caps `n`, so SSMax degenerates to a redundant constant temperature there. Keep SSMax only on full/global layers (set windowed layers' `s=0`). See `docs/ssmax.md` § "Do NOT use SSMax on sliding-window-attention layers".
 2. **SSMax init**: `1.0 / log(max_pos_emb / 2)` — ensures attention starts ~neutral, not 6× sharper than standard.
-3. **Shared expert is NOT routed** — it's always active. Only the Conv1D is shared.
+3. **Shared expert is NOT routed** — when enabled it's always active. **OFF by default (Jun 27 2026)**; `use_shared_expert=False` is the `BiBoConfig` default and `moe.py`'s fallback. The `moe_shared_scaling` 10K-iter MC in config init is now guarded by `use_shared_expert` (no wasted sim when off).
 4. **`output_attentions=True`** works (falls back to manual attention).
 5. **Router bias is non-trainable** — `requires_grad=False`, updated via heuristic `.add_()`.
 6. **Noise expert was removed** — no evidence it helps. Identity covers the "dump bucket" use case. See `docs/deprecated.md`.
@@ -391,6 +391,19 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   deleted). It was `False` in every config, added a per-token mean/std reduction + scale for no
   measured benefit, and the fused conv router does not implement it. `router_lambda` is now unused
   by the router hot path (still referenced by the config-init MC for `moe_shared_scaling`).
+- **(June 27 2026) BiBo↔Qwen now PARAM-MATCHED on BOTH axes; shared expert OFF by default.** Bench
+  expert layout bumped 6→**9 GLU** (`polyglu_expert_multiplier: 2→3`) + 2 param-free specials = 11
+  routed; Qwen `num_experts: 8→9`. A PolyGLU expert and a SwiGLU expert are param-identical, so 9
+  GLU == 9 SwiGLU exactly; specials are free; **shared expert turned OFF** (it's always-active, so
+  it would otherwise leave BiBo +13% active with no Qwen equivalent — the one asymmetry no Qwen
+  expert count can close). Result: **BiBo 137.48M/71.41M active vs Qwen 137.47M/71.41M, Δ<0.01M on
+  both** — the ONLY architectural difference is diverse PolyGLU activations + param-free specials vs
+  homogeneous SwiGLU (no size confound either direction). `top_k=2` unchanged (more experts add
+  specialization capacity, not active compute). `use_shared_expert` default is **False** in both
+  `BiBoConfig` and `moe.py`; the `moe_shared_scaling` MC is guarded by it (no wasted 10K sim when
+  off). Configs touched: `bibo.yaml`, `qwen3moe.yaml`, `bibo_vanilla.yaml`, `bibo_no_ssmax.yaml`
+  (the last is a stale divergent 16L config — bumped for layout consistency only). ⚠️ Existing
+  8-expert checkpoints are now architecture-incompatible (router/expert dims changed) — retrain.
 - **(June 24 2026) `patch_moe_auto` (recommended MoE patch)** — per-call dispatch: grouped path for `n_tokens >= GROUPED_MIN_TOKENS` (default 4096), else the fixed per-expert path. Beats PyTorch eager across all token regimes by construction (both branches grad-verified). Tune `GROUPED_MIN_TOKENS` after T4 cert.
 - **(June 26 2026) Partial RoPE head-split (`rope_nope_ratio=0.5` = 2:2, DEFAULT)** — first `round(num_heads*(1-ratio))` query heads + corresponding KV heads get full RoPE+NTK; the remaining heads are NoPE (no positional encoding). At the **12h/2kv default**: 6 RoPE+NTK heads (1 RoPE KV group) + 6 NoPE content heads (1 NoPE KV group) — clean KV-group split, no GQA geometry change needed (group size 6; 6%6=0). Empirical (synthetic passkey + MQAR length-gen, train@128, eval to 32×, 3 seeds): more NoPE monotonically improves extrapolation — pure NoPE hits XG=1.000 on both tasks vs full-RoPE+NTK 0.93 (passkey) / 0.33 (MQAR); 2:2 gets 0.99 (passkey) / 0.50 (MQAR). **2:2 chosen as the default** (not higher NoPE): our retrieval evals treat position as *noise* (RoPE's worst case), so they overstate NoPE's value for a general LM where position is signal — 2:2 keeps half the heads positional, and is the only partial ratio that's KV-aligned at 12h/2kv without changing GQA. Mechanism: RoPE position-encodes key tokens by *where* they're planted → breaks key-matching; NoPE heads match position-independently; SSMax sharpens; causal mask gives implicit scale-free position. **The boundary must align with KV groups** (config validation enforced; only {0.0, 0.5} valid at 12h/2kv). `rope_nope_ratio=0.0` restores original all-RoPE. **IID/downstream cost of NoPE is UNMEASURED** (our synthetic evals saturate to 1.00 at train length) — Kaggle ablation on real-LM perplexity needed before pushing the ratio higher (would require changing GQA geometry to unlock 0.25/0.75). See `src/.autoresearch/FINDINGS.md` (2026-06-26 V10 + MQAR).
 

@@ -179,7 +179,9 @@ class BiBoConfig(PretrainedConfig):
 
         # --- Auto-estimate scaling factor for shared expert if left as 1.0 ---
         self.moe_shared_scaling = moe_shared_scaling
-        if moe_shared_scaling == 1.0:
+        # Only auto-estimate when the shared expert is actually used — shared is OFF by default,
+        # so an unguarded MC would burn 10K iters every default-config build for an unused scalar.
+        if moe_shared_scaling == 1.0 and self.use_shared_expert:
             try:
                 import numpy as np
 
