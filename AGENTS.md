@@ -386,6 +386,39 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   Fused path covers the conv-router default (gate_type=sigmoid, router_activation=none); other
   combos fall back to `_original_forward`. ⚠️ Only active when `router_type="conv"` (all current
   bench configs use `"mlp"`).
+- **(June 27 2026) Muon switched to the Moonlight/Kimi recipe; muon_lr 0.02 → 3e-4.** The old Muon
+  was raw modded-nanogpt-style: a plain cubic Newton-Schulz (which UNDER-orthogonalized, SVs~0.4),
+  coupled weight decay, momentum applied AFTER orthogonalization, and lr=0.02 — an effective per-element
+  step ~6-10× hotter than any production Muon run and shape-inconsistent across layers. Now (`bench/optim.py`):
+  (1) tuned **quintic** Newton-Schulz `(3.4445,-4.7750,2.0315)` in fp32 (SVs→~1); (2) momentum on the raw
+  grad THEN orthogonalize (canonical order); (3) **consistent-RMS scaling** `update *= 0.2·√max(A,B)`
+  (Moonlight arXiv:2502.16982) so the update element-RMS is ~0.2 for EVERY matrix shape; (4) decoupled
+  (AdamW-style) weight decay. With this, `muon_lr` lives in the AdamW-aligned band the recent reports use
+  (Kimi K2 2e-4, Moonlight 4.2e-4, Mellum 3e-4); default **3e-4**. Verified `src/.autoresearch/test_muon_lr.py`:
+  per-element `|Δp|/lr` is flat at ~0.19 across square/tall/wide/gate_up AND 3D per-expert shapes (was
+  0.085 + shape-dependent with the cubic); tinylm passkey trains stably at 3e-4. **Per-expert Muon (both
+  models):** the stacked 3D expert tensors (`...experts.gate_up_proj` / `...experts.down_proj` — identical
+  layout in BiBo and Qwen3MoE) are orthogonalized PER EXPERT SLICE — `newton_schulz_iteration` batches over
+  the expert dim, `create_optimizer` routes them to Muon. So Muon now covers attention + dense MLP + ALL
+  experts (**95.9M** of ~137M; was 11M when experts sat on AdamW). 3D **conv kernels** (`gate_conv` — used by
+  BOTH the conv router `router_type=conv` AND the conv shared expert `shared_expert_type=conv`) are excluded
+  by name and stay on AdamW (a conv kernel isn't a matrix to orthogonalize). AdamW now holds only embeddings
+  (~41.5M) + norms + conv. Verified: experts_in_muon 16/16, conv_in_muon 0, both models 4-step NaN-free.
+  ⚠️ The tinylm passkey task saturates for both 3e-4 and 0.02 — it confirms attribution + stability, NOT
+  that 0.02 is worse; the real LR discriminator is the LM-loss Kaggle bench.
+- **(June 27 2026) Muon-step fusion investigated → compile is the only lever; Triton/batching rejected.**
+  Profiled the Muon step (`bench/bench_muon.py`): **GEMM-bound (~68-71% CUDA), gemm count = the NS
+  algorithmic floor** (3 matmuls/iter), cuBLAS bmm engine. So "fewer GEMMs than eager" is impossible
+  (unlike the conv router, NS has no elementwise glue to absorb into the matmul) and a Triton `tl.dot`
+  megakernel would LOSE (cuBLAS > Triton-GEMM, proven 3× in this repo; a 512² matrix won't fit SRAM).
+  **Cross-param shape-bucketing** (one batched NS over all same-shape matrices) was implemented, benched,
+  and **REVERTED**: numerically exact (1e-6 vs per-slice) but only ~1.1× on the FLOP-bound expert matmuls
+  at 2× memory → thrashed the 4 GB local GPU (22× slower with the model resident). Step stays **per-param**
+  (3D experts still batch over the expert dim inside NS — cheap). The surviving lever is **`compile_ns`**
+  (`hardware.compile_optimizer: false` default): `torch.compile`+cudagraphs on the per-param Newton-Schulz
+  cuts launch overhead without the batched-transient memory blowup. **Kaggle-only — torch.compile is broken
+  locally** (triton `AttrsDescriptor` mismatch); `bench/bench_muon.py` auto-skips it locally, run it on T4
+  to A/B eager-vs-compiled (numerics gate + speed) before trusting.
 - **(June 27 2026) Router logit-norm DEPRECATED** — the Skywork-MoE z-score logit normalization
   (`use_router_logit_norm`, Step 5 in `router.py`) is commented out (kept for reference, not
   deleted). It was `False` in every config, added a per-token mean/std reduction + scale for no
@@ -398,7 +431,13 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   it would otherwise leave BiBo +13% active with no Qwen equivalent — the one asymmetry no Qwen
   expert count can close). Result: **BiBo 137.48M/71.41M active vs Qwen 137.47M/71.41M, Δ<0.01M on
   both** — the ONLY architectural difference is diverse PolyGLU activations + param-free specials vs
-  homogeneous SwiGLU (no size confound either direction). `top_k=2` unchanged (more experts add
+  homogeneous SwiGLU (no size confound either direction). **Active-param convention** (`count_params`
+  in `bench/models.py`): BiBo's active-routed denominator is the **GLU-expert count (9), NOT
+  num_routed_experts (11)** — params live only in GLU experts, so including the 2 free Identity/Zero
+  specials in the denominator would under-count active (logged 68M instead of 71.4M) and break the
+  apples-to-apples vs Qwen's all-GLU 2-of-9. It's an UPPER BOUND: real active drops below 71.4M
+  whenever the router actually picks a free special (BiBo-only capability; only ever makes it cheaper).
+  `top_k=2` unchanged (more experts add
   specialization capacity, not active compute). `use_shared_expert` default is **False** in both
   `BiBoConfig` and `moe.py`; the `moe_shared_scaling` MC is guarded by it (no wasted 10K sim when
   off). Configs touched: `bibo.yaml`, `qwen3moe.yaml`, `bibo_vanilla.yaml`, `bibo_no_ssmax.yaml`

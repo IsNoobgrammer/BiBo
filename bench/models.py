@@ -134,9 +134,14 @@ def count_params(model, config) -> dict:
     routed_per_layer = moe_routed_total // max(num_moe, 1)
 
     if model_type == "bibo":
-        num_routed = config.num_routed_experts
+        # Denominator = GLU-expert count, NOT num_routed_experts. Params live only in the GLU experts
+        # (routed_per_layer above sums just those); the param-free Identity/Zero specials must be
+        # excluded or active under-counts vs an all-GLU MoE — apples-to-apples, BiBo's 2-of-9-GLU ==
+        # Qwen's 2-of-9. This is an UPPER BOUND: real active is lower whenever the router picks a
+        # free special (that capability is BiBo's, and it only ever makes BiBo cheaper, not costlier).
+        num_glu = config.polyglu_expert_multiplier * 3
         top_k = config.num_experts_per_tok
-        active_routed = routed_per_layer * (top_k / num_routed) * num_moe
+        active_routed = routed_per_layer * (top_k / max(num_glu, 1)) * num_moe
     else:
         num_routed = getattr(config, 'num_experts', 8)
         top_k = config.num_experts_per_tok

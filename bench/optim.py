@@ -20,15 +20,31 @@ import torch.optim as optim
 
 def newton_schulz_iteration(G, num_iters=5):
     """
-    Approximate matrix sign function for orthogonalization.
-    From Keller Jordan / modded-nanogpt.
+    Orthogonalize G (drive its singular values toward 1) via the TUNED QUINTIC Newton-Schulz
+    from Keller Jordan / modded-nanogpt — the same one Moonlight/Kimi use. The quintic coeffs
+    (3.4445, -4.7750, 2.0315) push SVs into ~[0.7, 1.3] in 5 iters; a plain cubic (3X-AX)/2
+    UNDER-orthogonalizes (SVs ~0.4) so the downstream 0.2·√max RMS scaling lands at ~0.085
+    instead of 0.2 and the LR is mis-attributed. Compute in fp32 for stability.
     """
-    assert G.ndim == 2
-    X = G / (G.norm() + 1e-7)
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G.float()
+    squeeze = X.ndim == 2
+    if squeeze:
+        X = X.unsqueeze(0)                     # (1, A, B) — unify 2D + batched (E, A, B) paths
+    # normalize each slice by its Frobenius norm (per-expert for the batched case)
+    X = X / (X.flatten(1).norm(dim=1).clamp_min(1e-7).view(-1, 1, 1))
+    transposed = X.size(1) > X.size(2)         # iterate on the smaller Gram matrix
+    if transposed:
+        X = X.transpose(1, 2)
     for _ in range(num_iters):
-        A = X @ X.T
-        X = (3 * X - A @ X) / 2
-    return X
+        A = X @ X.transpose(1, 2)
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if transposed:
+        X = X.transpose(1, 2)
+    if squeeze:
+        X = X.squeeze(0)
+    return X.to(G.dtype)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -37,24 +53,47 @@ def newton_schulz_iteration(G, num_iters=5):
 
 class Muon(optim.Optimizer):
     """
-    Muon optimizer — Nesterov momentum with orthogonalized gradients.
+    Muon optimizer — Moonlight/Kimi recipe (arXiv:2502.16982, 2507.20534).
 
-    For 2D weight matrices:
-      - Compute gradient
-      - Orthogonalize via Newton-Schulz iteration
-      - Apply Nesterov momentum update
+    For 2D weight matrices, per step:
+      1. momentum on the RAW gradient, THEN Newton-Schulz orthogonalize (canonical order)
+      2. CONSISTENT-RMS scale: update *= 0.2 * sqrt(max(fan_in, fan_out)).
+         The orthogonalized matrix has element-RMS ~= 1/sqrt(max(A,B)); this scaling forces
+         element-RMS ~= 0.2 (AdamW's typical update RMS) for EVERY matrix shape, so a single
+         AdamW-range LR (~2e-4..4e-4) is correctly attributed across all layers.
+      3. decoupled weight decay (AdamW-style: p *= 1 - lr*wd), NOT folded into the grad.
 
-    For 1D params: falls back to AdamW.
+    Without (2)+(3) the effective step is shape-dependent and ~6-10x hotter than this recipe —
+    that's why the old lr=0.02 (raw modded-nanogpt regime) was mis-scaled. See AGENTS.md.
 
-    Reference: Keller Jordan, modded-nanogpt
+    Stacked MoE expert tensors (3D, (num_experts, A, B) — identical layout in BiBo and Qwen3MoE)
+    are orthogonalized PER EXPERT SLICE: Newton-Schulz batches over the expert dim and the
+    0.2·√max(A,B) scaling uses the slice dims. So Muon covers attention + dense MLP + every expert.
+
+    Step is PER-PARAM (3D experts batch over the expert dim inside NS). Cross-param shape-bucketing
+    (one batched NS over all same-shape matrices) was tried and REVERTED (bench/bench_muon.py, Jun 27):
+    numerically exact (1e-6) but only ~1.1× on the FLOP-bound expert matmuls and 2× the memory — which
+    thrashed the 4GB local GPU (22× slower with the model resident). NS is GEMM-bound (71%, profiled);
+    the GEMM count (3 matmuls/iter) is the algorithmic floor — you can't go below eager, and cuBLAS bmm
+    beats Triton tl.dot here. The real launch-overhead lever is `compile_ns` (torch.compile + cudagraphs,
+    Kaggle-only — broken locally), which cuts launches WITHOUT the batched-transient memory blowup.
+
+    For 1D params (and 3D conv kernels): handled by the paired AdamW (see create_optimizer).
     """
 
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True,
                  weight_decay=0.0, adamw_params=None, adamw_lr=3e-4,
-                 adamw_betas=(0.9, 0.95), adamw_wd=0.1):
+                 adamw_betas=(0.9, 0.95), adamw_wd=0.1, compile_ns=False):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
                         weight_decay=weight_decay)
         super().__init__(params, defaults)
+
+        # Optionally torch.compile the (shape-bucketed) Newton-Schulz: keeps GEMMs on cuBLAS but
+        # fuses the elementwise (a*X + B@X, b*A + c*A@A) and cuts launch overhead on the tiny bmm.
+        # OFF by default — torch.compile is broken in the local env; flip on (Kaggle) via config.
+        # Calling torch.compile here is lazy (inductor only imports on first invocation), so it's
+        # inert when compile_ns=False. Bucketing means few distinct shapes -> bounded recompiles.
+        self._ns = torch.compile(newton_schulz_iteration, dynamic=False) if compile_ns else newton_schulz_iteration
 
         self.adamw_params = list(adamw_params) if adamw_params is not None else []
         self.adamw_lr = adamw_lr
@@ -69,7 +108,8 @@ class Muon(optim.Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            params = [p for p in group["params"] if p.grad is not None and p.ndim == 2]
+            # 2D weight matrices + 3D stacked MoE expert tensors (orthogonalized per slice)
+            params = [p for p in group["params"] if p.grad is not None and p.ndim in (2, 3)]
             if not params:
                 continue
 
@@ -78,26 +118,25 @@ class Muon(optim.Optimizer):
             weight_decay = group["weight_decay"]
 
             for p in params:
-                grad = p.grad
-
-                if weight_decay != 0:
-                    grad = grad.add(p, alpha=weight_decay)
-
-                g_orth = newton_schulz_iteration(grad)
-
                 state = self.state[p]
                 if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g_orth)
-
+                    state["momentum_buffer"] = torch.zeros_like(p.grad)
                 buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g_orth)
 
-                if group["nesterov"]:
-                    update = g_orth + momentum * buf
-                else:
-                    update = buf
+                # momentum on raw grad -> orthogonalize (Nesterov). For 3D experts, NS batches over
+                # the expert dim internally (cheap, E~9). self._ns is plain or torch.compile'd.
+                buf.mul_(momentum).add_(p.grad)
+                g = p.grad.add(buf, alpha=momentum) if group["nesterov"] else buf
+                g = self._ns(g)
 
-                p.add_(update, alpha=-lr)
+                # consistent-RMS scale (Moonlight) using the matrix dims (last two)
+                a_dim, b_dim = p.shape[-2], p.shape[-1]
+                g = g.mul_(0.2 * (max(a_dim, b_dim) ** 0.5))
+
+                # decoupled weight decay, then the scaled orthogonal step
+                if weight_decay != 0:
+                    p.mul_(1.0 - lr * weight_decay)
+                p.add_(g, alpha=-lr)
 
         return loss
 
@@ -130,7 +169,8 @@ def create_optimizer(model, cfg):
     train_cfg = cfg["training"]
     optim_type = train_cfg.get("optimizer", "muon_adamw8bit")
     lr = train_cfg.get("lr", 3e-4)
-    muon_lr = train_cfg.get("muon_lr", 0.02)
+    muon_lr = train_cfg.get("muon_lr", 3e-4)  # Moonlight/Kimi RMS-matched range (NOT raw 0.02)
+    compile_opt = bool(cfg.get("hardware", {}).get("compile_optimizer", False))  # Kaggle-only (compile broken locally)
     weight_decay = train_decay if (train_decay := train_cfg.get("weight_decay", 0.1)) else 0.1
 
     # Separate params by name:
@@ -145,10 +185,14 @@ def create_optimizer(model, cfg):
         is_embedding = "embed" in name or "lm_head" in name
         is_norm_bias = param.ndim <= 1 or "norm" in name or "bias" in name
         is_small = param.ndim == 2 and param.numel() <= 10000
+        # 3D stacked MoE expert tensors (BiBo + Qwen: ...experts.gate_up_proj / ...experts.down_proj)
+        # → Muon (orthogonalized per expert slice). Excludes 3D conv kernels (gate_conv) by name.
+        is_expert_3d = (param.ndim == 3 and "experts." in name
+                        and ("gate_up_proj" in name or "down_proj" in name))
 
         if is_embedding or is_norm_bias or is_small:
             adamw_params.append(param)
-        elif param.ndim == 2:
+        elif param.ndim == 2 or is_expert_3d:
             muon_params.append(param)
         else:
             adamw_params.append(param)
@@ -170,6 +214,7 @@ def create_optimizer(model, cfg):
             lr=muon_lr,
             momentum=0.95,
             weight_decay=weight_decay,
+            compile_ns=compile_opt,
         )
 
         # Combine into a single optimizer-like object
@@ -184,7 +229,7 @@ def create_optimizer(model, cfg):
             [{"params": adamw_params, "weight_decay": weight_decay}],
             lr=lr, betas=(0.9, 0.95), fused=fused,
         )
-        muon = Muon(muon_params, lr=muon_lr, momentum=0.95, weight_decay=weight_decay)
+        muon = Muon(muon_params, lr=muon_lr, momentum=0.95, weight_decay=weight_decay, compile_ns=compile_opt)
         optimizer = _CombinedOptimizer(muon, adamw)
         name = "Muon+AdamW(fused)" if fused else "Muon+AdamW"
 

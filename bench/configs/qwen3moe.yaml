@@ -42,7 +42,7 @@ training:
   seed: 42
   deterministic: true
   optimizer: "muon_adamw"       # identical to bibo.yaml — Muon for 2D weights + fused fp32 AdamW for embeds/norms (fair comparison)
-  muon_lr: 0.02
+  muon_lr: 3.0e-4               # RMS-matched Muon (Moonlight/Kimi band); identical to bibo.yaml
 
 eval:
   benchmarks: ["hellaswag"]
@@ -58,6 +58,7 @@ logging:
 
 hardware:
   compile: true
+  compile_optimizer: false   # torch.compile the Muon Newton-Schulz (Kaggle/T4 only; compile broken locally). Identical to bibo.yaml.
   triton: true
   grad_checkpoint: false
   fsdp: true

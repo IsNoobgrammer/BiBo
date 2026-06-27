@@ -50,7 +50,7 @@ training:
   seed: 42
   deterministic: true
   optimizer: "muon_adamw"       # Muon (Newton-Schulz orthogonalized) for 2D weights + FUSED fp32 AdamW for embeds/norms/scalars. Fused (not 8bit): T4 has memory to spare, fp32 states are cleaner + no bnb dependency. Use muon_adamw8bit if memory-bound.
-  muon_lr: 0.02                 # Muon LR for 2D matrices (AdamW lr above = embeds/norms/shared-scaling); 0.02 is the modded-nanogpt default
+  muon_lr: 3.0e-4               # Muon LR for 2D matrices, RMS-matched (Moonlight/Kimi/Mellum band 2e-4–4.2e-4). NOT raw 0.02 — Muon now applies the 0.2·√max(A,B) consistent-RMS scaling so AdamW-range LRs are correctly attributed.
 
 eval:
   benchmarks: ["hellaswag"]
@@ -66,6 +66,7 @@ logging:
 
 hardware:
   compile: true
+  compile_optimizer: false   # torch.compile the Muon Newton-Schulz (cuBLAS GEMM + fused elementwise + cudagraphs). Kaggle/T4 ONLY — compile is broken locally. A/B vs eager Muon before trusting (bench/bench_muon.py).
   triton: true
   grad_checkpoint: false
   fsdp: true
