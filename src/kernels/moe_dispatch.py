@@ -876,8 +876,9 @@ def triton_moe_experts_forward(
     for _c in expert_counts:
         boundaries.append(boundaries[-1] + _c)
 
-    # Output buffer
-    output = torch.zeros(num_tokens, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
+    # Output buffer — fp32 accumulator (matches eager BiBoFusedExperts + MiMo). Router weights are
+    # fp32; the weighted index_add accumulates in fp32, cast back to hidden dtype at the end.
+    output = torch.zeros(num_tokens, hidden_size, device=hidden_states.device, dtype=torch.float32)
 
     ACT_MAP = {"silu": 0, "relu2": 1, "tanh": 2}
 
@@ -915,7 +916,7 @@ def triton_moe_experts_forward(
             # Zero expert: multiply by 0, skip entirely (no-op)
             pass
 
-    return output
+    return output.to(hidden_states.dtype)
 
 
 # ═══════════════════════════════════════════════════════════════
