@@ -31,7 +31,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 from src.configuration_bibo import BiBoConfig
 from src.modeling.models import BiBoForCausalLM
 from src.kernels.patch import patch_bibo_with_triton
-from src.kernels.dense_mlp import patch_dense_mlp_with_triton
 from src.kernels.moe_dispatch import patch_moe_with_triton
 
 # ═══════════════════════════════════════════════════════════════
@@ -94,26 +93,22 @@ def count_params(model: torch.nn.Module) -> int:
 # Variants
 # ═══════════════════════════════════════════════════════════════
 
-VARIANTS = ['baseline', 'liger', 'dense_mlp', 'moe', 'all']
+VARIANTS = ['baseline', 'liger', 'moe', 'all']
 VARIANT_LABELS = {
     'baseline': 'Baseline',
     'liger': 'Liger (RMSNorm+RoPE)',
-    'dense_mlp': 'Dense MLP (Liger SwiGLU)',
-    'moe': 'MoE (Triton GLU)',
-    'all': 'All (Liger+MLP+MoE)',
+    'moe': 'MoE (per-expert, fused combine)',
+    'all': 'All (Liger+MoE)',
 }
 
 
 def apply_variant(model: torch.nn.Module, variant: str):
     if variant == 'liger':
         patch_bibo_with_triton(model)
-    elif variant == 'dense_mlp':
-        patch_dense_mlp_with_triton(model)
     elif variant == 'moe':
         patch_moe_with_triton(model)
     elif variant == 'all':
         patch_bibo_with_triton(model)
-        patch_dense_mlp_with_triton(model)
         patch_moe_with_triton(model)
 
 

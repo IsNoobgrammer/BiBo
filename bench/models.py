@@ -214,15 +214,14 @@ def apply_triton_kernels(model, config, no_triton=False, use_fused_ce=True):
 
         else:
             from src.kernels.patch import patch_qwen3_with_liger, patch_qwen3_fused_ce
-            from src.kernels.dense_mlp import patch_qwen_dense_mlp_with_triton
 
             patch_qwen3_with_liger(model)
             if use_fused_ce:
-                patch_qwen3_fused_ce(model)   # our kernel (not Liger's chunked CE)
-            patch_qwen_dense_mlp_with_triton(model)
-            dense_count = getattr(model, '_triton_qwen_dense_mlp_count', 0)
+                patch_qwen3_fused_ce(model)   # OUR fused_ce kernel — same one BiBo uses (not Liger's)
+            # Dense-MLP kernel dropped on BOTH sides — torch.compile handles dense MLP; keeps the
+            # BiBo-vs-Qwen bench symmetric (both compiled dense MLP, both our fused CE).
             ce_tag = " + FusedCE" if use_fused_ce else ""
-            print(f"  Triton: RMSNorm + RoPE{ce_tag} + Dense MLP x{dense_count}")
+            print(f"  Triton: RMSNorm + RoPE{ce_tag} (dense MLP compiled)")
 
     except Exception as e:
         print(f"  Triton FAILED: {e} — using PyTorch eager")

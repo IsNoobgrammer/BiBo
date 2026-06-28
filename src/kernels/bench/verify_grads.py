@@ -30,7 +30,6 @@ from src.configuration_bibo import BiBoConfig
 from src.modeling.models import BiBoForCausalLM
 from src.kernels.patch import patch_bibo_with_triton, unpatch_bibo
 from src.kernels.moe_dispatch import patch_moe_with_triton, unpatch_moe
-from src.kernels.dense_mlp import patch_dense_mlp_with_triton, unpatch_dense_mlp
 
 
 def make_test_model(device='cuda'):
@@ -76,7 +75,6 @@ def test_gradient_equivalence_fp32():
     # Apply all patches
     patch_bibo_with_triton(model_tri)
     patch_moe_with_triton(model_tri)
-    patch_dense_mlp_with_triton(model_tri)
 
     # Same input
     torch.manual_seed(123)
@@ -171,7 +169,6 @@ def test_gradient_equivalence_fp16():
 
     patch_bibo_with_triton(model_tri)
     patch_moe_with_triton(model_tri)
-    patch_dense_mlp_with_triton(model_tri)
 
     torch.manual_seed(123)
     input_ids = torch.randint(0, 1000, (2, 64)).to(device)
@@ -243,7 +240,6 @@ def test_no_frozen_params():
 
     patch_bibo_with_triton(model)
     patch_moe_with_triton(model)
-    patch_dense_mlp_with_triton(model)
 
     torch.manual_seed(123)
     input_ids = torch.randint(0, 1000, (4, 64)).to(device)
@@ -301,7 +297,6 @@ def test_no_stale_buffers():
 
     patch_bibo_with_triton(model)
     patch_moe_with_triton(model)
-    patch_dense_mlp_with_triton(model)
 
     bad_buffers = []
     for name, _ in model.named_buffers():
@@ -337,7 +332,6 @@ def test_multi_step_convergence():
     model_tri.load_state_dict(model_ref.state_dict())
     patch_bibo_with_triton(model_tri)
     patch_moe_with_triton(model_tri)
-    patch_dense_mlp_with_triton(model_tri)
     opt_tri = torch.optim.AdamW(model_tri.parameters(), lr=1e-3)
 
     # Fixed data for overfitting

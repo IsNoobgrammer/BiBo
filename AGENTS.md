@@ -290,7 +290,7 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 - MoE dispatch loop is fine for ≤16 experts on single GPU; needs grouped GEMM for 64+ experts with EP
 - All MoE Triton kernels now have custom Triton backward kernels (not PyTorch fallback)
 - GQA uses `repeat_kv` + plain SDPA (NOT `enable_gqa` — that hit the slow MATH backend; see design decision #10, reversed Jun 25 2026)
-- **(June 28 2026) Conv kernel REMOVED; BiBo kernel set is now exactly 3.** `conv_fused.py` (fused conv router + conv expert kernels) + its benches (`bench_conv.py`, `bench_conv_router.py`) and the conv tests/sections in `verify_grads.py`/`bench_isolated_kernels.py` are deleted; `__init__.py` and `bench/models.py` no longer import/patch it. **The 3 custom kernels: MoE (`moe_dispatch.py`), XSA (`xsa_fused.py`), fused-linear CE (`fused_ce.py`)** — plus external Liger RMSNorm/RoPE. The conv ROUTER capability still exists in the model (`router_type="conv"` runs eager); only its Triton kernel is gone (bench configs use `"mlp"`). `dense_mlp.py` / `moe_grouped.py` remain on disk but are NOT in the training set (compile handles dense MLP; grouped is the dead tl.dot path on T4) — candidates for removal too.
+- **(June 28 2026) Conv kernel REMOVED; BiBo kernel set is now exactly 3.** `conv_fused.py` (fused conv router + conv expert kernels) + its benches (`bench_conv.py`, `bench_conv_router.py`) and the conv tests/sections in `verify_grads.py`/`bench_isolated_kernels.py` are deleted; `__init__.py` and `bench/models.py` no longer import/patch it. **The 3 custom kernels: MoE (`moe_dispatch.py`), XSA (`xsa_fused.py`), fused-linear CE (`fused_ce.py`)** — plus external Liger RMSNorm/RoPE. The conv ROUTER capability still exists in the model (`router_type="conv"` runs eager); only its Triton kernel is gone (bench configs use `"mlp"`). **`dense_mlp.py` and `moe_grouped.py` also REMOVED** (dense MLP → torch.compile both BiBo and Qwen; grouped = dead tl.dot on T4). The Qwen baseline's CE uses **our** `fused_ce` kernel (`patch_qwen3_fused_ce`), same as BiBo — symmetric.
   **Planned kernels (add as benched, local + T4):** (1) a FUSED whole-router (conv OR mlp variant); (2) fuse the WHOLE MoE layer (RMSNorm → router → experts → RMSNorm) into one; (3) fuse the attention block into one. Each lands only after grad-equivalence + a T4 win vs the compiled baseline (Rules 1–4).
 - **(June 26 2026) FlashAttention-Turing — PLANNED attention lever for seq ≥ 2k (scoped, NOT integrated).**
   Repo: `ssiu/flash-attention-turing` (https://github.com/ssiu/flash-attention-turing) — a from-scratch
@@ -310,7 +310,7 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 - **(June 24 2026) Benchmark in fp16, not fp32** — T4 (training GPU) is fp16-only. The old fp32 numbers in `docs/kernel_benchmark_report.md` are unreliable (see correction header there). Use `triton.testing.do_bench`, never the hand-rolled 3-sample timer.
 - **(June 24 2026) MoE dispatch sync fix** — `triton_moe_experts_forward` now builds expert boundaries as CPU ints (was comparing CUDA scalar tensors per expert → implicit GPU sync per iter). Took the per-expert path from 0.84x regression → 1.40x vs eager (fp16).
 - **(June 28 2026) MoE per-expert path got a MANUAL backward + fused fp32 combine (`_BiBoPerExpertMoE` in `moe_dispatch.py`).** Was autograd-composition (forward-only Triton GLU; autograd auto-generated backward → grad-accum `add_` + per-op `fill_` glue ≈ 21% of fwd+bwd). Now one custom `autograd.Function`: per-expert dX/dW cuBLAS GEMMs + the existing GLU fwd/bwd kernels + a **fused weighted-scatter/gather combine** (`_combine_scatter_kernel`/`_combine_bwd_kernel`: `(eo·w)`→fp32 atomic-add; bwd gathers `grad_out[tok]`, emits `grad_eo=go·w` and `grad_w=Σ_h(go·eo)` — collapses the old mul+cast+index_add into 1 kernel each way), and ONE `index_add_` per expert for grad_hidden. **Scales m and n**: loop branches on expert index — `< num_polyglu`(=3·`polyglu_expert_multiplier`) GLU (weight slot e), `< zero_start` Identity (weighted passthrough, no GEMM), else Zero (skip). **Ported from `triton-kernel-fused` (T4-verified there: fwd+bwd 1.80→3.03× / 1.11× less mem vs compiled Qwen3MoE-eager, backward 2.5→5.9× — specials skip the GLU backward).** **Autocast-correct**: backward casts params to the compute dtype for the matmuls and grads back to each param's dtype on return (mirrors autograd-AMP). Verified vs eager `BiBoFusedExperts` on the 3050: fp32 grads ~1e-7, autocast-fp16 out ~6e-6 / weight-grads bit-identical, NaN-free, full-model patched loss matches eager 1.4e-5 — across m∈{2,3,4}, n∈{0,1,2}. All GLU kernels' tanh = **`libdevice.tanh`** (hardware, matches eager `torch.tanh` exactly, stable) — replaced BiBo's old forward `(e^2x−1)/(e^2x+1)` which OVERFLOWS to NaN for large gate; now bit-identical to tkf (cross-check `src/.autoresearch/bench_moe_vs_tkf.py`: fp32 0.0 across m∈{1..4}/n∈{0..2}). ⚠️ `_combine_bwd_kernel` reduces grad_w over the full H in one block (fine for hidden_size ≤ ~1024; needs a 2-stage reduce above that). Old forward-only `triton_fused_glu_activation`/`_FusedWeightScatterFunction` kept as reference (unused by the patched path). The tkf bench (`bench.py`) grew `--profile` (torch.profiler launch-count + per-op CUDA-time map) and `--no-special` (A/B the 9-GLU-only vs 9+Identity+Zero stack).
-- **(June 24 2026) Grouped-GEMM MoE** (`moe_grouped.py`, opt-in via `patch_moe_grouped`) — forward ~2–2.5x, fwd+bwd ~2x at 4k–8k tokens vs eager (fp16). **Certify the 16384-tok training shape on T4** — the 4GB RTX 3050 can't measure it (thermal + allocator pressure). Cert harness: `src/kernels/.autoresearch/bench_real.py`. Stays opt-in until T4-verified; per-expert path remains default.
+- **(June 24 2026; module REMOVED Jun 28) Grouped-GEMM MoE** (`moe_grouped.py`) — forward ~2–2.5x, fwd+bwd ~2x at 4k–8k tokens vs eager (fp16). **Certify the 16384-tok training shape on T4** — the 4GB RTX 3050 can't measure it (thermal + allocator pressure). Cert harness: `src/kernels/.autoresearch/bench_real.py`. Stays opt-in until T4-verified; per-expert path remains default.
 - **(June 24 2026) CE default = standard non-chunked fused CE** — `models.py` now defaults to
   `logits = lm_head(x)` + `F.cross_entropy` (aten-fused, non-chunked). Liger's chunked CE was REMOVED.
 - **(June 25 2026) Opt-in CE = BiBo's OWN fused-linear-CE Triton kernel** (`src/kernels/fused_ce.py`),
@@ -486,8 +486,9 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
      **added the XSA kernel** (`patch_xsa_with_triton()`, gated on `config.use_xsa`); fused CE stays on
      (`use_fused_ce=True` → `config.use_fused_linear_ce`). Net BiBo Triton set now = Liger RMSNorm+RoPE,
      MoE dispatch, XSA, fused-linear CE — NO dense-MLP kernel, NO conv-router kernel (removed Jun 28).
-     ⚠️ Qwen branch still patches `patch_qwen_dense_mlp_with_triton`; drop it too if you want the
-     BiBo-vs-Qwen bench to treat dense-MLP identically (both compiled).
+     The Qwen branch ALSO dropped `patch_qwen_dense_mlp_with_triton` (Jun 28) — both models now
+     compile dense MLP and both route CE through OUR `fused_ce` kernel (`patch_qwen3_fused_ce`):
+     fully symmetric except BiBo's PolyGLU experts vs Qwen's homogeneous SwiGLU.
 - **(June 27 2026) BiBo↔Qwen now PARAM-MATCHED on BOTH axes; shared expert OFF by default.** Bench
   expert layout bumped 6→**9 GLU** (`polyglu_expert_multiplier: 2→3`) + 2 param-free specials = 11
   routed; Qwen `num_experts: 8→9`. A PolyGLU expert and a SwiGLU expert are param-identical, so 9
@@ -507,7 +508,7 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   off). Configs touched: `bibo.yaml`, `qwen3moe.yaml`, `bibo_vanilla.yaml`, `bibo_no_ssmax.yaml`
   (the last is a stale divergent 16L config — bumped for layout consistency only). ⚠️ Existing
   8-expert checkpoints are now architecture-incompatible (router/expert dims changed) — retrain.
-- **(June 24 2026) `patch_moe_auto` (recommended MoE patch)** — per-call dispatch: grouped path for `n_tokens >= GROUPED_MIN_TOKENS` (default 4096), else the fixed per-expert path. Beats PyTorch eager across all token regimes by construction (both branches grad-verified). Tune `GROUPED_MIN_TOKENS` after T4 cert.
+- **(June 24 2026; REMOVED Jun 28 — per-expert is the only MoE path) `patch_moe_auto`** — per-call dispatch: grouped path for `n_tokens >= GROUPED_MIN_TOKENS` (default 4096), else the fixed per-expert path. Beats PyTorch eager across all token regimes by construction (both branches grad-verified). Tune `GROUPED_MIN_TOKENS` after T4 cert.
 - **(June 26 2026) Partial RoPE head-split (`rope_nope_ratio=0.5` = 2:2, DEFAULT)** — first `round(num_heads*(1-ratio))` query heads + corresponding KV heads get full RoPE+NTK; the remaining heads are NoPE (no positional encoding). At the **12h/2kv default**: 6 RoPE+NTK heads (1 RoPE KV group) + 6 NoPE content heads (1 NoPE KV group) — clean KV-group split, no GQA geometry change needed (group size 6; 6%6=0). Empirical (synthetic passkey + MQAR length-gen, train@128, eval to 32×, 3 seeds): more NoPE monotonically improves extrapolation — pure NoPE hits XG=1.000 on both tasks vs full-RoPE+NTK 0.93 (passkey) / 0.33 (MQAR); 2:2 gets 0.99 (passkey) / 0.50 (MQAR). **2:2 chosen as the default** (not higher NoPE): our retrieval evals treat position as *noise* (RoPE's worst case), so they overstate NoPE's value for a general LM where position is signal — 2:2 keeps half the heads positional, and is the only partial ratio that's KV-aligned at 12h/2kv without changing GQA. Mechanism: RoPE position-encodes key tokens by *where* they're planted → breaks key-matching; NoPE heads match position-independently; SSMax sharpens; causal mask gives implicit scale-free position. **The boundary must align with KV groups** (config validation enforced; only {0.0, 0.5} valid at 12h/2kv). `rope_nope_ratio=0.0` restores original all-RoPE. **IID/downstream cost of NoPE is UNMEASURED** (our synthetic evals saturate to 1.00 at train length) — Kaggle ablation on real-LM perplexity needed before pushing the ratio higher (would require changing GQA geometry to unlock 0.25/0.75). See `src/.autoresearch/FINDINGS.md` (2026-06-26 V10 + MQAR).
 
 ---
@@ -522,18 +523,16 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 src/kernels/
 ├── __init__.py              # Exports all patching functions
 ├── patch.py                 # Liger-Kernel patches (RMSNorm, RoPE)
+# The 3-kernel training set (+ Liger RMSNorm/RoPE via patch.py):
 ├── moe_dispatch.py          # MoE per-expert dispatch: manual backward + fused fp32 combine
 ├── xsa_fused.py             # XSA (Exclusive Self Attention) rejection kernel
-├── fused_ce.py              # fused-linear cross-entropy
-├── dense_mlp.py             # Triton fused SwiGLU for dense MLP (NOT in training set — compile handles it)
+├── fused_ce.py              # fused-linear cross-entropy (BiBo + Qwen baseline both use it)
 └── bench/                   # All kernel benchmarks
     ├── __init__.py
     ├── bench_utils.py       # Shared: benchmark_phase, gradient check, NaN check
-    ├── profile_benchmark.py # torch.profiler 4-way benchmark (Baseline/Liger/Triton/Triton+AT)
-    ├── verify_grads.py      # Gradient equivalence verification (6 tests)
+    ├── profile_benchmark.py # torch.profiler benchmark (Baseline/Liger/MoE/All)
+    ├── verify_grads.py      # Gradient equivalence verification
     ├── bench_moe.py         # MoE benchmark (correctness + 3-phase perf)
-    ├── bench_dense_mlp.py   # Dense MLP 3-variant head-to-head
-    ├── bench_conv.py        # Conv fusion benchmark
     ├── bench_moe_fwdbwd.py  # MoE full fwd+bwd training step benchmark
     └── verify_e2e.py        # Full model E2E verification
 
@@ -551,11 +550,8 @@ old_kernels/                  # Retired variants (kept for re-benchmarking)
 | `_fused_down_weight_kernel` | moe_dispatch.py | Triton | **Triton** (integrated) | Production |
 | `_fused_weight_scatter_kernel` | moe_dispatch.py | Triton | **Triton** (scatter→gather) | Production |
 | `_fused_router_kernel` | moe_dispatch.py | Triton | N/A (detached) | Production |
-| `_batched_glu_act_kernel` | moe_dispatch.py | Triton | **Triton** (`_TritonFusedGLUFunction`) | Production |
-| `_grouped_mm_kernel` | moe_grouped.py | Triton | **Triton** (`_GroupedMoE`, transposed via strides) | Opt-in (large-seq) |
-| `_grouped_wgrad_kernel` | moe_grouped.py | N/A | **Triton** (per-expert weight grads) | Opt-in (large-seq) |
+| `_batched_glu_act_kernel` | moe_dispatch.py | Triton | **Triton** (`_TritonFusedGLUFunction`) | reference (unused by patched path) |
 | `_combine_scatter_kernel` / `_combine_bwd_kernel` | moe_dispatch.py | Triton | **Triton** (in `_BiBoPerExpertMoE`) | Production (fused fp32 combine) |
-| `_fused_swiglu_*_kernel` | dense_mlp.py | Triton | **Triton** (`_FusedSwiGLUFull`) | NOT in training set (compile handles dense MLP) |
 | Liger RMSNorm | patch.py | Triton | Triton (Liger) | Production |
 | Liger RoPE | patch.py | Triton | Triton (Liger) | Production |
 | Liger SiLUMul | patch.py | Triton | Triton (Liger) | Production |
@@ -678,7 +674,6 @@ Triton GEMM that replaces cuBLAS without fusion rarely wins.
 ### Running Benchmarks
 
 ```bash
-.\\.venv\\Scripts\\python src/kernels/bench/bench_dense_mlp.py   # Dense MLP (3-variant head-to-head)
 .\\.venv\\Scripts\\python src/kernels/bench/bench_moe.py         # MoE layer
 .\\.venv\\Scripts\\python src/kernels/bench/bench_conv.py        # Conv fusion
 .\\.venv\\Scripts\\python src/kernels/bench/bench_moe_fwdbwd.py  # Full fwd+bwd
