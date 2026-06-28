@@ -316,13 +316,13 @@ class _CombinedOptimizer(optim.Optimizer):
 def create_scheduler(optimizer, warmup_steps, total_steps, min_lr_ratio=0.1,
                      scheduler="cosine", decay_frac=0.05,
                      whd5_fracs=(0.1, 0.5, 0.1, 0.2), whd5_mid=0.10,
-                     wsd_fracs=(0.15, 0.6, 0.25)):
+                     wsd_fracs=(0.05, 0.6, 0.35)):
     """LR schedule with linear warmup. scheduler = "cosine" | "whd" | "whd5".
 
     cosine — linear warmup (warmup_steps) → cosine decay to min_lr_ratio*peak (AdamW default).
     whd    — WSD (Warmup-Stable-Decay, Mellum 2 / GLM-4.5, arXiv:2605.31268): FRACTIONAL 3-phase
-             (warmup_steps + decay_frac IGNORED here) — warmup → HOLD@peak → LINEAR decay→0, split
-             by wsd_fracs (default 0.15 warmup / 0.60 hold / 0.25 decay; must sum to 1.0).
+             (warmup_steps + decay_frac IGNORED here) — warmup → HOLD@peak → COSINE decay→0, split
+             by wsd_fracs (default 0.05 warmup / 0.60 hold / 0.35 decay; must sum to 1.0).
     whd5   — custom 5-phase staircase WHD (the Muon goto / config default). Fractions of total_steps;
              warmup is FRACTIONAL here (whd5_fracs[0]), so `warmup_steps` is IGNORED for this type:
                warmup(.1)→hold@peak(.5)→linear decay→whd5_mid over (.1)→hold@whd5_mid(.2)→
@@ -347,7 +347,8 @@ def create_scheduler(optimizer, warmup_steps, total_steps, min_lr_ratio=0.1,
             p = step / max(total_steps, 1)
             if p < w:      return p / max(w, 1e-9)                             # warmup 0→peak
             if p < w + h:  return 1.0                                          # stable @ peak
-            return max(1.0 - (p - (w + h)) / max(1.0 - (w + h), 1e-9), 0.0)    # linear decay → 0
+            prog = min((p - (w + h)) / max(1.0 - (w + h), 1e-9), 1.0)          # 0→1 over decay phase
+            return 0.5 * (1.0 + math.cos(math.pi * prog))                      # cosine decay → 0
 
         if step < warmup_steps:
             return step / max(warmup_steps, 1)

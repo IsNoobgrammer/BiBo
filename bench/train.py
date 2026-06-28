@@ -266,7 +266,7 @@ def train(args):
         print(f"{TAG}   Steps: {train_cfg['total_steps']}")
         print(f"{TAG}   Optimizer: {train_cfg.get('optimizer', 'muon_adamw8bit')}")
         _sched = train_cfg.get("scheduler", "cosine")
-        _sdesc = {"whd": "WSD: 15% warmup → 60% hold → 25% linear decay to 0",
+        _sdesc = {"whd": "WSD: 5% warmup → 60% hold → 35% cosine decay to 0",
                   "whd5": "5-phase: warmup→hold→step to 10%→hold→decay to 0",
                   "cosine": "warmup + cosine decay"}.get(_sched, "")
         print(f"{TAG}   Scheduler: {_sched} ({_sdesc})")
