@@ -290,7 +290,8 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 - MoE dispatch loop is fine for ≤16 experts on single GPU; needs grouped GEMM for 64+ experts with EP
 - All MoE Triton kernels now have custom Triton backward kernels (not PyTorch fallback)
 - GQA uses `repeat_kv` + plain SDPA (NOT `enable_gqa` — that hit the slow MATH backend; see design decision #10, reversed Jun 25 2026)
-- Conv kernels (conv_fused.py) intentionally not used — 0.41x slower due to kernel launch overhead on small tensors
+- **(June 28 2026) Conv kernel REMOVED; BiBo kernel set is now exactly 3.** `conv_fused.py` (fused conv router + conv expert kernels) + its benches (`bench_conv.py`, `bench_conv_router.py`) and the conv tests/sections in `verify_grads.py`/`bench_isolated_kernels.py` are deleted; `__init__.py` and `bench/models.py` no longer import/patch it. **The 3 custom kernels: MoE (`moe_dispatch.py`), XSA (`xsa_fused.py`), fused-linear CE (`fused_ce.py`)** — plus external Liger RMSNorm/RoPE. The conv ROUTER capability still exists in the model (`router_type="conv"` runs eager); only its Triton kernel is gone (bench configs use `"mlp"`). `dense_mlp.py` / `moe_grouped.py` remain on disk but are NOT in the training set (compile handles dense MLP; grouped is the dead tl.dot path on T4) — candidates for removal too.
+  **Planned kernels (add as benched, local + T4):** (1) a FUSED whole-router (conv OR mlp variant); (2) fuse the WHOLE MoE layer (RMSNorm → router → experts → RMSNorm) into one; (3) fuse the attention block into one. Each lands only after grad-equivalence + a T4 win vs the compiled baseline (Rules 1–4).
 - **(June 26 2026) FlashAttention-Turing — PLANNED attention lever for seq ≥ 2k (scoped, NOT integrated).**
   Repo: `ssiu/flash-attention-turing` (https://github.com/ssiu/flash-attention-turing) — a from-scratch
   FlashAttention for **sm_75 / T4** (Dao's official flash-attn refuses Turing). Fits BiBo: **head_dim
@@ -484,7 +485,7 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
      lifted SiLU-mul ties a hand kernel (it's noise), so dense-MLP activation is left to the compiler;
      **added the XSA kernel** (`patch_xsa_with_triton()`, gated on `config.use_xsa`); fused CE stays on
      (`use_fused_ce=True` → `config.use_fused_linear_ce`). Net BiBo Triton set now = Liger RMSNorm+RoPE,
-     MoE-GLU dispatch, conv-router (if `router_type="conv"`), XSA, fused-linear CE — NO dense-MLP kernel.
+     MoE dispatch, XSA, fused-linear CE — NO dense-MLP kernel, NO conv-router kernel (removed Jun 28).
      ⚠️ Qwen branch still patches `patch_qwen_dense_mlp_with_triton`; drop it too if you want the
      BiBo-vs-Qwen bench to treat dense-MLP identically (both compiled).
 - **(June 27 2026) BiBo↔Qwen now PARAM-MATCHED on BOTH axes; shared expert OFF by default.** Bench
@@ -521,9 +522,10 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 src/kernels/
 ├── __init__.py              # Exports all patching functions
 ├── patch.py                 # Liger-Kernel patches (RMSNorm, RoPE)
-├── moe_dispatch.py          # Triton MoE kernels (fused GLU activation, router)
-├── dense_mlp.py             # Triton fused SwiGLU for dense MLP layers
-├── conv_fused.py            # Triton fused conv permute + activation + gate
+├── moe_dispatch.py          # MoE per-expert dispatch: manual backward + fused fp32 combine
+├── xsa_fused.py             # XSA (Exclusive Self Attention) rejection kernel
+├── fused_ce.py              # fused-linear cross-entropy
+├── dense_mlp.py             # Triton fused SwiGLU for dense MLP (NOT in training set — compile handles it)
 └── bench/                   # All kernel benchmarks
     ├── __init__.py
     ├── bench_utils.py       # Shared: benchmark_phase, gradient check, NaN check
@@ -552,9 +554,8 @@ old_kernels/                  # Retired variants (kept for re-benchmarking)
 | `_batched_glu_act_kernel` | moe_dispatch.py | Triton | **Triton** (`_TritonFusedGLUFunction`) | Production |
 | `_grouped_mm_kernel` | moe_grouped.py | Triton | **Triton** (`_GroupedMoE`, transposed via strides) | Opt-in (large-seq) |
 | `_grouped_wgrad_kernel` | moe_grouped.py | N/A | **Triton** (per-expert weight grads) | Opt-in (large-seq) |
-| `_fused_swiglu_*_kernel` | dense_mlp.py | Triton | **Triton** (`_FusedSwiGLUFull`) | Gold standard |
-| `_fused_permute_act_gate_kernel` | conv_fused.py | Triton | **Triton** (`_TritonConvGateMultiplyFunction`) | Production |
-| `_fused_permute_act_kernel` | conv_fused.py | Triton | **Triton** (`_TritonPermuteActFunction`) | Production |
+| `_combine_scatter_kernel` / `_combine_bwd_kernel` | moe_dispatch.py | Triton | **Triton** (in `_BiBoPerExpertMoE`) | Production (fused fp32 combine) |
+| `_fused_swiglu_*_kernel` | dense_mlp.py | Triton | **Triton** (`_FusedSwiGLUFull`) | NOT in training set (compile handles dense MLP) |
 | Liger RMSNorm | patch.py | Triton | Triton (Liger) | Production |
 | Liger RoPE | patch.py | Triton | Triton (Liger) | Production |
 | Liger SiLUMul | patch.py | Triton | Triton (Liger) | Production |

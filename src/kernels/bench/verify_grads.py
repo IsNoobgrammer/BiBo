@@ -54,29 +54,6 @@ def make_test_model(device='cuda'):
     return cfg, model
 
 
-def make_conv_test_model(device='cuda'):
-    """Create a small BiBo model with conv router + conv shared expert."""
-    cfg = BiBoConfig(
-        vocab_size=1000,
-        hidden_size=128,
-        num_hidden_layers=4,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        intermediate_size=256,
-        moe_intermediate_size=128,
-        polyglu_expert_multiplier=2,
-        special_expert_pairs=1,
-        num_experts_per_tok=2,
-        max_position_embeddings=512,
-        moe_shared_scaling=2.0,
-        use_ssmax=True,
-        router_type="conv",
-        shared_expert_type="conv",
-    )
-    model = BiBoForCausalLM(cfg).to(device).train()
-    return cfg, model
-
-
 def test_gradient_equivalence_fp32():
     """Test gradient equivalence in fp32 (strict tolerance)."""
     print("\n" + "=" * 60)
@@ -409,89 +386,6 @@ def test_multi_step_convergence():
     return True
 
 
-def test_conv_gradient_flow():
-    """Test gradient flow with conv router + conv shared expert + all Triton patches."""
-    print("\n" + "=" * 60)
-    print("TEST: Conv Model Gradient Flow (router_type=conv, shared=conv)")
-    print("=" * 60)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
-
-    # Reference (unpatched conv model)
-    _, model_ref = make_conv_test_model(device)
-
-    # Patched conv model (same weights)
-    torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
-    _, model_tri = make_conv_test_model(device)
-    model_tri.load_state_dict(model_ref.state_dict())
-
-    from src.kernels.conv_fused import patch_conv_router_with_triton, patch_conv_expert_with_triton
-    patch_bibo_with_triton(model_tri)
-    patch_moe_with_triton(model_tri)
-    patch_dense_mlp_with_triton(model_tri)
-    patch_conv_router_with_triton(model_tri)
-    patch_conv_expert_with_triton(model_tri)
-
-    # Same input
-    torch.manual_seed(123)
-    input_ids = torch.randint(0, 1000, (2, 64)).to(device)
-
-    # Forward + backward (reference)
-    out_ref = model_ref(input_ids=input_ids, labels=input_ids)
-    out_ref.loss.backward()
-
-    # Forward + backward (triton)
-    out_tri = model_tri(input_ids=input_ids, labels=input_ids)
-    out_tri.loss.backward()
-
-    loss_diff = abs(out_ref.loss.item() - out_tri.loss.item())
-    print(f"  Loss: ref={out_ref.loss.item():.6f}, tri={out_tri.loss.item():.6f}, diff={loss_diff:.2e}")
-
-    # Check all params have gradients
-    failures = []
-    max_grad_diff = 0.0
-    checked = 0
-
-    for (name_ref, p_ref), (name_tri, p_tri) in zip(
-        model_ref.named_parameters(), model_tri.named_parameters()
-    ):
-        if p_ref.grad is None and p_tri.grad is None:
-            continue
-        checked += 1
-
-        if p_ref.grad is not None and p_tri.grad is None:
-            failures.append(f"  FAIL: {name_tri} has grad=None (ref has grad)")
-            continue
-
-        if p_ref.grad is not None and p_tri.grad is not None:
-            ref_norm = p_ref.grad.norm().item()
-            tri_norm = p_tri.grad.norm().item()
-            if tri_norm == 0 and ref_norm > 0:
-                failures.append(f"  FAIL: {name_tri} has zero grad (ref norm={ref_norm:.4e})")
-                continue
-
-            diff = (p_ref.grad - p_tri.grad).abs().max().item()
-            max_grad_diff = max(max_grad_diff, diff)
-            if diff > 1e-3:
-                failures.append(f"  FAIL: {name_tri} grad diff={diff:.2e} > 1e-3")
-
-    print(f"  Parameters checked: {checked}")
-    print(f"  Max gradient difference: {max_grad_diff:.2e}")
-
-    if failures:
-        print(f"\n  FAILURES ({len(failures)}):")
-        for f in failures[:10]:
-            print(f"    {f}")
-        print(f"\n  RESULT: FAIL")
-        return False
-    else:
-        print(f"\n  RESULT: PASS (conv model gradients match within 1e-3)")
-        return True
-
-
 if __name__ == "__main__":
     print("=" * 60)
     print("GRADIENT EQUIVALENCE VERIFICATION")
@@ -510,7 +404,6 @@ if __name__ == "__main__":
     results['no_frozen'] = test_no_frozen_params()
     results['no_buffers'] = test_no_stale_buffers()
     results['convergence'] = test_multi_step_convergence()
-    results['conv_grads'] = test_conv_gradient_flow()
 
     print("\n" + "=" * 60)
     print("SUMMARY")

@@ -8,11 +8,9 @@ Two fixed baselines:
   1. Baseline: Pure PyTorch eager (zero patches)
   2. Liger: Liger-Kernel only (reference, not tested per-component)
 
-Four isolated kernel tests:
+Isolated kernel tests:
   1. Dense MLP: BiBoMLP module — 3 variants
   2. MoE GLU: BiBoFusedExperts module — fused GLU activation
-  3. Conv Expert: BiBoCausalConv1D module — fused permute+act+gate
-  4. Conv Router: BiBoMoERouter module — optimized conv router
 
 Each test follows the 4 mandatory rules (per config):
   Rule 1: Gradient alignment with baseline (per-param diff, cosine sim)
@@ -23,8 +21,6 @@ Each test follows the 4 mandatory rules (per config):
 Run: .\\venv\\Scripts\\python src\\kernels\\bench\\bench_isolated_kernels.py
       .\\venv\\Scripts\\python src\\kernels\\bench\\bench_isolated_kernels.py --section dense_mlp
       .\\venv\\Scripts\\python src\\kernels\\bench\\bench_isolated_kernels.py --section moe
-      .\\venv\\Scripts\\python src\\kernels\\bench\\bench_isolated_kernels.py --section conv_expert
-      .\\venv\\Scripts\\python src\\kernels\\bench\\bench_isolated_kernels.py --section conv_router
 """
 import sys
 import os
@@ -370,141 +366,13 @@ def section_moe():
 # SECTION 3: Conv Expert
 # ═══════════════════════════════════════════════════════════════
 
-def section_conv_expert():
-    print_separator("SECTION 3: Conv Expert Fused — Triton vs baseline (multi-config)")
-    from src.kernels.conv_fused import _TritonConvGateMultiplyFunction
-    device = 'cuda'
-
-    all_gm, all_gc, all_ld, all_sp = [], [], [], []
-
-    for h, i, moe_i, seqs, label in CONFIGS:
-        for seq in seqs:
-            print_config_header(h, i, moe_i, seq, label)
-            B, S, I = BATCH, seq, moe_i
-
-            c = torch.randn(B, I, S, device=device, dtype=torch.float32, requires_grad=True)
-            u = torch.randn(B, S, I, device=device, dtype=torch.float32, requires_grad=True)
-
-            # Baseline
-            c_b = c.detach().clone().requires_grad_(True)
-            u_b = u.detach().clone().requires_grad_(True)
-            ref = F.silu(c_b.permute(0, 2, 1)) * u_b
-            lb = ref.sum().item()
-            ref.sum().backward()
-
-            # Triton
-            c_t = c.detach().clone().requires_grad_(True)
-            u_t = u.detach().clone().requires_grad_(True)
-            tri = _TritonConvGateMultiplyFunction.apply(c_t, u_t, 0)
-            lt = tri.sum().item()
-            tri.sum().backward()
-
-            gm = max((c_b.grad - c_t.grad).abs().max().item(), (u_b.grad - u_t.grad).abs().max().item())
-            gc = 1.0
-            ld = abs(lb - lt)
-
-            # Forward diff
-            c2 = c.detach().clone()
-            u2 = u.detach().clone()
-            fwd_diff = (F.silu(c2.permute(0,2,1)) * u2 - _TritonConvGateMultiplyFunction.apply(c2.clone(), u2.clone(), 0)).abs().max().item()
-            print(f"  │ grad_max={gm:.2e}  fwd_diff={fwd_diff:.2e}  loss_diff={ld:.2e}")
-
-            # Perf
-            def bf():
-                c2 = torch.randn(B, I, S, device=device, dtype=torch.float32, requires_grad=True)
-                u2 = torch.randn(B, S, I, device=device, dtype=torch.float32, requires_grad=True)
-                (F.silu(c2.permute(0,2,1)) * u2).sum().backward()
-            def tf():
-                c2 = torch.randn(B, I, S, device=device, dtype=torch.float32, requires_grad=True)
-                u2 = torch.randn(B, S, I, device=device, dtype=torch.float32, requires_grad=True)
-                _TritonConvGateMultiplyFunction.apply(c2, u2, 0).sum().backward()
-
-            br = benchmark_phase(bf, "base", 5, 10, False)
-            tr = benchmark_phase(tf, "triton", 5, 10, False)
-            sp = br['median_ms'] / tr['median_ms'] if tr['median_ms'] > 0 else 0
-            print(f"  │ baseline={br['median_ms']:.3f}ms  triton={tr['median_ms']:.3f}ms  speedup={sp:.2f}x")
-
-            all_gm.append(gm); all_gc.append(gc); all_ld.append(ld); all_sp.append(sp)
-
-            del c, u, c_b, u_b, c_t, u_t
-            torch.cuda.empty_cache()
-
-    print_separator("CONV EXPERT — AVERAGED ACROSS ALL CONFIGS")
-    print(f"  Avg grad max:  {sum(all_gm)/len(all_gm):.2e}")
-    print(f"  Avg loss diff: {sum(all_ld)/len(all_ld):.2e}")
-    print(f"  Avg speedup:   {sum(all_sp)/len(all_sp):.2f}x")
-    print(f"  Min speedup:   {min(all_sp):.2f}x")
-    print(f"  Max speedup:   {max(all_sp):.2f}x")
-
-
-# ═══════════════════════════════════════════════════════════════
-# SECTION 4: Conv Router
-# ═══════════════════════════════════════════════════════════════
-
-def section_conv_router():
-    print_separator("SECTION 4: Conv Router — Triton vs baseline (multi-config)")
-    from src.modeling.ffn.router import BiBoMoERouter
-    from src.kernels.conv_fused import triton_causal_conv1d_router
-    device = 'cuda'
-
-    all_ld, all_sp = [], []
-
-    for h, i, moe_i, seqs, label in CONFIGS:
-        config = make_config(h, i, moe_i)
-        config.router_type = "conv"
-        for seq in seqs:
-            print_config_header(h, i, moe_i, seq, label)
-            B, S, H = BATCH, seq, h
-            E = config.num_routed_experts
-
-            router = BiBoMoERouter(config).to(device).float().train()
-            x = torch.randn(B, S, H, device=device, dtype=torch.float32)
-
-            with torch.no_grad():
-                # Baseline
-                x_p = F.pad(x.permute(0, 2, 1), (router.kernel_size - 1, 0))
-                lb = F.conv1d(x_p, router.gate_conv.weight)
-                lb_flat = lb.permute(0, 2, 1).reshape(B * S, E)
-
-                # Triton
-                lt = triton_causal_conv1d_router(x, router.gate_conv.weight, E, router.kernel_size)
-
-            ld = (lb_flat.float() - lt.float()).abs().max().item()
-            print(f"  │ logits_diff={ld:.2e}")
-
-            # Perf
-            def bf():
-                with torch.no_grad():
-                    xp = F.pad(x.permute(0, 2, 1), (router.kernel_size - 1, 0))
-                    F.conv1d(xp, router.gate_conv.weight)
-            def tf():
-                with torch.no_grad():
-                    triton_causal_conv1d_router(x, router.gate_conv.weight, E, router.kernel_size)
-
-            br = benchmark_phase(bf, "base", 5, 10, False)
-            tr = benchmark_phase(tf, "triton", 5, 10, False)
-            sp = br['median_ms'] / tr['median_ms'] if tr['median_ms'] > 0 else 0
-            print(f"  │ baseline={br['median_ms']:.3f}ms  triton={tr['median_ms']:.3f}ms  speedup={sp:.2f}x")
-
-            all_ld.append(ld); all_sp.append(sp)
-            del router, x
-            torch.cuda.empty_cache()
-
-    print_separator("CONV ROUTER — AVERAGED ACROSS ALL CONFIGS")
-    print(f"  Avg logits diff: {sum(all_ld)/len(all_ld):.2e}")
-    print(f"  Avg speedup:     {sum(all_sp)/len(all_sp):.2f}x")
-    print(f"  Min speedup:     {min(all_sp):.2f}x")
-    print(f"  Max speedup:     {max(all_sp):.2f}x")
-
-
 # ═══════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser(description="BiBo Isolated Kernel Benchmark (multi-config)")
-    parser.add_argument("--section", choices=["dense_mlp", "moe", "conv_expert", "conv_router", "all"],
-                        default="all")
+    parser.add_argument("--section", choices=["dense_mlp", "moe", "all"], default="all")
     args = parser.parse_args()
 
     print("=" * 70)
@@ -525,8 +393,6 @@ def main():
     sections = {
         "dense_mlp": section_dense_mlp,
         "moe": section_moe,
-        "conv_expert": section_conv_expert,
-        "conv_router": section_conv_router,
     }
 
     if args.section == "all":

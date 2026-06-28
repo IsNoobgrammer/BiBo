@@ -41,9 +41,7 @@ def run_cell(level, ce, B, S):
         from src.kernels.patch import patch_bibo_with_triton
         from src.kernels.moe_grouped import patch_moe_auto
         from src.kernels.dense_mlp import patch_dense_mlp_with_triton
-        from src.kernels.conv_fused import patch_conv_router_with_triton, patch_conv_expert_with_triton
         patch_bibo_with_triton(m); patch_moe_auto(m); patch_dense_mlp_with_triton(m)
-        patch_conv_router_with_triton(m); patch_conv_expert_with_triton(m)
     m.config.use_fused_linear_ce = bool(ce)
     m = m.cuda().train()
     x = torch.randint(0, 81000, (B, S), device="cuda")

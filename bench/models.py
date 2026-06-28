@@ -195,15 +195,13 @@ def apply_triton_kernels(model, config, no_triton=False, use_fused_ce=True):
         if not is_qwen:
             from src.kernels.patch import patch_bibo_with_liger
             from src.kernels.moe_dispatch import patch_moe_with_triton
-            from src.kernels.conv_fused import patch_conv_router_with_triton
             from src.kernels.xsa_fused import patch_xsa_with_triton
 
             patch_bibo_with_liger(model)          # Liger RMSNorm + RoPE
-            patch_moe_with_triton(model)          # MoE expert GLU dispatch (the big win)
-            patch_conv_router_with_triton(model)  # conv router (no-op unless router_type="conv")
+            patch_moe_with_triton(model)          # MoE per-expert dispatch + fused combine (manual bwd)
             # Dense-MLP SwiGLU kernel intentionally NOT applied — torch.compile's lifted SiLU-mul ties
             # a hand kernel (it's noise); leave dense-MLP activation to the compiler.
-            # Conv shared-expert kernel also NOT applied — 0.41x (launch overhead). See docs/triton_kernels.md.
+            # Conv router kernel REMOVED — conv router (router_type="conv") runs eager; bench uses "mlp".
             xsa_on = getattr(config, "use_xsa", False)
             if xsa_on:
                 patch_xsa_with_triton()           # our fused XSA rejection kernel
@@ -212,7 +210,7 @@ def apply_triton_kernels(model, config, no_triton=False, use_fused_ce=True):
                 model.config.use_fused_linear_ce = True
             ce_tag = " + FusedCE" if use_fused_ce else ""
             xsa_tag = " + XSA" if xsa_on else ""
-            print(f"  Triton: RMSNorm + RoPE + MoE GLU + ConvRouter{xsa_tag}{ce_tag} (no dense-MLP kernel — compiled)")
+            print(f"  Triton: RMSNorm + RoPE + MoE{xsa_tag}{ce_tag} (no dense-MLP/conv kernel — compiled/eager)")
 
         else:
             from src.kernels.patch import patch_qwen3_with_liger, patch_qwen3_fused_ce

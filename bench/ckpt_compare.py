@@ -18,12 +18,10 @@ def _build():
     from src.kernels.patch import patch_bibo_with_triton
     from src.kernels.moe_grouped import patch_moe_auto
     from src.kernels.dense_mlp import patch_dense_mlp_with_triton
-    from src.kernels.conv_fused import patch_conv_router_with_triton, patch_conv_expert_with_triton
     cfg = yaml.safe_load(open(os.path.join(_REPO, "bench/configs/bibo.yaml")))
     torch.manual_seed(0)
     m, c = build_model_from_config(cfg)
     patch_bibo_with_triton(m); patch_moe_auto(m); patch_dense_mlp_with_triton(m)
-    patch_conv_router_with_triton(m); patch_conv_expert_with_triton(m)
     m.config.use_fused_linear_ce = True; m.config.use_cache = False
     return m.cuda().train()
 
