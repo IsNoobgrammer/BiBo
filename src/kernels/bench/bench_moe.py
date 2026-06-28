@@ -1,8 +1,9 @@
 """
 MoE Layer Benchmark — Triton vs PyTorch baseline.
 
-Tests the Triton MoE GLU activation kernel (_fused_glu_act_kernel) and
-the fused router kernel (_fused_router_kernel) against PyTorch baselines.
+Tests the Triton MoE GLU activation kernel (_fused_glu_act_kernel) against
+PyTorch baselines. (The fused router kernel was removed Jun 28 2026 — router is
+eager-only, pure MiMo; see src/.autoresearch/bench_router_vs_mimo.py.)
 
 All benchmarks follow the 4 mandatory rules:
   Rule 1: Gradient equivalence vs baseline (original PyTorch)
@@ -93,35 +94,8 @@ def test_glu_kernel_correctness():
     return all_pass
 
 
-def test_router_kernel_correctness():
-    """Test triton_fused_router matches PyTorch baseline."""
-    print_separator("KERNEL CORRECTness: Fused Router")
-
-    from src.kernels.moe_dispatch import triton_fused_router
-
-    device = 'cuda'
-    N, E = 256, 8
-    logits = torch.randn(N, E, device=device, dtype=torch.float16)
-    bias = torch.randn(E, device=device, dtype=torch.float16)
-
-    # Reference: PyTorch
-    scores_ref = torch.sigmoid(logits.float())
-    mean = scores_ref.mean(dim=-1, keepdim=True)
-    std = scores_ref.std(dim=-1, keepdim=True) + 1e-6
-    scores_norm_ref = (scores_ref - mean) / std
-    selection_ref = scores_norm_ref + bias.float()
-
-    # Triton
-    scores_tri, selection_tri = triton_fused_router(logits, bias, router_lambda=1.0, use_logit_norm=True)
-
-    score_diff = (scores_norm_ref.half() - scores_tri).abs().max().item()
-    sel_diff = (selection_ref.half() - selection_tri).abs().max().item()
-    passed = score_diff < 1e-2 and sel_diff < 1e-2  # Router has higher tolerance
-    print(f"  Scores diff: {score_diff:.4e}")
-    print(f"  Selection diff: {sel_diff:.4e}")
-    print(f"  Result: {'PASS' if passed else 'FAIL'}")
-
-    return passed
+# (test_router_kernel_correctness REMOVED Jun 28 2026 — the fused router kernel it tested is gone;
+# router is eager-only, pure MiMo. See src/.autoresearch/bench_router_vs_mimo.py for router parity.)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -250,7 +224,6 @@ def main():
 
     # Kernel correctness
     glu_ok = test_glu_kernel_correctness()
-    router_ok = test_router_kernel_correctness()
 
     # Rule 1: Gradient equivalence
     grad_ok = test_gradient_equivalence(config)
@@ -264,7 +237,6 @@ def main():
     # Summary
     print_separator("FINAL VERDICT")
     print(f"  GLU Kernel Correctness:    {'PASS' if glu_ok else 'FAIL'}")
-    print(f"  Router Kernel Correctness: {'PASS' if router_ok else 'FAIL'}")
     print(f"  Rule 1 (Grad Equiv):       {'PASS' if grad_ok else 'FAIL'}")
     print(f"  Rule 2 (NaN Stable):       {'PASS' if nan_ok else 'FAIL'}")
     print(f"  Rule 3 (Perf):             See table above")

@@ -53,13 +53,10 @@ class BiBoConfig(PretrainedConfig):
         # Router
         router_type="mlp",  # "mlp" or "conv"
         kernel_size=3,
-        router_lambda=1.0,  # Skywork-MoE logit normalization scaling
         router_noise=0,  # Auto: log(num_experts) * 0.1
         bias_update_factor=None,  # Auto: (1 - exp(-n/48)) * 0.5
         bias_update_threshold=8000,  # User knob: tokens between bias updates
         router_temperature=1.3,  # Legacy (not used; kept for compat)
-        # Router logit normalization (Skywork-MoE style)
-        use_router_logit_norm=False,  # z-score normalize logits before softmax
         # Load balancing strategy: "none", "bias" (heuristic bias updates), "aux_loss" (Switch Transformer / Qwen style)
         load_balance_strategy="bias",
         aux_loss_coef=0.01,  # aux load-balancing loss coef (when strategy="aux_loss"); 1e-2 = ablated consensus (Switch-T, ST-MoE, OLMoE)
@@ -68,9 +65,9 @@ class BiBoConfig(PretrainedConfig):
         router_activation="none",
         # Shared expert
         shared_expert_type="mlp",  # "mlp" (SwiGLU, like Qwen) or "conv" (CausalConv1D)
-        moe_shared_scaling=1.0,  # Auto-computed if 1.0 (DeepSeek-V2/V3 style)
-        norm_topk_prob=False,
+        norm_topk_prob=True,  # MiMo-V2.5 / DeepSeek-V3: renormalize the top-k weights to sum to 1
         gate_type="sigmoid",  # "sigmoid" (DeepSeek-V3, independent) or "softmax" (legacy, competitive)
+        routed_scaling_factor=1.0,  # MiMo/DeepSeek-V3 final routed-weight scale; 1.0 = no-op (MiMo-V2.5)
         output_router_logits=False,
         **kwargs,
     ):
@@ -118,10 +115,9 @@ class BiBoConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.gate_type = gate_type
-        self.router_lambda = router_lambda
+        self.routed_scaling_factor = routed_scaling_factor
         self.router_noise = router_noise
         self.shared_expert_type = shared_expert_type
-        self.use_router_logit_norm = use_router_logit_norm
         self.load_balance_strategy = load_balance_strategy
         self.aux_loss_coef = aux_loss_coef
         self.router_activation = router_activation
@@ -179,34 +175,8 @@ class BiBoConfig(PretrainedConfig):
         else:
             self.bias_update_threshold = 8000
 
-        # --- Auto-estimate scaling factor for shared expert if left as 1.0 ---
-        self.moe_shared_scaling = moe_shared_scaling
-        # Only auto-estimate when the shared expert is actually used — shared is OFF by default,
-        # so an unguarded MC would burn 10K iters every default-config build for an unused scalar.
-        if moe_shared_scaling == 1.0 and self.use_shared_expert:
-            try:
-                import numpy as np
-
-                def softmax(x):
-                    e = np.exp(x - x.max())
-                    return e / e.sum()
-
-                n = self.num_routed_experts
-                k = self.num_experts_per_tok
-                s = getattr(self, "num_shared_experts", 1) or 1
-                lam = self.router_lambda  # Account for Skywork-MoE logit normalization
-                factors = []
-                for _ in range(10000):
-                    logits = np.random.randn(n - s)
-                    # Simulate actual router: normalize then scale by router_lambda
-                    logits_norm = (logits - logits.mean()) / (logits.std() + 1e-6)
-                    logits_scaled = lam * logits_norm
-                    p = np.sort(softmax(logits_scaled))[::-1][: k - s]
-                    factors.append(s**0.5 / (np.sum(p**2) ** 0.5))
-                approx_lambda = float(np.mean(factors))
-                self.moe_shared_scaling = round(approx_lambda, 2)
-            except Exception as e:
-                print(f"[BiBoConfig] Could not auto-set moe_shared_scaling: {e}")
+        # (moe_shared_scaling removed — DEPRECATED. The shared expert, when enabled, is added
+        # directly like DeepSeek-V3/Gemma; no learned or MC-estimated scalar.)
 
         # Dynamic NTK-aware RoPE on by default: identity within the trained window
         # (seq_len <= max_position_embeddings), smooth base growth beyond it. Set

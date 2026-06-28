@@ -21,12 +21,13 @@ import triton.language as tl
 __all__ = ["fused_linear_cross_entropy", "fused_linear_cross_entropy_tldot"]
 
 # Backward chunk is sized so the transient (CHUNK,V) fp16 logit buffer stays under this budget.
-# 384 MiB → CHUNK≈2485 at V=81000. Sets the (CHUNK,V) fp16 transient in both the cuBLAS-chunked
-# forward and backward (logits chunk + its transpose for the gw GEMM). Lowered 1024→384 MiB: at
-# 1 GiB the bigger Qwen (141.9M) OOM'd on the 1 GB chunk transient on a 16 GB T4. 384 MiB keeps the
-# transient ~0.27 GB with negligible speed cost (a few more cuBLAS GEMM launches). Raise if you have
-# headroom and want fewer launches; lower further if still memory-pressured.
-_BWD_LOGITS_BUDGET = 384 * 1024 * 1024
+# 192 MiB → CHUNK≈1242 at V=81000. Sets the (CHUNK,V) fp16 transient in both the cuBLAS-chunked
+# forward and backward (logits chunk + its transpose for the gw GEMM). T4-tuned: the ce_fit sweep
+# (128..512MB step 64) put 192MB at the latency knee — fastest budget in all 3 runs (0.57x compiled,
+# stable) AND 3.40x less peak; 384MB+ is both slower and heavier. Lowered 1024→384→192 MiB (1 GiB
+# OOM'd the bigger Qwen on a 16 GB T4). Raise for fewer launches if you have headroom; lower if
+# still memory-pressured.
+_BWD_LOGITS_BUDGET = 192 * 1024 * 1024
 
 
 @triton.jit
@@ -104,6 +105,26 @@ def _grad_logits_inplace(logits, lse, labels, scale, ignore_index):
     return logits
 
 
+@triton.jit
+def _fwd_reduce_kernel(L_ptr, Lab_ptr, Lse_ptr, Tgt_ptr, M, V, s_n, s_v, ignore_index,
+                       BLOCK_V: tl.constexpr):
+    # One program per row of a chunk. Online-softmax over V — reads fp16 logits, accumulates max+sum
+    # in fp32 REGISTERS (no fp32 (C,V) buffer), and gathers the target logit in the SAME launch.
+    # Replaces the old .float() + torch.logsumexp + .gather (3 passes + fp32 (C,V) alloc).
+    row = tl.program_id(0)
+    lab = tl.load(Lab_ptr + row)
+    m = -float("inf"); s = 0.0
+    for v0 in range(0, V, BLOCK_V):
+        offs = v0 + tl.arange(0, BLOCK_V)
+        x = tl.load(L_ptr + row * s_n + offs * s_v, mask=offs < V, other=-float("inf")).to(tl.float32)
+        m_new = tl.maximum(m, tl.max(x, 0))
+        s = s * tl.exp(m - m_new) + tl.sum(tl.exp(x - m_new), 0)
+        m = m_new
+    tl.store(Lse_ptr + row, m + tl.log(s))
+    safe_lab = tl.where(lab == ignore_index, 0, lab)
+    tl.store(Tgt_ptr + row, tl.load(L_ptr + row * s_n + safe_lab * s_v).to(tl.float32))
+
+
 class _FLCE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, weight, labels, ignore_index):
@@ -143,15 +164,19 @@ def fused_linear_cross_entropy_tldot(hidden, weight, labels, ignore_index=-100):
     return _FLCE.apply(hidden, weight, labels, ignore_index)
 
 
-# ── cuBLAS-chunked CE (DEFAULT): forward GEMM via cuBLAS in row-chunks, keeps only lse(N,) ──
-# Replaces the tl.dot forward (the ~2% SoL bottleneck) with cuBLAS (~50% SoL) while keeping the
-# cut-cross-entropy memory profile (never materializes the full (N,V) logits). Backward is the same
-# cuBLAS-chunked recompute the tl.dot path already used. Grad-exact vs F.cross_entropy.
+# ── Fused-fwd+bwd CE (DEFAULT): grad computed in the FORWARD chunk loop, NO backward recompute ──
+# CE's grad w.r.t. logits = (softmax - onehot)/n needs only logits + labels (loss is scalar -> the
+# upstream grad is a scalar multiplier), so the whole gradient is formed in the forward chunk loop
+# while each (chunk,V) logit tile is live, then discarded. NEVER materializes (N,V); 3 GEMMs over the
+# data (logits, grad_h, grad_w), NO recompute GEMM. Beats the old recompute path (4 GEMMs) and Liger's
+# fused-linear CE: at the BiBo step (T4, N=16384/V=81000, 192MB budget) 260ms vs Liger@chunk1024 321ms
+# (19% faster) AND grads TIGHTER to fp32 eager (grad_hidden rel 1.9e-3 vs Liger 1.1e-2; grad_weight
+# 7e-4 both). Loss bit-identical to Liger / eager to 1e-6.
 def _chunk_rows(N, V):
     return max(512, min(N, _BWD_LOGITS_BUDGET // (V * 2)))
 
 
-class _CECublasChunked(torch.autograd.Function):
+class _CEFusedFwdBwd(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, weight, labels, ignore_index):
         N, Hd = hidden.shape
@@ -159,39 +184,36 @@ class _CECublasChunked(torch.autograd.Function):
         C = _chunk_rows(N, V)
         lse = torch.empty(N, device=hidden.device, dtype=torch.float32)
         tgt = torch.empty(N, device=hidden.device, dtype=torch.float32)
-        safe = labels.clamp(min=0)
-        with torch.no_grad():
-            for i in range(0, N, C):
-                logits = torch.mm(hidden[i:i+C], weight.t()).float()    # cuBLAS (C,V)
-                lse[i:i+C] = torch.logsumexp(logits, dim=-1)
-                tgt[i:i+C] = logits.gather(1, safe[i:i+C, None]).squeeze(1)
+        gh = torch.empty(N, Hd, device=hidden.device, dtype=hidden.dtype)
+        gw = torch.zeros(V, Hd, device=hidden.device, dtype=torch.float32)
+        for i in range(0, N, C):
+            cl = min(C, N - i)
+            hc = hidden[i:i+C]
+            logits = torch.mm(hc, weight.t())                           # GEMM 1: cuBLAS (C,V) fp16
+            # per-row online-softmax -> lse+target, then 2D-grid kernel OVERWRITES logits in place
+            # with the (unscaled) grad-logits g = softmax-onehot. logits IS g after these two launches.
+            _fwd_reduce_kernel[(cl,)](logits, labels[i:i+C], lse[i:i+C], tgt[i:i+C],
+                                      cl, V, logits.stride(0), logits.stride(1), ignore_index,
+                                      BLOCK_V=1024)
+            _grad_logits_inplace(logits, lse[i:i+C], labels[i:i+C], 1.0, ignore_index)
+            gh[i:i+C] = torch.mm(logits, weight)                        # GEMM 2: (C,H)
+            gw.add_(torch.mm(logits.t(), hc).float())                   # GEMM 3: (V,H), fp32 accum
         valid = labels != ignore_index
-        loss = ((lse - tgt) * valid).sum() / valid.sum().clamp(min=1)
-        ctx.save_for_backward(hidden, weight, labels, lse, valid.sum().clamp(min=1))
-        ctx.ignore_index = ignore_index
+        n_valid = valid.sum().clamp(min=1)
+        loss = ((lse - tgt) * valid).sum() / n_valid
+        ctx.save_for_backward(gh, gw, n_valid, weight)
         return loss
 
     @staticmethod
     def backward(ctx, grad_out):
-        hidden, weight, labels, lse, n_valid = ctx.saved_tensors
-        ig = ctx.ignore_index
-        N, Hd = hidden.shape
-        V = weight.shape[0]
-        sc = float(grad_out / n_valid)
-        gh = torch.empty(N, Hd, device=hidden.device, dtype=hidden.dtype)
-        gw = torch.zeros(V, Hd, device=hidden.device, dtype=torch.float32)
-        C = _chunk_rows(N, V)
-        for i in range(0, N, C):
-            hc = hidden[i:i+C]; labc = labels[i:i+C]; lsec = lse[i:i+C]
-            logits = torch.mm(hc, weight.t())                           # cuBLAS recompute (C,V)
-            g = _grad_logits_inplace(logits, lsec, labc, sc, ig)        # in-place fp16 (softmax-onehot)*sc
-            gh[i:i+C] = torch.mm(g, weight)
-            gw += torch.mm(g.t(), hc).float()
-        return gh, gw.to(weight.dtype), None, None
+        gh, gw, n_valid, weight = ctx.saved_tensors
+        sc = grad_out / n_valid                                          # scalar: loss-mean + upstream
+        return (gh * sc.to(gh.dtype)), (gw * sc).to(weight.dtype), None, None
 
 
 def fused_linear_cross_entropy(hidden, weight, labels, ignore_index=-100):
     """hidden (N,H), weight=lm_head.weight (V,H), labels (N,) -> mean CE loss.
-    cuBLAS-chunked (DEFAULT): cuBLAS GEMM in row-chunks, never materializes (N,V). Bounded memory
-    (~chunk transient), cuBLAS speed. For the legacy tl.dot kernel use fused_linear_cross_entropy_tldot."""
-    return _CECublasChunked.apply(hidden, weight, labels, ignore_index)
+    Fused-fwd+bwd (DEFAULT): cuBLAS GEMM in row-chunks, grad computed in forward (NO recompute),
+    never materializes (N,V). Bounded memory (~chunk transient), beats Liger on speed + grad accuracy.
+    For the legacy tl.dot kernel use fused_linear_cross_entropy_tldot."""
+    return _CEFusedFwdBwd.apply(hidden, weight, labels, ignore_index)

@@ -105,8 +105,10 @@ class BiBoFusedExperts(nn.Module):
         boundaries = torch.zeros(num_routed + 1, dtype=torch.long, device=hidden_states.device)
         boundaries[1:] = torch.cumsum(expert_counts, dim=0)
         
-        # Process each expert's chunk
-        output = torch.zeros(num_tokens, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
+        # Process each expert's chunk. fp32 accumulator (MiMo-style): weights are fp32 and the
+        # weighted index_add accumulates in fp32, cast back to hidden dtype at the end — keeps the
+        # whole router→combine path fp32 for precision.
+        output = torch.zeros(num_tokens, hidden_size, device=hidden_states.device, dtype=torch.float32)
         
         for expert_idx in range(num_routed):
             # Use tensor indexing instead of .item() to avoid graph breaks
@@ -143,7 +145,7 @@ class BiBoFusedExperts(nn.Module):
                 # Zero expert: skip (output is zero, router gradients don't depend on expert output)
                 pass
 
-        return output
+        return output.to(hidden_states.dtype)
 
 
 class BiBoMoELayer(nn.Module):
@@ -181,12 +183,8 @@ class BiBoMoELayer(nn.Module):
                 self.shared_experts_list.append(BiBoCausalConv1D(config))
             else:
                 self.shared_experts_list.append(BiBoMLP(config, is_expert=True))
-            # LEARNABLE shared-expert scale (LayerScale-style), one scalar per MoE layer. Init from
-            # config.moe_shared_scaling (the magnitude-balance estimate) and let the optimizer tune it,
-            # instead of a fixed constant that's wrong at init and must be re-derived when dims/experts
-            # change. ndim=0 → optim.py routes it to AdamW (not Muon). Only created when shared is on.
-            self.moe_shared_scaling = nn.Parameter(
-                torch.tensor(float(getattr(config, 'moe_shared_scaling', 1.0))))
+            # moe_shared_scaling DEPRECATED — the shared expert is added directly (DeepSeek-V3/Gemma),
+            # no learned or MC-estimated scalar.
         self.gate = BiBoMoERouter(config)
 
     @torch.no_grad()
@@ -255,7 +253,7 @@ class BiBoMoELayer(nn.Module):
         # Shared expert (only if enabled)
         if self.use_shared_expert:
             shared_combined = self.shared_experts_list[0](hidden_states)
-            final_output = final_routed + (self.moe_shared_scaling * shared_combined)
+            final_output = final_routed + shared_combined          # direct add (DeepSeek-V3/Gemma)
         else:
             final_output = final_routed
 

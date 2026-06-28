@@ -19,7 +19,7 @@ BiBo is a **Mixture-of-Experts (MoE) Transformer** for causal language modeling.
 1. **SSMax** — learnable per-head query scaling (`scale * log(n)`, where `n` is each query's **causal context length** `(kv_len − q_len) + t + 1`, not a global `kv_len`) that prevents attention fading at long sequences
 2. **Diverse experts** — PolyGLU layout: groups of 3 GLU experts with different activations (SiLU, ReLU², Tanh) + Identity/Zero special experts
 3. **Shared Conv1D expert** — causal convolution (gated, SwiGLU-style), always-active WHEN enabled. **OFF by default (since Jun 27 2026)** so BiBo stays param-matched to a no-shared baseline; opt in with `use_shared_expert=true`.
-4. **Router logit normalization** — `router_lambda` scales normalized logits + threshold-based bias heuristics for load balancing
+4. **MiMo-V2.5 / DeepSeek-V3 router** — sigmoid scoring, auxiliary-loss-free bias (selection-only) updated by `b += u·sign(mean−load)`, `norm_topk_prob` (top-k sum-to-1), `routed_scaling_factor`. Verified bit-equivalent to MiMo's gate (`src/.autoresearch/bench_router_vs_mimo.py`). No Skywork logit-norm.
 5. **Flash Attention (SDPA)** — uses `F.scaled_dot_product_attention` when `output_attentions=False`
 6. **Conv router option** — `router_type="conv"` gives router local context awareness
 7. **XSA (Exclusive Self Attention)** — parameter-free rejection of each token's attention output from its own value vector (`z = y − (y·v)v/‖v‖²`); applied after value-aggregation, before o_proj. See `docs/xsa.md`
@@ -115,7 +115,7 @@ BiBoForCausalLM
 
 **Attention**: SDPA (Flash Attention) by default. Falls back to manual matmul when `output_attentions=True`. GQA (fewer KV heads). QK-norm. SSMax query scaling. XSA rejection on the output (`use_xsa`).
 
-**MoE**: First and last layers are dense MLP (layers 0 and N-1; `mlp_only_layers=[0, N-1]`). All remaining layers are MoE. Router uses logit normalization. Bias heuristics for load balancing. Router bias is `requires_grad=False` (not optimizer-managed, updated heuristically).
+**MoE**: First and last layers are dense MLP (layers 0 and N-1; `mlp_only_layers=[0, N-1]`). All remaining layers are MoE. Router = MiMo/DeepSeek-V3 sigmoid gate (no logit-norm). Bias heuristics for load balancing. Router bias is `requires_grad=False` (not optimizer-managed, updated heuristically).
 
 **Expert layout (PolyGLU)**: `polyglu_expert_multiplier` groups of 3 (SiLU-GLU, ReLU²-GLU, Tanh-GLU) + `special_expert_pairs` × (Identity, Zero). Config default: 2×3 + 1×2 = 8 routed. **Bench configs (Jun 27 2026): 3×3 + 1×2 = 9 GLU + 2 specials = 11 routed**, shared expert OFF — param-matched to Qwen's 9 experts on BOTH total (137.5M) and active (71.4M).
 
@@ -136,7 +136,10 @@ BiBoForCausalLM
 | `bias_update_factor` | 0.01 | Load balancing step size |
 | `bias_update_threshold` | 100K | Tokens between bias updates |
 | `shared_expert_type` | "mlp" | Shared expert type: `"mlp"` (SwiGLU, like Qwen) or `"conv"` (CausalConv1D) |
-| `moe_shared_scaling` | auto | **LEARNABLE scalar** (nn.Parameter, 1 per MoE layer, LayerScale-style). The config value is only the INIT (MC-estimated when 1.0); the optimizer tunes it during training. Only created when `use_shared_expert=True`; routes to AdamW (ndim=0). |
+| `norm_topk_prob` | True | MiMo/DeepSeek-V3: renormalize the top-k routed weights to sum to 1 (÷ their sum). Default flipped True (Jun 28). |
+| `routed_scaling_factor` | 1.0 | MiMo/DeepSeek-V3 final routed-weight scale, applied after `norm_topk_prob`. 1.0 = no-op (MiMo-V2.5). |
+| ~~`use_router_logit_norm` / `router_lambda`~~ | removed | **Skywork logit-norm REMOVED (Jun 28 2026)** — MiMo has none. Router is pure MiMo. |
+| ~~`moe_shared_scaling`~~ | removed | **DEPRECATED (Jun 28 2026)** — shared expert adds directly (DeepSeek-V3/Gemma), no learned/MC scalar. |
 | `mlp_only_layers` | [0, N-1] | Which layers use dense MLP instead of MoE (first + last) |
 | `rope_nope_ratio` | 0.5 | Fraction of attention heads that are NoPE (no positional encoding). 0.5 = 2:2 (6 RoPE+NTK heads, 6 NoPE content heads at the 12h/2kv default). 0.0 = all RoPE (original). Must align with KV group boundaries. |
 
@@ -328,6 +331,29 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   Ties std CE on speed (both cuBLAS), saves 1.5 GB (only (chunk,V) transients, never full (N,V)) →
   the one CE path at B16. Memory knob = `_BWD_LOGITS_BUDGET` (1 GiB → chunk ~6710; lower for less
   peak at a few more launches). tl.dot path is dead, reference only.
+- **(June 28 2026) CE upgraded to FUSED-FWD+BWD — `_CEFusedFwdBwd` replaces the cuBLAS-recompute
+  `_CECublasChunked`** (`fused_ce.py`, still the default `fused_linear_cross_entropy`). CE's grad
+  w.r.t. logits = (softmax−onehot)/n needs ONLY logits+labels (loss is scalar → upstream grad is a
+  scalar), so the FULL gradient is computed in the FORWARD chunk loop while each (chunk,V) tile is
+  live, then discarded — backward is just a scalar scale of stashed grad_h/grad_w. **3 GEMMs over
+  the data (logits, grad_h, grad_w), NO recompute** (recompute was the 4th GEMM = a pure latency tax,
+  no memory upside). Per chunk: cuBLAS logits → `_fwd_reduce_kernel` (per-row online-softmax → lse+tgt,
+  no fp32 (C,V) buffer; replaces the `.float()+logsumexp+gather`) → `_grad_logits_inplace` (2D-grid,
+  overwrites logits in place with grad) → grad GEMMs. ⚠️ The 2D-grid grad kernel is load-bearing: a
+  one-program-per-row fused reduce+grad kernel was tried and LOST on T4 (only ~chunk programs, V
+  streamed twice serially → launch/occupancy-bound); the 2D grid (~chunk/32 × V/256 programs)
+  saturates the SMs. **This BEATS Liger's fused-linear CE — the new external baseline.** T4 ce_fit
+  (N=16384/V=81000/H512, 192MB budget, --compile): ours **260ms / 904MB / 0.76× compiled** vs
+  **Liger@chunk1024 321ms / 836MB** (19% faster, +68MB) vs **Liger@chunk2048 283ms / 1083MB** (faster
+  AND 180MB less). Curve flat 260–264ms across 192–384MB (GEMM-bound, no longer launch-bound). Grads
+  are TIGHTER to fp32 eager than Liger's: grad_hidden rel **1.9e-3** (Liger 1.1e-2), grad_weight
+  **7e-4** (both); loss bit-identical to Liger, eager to 1e-6. Standalone kernel/bench lives in the
+  `triton-kernel-fused` repo (autoresearch round 3). Default budget = 192MB (T4 latency knee). The
+  recompute `_CECublasChunked` is removed from `fused_ce.py` (dominated); `_FLCE`/`fused_linear_cross_entropy_tldot`
+  kept as the dead tl.dot reference. ⚠️ **Still SUPERSEDED at ce_fit by compiled std CE on raw speed**
+  (197ms vs 260ms) — fused CE is the MEMORY play (3.4× less peak) + the only path when std CE OOMs
+  (≥4096 tok / long-context); both models still default to compiled std CE (`use_fused_ce: false`)
+  when logits fit. The fused kernel is now the right choice the moment memory is the constraint.
 - **(June 25 2026) CE wired into model patching** — `apply_triton_kernels(model, config,
   use_fused_ce=True)` now enables the fused CE by default: BiBo sets `config.use_fused_linear_ce`;
   `patch_qwen3_fused_ce` swaps Qwen's loss to OUR kernel (was Liger's chunked CE). Pass
@@ -419,11 +445,39 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   cuts launch overhead without the batched-transient memory blowup. **Kaggle-only — torch.compile is broken
   locally** (triton `AttrsDescriptor` mismatch); `bench/bench_muon.py` auto-skips it locally, run it on T4
   to A/B eager-vs-compiled (numerics gate + speed) before trusting.
-- **(June 27 2026) Router logit-norm DEPRECATED** — the Skywork-MoE z-score logit normalization
-  (`use_router_logit_norm`, Step 5 in `router.py`) is commented out (kept for reference, not
-  deleted). It was `False` in every config, added a per-token mean/std reduction + scale for no
-  measured benefit, and the fused conv router does not implement it. `router_lambda` is now unused
-  by the router hot path (still referenced by the config-init MC for `moe_shared_scaling`).
+- **(June 28 2026) Router = MiMo-V2.5 / DeepSeek-V3 gate, verified equivalent; `moe_shared_scaling`
+  REMOVED; Skywork logit-norm REMOVED (pure MiMo).** Changes:
+  1. **`routed_scaling_factor` added** (config, default 1.0 = MiMo-V2.5's no-op). The router now
+     matches MiMo's gate exactly: sigmoid scoring → bias-added-for-SELECTION-only → weight gathered
+     from UNBIASED scores → `norm_topk_prob` (eps 1e-20) → `× routed_scaling_factor`. Verified bit-for-bit
+     (norm off) / 2e-7 (norm on, fp32 reduction noise) vs a faithful `MiMoV2MoEGate` replica with tied
+     weights — outputs, selected-expert sets, grad→gate-weight, grad→input, and loss all match. Bench:
+     `src/.autoresearch/bench_router_vs_mimo.py`. (BiBo already did sigmoid+bias+gather; only the scale
+     was missing. MiMo's group/device-limited routing is a no-op at its shipped `n_group=1` and BiBo is
+     single-node → not implemented.)
+  2. **`moe_shared_scaling` REMOVED (DEPRECATED).** The learnable per-layer scalar + its 10K-iter MC
+     init are gone from `config` and `moe.py`. When the shared expert is enabled it is now **added
+     directly** (`final_routed + shared_combined`, DeepSeek-V3/Gemma style). Old configs/benches passing
+     `moe_shared_scaling=` are harmlessly ignored (lands in `**kwargs`). Shared expert still OFF by default.
+  3. **Skywork logit-norm REMOVED entirely (pure MiMo).** `use_router_logit_norm` + `router_lambda`
+     deleted from `config` and `router.py` — MiMo/DeepSeek-V3 has **no** z-score logit normalization
+     (the only normalization in MiMo's gate is `norm_topk_prob`, the top-k sum-to-1, which is a
+     different op). Selection is now just `scores + bias`, always. `norm_topk_prob` default flipped
+     **False→True** to match MiMo. Old configs passing `router_lambda=`/`use_router_logit_norm=` are
+     harmlessly ignored (`**kwargs`). The Triton fused-router kernel (`moe_dispatch.py`
+     `_fused_router_kernel` / `triton_fused_router`) and its `bench_moe.py` test were **REMOVED**
+     (Jun 28) — it carried the Skywork logit-norm; router is eager-only (sigmoid+bias is a trivial
+     2-op elementwise the compiler fuses for free). The fused CONV router (`conv_fused.py`) has no
+     logit-norm, so eager and fused-conv agree. Stage-by-stage MiMo parity (scores → selection →
+     before-norm → after-norm) verified in the bench: all 0.0 except 3e-8 post-norm; norm takes
+     Σw 2.07→1.0000. (The 3e-8 is fp32 non-associative summation — MiMo `topk(sorted=False)` vs
+     BiBo `sorted=True` sum the k weights in different orders; not a divergence.)
+  4. **Router + MoE combine now fully fp32 (MiMo-style).** The gate keeps weights in **fp32**
+     (`router.py` returns `norm_weights.float()`, no down-cast), and `BiBoFusedExperts` accumulates
+     the weighted combine in an **fp32 output buffer**, casting to hidden dtype only at the end. So
+     the whole router→combine path is fp32 even under bf16/fp16 training (verified fp32/fp16/bf16
+     fwd+bwd NaN-free). ⚠️ The OPT-IN Triton MoE kernels (`triton_moe_experts_forward`, `moe_grouped`)
+     now receive fp32 weights — re-verify/cast there if you enable them; the default eager path is done.
 - **(June 27 2026) BiBo↔Qwen now PARAM-MATCHED on BOTH axes; shared expert OFF by default.** Bench
   expert layout bumped 6→**9 GLU** (`polyglu_expert_multiplier: 2→3`) + 2 param-free specials = 11
   routed; Qwen `num_experts: 8→9`. A PolyGLU expert and a SwiGLU expert are param-identical, so 9

@@ -330,54 +330,9 @@ def triton_fused_linear_glu(
     """
     return _FusedLinearGLUFunction.apply(x, weight, act_type)
 
-# ═══════════════════════════════════════════════════════════════
-# KERNEL 3: Fused Router (sigmoid + norm + bias)
-# ═══════════════════════════════════════════════════════════════
-
-@triton.jit
-def _fused_router_kernel(
-    Logits_ptr,     # (N, E) raw logits
-    Scores_ptr,     # (N, E) unbiased scores output
-    Selection_ptr,  # (N, E) biased scores for topk
-    Bias_ptr,       # (E,) router bias
-    N, E,
-    router_lambda,
-    stride_n, stride_e,
-    USE_LOGIT_NORM: tl.constexpr,
-    BLOCK_E: tl.constexpr,
-):
-    """Fused: sigmoid → optional z-norm → bias addition."""
-    pid = tl.program_id(0)  # one program per token
-    
-    offs_e = tl.arange(0, BLOCK_E)
-    mask_e = offs_e < E
-    
-    # Load logits
-    logits = tl.load(
-        Logits_ptr + pid * stride_n + offs_e * stride_e,
-        mask=mask_e, other=0.0
-    ).to(tl.float32)
-    
-    # Sigmoid
-    scores = 1.0 / (1.0 + tl.exp(-logits))
-    
-    # Optional z-score normalization
-    if USE_LOGIT_NORM:
-        # Compute mean and std over experts (match PyTorch: unbiased=True, divides by N-1)
-        sum_s = tl.sum(tl.where(mask_e, scores, tl.zeros_like(scores)))
-        mean = sum_s / E
-        diff = scores - mean
-        sum_sq = tl.sum(tl.where(mask_e, diff * diff, tl.zeros_like(diff)))
-        std = tl.sqrt(sum_sq / (E - 1) + 1e-6)
-        scores = router_lambda * diff / std
-    
-    # Store unbiased scores
-    tl.store(Scores_ptr + pid * stride_n + offs_e * stride_e, scores, mask=mask_e)
-    
-    # Add bias for selection
-    bias = tl.load(Bias_ptr + offs_e, mask=mask_e, other=0.0).to(tl.float32)
-    selection = scores + bias
-    tl.store(Selection_ptr + pid * stride_n + offs_e * stride_e, selection, mask=mask_e)
+# (KERNEL 3 "Fused Router" REMOVED Jun 28 2026 — it carried the Skywork z-score logit-norm, which
+# is not part of MiMo/DeepSeek-V3 routing. The eager router is the single source of truth; sigmoid +
+# bias is a trivial 2-op elementwise that the compiler fuses for free, so no kernel is warranted.)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -869,34 +824,6 @@ def triton_fused_down_weight(
         BLOCK_I=BLOCK_I,
     )
     return out
-
-
-def triton_fused_router(
-    logits: torch.Tensor,   # (N, E)
-    bias: torch.Tensor,     # (E,)
-    router_lambda: float,
-    use_logit_norm: bool,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Fused router scoring: sigmoid + optional norm + bias.
-    Returns (scores, selection_scores).
-    """
-    N, E = logits.shape
-    scores = torch.empty_like(logits)
-    selection = torch.empty_like(logits)
-    
-    BLOCK_E = triton.next_power_of_2(E)
-    BLOCK_E = min(BLOCK_E, 64)
-    
-    grid = (N,)
-    _fused_router_kernel[grid](
-        logits, scores, selection, bias,
-        N, E, router_lambda,
-        logits.stride(0), logits.stride(1),
-        USE_LOGIT_NORM=use_logit_norm,
-        BLOCK_E=BLOCK_E,
-    )
-    return scores, selection
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -1,4 +1,4 @@
-"""MoE router — DeepSeek-V3 auxiliary-loss-free sigmoid gating + logit norm"""
+"""MoE router — MiMo-V2.5 / DeepSeek-V3 auxiliary-loss-free sigmoid gating (verbatim routing)."""
 import math
 import torch
 import torch.nn as nn
@@ -20,14 +20,13 @@ class BiBoMoERouter(nn.Module):
     3. Bias updated via: b_i += u * sign(mean_load - expert_load), u=0.001
     4. No interference gradients — bias is outside the computation graph
     
-    Pipeline:
+    Pipeline (matches MiMo-V2.5 `MiMoV2MoEGate` exactly; no Skywork logit-norm):
         1. raw_logits = W @ x  (MLP or Conv)
         2. raw_logits += noise  (DEPRECATED — commented out; we use router_noise=0)
         3. scores = sigmoid(raw_logits)  — independent per-expert scores
-        4. if use_router_logit_norm: scores = lambda * (scores - mean) / std
-        5. selection_scores = scores + bias  — for top-k selection ONLY
-        6. top_k_indices = topk(selection_scores)
-        7. top_k_weights = normalize(scores[top_k_indices])  — UNBIASED weights
+        4. selection_scores = scores + bias  — for top-k selection ONLY
+        5. top_k_indices = topk(selection_scores)
+        6. top_k_weights = scores[top_k_indices]  — UNBIASED; ÷sum if norm_topk_prob; × routed_scaling
     """
     def __init__(self, config: BiBoConfig):
         super().__init__()
@@ -37,13 +36,12 @@ class BiBoMoERouter(nn.Module):
         self.router_type = config.router_type
         self.kernel_size = config.kernel_size
         self.causal_padding = self.kernel_size - 1
-        self.router_lambda = getattr(config, 'router_lambda', 1.0)
-        
+
         # Configurable options
-        self.use_router_logit_norm = getattr(config, 'use_router_logit_norm', False)
         self.router_activation = getattr(config, 'router_activation', 'none')
         self.norm_topk_prob = getattr(config, 'norm_topk_prob', False)
         self.gate_type = getattr(config, 'gate_type', 'sigmoid')  # 'sigmoid' or 'softmax'
+        self.routed_scaling_factor = getattr(config, 'routed_scaling_factor', 1.0)  # MiMo/DeepSeek-V3
 
         # Load-balancing bias — heuristically updated (not optimizer-managed)
         # DeepSeek-V3: bias only affects selection, not output weights
@@ -108,30 +106,27 @@ class BiBoMoERouter(nn.Module):
             # Softmax: competitive normalization (legacy)
             scores = F.softmax(router_logits, dim=1)
 
-        # Step 5: router logit normalization (Skywork-MoE style) — DEPRECATED (2026-06-27).
-        # Disabled everywhere (use_router_logit_norm=False in all configs) and removed from the
-        # hot path: it adds a mean/std reduction + scale per token for no measured benefit, and
-        # the fused conv router does not implement it. Kept commented (not deleted) for reference.
-        # if self.use_router_logit_norm:
-        #     mean = scores.mean(dim=1, keepdim=True)
-        #     std = scores.std(dim=1, keepdim=True) + 1e-6
-        #     scores = self.router_lambda * (scores - mean) / std
-
-        # Step 6: selection uses scores + bias (bias for load balancing ONLY)
-        # DeepSeek-V3: bias affects selection, NOT output weights
+        # Step 5: selection uses scores + bias. Bias is for load-balancing SELECTION ONLY
+        # (MiMo/DeepSeek-V3) — never the combine weights (those come from raw `scores`, Step 7).
         selection_scores = scores + self.bias
 
-        # Step 7: top-k selection
-        _, top_k_indices = torch.topk(selection_scores, self.top_k, dim=-1)
+        # Step 6: top-k selection. sorted=False to match MiMo's gate EXACTLY — same return order =>
+        # same fp summation order in the norm divisor => bit-exact weights (vs sorted=True's 1-ULP drift).
+        _, top_k_indices = torch.topk(selection_scores, self.top_k, dim=-1, sorted=False)
 
         # Step 8: gather UNBIASED weights — normalize only if norm_topk_prob=True
         # CRITICAL: use original scores, NOT selection_scores (which includes bias)
         top_k_weights = scores.gather(-1, top_k_indices)
-        if self.norm_topk_prob:
-            norm_weights = top_k_weights / (top_k_weights.sum(-1, keepdim=True) + 1e-6)
+        if self.top_k > 1 and self.norm_topk_prob:
+            # MiMo/DeepSeek-V3 use +1e-20 (sigmoid scores don't sum to 1, so renormalize the top-k)
+            norm_weights = top_k_weights / (top_k_weights.sum(-1, keepdim=True) + 1e-20)
         else:
             norm_weights = top_k_weights
+        # MiMo/DeepSeek-V3: rescale the routed weights by a constant AFTER norm (1.0 = no-op)
+        norm_weights = norm_weights * self.routed_scaling_factor
 
         top_k_indices = rearrange(top_k_indices, '(b s) k -> b s k', b=batch_size)
         norm_weights = rearrange(norm_weights, '(b s) k -> b s k', b=batch_size)
-        return top_k_indices.long(), norm_weights.to(hidden_states.dtype)
+        # Keep weights in fp32 (like MiMo's gate) — the MoE combine accumulates in fp32 and casts
+        # to hidden dtype at the end. ALL router ops stay fp32 end-to-end (logits→sigmoid→norm→here).
+        return top_k_indices.long(), norm_weights.float()
