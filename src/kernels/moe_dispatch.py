@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice   # hardware tanh (matches torch.tanh; stable, no overflow)
 from einops import rearrange
 from typing import List, Tuple, Optional
 
@@ -74,10 +75,9 @@ def _fused_glu_act_kernel(
     elif ACT_TYPE == 1:  # ReLU²: relu(x)²
         relu_g = tl.where(gate > 0, gate, tl.zeros_like(gate))
         act_gate = relu_g * relu_g
-    else:  # Tanh: (exp(2x) - 1) / (exp(2x) + 1)
-        exp2x = tl.exp(2.0 * gate)
-        act_gate = (exp2x - 1.0) / (exp2x + 1.0)
-    
+    else:  # Tanh (hardware libdevice — matches torch.tanh, no overflow)
+        act_gate = libdevice.tanh(gate)
+
     # GLU multiply
     result = act_gate * up
     
@@ -220,8 +220,8 @@ def _fused_linear_glu_kernel(
         act_gate = acc_gate * (1.0 / (1.0 + tl.exp(-acc_gate)))
     elif ACT_TYPE == 1:  # ReLU²: max(gate, 0)²
         act_gate = tl.maximum(acc_gate, 0.0) ** 2
-    else:  # Tanh: 2*sigmoid(2*gate) - 1 (fast approximation)
-        act_gate = 2.0 * (1.0 / (1.0 + tl.exp(-2.0 * acc_gate))) - 1.0
+    else:  # Tanh (hardware libdevice — matches torch.tanh, no overflow)
+        act_gate = libdevice.tanh(acc_gate)
 
     result = act_gate * acc_up
 
@@ -385,9 +385,8 @@ def _batched_glu_act_kernel(
     # ReLU²: relu(x)²
     relu_g = tl.where(gate > 0, gate, tl.zeros_like(gate))
     relu2_gate = relu_g * relu_g
-    # Tanh: tanh(x)
-    exp2x = tl.exp(2.0 * gate)
-    tanh_gate = (exp2x - 1.0) / (exp2x + 1.0)
+    # Tanh (hardware libdevice — matches torch.tanh, no overflow)
+    tanh_gate = libdevice.tanh(gate)
 
     # Select activation based on per-row act_type
     act_gate = tl.where(act_type[:, None] == 0, silu_gate,
@@ -695,8 +694,8 @@ def _fused_glu_act_backward_kernel(
         relu_gate = tl.maximum(gate, 0.0)
         act_gate = relu_gate * relu_gate
         dact = 2.0 * relu_gate
-    else:  # Tanh
-        act_gate = 2.0 * (1.0 / (1.0 + tl.exp(-2.0 * gate))) - 1.0
+    else:  # Tanh (hardware libdevice — matches torch.tanh, no overflow)
+        act_gate = libdevice.tanh(gate)
         dact = 1.0 - act_gate * act_gate
 
     # Compute gradients
@@ -827,6 +826,174 @@ def triton_fused_down_weight(
 
 
 # ═══════════════════════════════════════════════════════════════
+# Fused weighted scatter / gather (combine tail) — fp32 accumulate (MiMo)
+#
+# Forward combine per expert: (eo * w) -> fp32 atomic-add into out. Within an expert the token
+# indices are UNIQUE (top-k = distinct experts) so the fp32 atomics never contend -> deterministic,
+# equals index_add. Backward: gather grad_out[tok], emit grad_eo = go*w and grad_w = sum_h(go*eo).
+# Ported from triton-kernel-fused (T4-verified: combine tail mul+cast+index_add -> 1 kernel each way).
+# ═══════════════════════════════════════════════════════════════
+
+@triton.jit
+def _combine_scatter_kernel(EO_ptr, W_ptr, Tok_ptr, Out_ptr, m, H, s_eo_m, s_eo_h, s_out_n, s_out_h,
+                            BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr):
+    pid_m = tl.program_id(0); pid_h = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M); offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask_m = offs_m < m; mask = mask_m[:, None] & (offs_h < H)[None, :]
+    eo = tl.load(EO_ptr + offs_m[:, None] * s_eo_m + offs_h[None, :] * s_eo_h, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(W_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)[:, None]
+    tok = tl.load(Tok_ptr + offs_m, mask=mask_m, other=0)
+    tl.atomic_add(Out_ptr + tok[:, None] * s_out_n + offs_h[None, :] * s_out_h, eo * w, mask=mask)
+
+
+@triton.jit
+def _combine_bwd_kernel(GO_ptr, EO_ptr, W_ptr, Tok_ptr, GradEO_ptr, GradW_ptr, m, H,
+                        s_go_n, s_go_h, s_eo_m, s_eo_h, s_geo_m, s_geo_h,
+                        BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr):
+    pid_m = tl.program_id(0)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M); offs_h = tl.arange(0, BLOCK_H)
+    mask_m = offs_m < m; mask = mask_m[:, None] & (offs_h < H)[None, :]
+    tok = tl.load(Tok_ptr + offs_m, mask=mask_m, other=0)
+    go = tl.load(GO_ptr + tok[:, None] * s_go_n + offs_h[None, :] * s_go_h, mask=mask, other=0.0).to(tl.float32)
+    eo = tl.load(EO_ptr + offs_m[:, None] * s_eo_m + offs_h[None, :] * s_eo_h, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(W_ptr + offs_m, mask=mask_m, other=0.0).to(tl.float32)[:, None]
+    tl.store(GradEO_ptr + offs_m[:, None] * s_geo_m + offs_h[None, :] * s_geo_h,
+             (go * w).to(GradEO_ptr.dtype.element_ty), mask=mask)
+    tl.store(GradW_ptr + offs_m, tl.sum(go * eo, axis=1), mask=mask_m)
+
+
+def _combine_scatter(eo, w, tok, out):
+    m, H = eo.shape
+    BLOCK_M = max(16, min(64, triton.next_power_of_2(m))); BLOCK_H = max(16, min(128, triton.next_power_of_2(H)))
+    grid = (triton.cdiv(m, BLOCK_M), triton.cdiv(H, BLOCK_H))
+    _combine_scatter_kernel[grid](eo, w, tok, out, m, H, eo.stride(0), eo.stride(1),
+                                  out.stride(0), out.stride(1), BLOCK_M=BLOCK_M, BLOCK_H=BLOCK_H)
+
+
+def _combine_bwd(grad_out, eo, w, tok):
+    # NOTE: BLOCK_H spans full H in one block (the grad_w row-reduction must be complete). Fine for
+    # H <= ~1024 (BiBo hidden_size 512). For larger H this kernel would need a two-stage reduce.
+    m, H = eo.shape
+    grad_eo = torch.empty_like(eo)
+    grad_w = torch.empty(m, device=eo.device, dtype=torch.float32)   # fp32 reduction (MiMo)
+    BLOCK_M = 16; BLOCK_H = triton.next_power_of_2(H)
+    _combine_bwd_kernel[(triton.cdiv(m, BLOCK_M),)](grad_out, eo, w, tok, grad_eo, grad_w, m, H,
+                        grad_out.stride(0), grad_out.stride(1), eo.stride(0), eo.stride(1),
+                        grad_eo.stride(0), grad_eo.stride(1), BLOCK_M=BLOCK_M, BLOCK_H=BLOCK_H)
+    return grad_eo, grad_w
+
+
+# raw GLU fwd/bwd (reuse the existing per-expert constexpr-act kernels; no nested autograd.Function)
+def _glu_fwd_raw(gate_up, act_type):
+    M = gate_up.shape[0]; I = gate_up.shape[1] // 2
+    out = torch.empty(M, I, device=gate_up.device, dtype=gate_up.dtype)
+    BLOCK_M = max(16, min(64, triton.next_power_of_2(M))); BLOCK_I = max(16, min(128, triton.next_power_of_2(I)))
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(I, BLOCK_I))
+    _fused_glu_act_kernel[grid](gate_up, out, M, I, gate_up.stride(0), gate_up.stride(1),
+                                out.stride(0), out.stride(1), ACT_TYPE=act_type, BLOCK_M=BLOCK_M, BLOCK_I=BLOCK_I)
+    return out
+
+
+def _glu_bwd_raw(grad_out, gate_up, act_type):
+    M = gate_up.shape[0]; I = gate_up.shape[1] // 2
+    ggu = torch.empty(M, 2 * I, device=gate_up.device, dtype=gate_up.dtype)
+    BLOCK_M = max(16, min(64, triton.next_power_of_2(M))); BLOCK_I = max(16, min(128, triton.next_power_of_2(I)))
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(I, BLOCK_I))
+    _fused_glu_act_backward_kernel[grid](grad_out.contiguous(), gate_up, ggu, M, I,
+                                         grad_out.stride(0), grad_out.stride(1), gate_up.stride(0), gate_up.stride(1),
+                                         ggu.stride(0), ggu.stride(1), ACT_TYPE=act_type, BLOCK_M=BLOCK_M, BLOCK_I=BLOCK_I)
+    return ggu
+
+
+# ═══════════════════════════════════════════════════════════════
+# Per-expert MoE with a MANUAL backward (PolyGLU + Identity + Zero), fp32 combine.
+#
+# Mirrors triton-kernel-fused's _PerExpertMoE (T4: fwd+bwd 1.80x -> 3.03x, 1.11x less mem vs compiled
+# Qwen3MoE-eager). The previous BiBo path was autograd-composition -> autograd inserted grad-accum
+# add_/fill_ glue (~21% of fwd+bwd). This computes only the essential per-expert dX/dW GEMMs + GLU
+# bwd + fused combine, scatters grad_hidden in one index_add_ per expert (no autograd glue).
+#
+# Scales m (num_polyglu = 3 * polyglu_expert_multiplier GLU experts) and n (special_expert_pairs ->
+# Identity then Zero) — the loop branches on expert index: < num_polyglu = GLU (weight slot e),
+# < zero_start = Identity (weighted passthrough, no GEMM), else Zero (skip).
+#
+# AUTOCAST: forward matmuls autocast (fp16); backward runs outside autocast, so params are cast to
+# the compute dtype for the matmuls and grads are cast back to each param's dtype on return — this
+# mirrors what autograd-AMP does, so grads match the eager path under autocast.
+# ═══════════════════════════════════════════════════════════════
+
+class _BiBoPerExpertMoE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hidden, idx, wt, gate_up_proj, down_proj, act_types, num_polyglu, zero_start, num_routed):
+        num_tokens, H = hidden.shape
+        top_k = idx.shape[1]; dev = hidden.device
+        flat_e = idx.flatten()
+        flat_t = torch.arange(num_tokens, device=dev).unsqueeze(1).expand_as(idx).flatten()
+        sorted_e, order = flat_e.sort()
+        st = flat_t[order]; sw = wt.flatten()[order]
+        counts = torch.bincount(sorted_e, minlength=num_routed).tolist()
+        bounds = [0]
+        for c in counts:
+            bounds.append(bounds[-1] + c)
+        x_s = hidden.index_select(0, st)                                 # (M,H)
+        out = torch.zeros(num_tokens, H, device=dev, dtype=torch.float32)  # fp32 accumulate (MiMo)
+        gate_up_l = [None] * num_routed; inter_l = [None] * num_routed; eo_l = [None] * num_routed
+        for e in range(num_routed):
+            s, en = bounds[e], bounds[e + 1]
+            if en == s:
+                continue
+            if e >= zero_start:                                          # Zero: contributes nothing
+                continue
+            if e >= num_polyglu:                                         # Identity: weighted passthrough
+                _combine_scatter(x_s[s:en], sw[s:en], st[s:en], out)
+                continue
+            gu = F.linear(x_s[s:en], gate_up_proj[e])                    # GLU; weight slot e (GLU first)
+            it = _glu_fwd_raw(gu, act_types[e])
+            eo = F.linear(it, down_proj[e])
+            gate_up_l[e] = gu; inter_l[e] = it; eo_l[e] = eo
+            _combine_scatter(eo, sw[s:en], st[s:en], out)
+        ctx.save_for_backward(x_s, st, sw, order, gate_up_proj, down_proj)
+        ctx.lists = (gate_up_l, inter_l, eo_l); ctx.bounds = bounds
+        ctx.meta = (num_tokens, H, top_k, num_polyglu, zero_start, num_routed, tuple(act_types), hidden.dtype)
+        return out.to(hidden.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x_s, st, sw, order, gate_up_proj, down_proj = ctx.saved_tensors
+        gate_up_l, inter_l, eo_l = ctx.lists
+        num_tokens, H, top_k, num_polyglu, zero_start, num_routed, act_types, hidden_dtype = ctx.meta
+        bounds = ctx.bounds; M = st.numel()
+        grad_out = grad_out.contiguous()
+        grad_hidden = torch.zeros(num_tokens, H, device=grad_out.device, dtype=x_s.dtype)
+        grad_gate_up_proj = torch.zeros_like(gate_up_proj)
+        grad_down_proj = torch.zeros_like(down_proj)
+        grad_w_s = torch.zeros(M, device=grad_out.device, dtype=sw.dtype)
+        for e in range(num_routed):
+            s, en = bounds[e], bounds[e + 1]
+            if en == s:
+                continue
+            if e >= zero_start:                                          # Zero: no grad
+                continue
+            if e >= num_polyglu:                                         # Identity: out = w*input
+                ge, gw = _combine_bwd(grad_out, x_s[s:en], sw[s:en], st[s:en])
+                grad_w_s[s:en] = gw.to(sw.dtype)
+                grad_hidden.index_add_(0, st[s:en], ge.to(grad_hidden.dtype))
+                continue
+            ge, gw = _combine_bwd(grad_out, eo_l[e], sw[s:en], st[s:en])  # ge=(m,H) compute-dtype, gw fp32
+            grad_w_s[s:en] = gw.to(sw.dtype)
+            cdt = ge.dtype
+            grad_inter = ge @ down_proj[e].to(cdt)                       # (m,H)@(H,I) -> (m,I)
+            grad_down_proj[e] = (ge.t() @ inter_l[e].to(cdt)).to(down_proj.dtype)
+            grad_gate_up = _glu_bwd_raw(grad_inter, gate_up_l[e], act_types[e])   # (m,2I)
+            grad_gate_up_proj[e] = (grad_gate_up.t() @ x_s[s:en].to(grad_gate_up.dtype)).to(gate_up_proj.dtype)
+            grad_hidden.index_add_(0, st[s:en], (grad_gate_up @ gate_up_proj[e].to(grad_gate_up.dtype)).to(grad_hidden.dtype))
+        grad_wt = torch.zeros(num_tokens * top_k, device=grad_out.device, dtype=sw.dtype)
+        grad_wt[order] = grad_w_s
+        return (grad_hidden.to(hidden_dtype), None, grad_wt.view(num_tokens, top_k),
+                grad_gate_up_proj, grad_down_proj, None, None, None, None)
+
+
+# ═══════════════════════════════════════════════════════════════
 # Optimized MoE Expert Forward
 # ═══════════════════════════════════════════════════════════════
 
@@ -852,71 +1019,16 @@ def triton_moe_experts_forward(
 
     Batched GLU kernel available via triton_batched_glu_activation()
     for cases where launch overhead dominates (large models).
+
+    Routes through _BiBoPerExpertMoE (custom backward, fused fp32 combine). Scales m GLU groups +
+    n special pairs via num_polyglu_experts / zero_start. identity_start is unused (Identity is the
+    [num_polyglu_experts, zero_start) range).
     """
-    num_tokens, hidden_size = hidden_states.shape
-
-    # Sort tokens by expert
-    flat_expert_indices = top_k_indices.flatten()
-    flat_token_indices = torch.arange(
-        num_tokens, device=hidden_states.device
-    ).unsqueeze(1).expand_as(top_k_indices).flatten()
-    flat_weights = top_k_weights.flatten()
-
-    sorted_expert_indices, sort_order = flat_expert_indices.sort()
-    sorted_token_indices = flat_token_indices[sort_order]
-    sorted_weights = flat_weights[sort_order]
-
-    # Expert boundaries — pulled to CPU ints with ONE sync, then the loop below
-    # uses Python ints. Comparing/slicing with CUDA *scalar* tensors (the old
-    # `start = boundaries[i]; if end - start == 0`) forces an implicit GPU sync
-    # EVERY iteration, serializing the whole dispatch. That alone made this path
-    # ~1.6x slower and lose to PyTorch eager in fp16 (measured, RTX 3050).
-    expert_counts = torch.bincount(sorted_expert_indices, minlength=num_routed_experts).tolist()
-    boundaries = [0]
-    for _c in expert_counts:
-        boundaries.append(boundaries[-1] + _c)
-
-    # Output buffer — fp32 accumulator (matches eager BiBoFusedExperts + MiMo). Router weights are
-    # fp32; the weighted index_add accumulates in fp32, cast back to hidden dtype at the end.
-    output = torch.zeros(num_tokens, hidden_size, device=hidden_states.device, dtype=torch.float32)
-
-    ACT_MAP = {"silu": 0, "relu2": 1, "tanh": 2}
-
-    for expert_idx in range(num_routed_experts):
-        start = boundaries[expert_idx]
-        end = boundaries[expert_idx + 1]
-
-        if end == start:
-            continue
-
-        token_idx = sorted_token_indices[start:end]
-        weights = sorted_weights[start:end]
-        current_state = hidden_states[token_idx]
-
-        if expert_idx < num_polyglu_experts:
-            act_name = expert_activations[expert_idx]
-            act_type = ACT_MAP[act_name]
-
-            # cuBLAS GEMM for gate_up
-            gate_up = F.linear(current_state, gate_up_proj[expert_idx])
-
-            # Triton GLU activation
-            intermediate = triton_fused_glu_activation(gate_up, act_type)
-
-            # cuBLAS GEMM for down
-            expert_out = F.linear(intermediate, down_proj[expert_idx])
-
-            # Weight multiply + scatter
-            output.index_add_(0, token_idx, expert_out * weights.unsqueeze(-1))
-
-        elif expert_idx < zero_start:
-            # Identity expert: pass through with weight
-            output.index_add_(0, token_idx, current_state * weights.unsqueeze(-1))
-        else:
-            # Zero expert: multiply by 0, skip entirely (no-op)
-            pass
-
-    return output.to(hidden_states.dtype)
+    act_types = [_ACT_MAP[a] for a in expert_activations]   # length num_polyglu_experts
+    return _BiBoPerExpertMoE.apply(
+        hidden_states, top_k_indices, top_k_weights, gate_up_proj, down_proj,
+        act_types, num_polyglu_experts, zero_start, num_routed_experts,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
