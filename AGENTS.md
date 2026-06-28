@@ -478,6 +478,14 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
      the whole router→combine path is fp32 even under bf16/fp16 training (verified fp32/fp16/bf16
      fwd+bwd NaN-free). ⚠️ The OPT-IN Triton MoE kernels (`triton_moe_experts_forward`, `moe_grouped`)
      now receive fp32 weights — re-verify/cast there if you enable them; the default eager path is done.
+  5. **Default training kernel set changed** (`bench/models.py::apply_triton_kernels`, BiBo branch):
+     **dropped the dense-MLP SwiGLU Triton patch** (`patch_dense_mlp_with_triton`) — torch.compile's
+     lifted SiLU-mul ties a hand kernel (it's noise), so dense-MLP activation is left to the compiler;
+     **added the XSA kernel** (`patch_xsa_with_triton()`, gated on `config.use_xsa`); fused CE stays on
+     (`use_fused_ce=True` → `config.use_fused_linear_ce`). Net BiBo Triton set now = Liger RMSNorm+RoPE,
+     MoE-GLU dispatch, conv-router (if `router_type="conv"`), XSA, fused-linear CE — NO dense-MLP kernel.
+     ⚠️ Qwen branch still patches `patch_qwen_dense_mlp_with_triton`; drop it too if you want the
+     BiBo-vs-Qwen bench to treat dense-MLP identically (both compiled).
 - **(June 27 2026) BiBo↔Qwen now PARAM-MATCHED on BOTH axes; shared expert OFF by default.** Bench
   expert layout bumped 6→**9 GLU** (`polyglu_expert_multiplier: 2→3`) + 2 param-free specials = 11
   routed; Qwen `num_experts: 8→9`. A PolyGLU expert and a SwiGLU expert are param-identical, so 9
