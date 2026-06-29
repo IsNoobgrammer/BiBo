@@ -207,13 +207,16 @@ def log_eval_metrics(step, eval_results, tokens=None):
 
 def log_samples(step, samples):
     """Log generated samples as WandB Table."""
-    table = wandb.Table(columns=["prompt", "generated"])
+    table = wandb.Table(columns=["prompt", "generated", "top1_prob", "entropy", "first_token"])
     for s in samples:
-        table.add_data(s["prompt"], s["generated"][:200])
-    wandb.log({
-        "samples/step": step,
-        "samples/table": table,
-    })
+        table.add_data(s["prompt"], s["generated"][:200],
+                       s.get("top1_prob"), s.get("entropy"), s.get("first_token"))
+    log = {"samples/step": step, "samples/table": table}
+    if samples and "top1_prob" in samples[0]:
+        # scalar trend lines (table values aren't plottable over steps)
+        log["samples/top1_prob"] = sum(s["top1_prob"] for s in samples) / len(samples)
+        log["samples/entropy"] = sum(s["entropy"] for s in samples) / len(samples)
+    wandb.log(log)
 
 
 # ─────────────────────────────────────────────────────────────

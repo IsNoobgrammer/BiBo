@@ -45,12 +45,13 @@ training:
   muon_lr: 3.0e-4               # RMS-matched Muon (Moonlight/Kimi band); identical to bibo.yaml
   scheduler: "whd"              # WSD (Warmup-Stable-Decay), DEFAULT: 15% warmup → 60% hold → 25% linear decay→0 (fractions of total_steps); identical to bibo.yaml.
   muon_ns_steps: 5              # Turbo-Muon NS iters (ONLY active with --modded-muon; 1-5); identical to bibo.yaml. 5 = full Turbo NS, 4 = turbo.
+  modded_muon: true            # Polar-Express NS coeffs (default). false = tuned quintic Moonlight NS.
   decay_frac: 0.05              # LEGACY — unused (whd now fractional WSD); kept only because train.py passes it. Identical to bibo.yaml.
 
 eval:
   benchmarks: ["hellaswag"]
   eval_every: 500
-  sample_every: 500
+  sample_every: 200
   max_eval_examples: 1024   # cap HellaSwag/ARC per eval (keeps eval fast; identical to bibo.yaml)
 
 logging:

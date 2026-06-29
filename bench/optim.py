@@ -196,8 +196,8 @@ def create_optimizer(model, cfg):
     compile_opt = bool(cfg.get("hardware", {}).get("compile_optimizer", False))  # Kaggle-only (compile broken locally)
     weight_decay = train_decay if (train_decay := train_cfg.get("weight_decay", 0.1)) else 0.1
 
-    # --modded-muon: swap the quintic NS coeffs for the Polar-Express ones. Default path unchanged.
-    use_modded = bool(train_cfg.get("modded_muon", False))
+    # Polar-Express NS coeffs are the DEFAULT now; set modded_muon:false to fall back to tuned quintic.
+    use_modded = bool(train_cfg.get("modded_muon", True))
     # Vendored FusedMuon (fp16 NS + same-shape batched + foreach; DistributedMuon under DDP) — default ON.
     # Set `use_fused_muon: false` to fall back to the eager Muon/ModdedMuon.
     use_fused = bool(train_cfg.get("use_fused_muon", True))

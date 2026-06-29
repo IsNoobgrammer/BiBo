@@ -279,11 +279,19 @@ def generate_samples(model, prompts=None, max_new_tokens=100, temperature=0.8,
         input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
         generated_ids = input_ids.clone()
 
+        ent_sum, top1_sum, n_steps, first_token = 0.0, 0.0, 0, None
         for _ in range(max_new_tokens):
             with torch.autocast("cuda", dtype=torch.float16):
                 outputs = model(input_ids=generated_ids)
-                logits = outputs.logits[:, -1, :] / temperature
+                last_logits = outputs.logits[:, -1, :]
+            # Collapse diagnostic on the RAW (temp=1, un-truncated) distribution: top-1 prob ~0.95+
+            # and entropy ~0 → hard distribution collapse; moderate values → plain underfit.
+            p = F.softmax(last_logits.float(), dim=-1)
+            top1_sum += p.max(-1).values.item()
+            ent_sum += -(p * p.clamp_min(1e-12).log()).sum(-1).item()
+            n_steps += 1
 
+            logits = last_logits / temperature
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
             sorted_mask = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
@@ -291,13 +299,20 @@ def generate_samples(model, prompts=None, max_new_tokens=100, temperature=0.8,
             probs = F.softmax(sorted_logits, dim=-1)
             next_idx = torch.multinomial(probs, num_samples=1)
             next_token = sorted_indices.gather(-1, next_idx)
+            if first_token is None:
+                first_token = next_token.item()
             generated_ids = torch.cat([generated_ids, next_token], dim=-1)
 
             if next_token.item() == tokenizer.eos_token_id:
                 break
 
         text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        results.append({"prompt": prompt, "generated": text})
+        results.append({
+            "prompt": prompt, "generated": text,
+            "top1_prob": top1_sum / max(n_steps, 1),     # mean over generated steps
+            "entropy": ent_sum / max(n_steps, 1),        # nats; near 0 → collapsed
+            "first_token": first_token,                  # same across prompts → collapse
+        })
 
     model.train()
     return results

@@ -629,11 +629,17 @@ def train(args):
             # ── Sample Generation ─────────────────────────────
             if is_main and step % sample_every == 0:
                 try:
-                    samples = generate_samples(eval_model, device=device,
-                                               prompts=["The meaning of life is"],
-                                               max_new_tokens=50)
+                    samples = generate_samples(
+                        eval_model, device=device,
+                        prompts=["The meaning of life is", "Once upon a time"],
+                        max_new_tokens=50)
                     log_samples(step, samples)
-                    print(f"    [SAMPLE] {samples[0]['generated'][:100]}...")
+                    for s in samples:
+                        print(f"    [SAMPLE] top1={s['top1_prob']:.3f} ent={s['entropy']:.2f} "
+                              f"tok0={s['first_token']} | {s['generated'][:90]}...")
+                    # Same first token across both prompts → distribution collapse (not underfit).
+                    if samples[0]["first_token"] == samples[1]["first_token"]:
+                        print(f"    [SAMPLE] ⚠ first token prompt-independent ({samples[0]['first_token']}) → likely collapse")
                 except torch.cuda.OutOfMemoryError:
                     torch.cuda.empty_cache()
 
@@ -642,6 +648,14 @@ def train(args):
                 ckpt_path = os.path.join(REPO_ROOT, "bench", "checkpoints",
                                          f"{model_type}_step_{step}.pt")
                 save_checkpoint(model, optimizer, scheduler, step, ckpt_path)
+
+            # Eval/sample/ckpt above run on rank 0 only; the other ranks idle. Barrier so they
+            # wait here (every rank evaluates this guard identically) instead of racing into the
+            # next grad all-reduce and stalling there while rank 0 is still in eval — and so a slow
+            # eval can't push the other ranks toward an NCCL collective-timeout. (ckpt steps are a
+            # multiple of eval_every, so step%eval_every==0 already covers them.)
+            if is_distributed and (step % eval_every == 0 or step % sample_every == 0):
+                dist.barrier()
 
     # ── Final Summary ─────────────────────────────────────────
     if is_main:
