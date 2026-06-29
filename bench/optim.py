@@ -160,27 +160,14 @@ except ImportError:
 # Optimizer factory
 # ─────────────────────────────────────────────────────────────
 
-def _build_muon(muon_params, muon_lr, weight_decay, use_modded, compile_opt, muon_extra, use_fused):
-    """Build the Muon sub-optimizer. Default = vendored FusedMuon (fp16 NS + same-shape batched +
-    foreach, Moonlight recipe) — bit-parity to the eager step in fp32, faster + lower peak on T4. Under
-    DDP (world_size>1) uses DistributedMuon (option B: each rank does ~1/world_size of the NS). Falls back
-    to the eager Muon/ModdedMuon if `use_fused_muon: false` in config or on CPU. Returns (opt, impl_name).
-    """
-    if not (use_fused and torch.cuda.is_available()):
-        MuonClass = Muon
-        if use_modded:
-            from optim_modded import ModdedMuon as MuonClass
-        return (MuonClass(muon_params, lr=muon_lr, momentum=0.95, weight_decay=weight_decay,
-                          compile_ns=compile_opt, **muon_extra), "eager")
-    import torch.distributed as dist
-    from fused_muon import FusedMuon, DistributedMuon, _PE_COEFFS, _QUINTIC
-    # default NS coeffs = BiBo's tuned quintic Moonlight; --modded-muon swaps in the Polar-Express coeffs.
-    coeffs = _PE_COEFFS if use_modded else _QUINTIC
-    kw = dict(lr=muon_lr, momentum=0.95, weight_decay=weight_decay,
-              coeffs=coeffs, scale_mode="moonlight", ns_dtype=torch.float16)
-    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-        return DistributedMuon(muon_params, **kw), "fused+DDP-optionB"
-    return FusedMuon(muon_params, **kw), "fused"
+def _build_muon(muon_params, muon_lr, weight_decay, use_modded, compile_opt, muon_extra):
+    """Build the eager Muon sub-optimizer (Moonlight recipe). `modded_muon: true` uses ModdedMuon
+    (Polar-Express NS coeffs); otherwise the tuned-quintic Muon. Returns (opt, impl_name)."""
+    MuonClass = Muon
+    if use_modded:
+        from optim_modded import ModdedMuon as MuonClass
+    return (MuonClass(muon_params, lr=muon_lr, momentum=0.95, weight_decay=weight_decay,
+                      compile_ns=compile_opt, **muon_extra), "eager")
 
 
 def create_optimizer(model, cfg):
@@ -198,9 +185,6 @@ def create_optimizer(model, cfg):
 
     # Polar-Express NS coeffs are the DEFAULT now; set modded_muon:false to fall back to tuned quintic.
     use_modded = bool(train_cfg.get("modded_muon", True))
-    # Vendored FusedMuon (fp16 NS + same-shape batched + foreach; DistributedMuon under DDP) — default ON.
-    # Set `use_fused_muon: false` to fall back to the eager Muon/ModdedMuon.
-    use_fused = bool(train_cfg.get("use_fused_muon", True))
     ns_steps = int(train_cfg.get("muon_ns_steps", 4))
     muon_extra = {"ns_steps": ns_steps} if use_modded else {}   # eager-fallback only
 
@@ -241,7 +225,7 @@ def create_optimizer(model, cfg):
             )
 
         muon, muon_impl = _build_muon(muon_params, muon_lr, weight_decay, use_modded,
-                                      compile_opt, muon_extra, use_fused)
+                                      compile_opt, muon_extra)
 
         # Combine into a single optimizer-like object
         optimizer = _CombinedOptimizer(muon, adamw)
@@ -256,7 +240,7 @@ def create_optimizer(model, cfg):
             lr=lr, betas=(0.9, 0.95), fused=fused,
         )
         muon, muon_impl = _build_muon(muon_params, muon_lr, weight_decay, use_modded,
-                                      compile_opt, muon_extra, use_fused)
+                                      compile_opt, muon_extra)
         optimizer = _CombinedOptimizer(muon, adamw)
         name = ("Muon+AdamW(fused)" if fused else "Muon+AdamW") + f" [{muon_impl}]"
 
@@ -293,7 +277,7 @@ def create_optimizer(model, cfg):
         name = "AdamW"
 
     if use_modded and "Muon" in name:
-        name += " [PE-NS 5it]" if (use_fused and torch.cuda.is_available()) else f" [Turbo-NS {ns_steps}it]"
+        name += f" [Turbo-NS {ns_steps}it]"
     print(f"  Optimizer: {name}")
     return optimizer, name
 

@@ -5,10 +5,6 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple, Union
 from torch.nn import CrossEntropyLoss
 
-# Cross-entropy: default = standard F.cross_entropy; opt-in (config.use_fused_linear_ce=True) =
-# BiBo's own fused-linear-CE Triton kernel (src/kernels/fused_ce.py). Liger's chunked CE removed
-# (it was 3-4x slower than standard at vocab<=81k; ours is comparable at small N, faster at large).
-
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -293,22 +289,8 @@ class BiBoForCausalLM(BiBoPreTrainedModel, GenerationMixin):
         hidden_states = outputs.last_hidden_state
 
         loss = None
-        # Default: standard (non-chunked) fused CE — `logits = lm_head(x)` + F.cross_entropy.
-        # Opt-in `config.use_fused_linear_ce=True` → BiBo's own fused-linear-CE Triton kernel
-        # (cut-cross-entropy style): never materializes (N,V) logits, ~comparable to standard at
-        # small N and far faster + leaner at large N (the only viable path at the real 16k-token
-        # step, where standard OOMs). Replaces the old Liger chunked CE (which was 3-4x slower).
-        if labels is not None and getattr(self.config, "use_fused_linear_ce", False):
-            from src.kernels.fused_ce import fused_linear_cross_entropy
-            shift_hidden = hidden_states[..., :-1, :].reshape(-1, hidden_states.shape[-1])
-            shift_labels = labels[..., 1:].reshape(-1).to(shift_hidden.device)
-            # match weight dtype to hidden (autocast keeps params fp32; the kernel's tl.dot needs
-            # matching operand dtypes). Autograd chains the cast back to the fp32 param grad.
-            lm_w = self.lm_head.weight.to(shift_hidden.dtype)
-            loss = fused_linear_cross_entropy(shift_hidden, lm_w, shift_labels)
-            logits = None  # not materialized
-        elif labels is not None:
-            # Standard CE — fast, uses one big F.linear + F.cross_entropy
+        # Standard CE — one big F.linear + F.cross_entropy.
+        if labels is not None:
             logits = self.lm_head(hidden_states)
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()

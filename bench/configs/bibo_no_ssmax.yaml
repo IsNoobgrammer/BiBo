@@ -58,6 +58,5 @@ logging:
 
 hardware:
   compile: true
-  triton: true
   grad_checkpoint: false
   fsdp: true

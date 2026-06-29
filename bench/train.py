@@ -1,8 +1,7 @@
 """
 BiBo Benchmark — Unified Training Script
 
-Supports BiBo, BiBo variants, and Qwen3MoE via YAML config.
-Both models get Liger kernels (RMSNorm, RoPE, SiLUMul, FusedCE) + dense MLP Triton.
+Supports BiBo, BiBo variants, and Qwen3MoE via YAML config (PyTorch eager + torch.compile).
 
 Usage:
     python bench/train.py --config bench/configs/bibo.yaml
@@ -40,7 +39,7 @@ BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, BENCH_DIR)
 
-from models import build_model_from_config, count_params, apply_triton_kernels, resize_embeddings
+from models import build_model_from_config, count_params, resize_embeddings
 from data import load_benchmark_data, create_dataloader
 from optim import create_optimizer, create_scheduler, HAS_BNB
 from eval import evaluate, generate_samples, get_tokenizer, run_all_evals, evaluate_length_extrapolation
@@ -59,10 +58,9 @@ AMP_DTYPE = torch.float16
 def set_deterministic(seed, strict=False):
     """Make training reproducible: identical config + seed -> identical loss curve.
 
-    strict=False (default): warn on ops with no deterministic CUDA impl but keep
-      running. Curves are reproducible except for custom Triton atomic kernels.
+    strict=False (default): warn on ops with no deterministic CUDA impl but keep running.
     strict=True: hard-error on any non-deterministic op (use to hunt what breaks
-      bit-exact reproducibility; will crash on custom atomic kernels).
+      bit-exact reproducibility).
     """
     os.environ["PYTHONHASHSEED"] = str(seed)
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -96,10 +94,6 @@ def parse_args():
                    help="Cap HellaSwag/ARC examples per eval (default 500 via config). Keeps eval fast.")
     p.add_argument("--wandb_name", type=str, default=None)
     p.add_argument("--no_compile", action="store_true")
-    p.add_argument("--no_triton", action="store_true")
-    p.add_argument("--no_fused_ce", action="store_true",
-                   help="Keep Triton body kernels but use standard (compiled) CE instead of the "
-                        "fused-linear-CE kernel. Faster when the (N,V) logits fit in memory.")
     p.add_argument("--no_wandb", action="store_true")
     p.add_argument("--eval_only", action="store_true")
     p.add_argument("--grad_checkpoint", action="store_true")
@@ -289,9 +283,6 @@ def train(args):
             _strict = train_cfg.get("strict_deterministic", False)
             print(f"{TAG}   Deterministic: ON (seed={train_cfg.get('seed', 42)}, "
                   f"strict={_strict}) — identical config => identical curve")
-            if not _strict:
-                print(f"{TAG}     note: custom Triton atomic kernels remain non-bit-exact; "
-                      f"use --no_triton for a bit-exact reference curve")
         print(f"{TAG} " + "=" * 60)
 
     # ── Data ──────────────────────────────────────────────────
@@ -337,19 +328,6 @@ def train(args):
     config.use_cache = False
 
     model = model.to(device)
-
-    # ── Triton Kernels (Liger + Dense MLP for BOTH models) ────
-    if not args.no_triton:
-        # Standard (compiled) CE is the DEFAULT — measured 2.36x faster / 14.7% vs 6.2% MFU at
-        # H512/V81920/B16 (the fused tl.dot-CE forward runs at ~2% SoL vs cuBLAS ~50%; it only
-        # helps when the (N,V) logits OOM). Opt in with use_fused_ce: true (config) for that regime.
-        use_fused_ce = bool(train_cfg.get("use_fused_ce", False)) and not args.no_fused_ce
-        if is_main:
-            print(f"{TAG} Applying Triton kernels... (CE: {'fused' if use_fused_ce else 'standard/compiled'})")
-        apply_triton_kernels(model, config, no_triton=False, use_fused_ce=use_fused_ce)
-    else:
-        if is_main:
-            print(f"{TAG} Triton DISABLED (--no_triton)")
 
     # ── DDP ───────────────────────────────────────────────────
     if is_distributed:
@@ -413,7 +391,6 @@ def train(args):
             "deterministic": train_cfg.get("deterministic", True),
             "strict_deterministic": train_cfg.get("strict_deterministic", False),
             "compile": not args.no_compile,
-            "triton": not args.no_triton,
             "warmup_steps": train_cfg.get("warmup_steps", 1000),
             "weight_decay": train_cfg.get("weight_decay", 0.1),
             "grad_clip": train_cfg.get("grad_clip", 1.0),

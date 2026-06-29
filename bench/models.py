@@ -1,8 +1,7 @@
 """
 BiBo Benchmark — Unified Model Builder
 
-Builds BiBo or Qwen3MoE from YAML config dict.
-Applies Liger-Kernel + Triton optimizations to both models.
+Builds BiBo or Qwen3MoE from YAML config dict (PyTorch eager; torch.compile handled in train.py).
 """
 
 import sys
@@ -164,67 +163,6 @@ def count_params(model, config) -> dict:
         "num_dense_layers": num_dense,
         "routed_per_layer": int(routed_per_layer),
     }
-
-
-def apply_triton_kernels(model, config, no_triton=False, use_fused_ce=True):
-    """
-    Apply Liger-Kernel + Triton patches to BOTH BiBo and Qwen3MoE.
-
-    Liger ops applied to both:
-      - RMSNorm (8-9x faster)
-      - RoPE (2-3x faster)
-      - SiLUMul (for MLP activation)
-      - Fused CrossEntropy (handled at training loop level)
-
-    BiBo-only:
-      - MoE fused GLU activation
-      - MoE weight scatter
-      - Conv fused ops (router + expert)
-
-    Both:
-      - Dense MLP SwiGLU (Triton fused forward + backward)
-    """
-    if no_triton:
-        return
-
-    model_type = getattr(config, 'model_type', 'bibo')
-    # Qwen3MoeConfig uses "qwen3_moe", YAML uses "qwen3moe"
-    is_qwen = model_type in ("qwen3moe", "qwen3_moe")
-
-    try:
-        if not is_qwen:
-            from src.kernels.patch import patch_bibo_with_liger
-            from src.kernels.moe_dispatch import patch_moe_with_triton
-            from src.kernels.xsa_fused import patch_xsa_with_triton
-
-            patch_bibo_with_liger(model)          # Liger RMSNorm + RoPE
-            patch_moe_with_triton(model)          # MoE per-expert dispatch + fused combine (manual bwd)
-            # Dense-MLP SwiGLU kernel intentionally NOT applied — torch.compile's lifted SiLU-mul ties
-            # a hand kernel (it's noise); leave dense-MLP activation to the compiler.
-            # Conv router kernel REMOVED — conv router (router_type="conv") runs eager; bench uses "mlp".
-            xsa_on = getattr(config, "use_xsa", False)
-            if xsa_on:
-                patch_xsa_with_triton()           # our fused XSA rejection kernel
-            # CE: BiBo routes through our fused-linear-CE via an instance config flag.
-            if use_fused_ce:
-                model.config.use_fused_linear_ce = True
-            ce_tag = " + FusedCE" if use_fused_ce else ""
-            xsa_tag = " + XSA" if xsa_on else ""
-            print(f"  Triton: RMSNorm + RoPE + MoE{xsa_tag}{ce_tag} (no dense-MLP/conv kernel — compiled/eager)")
-
-        else:
-            from src.kernels.patch import patch_qwen3_with_liger, patch_qwen3_fused_ce
-
-            patch_qwen3_with_liger(model)
-            if use_fused_ce:
-                patch_qwen3_fused_ce(model)   # OUR fused_ce kernel — same one BiBo uses (not Liger's)
-            # Dense-MLP kernel dropped on BOTH sides — torch.compile handles dense MLP; keeps the
-            # BiBo-vs-Qwen bench symmetric (both compiled dense MLP, both our fused CE).
-            ce_tag = " + FusedCE" if use_fused_ce else ""
-            print(f"  Triton: RMSNorm + RoPE{ce_tag} (dense MLP compiled)")
-
-    except Exception as e:
-        print(f"  Triton FAILED: {e} — using PyTorch eager")
 
 
 def resize_embeddings(model, config, target_vocab_size):

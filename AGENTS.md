@@ -70,9 +70,6 @@ misc/kaggle/multi_gpu/             # 2×T4 parallel ablation
 └── report/                        # Next.js report (deployed via GitHub Pages)
 
 research_on_activations/           # Activation function research (gitignored)
-old_kernels/                        # Retired kernel variants (kept for re-benchmarking)
-├── dense_mlp.py                   # Forward-only variant (Triton fwd, PyTorch bwd)
-└── dense_mlp_fused.py             # Fully fused fwd+bwd single kernel
 
 legacy/                            # Old monolithic code (DO NOT USE for new work)
 ```
@@ -280,6 +277,19 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 
 ## Known Quirks / TODOs
 
+- **(June 30 2026) ALL custom kernels REMOVED — BiBo + bench run pure PyTorch eager + torch.compile.**
+  The entire `src/kernels/` tree (MoE dispatch, XSA, fused-linear CE, fused conv-router, Liger
+  RMSNorm/RoPE patches), the kernel benches, the vendored fused Muon (`bench/fused_muon.py`), and the
+  kernel-only bench/profile scripts (`ckpt_compare.py`, `e2e_ce_matrix.py`, `e2e_profile_1024.py`,
+  `_compare_final.py`, `profile_bibo.py`) were deleted. **Kernels now live in a SEPARATE repo** and are
+  consumed from there. Consequently: `bench/models.py` no longer has `apply_triton_kernels`; `train.py`
+  dropped `--no_triton`/`--no_fused_ce` and the kernel-apply block; CE is always standard
+  `F.cross_entropy` (the `use_fused_linear_ce` path is gone from `models.py`); the conv router runs the
+  eager `nn.Conv1d` path (the `use_fused_conv_router` fast path is gone from `router.py`); Muon is
+  eager-only (the `use_fused_muon` path is gone from `optim.py`); configs dropped `use_fused_ce` and the
+  dead `triton:` key. **Everything below this entry that describes a custom Triton/Liger kernel, a
+  `src/kernels/...` path, or fused Muon is HISTORY — those files no longer exist in this repo.** Speed
+  levers that remain in-repo: `torch.compile` (`hardware.compile`) and `compile_optimizer`.
 - `router_temperature` param exists in config but is never used (legacy, kept for compat)
 - `moe_shared_scaling` is a **learnable nn.Parameter** (per MoE layer) as of this session — the config float is only its init. Rationale (from the shared-expert research): no production MoE hardcodes a fixed shared scalar — DeepSeek/Gemma just add (Gemma sizes 3×), Qwen2 used a learnable per-token gate (dropped in Qwen3), Qwen3/MiMo-V2 dropped the shared expert entirely. The old fixed 0.40 was ~7.5× below the measured init-balance (~3.0) AND the MC auto-formula diverges as experts scale; a learnable scalar (LayerScale-style) fixes both. Disable the shared expert with `use_shared_expert=False` / `--no-shared-expert`. ⚠️ The scalar lands in the AdamW group **with weight_decay** (norms/biases do too in this repo) — WD gently pulls it toward 0; acceptable but worth excluding if it underperforms.
 - `moe_shared_scaling=1.0` triggers a 10K-iteration Monte Carlo in config init (now used as the learnable param's INIT) — pass explicit value to skip
@@ -513,174 +523,14 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 
 ---
 
-## Triton Kernels (`src/kernels/`)
+## Kernels — moved to a separate repo (June 30 2026)
 
-**All custom GPU kernels MUST be written in `src/kernels/`. Read the `tritonify` skill before implementing any kernel.**
-
-### Architecture
-
-```
-src/kernels/
-├── __init__.py              # Exports all patching functions
-├── patch.py                 # Liger-Kernel patches (RMSNorm, RoPE)
-# The 3-kernel training set (+ Liger RMSNorm/RoPE via patch.py):
-├── moe_dispatch.py          # MoE per-expert dispatch: manual backward + fused fp32 combine
-├── xsa_fused.py             # XSA (Exclusive Self Attention) rejection kernel
-├── fused_ce.py              # fused-linear cross-entropy (BiBo + Qwen baseline both use it)
-└── bench/                   # All kernel benchmarks
-    ├── __init__.py
-    ├── bench_utils.py       # Shared: benchmark_phase, gradient check, NaN check
-    ├── profile_benchmark.py # torch.profiler benchmark (Baseline/Liger/MoE/All)
-    ├── verify_grads.py      # Gradient equivalence verification
-    ├── bench_moe.py         # MoE benchmark (correctness + 3-phase perf)
-    ├── bench_moe_fwdbwd.py  # MoE full fwd+bwd training step benchmark
-    └── verify_e2e.py        # Full model E2E verification
-
-old_kernels/                  # Retired variants (kept for re-benchmarking)
-├── dense_mlp.py             # Forward-only (Triton fwd, PyTorch bwd)
-└── dense_mlp_fused.py       # Fully fused fwd+bwd single kernel
-```
-
-### Kernel Inventory (June 2026)
-
-| Kernel | File | Forward | Backward | Status |
-|--------|------|---------|----------|--------|
-| `_fused_glu_act_kernel` | moe_dispatch.py | Triton | **Triton** (`_TritonMoEGLUFunction`) | Production |
-| `_fused_linear_glu_kernel` | moe_dispatch.py | Triton | **Triton** (recomputes gate_up) | Production |
-| `_fused_down_weight_kernel` | moe_dispatch.py | Triton | **Triton** (integrated) | Production |
-| `_fused_weight_scatter_kernel` | moe_dispatch.py | Triton | **Triton** (scatter→gather) | Production |
-| `_fused_router_kernel` | moe_dispatch.py | Triton | N/A (detached) | Production |
-| `_batched_glu_act_kernel` | moe_dispatch.py | Triton | **Triton** (`_TritonFusedGLUFunction`) | reference (unused by patched path) |
-| `_combine_scatter_kernel` / `_combine_bwd_kernel` | moe_dispatch.py | Triton | **Triton** (in `_BiBoPerExpertMoE`) | Production (fused fp32 combine) |
-| Liger RMSNorm | patch.py | Triton | Triton (Liger) | Production |
-| Liger RoPE | patch.py | Triton | Triton (Liger) | Production |
-| Liger SiLUMul | patch.py | Triton | Triton (Liger) | Production |
-| Liger Fused CE | models.py | Triton | Triton (Liger) | Production |
-
-### Backward Kernel Pattern (from dense_mlp.py gold standard)
-
-```python
-class _FusedXxxFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, weight, act_type):
-        ctx.save_for_backward(x, weight)
-        ctx.act_type = act_type
-        # Launch Triton forward kernel
-        out = torch.empty(...)
-        _fused_xxx_forward_kernel[grid](x, weight, out, ...)
-        return out
-    
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, weight = ctx.saved_tensors
-        # Launch Triton backward kernel for activation derivatives
-        grad_gate_up = torch.empty(...)
-        _fused_xxx_backward_kernel[grid](grad_output, x, weight, grad_gate_up, ...)
-        # GEMM backward via cuBLAS (optimal for large shapes)
-        grad_x = F.linear(grad_gate_up, weight)
-        grad_weight = torch.mm(grad_gate_up.t(), x.float())
-        return grad_x, grad_weight, None
-```
-
-### Backward Kernel Reference (from tritonify)
-
-**GLU activation backward** (from glu-kernels.md):
-- SiLU: `dact = sig * (1 + g * (1 - sig))`
-- ReLU²: `dact = 2 * relu(g)`
-- Tanh: `dact = 1 - tanh(g)²`
-- All computed in float32 to prevent overflow
-
-**Weight scatter backward** (from moe-kernels.md):
-- Forward: `out[idx[n]] += expert_out[n] * weights[n]` (atomic_add)
-- Backward: `grad_expert_out[n] = grad_out[idx[n]] * weights[n]` (gather)
-- Backward: `grad_weights[n] = (grad_out[idx[n]] * expert_out[n]).sum()` (reduce)
-
-**GEMM backward** (from llm-optimizations.md):
-- `grad_x = grad_output @ weight` (cuBLAS)
-- `grad_weight = grad_output.T @ x` (cuBLAS)
-- Always use float32 for the GEMM to prevent overflow
-
-### 4 Mandatory Rules for All Triton Kernels
-
-Every kernel implementation and benchmark MUST satisfy ALL 4 rules:
-
-**Rule 1: Gradient Equivalence**
-> For every Triton implementation, the gradient must match the **baseline (original PyTorch)** — NOT the Triton-patched version.
-
-- Baseline = PyTorch eager with no patches applied
-- Tolerance: atol=1e-3, rtol=1e-3 (fp16); atol=1e-5 (fp32)
-- Verified by: `verify_grads.py` + per-bench gradient checks
-- If a kernel passes forward correctness but fails gradient equivalence, it is BROKEN for training
-
-**Rule 2: NaN-Free Multi-Pass Stability**
-> Every kernel must complete ≥2 full forward+backward passes with zero NaN losses.
-
-- Run 2+ forward+backward cycles on the same input
-- Check `loss.isnan().any() == False` after every pass
-- Check `all(p.grad is not None and not p.grad.isnan().any() for p in model.parameters())`
-- If any NaN → kernel is broken, do not proceed to benchmarking
-
-**Rule 3: Three-Phase Benchmark (Fwd / Bwd / Fwd+Bwd)**
-> Every kernel must be benchmarked separately for forward, backward, and forward+backward.
-
-- **Forward-only**: `model(x)` with `torch.no_grad()` — measures inference speed
-- **Backward-only**: Run forward once, then `loss.backward()` — measures gradient computation
-- **Forward+Backward**: Full training step — measures total training cost
-- Each phase runs **≥3 warmup steps + ≥3 timed steps** before averaging
-- Report: median time (ms), speedup vs baseline, peak memory (MB)
-
-**Rule 4: torch.profiler for All Benchmarks**
-> All benchmarks MUST use `torch.profiler` for timing and kernel breakdowns.
-
-- Use `torch.profiler` with `ProfilerActivity.CPU, ProfilerActivity.CUDA`
-- Use `prof.key_averages().table(sort_by="cuda_time_total")` for kernel breakdown
-- Use `torch.cuda.Event(enable_timing=True)` for wall-clock timing
-- NEVER use `time.time()` for GPU benchmarking
-
-### GEMM Policy: When to Use Triton vs cuBLAS
-
-**Default: cuBLAS** for standard large GEMMs (M ≥ 128, K, N ≥ 512).
-
-**Use Triton GEMMs when fusion eliminates HBM round-trips:**
-
-| Case | Why Triton wins | BiBo target | Expected gain |
-|------|----------------|-------------|---------------|
-| GEMM + SwiGLU activation | Fuses gate_up GEMM + silu(gate)*up into 1 kernel. Eliminates (M,2I) write + read. | Dense MLP layers | 1.2-1.5x on activation |
-| Small-M expert GEMM | cuBLAS overhead dominates at M<32. Memory-bound, not compute-bound. | MoE expert dispatch | 1.3-1.5x on MoE fwd |
-| GEMM + bias + activation | Eliminates 2 HBM round-trips. | Conv expert gate | 1.3-1.4x |
-
-**Do NOT write Triton GEMMs for:**
-- Large standard shapes (M ≥ 128) without fusion — cuBLAS tensor cores win
-- Router matmul (small N) — cuBLAS heuristic handles this efficiently
-
-**Sources:** Liger-Kernel paper (arXiv:2410.10989), TritonMoE paper (arXiv:2605.23911),
-Triton matmul tutorial, CSDN Triton matmul optimization, GitHub triton-fp8-matmul
-
-**Key insight from research:** The win from "Triton GEMM" is almost always **fusion** —
-combining the GEMM with a subsequent operation into a single kernel launch. A standalone
-Triton GEMM that replaces cuBLAS without fusion rarely wins.
-
-### Kernel Development Rules
-
-1. **Liger-Kernel first** — check if Liger already provides the op before writing custom
-2. **Monkey-patch pattern** — kernels applied via `patch_*` functions, never modify modeling code
-3. **autograd.Function mandatory** — wrap every raw Triton kernel in `torch.autograd.Function`
-4. **JIT + Autotune toggle** — every kernel has `_kernel` (fixed) and `_kernel_at` (autotuned), controlled by `USE_AUTOTUNE` flag
-5. **NEVER use `register_buffer` for tensors that need gradients** — buffers are excluded from autograd
-6. **Read the tritonify skill** — before implementing any kernel, load the `tritonify` skill and read its references
-7. **Correctness is binary** — atol=1e-3 for fp16, atol=1e-5 for fp32
-8. **Run `verify_grads.py` before promoting any kernel** — gradient equivalence check
-
-### Running Benchmarks
-
-```bash
-.\\.venv\\Scripts\\python src/kernels/bench/bench_moe.py         # MoE layer
-.\\.venv\\Scripts\\python src/kernels/bench/bench_conv.py        # Conv fusion
-.\\.venv\\Scripts\\python src/kernels/bench/bench_moe_fwdbwd.py  # Full fwd+bwd
-.\\.venv\\Scripts\\python src/kernels/bench/verify_e2e.py        # E2E correctness
-.\\.venv\\Scripts\\python src/kernels/bench/verify_grads.py      # Gradient verification
-.\\.venv\\Scripts\\python src/kernels/bench/profile_benchmark.py # torch.profiler 4-way
-```
+**There are no custom GPU kernels in this repo anymore.** BiBo and the Qwen baseline run pure PyTorch
+eager + `torch.compile`. All Triton/Liger kernels (MoE dispatch, XSA, fused-linear CE, fused conv-router,
+Liger RMSNorm/RoPE), the kernel benches, and the vendored fused Muon were removed and now live in a
+**separate kernels repo**, consumed from there. Do not re-introduce `src/kernels/` here. See the top of
+"Known Quirks / TODOs" for exactly what the removal changed in `models.py`, `train.py`, `optim.py`,
+`router.py`, and the configs.
 
 ---
 

@@ -39,7 +39,6 @@ model:
 training:
   batch_size: 16
   grad_accum: 1
-  use_fused_ce: true
   total_steps: 50000
   warmup_steps: 100
   lr: 5.0e-4
@@ -66,6 +65,5 @@ logging:
 
 hardware:
   compile: true
-  triton: true
   grad_checkpoint: false
   fsdp: true
