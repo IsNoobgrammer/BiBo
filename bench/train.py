@@ -118,7 +118,9 @@ def parse_args():
     p.add_argument("--no-shared-expert", "--no_shared_expert", dest="no_shared_expert", action="store_true",
                    help="BiBo: force the shared expert off (use_shared_expert=False; already the default). Overrides a config that sets it on.")
     p.add_argument("--modded-muon", "--modded_muon", dest="modded_muon", action="store_true",
-                   help="Use Turbo-Muon NS (AOL + per-iter coeffs, 4 iters) instead of the standard 5-iter quintic. Both models. Keeps Moonlight scaling + muon_lr.")
+                   help="Force Polar-Express NS coeffs (this is already the default; flag kept for explicitness). Both models.")
+    p.add_argument("--default-muon", "--default_muon", dest="default_muon", action="store_true",
+                   help="Switch Muon NS back to the tuned 5-iter quintic Moonlight coeffs (default is Polar-Express). Both models.")
     p.add_argument("--scheduler", choices=["cosine", "whd", "whd5"], default=None,
                    help="LR schedule: 'whd5' (5-phase staircase WHD, default/Muon goto), 'whd' (simple Warmup-Hold-Decay), or 'cosine' (AdamW). Overrides config. Use 'cosine' for AdamW baselines.")
     p.add_argument("--exp-post-embed-norm", "--exp_post_embed_norm", dest="exp_post_embed_norm", action="store_true",
@@ -148,8 +150,12 @@ def load_config(args):
         t["seq_len"] = args.seq_len
     if args.seed is not None:
         t["seed"] = args.seed
-    if args.modded_muon:
-        t["modded_muon"] = True   # create_optimizer swaps in Turbo-Muon NS (bench/optim_modded.py)
+    # Polar-Express NS is the default (config modded_muon defaults True). --default-muon forces the
+    # quintic; --modded-muon forces PE (redundant with the default, kept for explicitness).
+    if args.default_muon:
+        t["modded_muon"] = False
+    elif args.modded_muon:
+        t["modded_muon"] = True
     if args.scheduler is not None:
         t["scheduler"] = args.scheduler
     if args.muon_ns_steps is not None:
@@ -277,8 +283,8 @@ def train(args):
             print(f"{TAG}   + shared expert ENABLED via --shared-expert (use_shared_expert=True)")
         if cfg.get("_post_embed_norm"):
             print(f"{TAG}   + EXP post-embedding RMSNorm via --exp-post-embed-norm (final pre-LM-head norm always on)")
-        if train_cfg.get("modded_muon"):
-            print(f"{TAG}   + Turbo-Muon NS via --modded-muon (AOL + 4-iter Polar coeffs; Moonlight scaling kept)")
+        _ns = "Polar-Express" if train_cfg.get("modded_muon", True) else "tuned quintic (Moonlight)"
+        print(f"{TAG}   Muon NS coeffs: {_ns}{' (via --default-muon)' if not train_cfg.get('modded_muon', True) else ''}")
         if train_cfg.get("deterministic", True):
             _strict = train_cfg.get("strict_deterministic", False)
             print(f"{TAG}   Deterministic: ON (seed={train_cfg.get('seed', 42)}, "
