@@ -46,8 +46,6 @@ def build_model_from_config(cfg: dict):
             moe_intermediate_size=model_cfg.get("moe_intermediate_size", None),
             use_shared_expert=model_cfg.get("use_shared_expert", False),
             router_type=model_cfg.get("router_type", "mlp"),
-            router_lambda=model_cfg.get("router_lambda", 1.0),
-            use_router_logit_norm=model_cfg.get("use_router_logit_norm", False),
             router_noise=model_cfg.get("router_noise", 0.0),
             bias_update_threshold=model_cfg.get("bias_update_threshold", 100000),
             bias_update_factor=model_cfg.get("bias_update_factor", 0.01),
@@ -56,7 +54,6 @@ def build_model_from_config(cfg: dict):
             rms_norm_eps=model_cfg.get("rms_norm_eps", 1e-6),
             attention_dropout=model_cfg.get("attention_dropout", 0.0),
             attention_bias=model_cfg.get("attention_bias", False),
-            moe_shared_scaling=1.0,
         )
         model = BiBoForCausalLM(config)
 

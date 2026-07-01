@@ -166,7 +166,6 @@ class BiBoMoELayer(nn.Module):
         self.bias_update_factor = config.bias_update_factor
         self.bias_update_threshold = config.bias_update_threshold
         self.load_balance_strategy = getattr(config, 'load_balance_strategy', 'none')
-        self.aux_loss_coef = getattr(config, 'aux_loss_coef', 0.001)
 
         # Token counter + accumulated TPE for threshold-based bias updates (only for strategy="bias")
         self.register_buffer("tokens_processed", torch.tensor(0, dtype=torch.long))

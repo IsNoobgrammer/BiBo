@@ -24,12 +24,9 @@ model:
   use_shared_expert: false         # OFF (default) — match bibo.yaml / Qwen
   shared_expert_type: "mlp"
   router_type: "mlp"               # ABLATED (no conv router; already the default)
-  router_lambda: 1.0
-  use_router_logit_norm: false
   router_noise: 0.0
   bias_update_threshold: 100000
   bias_update_factor: 0.01
-  moe_shared_scaling: 0.40
   tie_word_embeddings: true
   rope_theta: 10000.0
   rms_norm_eps: 1.0e-6

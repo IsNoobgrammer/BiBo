@@ -69,6 +69,85 @@ max_output ≥ 1 / [(n-1)/n^(s·(z_max - z_2nd)) + 1]
 
 This means attention focuses on elements exceeding others by approximately `1/s`, independent of sequence length.
 
+## Theoretical Grounding: `log n` is the *critical* scaling (MIT, 2025)
+
+The SSMax paper motivates `s·log(n)` empirically. A separate theory paper proves it is the **right
+order of magnitude** — not a heuristic.
+
+**Paper**: [Critical attention scaling in long-context transformers](https://arxiv.org/abs/2510.05554)
+(Chen, Lin, Polyanskiy, Rigollet — MIT, 2025).
+
+They analyze attention scaled as `β_n = γ·log n` (which is **exactly SSMax** with `γ ↔ s`) and prove a
+**phase transition** in how tokens contract as `n → ∞`, governed by a critical constant `γ* = 1/(1−ρ)`
+where `ρ` is the background token–token inner product (a representation-geometry property):
+
+| regime | condition | behavior |
+|---|---|---|
+| **subcritical** | `γ < γ*` | rank collapse — attention → uniform, tokens cluster, **vanishing gradients** |
+| **critical** | `γ = γ*` | sparse, **content-adaptive** attention (the target) |
+| **supercritical** | `γ > γ*` | attention → identity-like, **token interaction suppressed** |
+
+What this establishes for BiBo:
+
+1. **The `log n` form is critical, not arbitrary.** The paper singles out `log n` as the knife-edge
+   (it notes YaRN uses `(log n)²`, Qwen/SSMax use `log n`). This is first-principles backing for
+   SSMax's functional form — the subcritical regime *is* the "attention fading + vanishing gradients"
+   failure SSMax was built to prevent.
+
+2. **`s` is a critical threshold, not a free "bigger = sharper" knob.** Being on the wrong side is a
+   **qualitative** failure: too small → fading *and* dead gradients; too large → a *frozen*,
+   identity-like layer that suppresses interaction. The right target is `s·log(n) ≈ γ*` at your
+   operating length — consistent with the neutral-init recipe above (`s ≈ 1/log(max_pos/2)`).
+
+3. **⚠️ Two-sided extrapolation risk — supercritical over-sharpening.** Because `C = s·log(n)` grows
+   with `n`, a model that learns a large `s` at a **short** training length can be pushed
+   **supercritical** at long test lengths (e.g. `s≈2.4` learned at L=64 gives `C≈33` at n=1M →
+   near-identity attention, interaction dies). This is a *distinct* long-context failure from the
+   attention-sink escape problem (see `docs/attention_layers.md`). **Calibrate `s` so that at your
+   maximum intended context you sit near-critical, not past it** — i.e. train/anneal `s` against the
+   longest length you care about, and monitor that `s·log(n_max)` stays in the critical band.
+
+4. **Corroborates disabling SSMax on SWA layers.** Rank collapse is an `n → ∞` phenomenon; a fixed
+   window caps `n ≤ W`, so the pathology never sets in — independent confirmation of the "no SSMax on
+   windowed layers" rule below and in `docs/attention_layers.md`.
+
+Scope note: the paper uses standard sum-to-1 softmax — it says **nothing** about attention sinks,
+opt-out, or letting weights sum to `< 1` (that is the orthogonal sink mechanism in
+`docs/attention_layers.md`), nor about value/output scaling.
+
+## Extrapolation Plan (train ~128K → serve ~1M, the ~10× buffer)
+
+**Target:** train at ~128K context, expect clean serving to ~1M (≈8×, inside SSMax's demonstrated
+~10× envelope). No inference-time tricks required.
+
+**Why it works — critical `s` is scale-invariant.** The regime is set by `s` (the *coefficient* of
+`log n`) vs `γ* = 1/(1−ρ)`, **not** by the product `s·log(n)`. So if `s` lands in the critical band at
+the training length, `β_n = s·log n` is the critical trajectory at *every* `n` — including 1M. There is
+**no mechanical over-sharpening at long `n`**; the only failure is `s` being learned off-`γ*` (hot →
+supercritical, cold → fading), and that risk shrinks the longer you train. Hence: get `s` critical at
+128K and the mechanism extrapolates by construction.
+
+**Rejected: interpolating `n` (YaRN/NTK-style).** Because SSMax enters as `s·log(n)`, compressing `n`
+in log-space is *algebraically identical to rescaling `s`* (`s·log(n^α) = (α·s)·log n`). SSMax has no
+frequency spectrum, so YaRN/NTK's frequency-selective interpolation has **no analog** — the only knob is
+`s`. Remapping `n` is therefore just a test-time `s`-rescale, and it **only helps if `s` was learned too
+hot; if `s` is already critical it under-sharpens against the real `n`-term denominator and re-introduces
+fading.** We don't do it — we get `s` right at train time instead. (YaRN's *attention-temperature* term
+— `√(1/t)=0.1·ln(scale)+1` — is the real cousin of SSMax; its *frequency* interpolation is not.)
+
+**Two caveats (both small):**
+1. **~10× is empirical, not a theorem — verify, don't assume.** Confirm `s` sits in the critical band at
+   128K (monitor `s·log(n)` and attention entropy; watch for entropy collapse = too hot), then **eval at
+   1M**. If `s` learned a hair hot it degrades *before* 1M — that's the signal, and the fix is
+   training-length (curriculum longer), not `n`-interpolation.
+2. **SSMax is only the attention-sharpness axis.** Real 1M serving also needs *positional* extrapolation.
+   BiBo is well-set: **NoPE heads (`rope_nope_ratio=0.5`) are position-agnostic → extrapolate for free**,
+   and the RoPE heads use dynamic-NTK. The positional side complements the SSMax buffer; SSMax alone with
+   pure RoPE (no NTK/NoPE) would cap sooner.
+
+**Plan in one line:** train `s` critical at ~128K → lean on the NoPE heads for position → expect ~10×
+headroom → **validate at 1M** rather than trusting it. No interpolation, no extra machinery.
+
 ## Implementation in Attention
 
 ### Standard Attention (Softmax)

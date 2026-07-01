@@ -193,7 +193,7 @@ BiBoForCausalLM
 
 ## Important Design Decisions
 
-1. **No sliding window / recurrent attention** — removed. Only standard softmax + SSMax. **If SWA is ever added: do NOT use SSMax on the windowed layers** — a fixed window caps `n`, so SSMax degenerates to a redundant constant temperature there. Keep SSMax only on full/global layers (set windowed layers' `s=0`). See `docs/ssmax.md` § "Do NOT use SSMax on sliding-window-attention layers".
+1. **No sliding window / recurrent attention** — removed. Only standard softmax + SSMax. **BINDING VERDICT for when SWA returns (2026-07-01): SWA layers use ONLY an (unscaled) attention sink — no SSMax, no value-scaling; global layers pick one of {SSMax+sink, SSMax-only, sink-only}, value-scaling never used. Full rationale (why SSMax is redundant on windowed layers, the SSMax×sink coupling / Option A, the head_dim-based escape analysis, why we skip value-scale and a per-dim sink) + reference impl in `docs/attention_layers.md`.** See also `docs/ssmax.md`.
 2. **SSMax init**: `1.0 / log(max_pos_emb / 2)` — ensures attention starts ~neutral, not 6× sharper than standard.
 3. **Shared expert is NOT routed** — when enabled it's always active. **OFF by default (Jun 27 2026)**; `use_shared_expert=False` is the `BiBoConfig` default and `moe.py`'s fallback. The `moe_shared_scaling` 10K-iter MC in config init is now guarded by `use_shared_expert` (no wasted sim when off).
 4. **`output_attentions=True`** works (falls back to manual attention).
@@ -290,7 +290,6 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   dead `triton:` key. **Everything below this entry that describes a custom Triton/Liger kernel, a
   `src/kernels/...` path, or fused Muon is HISTORY — those files no longer exist in this repo.** Speed
   levers that remain in-repo: `torch.compile` (`hardware.compile`) and `compile_optimizer`.
-- `router_temperature` param exists in config but is never used (legacy, kept for compat)
 - `moe_shared_scaling` is a **learnable nn.Parameter** (per MoE layer) as of this session — the config float is only its init. Rationale (from the shared-expert research): no production MoE hardcodes a fixed shared scalar — DeepSeek/Gemma just add (Gemma sizes 3×), Qwen2 used a learnable per-token gate (dropped in Qwen3), Qwen3/MiMo-V2 dropped the shared expert entirely. The old fixed 0.40 was ~7.5× below the measured init-balance (~3.0) AND the MC auto-formula diverges as experts scale; a learnable scalar (LayerScale-style) fixes both. Disable the shared expert with `use_shared_expert=False` / `--no-shared-expert`. ⚠️ The scalar lands in the AdamW group **with weight_decay** (norms/biases do too in this repo) — WD gently pulls it toward 0; acceptable but worth excluding if it underperforms.
 - `moe_shared_scaling=1.0` triggers a 10K-iteration Monte Carlo in config init (now used as the learnable param's INIT) — pass explicit value to skip
 - The `legacy/` folder has the old monolithic code — don't touch it, it's reference only
@@ -565,7 +564,7 @@ Liger RMSNorm/RoPE), the kernel benches, and the vendored fused Muon were remove
 2. Read `src/modeling/attn/base.py` for attention logic (SDPA + SSMax)
 3. Read `src/modeling/ffn/moe.py` for MoE dispatch logic
 4. Read `src/modeling/ffn/router.py` for routing logic (logit norm + bias heuristics)
-5. Read `docs/ssmax.md` for SSMax theory; `docs/xsa.md` for Exclusive Self Attention
+5. Read `docs/ssmax.md` for SSMax theory; `docs/xsa.md` for Exclusive Self Attention; `docs/attention_layers.md` for the SWA/global layer verdict (sink × SSMax × value-scale)
 6. Read `docs/deprecated.md` for removed components
 7. Read `docs/configuration_guide.md` for tuning guidance
 8. Read `shaurya_notes.md` for research insights and findings
