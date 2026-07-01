@@ -35,13 +35,18 @@ class BiBoConfig(PretrainedConfig):
         exp_post_embed_norm=False,  # EXPERIMENTAL: extra RMSNorm after embeddings, before block 0 (BLOOM-style). Final pre-LM-head norm always on regardless.
         # ── Attention ────────────────────────────────────────────
         use_xsa=True,   # Exclusive Self Attention (https://arxiv.org/abs/2603.09078)
-        use_ssmax=True,  # SSMax: scaling softmax for long context
+        use_ssmax=True,  # SSMax: scaling softmax for long context (forced OFF on SWA layers)
         attention_dropout=0.0,
         attention_bias=False,
-        # ── RoPE ─────────────────────────────────────────────────
-        rope_theta=None,    # Auto-derived (10000.0) if None
+        # ── Hybrid SWA / attention sink (docs/attention_layers.md) ──
+        hybrid_layer_pattern=None,       # per-layer list: 1=sliding-window, 0=full. None => all-global (current)
+        sliding_window=128,              # SWA window W (keys visible per query on windowed layers)
+        add_swa_attention_sink_bias=True,   # learnable per-head sink on SWA layers (the norm; unscaled)
+        add_full_attention_sink_bias=False,  # sink on global layers (False => G2, current behavior)
+        # ── RoPE (dim-wise partial: first rope_dim of EVERY head rotate, rest NoPE) ──
+        rope_theta=None,    # Auto-derived (1e7) if None — matched to partial rotary
         rope_scaling=None,  # Auto: {"type": "dynamic", "factor": 1.0} if None
-        rope_nope_ratio=0.5,  # Fraction of heads that are NoPE. 0.5 = 2:2 (6 RoPE+NTK heads, 6 NoPE content heads at 12h/2kv). 0.0 = all RoPE.
+        partial_rotary_factor=0.334,  # fraction of head_dim that gets RoPE (dim-wise, all heads). 1.0 = full RoPE.
         # ── Tokens / embeddings ──────────────────────────────────
         pad_token_id=None,
         bos_token_id=0,
@@ -52,12 +57,10 @@ class BiBoConfig(PretrainedConfig):
         mlp_only_layers=None,  # Auto: [0, num_hidden_layers - 1] (first + last dense)
         moe_intermediate_size=None,  # Auto: intermediate_size // num_experts_per_tok
         num_experts_per_tok=6,
-        num_experts=None,  # Auto: num_routed_experts + num_shared_experts
         polyglu_expert_multiplier=2,  # Groups of 3 (SiLU, ReLU², Tanh) GLU experts
         special_expert_pairs=1,       # Pairs of (Identity, Zero) experts
         # ── Shared expert ────────────────────────────────────────
         use_shared_expert=False,    # Off by default (param-match Qwen3MoE — no shared expert)
-        num_shared_experts=1,
         shared_expert_type="mlp",   # "mlp" (SwiGLU, like Qwen) or "conv" (CausalConv1D)
         # ── Router ───────────────────────────────────────────────
         router_type="mlp",   # "mlp" or "conv"
@@ -70,7 +73,6 @@ class BiBoConfig(PretrainedConfig):
         load_balance_strategy="bias",  # "none" or "bias" (heuristic aux-loss-free bias updates)
         bias_update_factor=None,    # Auto: Hill function of num_routed_experts
         bias_update_threshold=8000,  # tokens between bias updates
-        output_router_logits=False,
         **kwargs,
     ):
         # ── Core dimensions ──────────────────────────────────────
@@ -95,9 +97,17 @@ class BiBoConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.attention_bias = attention_bias
 
-        # ── RoPE ─────────────────────────────────────────────────
+        # ── Hybrid SWA / attention sink ──────────────────────────
+        self.hybrid_layer_pattern = hybrid_layer_pattern
+        self.sliding_window = sliding_window
+        self.add_swa_attention_sink_bias = add_swa_attention_sink_bias
+        self.add_full_attention_sink_bias = add_full_attention_sink_bias
+
+        # ── RoPE (dim-wise partial) ──────────────────────────────
         self.rope_scaling = rope_scaling
-        self.rope_nope_ratio = rope_nope_ratio
+        self.partial_rotary_factor = partial_rotary_factor
+        # head_dim / rope_dim are DERIVED below (after super().__init__) so a stale value serialized
+        # into config.json can't override the value implied by hidden_size / heads / partial factor.
 
         # ── Tokens / embeddings ──────────────────────────────────
         self.pad_token_id = pad_token_id
@@ -112,14 +122,13 @@ class BiBoConfig(PretrainedConfig):
         self.special_expert_pairs = special_expert_pairs
         # experts = polyglu_multiplier * 3 (SiLU, ReLU², Tanh) + special_pairs * 2 (Identity, Zero)
         self.num_routed_experts = (polyglu_expert_multiplier * 3) + (special_expert_pairs * 2)
-        self.num_experts = (
-            num_experts if num_experts is not None
-            else (self.num_routed_experts + num_shared_experts)
-        )
+        # num_experts == the full routed set (all PolyGLU + special experts). Alias kept for HF
+        # tooling/logging; there is no separate shared-expert count knob — the shared expert, when
+        # enabled, is a single always-on module (see BiBoMoELayer).
+        self.num_experts = self.num_routed_experts
 
         # ── Shared expert ────────────────────────────────────────
         self.use_shared_expert = use_shared_expert
-        self.num_shared_experts = num_shared_experts
         self.shared_expert_type = shared_expert_type
 
         # ── Router ───────────────────────────────────────────────
@@ -131,14 +140,14 @@ class BiBoConfig(PretrainedConfig):
         self.routed_scaling_factor = routed_scaling_factor
         self.router_noise = router_noise
         self.load_balance_strategy = load_balance_strategy
-        self.output_router_logits = output_router_logits
 
         # ============================================================
         # Auto-derived hyperparameters (when left as None)
         # ============================================================
 
-        # rope_theta: default 10000 (matches Qwen3MoE / standard LLaMA)
-        self.rope_theta = rope_theta if rope_theta is not None else 10000.0
+        # rope_theta: default 1e7 (matched to dim-wise partial RoPE — fewer rotated dims want
+        # longer wavelengths; MiMo-V2.5 pairs partial_rotary_factor=0.334 with theta=1e7).
+        self.rope_theta = rope_theta if rope_theta is not None else 1e7
 
         # moe_intermediate_size: compute parity with dense FFN.
         #   dense active/token = 2*hidden*intermediate ; MoE = 2*hidden*moe_intermediate*top_k
@@ -168,7 +177,7 @@ class BiBoConfig(PretrainedConfig):
         # mlp_only_layers: first + last layers are dense MLP, rest are MoE
         self.mlp_only_layers = (
             mlp_only_layers if mlp_only_layers is not None
-            else [0, num_hidden_layers - 1]
+            else sorted({0, num_hidden_layers - 1})   # dedupe: N==1 -> [0], not [0,0]
         )
 
         super().__init__(
@@ -179,6 +188,12 @@ class BiBoConfig(PretrainedConfig):
             **kwargs,
         )
 
+        # Derived dims — computed AFTER super().__init__(**kwargs) so a stale serialized head_dim/
+        # rope_dim (which arrive via **kwargs on reload) cannot win over the current derivation.
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        _rope_dim = round(self.partial_rotary_factor * self.head_dim)
+        self.rope_dim = _rope_dim - (_rope_dim % 2)   # force even (rotate_half needs an even dim)
+
         # ============================================================
         # Validations
         # ============================================================
@@ -188,6 +203,8 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError(
                 f"hidden_size ({self.hidden_size}) must be divisible by num_attention_heads ({self.num_attention_heads})"
             )
+        if self.num_key_value_heads <= 0:
+            raise ValueError("num_key_value_heads must be positive")
         if self.num_attention_heads % self.num_key_value_heads != 0:
             raise ValueError(
                 f"num_attention_heads ({self.num_attention_heads}) must be divisible by num_key_value_heads ({self.num_key_value_heads})"
@@ -208,6 +225,14 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError("kernel_size must be positive")
         if self.bias_update_factor < 0.0:
             raise ValueError("bias_update_factor must be non-negative")
+        if self.bias_update_threshold <= 0:
+            raise ValueError("bias_update_threshold must be positive")
+        if self.add_full_attention_sink_bias and self.use_ssmax:
+            raise ValueError(
+                "add_full_attention_sink_bias=True with use_ssmax=True (global sink + SSMax, 'G1') "
+                "needs the sink scaled by the SSMax factor C=s·log(n) (docs/attention_layers.md §4); "
+                "that coupling is not implemented yet. Disable one, or wire the C-scaled sink first."
+            )
         if self.router_noise < 0.0:
             raise ValueError("router_noise must be non-negative")
         if self.shared_expert_type not in ("mlp", "conv"):
@@ -222,8 +247,13 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError(
                 f"num_routed_experts must be >= 3 (got {self.num_routed_experts}). Increase polyglu_expert_multiplier or special_expert_pairs."
             )
-        if self.num_experts_per_tok > self.num_experts:
-            raise ValueError("num_experts_per_tok cannot exceed total number of experts")
+        if self.num_experts_per_tok < 1:
+            raise ValueError("num_experts_per_tok must be >= 1")
+        if self.num_experts_per_tok > self.num_routed_experts:
+            raise ValueError(
+                f"num_experts_per_tok ({self.num_experts_per_tok}) cannot exceed num_routed_experts "
+                f"({self.num_routed_experts}) — the router only selects among routed experts."
+            )
         if self.load_balance_strategy not in ("none", "bias"):
             raise ValueError(
                 f"load_balance_strategy must be 'none' or 'bias', got '{self.load_balance_strategy}'"
@@ -238,16 +268,29 @@ class BiBoConfig(PretrainedConfig):
             )
         if self.rope_scaling.get("factor", 1.0) <= 0:
             raise ValueError("rope_scaling['factor'] must be positive")
-        if not (0.0 <= self.rope_nope_ratio < 1.0):
-            raise ValueError(f"rope_nope_ratio must be in [0, 1), got {self.rope_nope_ratio}")
-        _groups = self.num_attention_heads // self.num_key_value_heads
-        _n_rope = self.num_attention_heads - round(self.num_attention_heads * self.rope_nope_ratio)
-        if _n_rope % _groups != 0:
+        if not (0.0 < self.partial_rotary_factor <= 1.0):
+            raise ValueError(f"partial_rotary_factor must be in (0, 1], got {self.partial_rotary_factor}")
+        if self.rope_dim < 2:
             raise ValueError(
-                f"rope_nope_ratio={self.rope_nope_ratio} gives {_n_rope} RoPE heads, which is not divisible by "
-                f"num_key_value_groups={_groups}. The RoPE/NoPE boundary must align with KV groups. "
-                f"Try rope_nope_ratio=0.5 (half heads)."
+                f"partial_rotary_factor={self.partial_rotary_factor} gives rope_dim={self.rope_dim} "
+                f"(head_dim={self.head_dim}); need at least 2 rotary dims. Increase the factor."
             )
+        if self.sliding_window is not None and self.sliding_window <= 0:
+            raise ValueError("sliding_window must be positive")
+        if self.hybrid_layer_pattern is not None:
+            if len(self.hybrid_layer_pattern) != self.num_hidden_layers:
+                raise ValueError(
+                    f"hybrid_layer_pattern length ({len(self.hybrid_layer_pattern)}) must equal "
+                    f"num_hidden_layers ({self.num_hidden_layers})"
+                )
+            if any(v not in (0, 1) for v in self.hybrid_layer_pattern):
+                raise ValueError("hybrid_layer_pattern entries must be 0 (full) or 1 (sliding-window)")
+            if any(v == 1 for v in self.hybrid_layer_pattern) and not (
+                isinstance(self.sliding_window, int) and self.sliding_window > 0):
+                raise ValueError(
+                    "hybrid_layer_pattern marks SWA layers (1) but sliding_window is not a positive "
+                    "int — SWA layers require a window size (else they silently run full-attention)."
+                )
         for idx in self.mlp_only_layers:
             if not (0 <= idx < self.num_hidden_layers):
                 raise ValueError(

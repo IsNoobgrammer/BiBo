@@ -104,7 +104,7 @@ def parse_args():
     p.add_argument("--no-ssmax", "--no_ssmax", dest="no_ssmax", action="store_true",
                    help="BiBo: disable SSMax query scaling (use_ssmax=False)")
     p.add_argument("--no-partial-rope", "--no_partial_rope", dest="no_partial_rope", action="store_true",
-                   help="BiBo: disable partial RoPE / NoPE heads (rope_nope_ratio=0.0 → all-RoPE)")
+                   help="BiBo: disable partial RoPE (partial_rotary_factor=1.0 → all-RoPE, no NoPE dims)")
     p.add_argument("--no-conv-router", "--no_conv_router", dest="no_conv_router", action="store_true",
                    help="BiBo: use the MLP router instead of the conv router (router_type='mlp')")
     p.add_argument("--shared-expert", "--shared_expert", dest="shared_expert", action="store_true",
@@ -166,7 +166,7 @@ def load_config(args):
     ablated = []
     if args.no_xsa:          m["use_xsa"] = False;        ablated.append("xsa")
     if args.no_ssmax:        m["use_ssmax"] = False;      ablated.append("ssmax")
-    if args.no_partial_rope: m["rope_nope_ratio"] = 0.0;  ablated.append("partial-rope")
+    if args.no_partial_rope: m["partial_rotary_factor"] = 1.0;  ablated.append("partial-rope")
     if args.no_conv_router:  m["router_type"] = "mlp";    ablated.append("conv-router")
     if args.no_shared_expert: m["use_shared_expert"] = False; ablated.append("shared-expert")
     if args.shared_expert:    m["use_shared_expert"] = True;  cfg["_shared_on"] = True  # opt in (default off)

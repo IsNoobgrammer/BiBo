@@ -1,9 +1,10 @@
 # Attention Layer Design Verdict — SWA vs Global (SSMax × Sink × Value-Scale)
 
-> **Status:** forward-looking design norm (2026-07-01). BiBo is currently full-attention only
-> (sliding-window was removed — see AGENTS.md design decision #1). This file is the **binding spec
-> for when hybrid SWA lands** and for how SSMax/sink/value-scale combine on each layer type.
-> Reference implementation + grad-checks + all supporting experiments: `src/.autoresearch/ssmax_sink_ref.py`.
+> **Status:** IMPLEMENTED (2026-07-01) — hybrid SWA + attention sink + dim-wise partial RoPE are live
+> in `src/modeling/attn/base.py` (single parameterized `BiBoAttention`). This file is the binding spec
+> for how SSMax/sink/value-scale combine on each layer type. Currently wired: **SWA = sink + no SSMax**
+> (this doc's SWA row) and **global = G2** (SSMax, no sink); G1/G3 (global sink) are supported by the
+> code but off by default in bench configs. Reference impl + grad-checks: `src/.autoresearch/ssmax_sink_ref.py`.
 
 ---
 
@@ -27,17 +28,18 @@ appended as one value-less softmax column and dropped before the value matmul (G
 
 ---
 
-## 2. Config surface (to add when SWA is implemented — not yet in code)
+## 2. Config surface (IMPLEMENTED in `BiBoConfig`)
 
-Mirror MiMo-V2.5's split so sink is toggled **per attention type**:
+Mirrors MiMo-V2.5's split so sink is toggled **per attention type**:
 
-- `hybrid_layer_pattern` / `layer_types` — which layers are `sliding_attention` vs `full_attention`.
-- `add_swa_attention_sink_bias` — **forced True** for SWA (the norm; §3).
-- `add_full_attention_sink_bias` — the sink toggle for global layers (G1/G3 = True, G2 = False).
-- `use_ssmax` — already exists; **forced False on SWA layers**; selects G1/G2 (True) vs G3 (False) on global.
+- `hybrid_layer_pattern` — per-layer list, `1`=sliding-window, `0`=full. `None` → all-global. `sliding_window` = W (128).
+- `add_swa_attention_sink_bias` (default True) — the learnable per-head sink on SWA layers (the norm; §3).
+- `add_full_attention_sink_bias` (default False) — sink toggle for global layers (G1/G3 = True, G2 = False).
+- `use_ssmax` — **auto-forced False on SWA layers** in `BiBoAttention.__init__` (`use_ssmax and not is_swa`);
+  on global it selects G1/G2 (True) vs G3 (False).
 - Value scaling: **no config** — we do not add it (§5).
 
-SWA layers are not free to opt out of the norm: sink ON, SSMax OFF, value-scale OFF.
+SWA layers are not free to opt out of the norm: `BiBoAttention` forces sink ON, SSMax OFF, value-scale OFF.
 
 ---
 

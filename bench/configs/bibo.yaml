@@ -14,7 +14,7 @@ model:
   num_key_value_heads: 2           # GQA: 2=GQA(2:1), 4=MHA (set =num_attention_heads to ablate GQA off)
   use_ssmax: true                  # SSMax length-aware query scaling
   use_xsa: true                    # Exclusive Self Attention rejection
-  rope_nope_ratio: 0.5             # Partial RoPE: 0.5=2 RoPE+2 NoPE heads; 0.0=all-RoPE (ablate partial-RoPE off)
+  partial_rotary_factor: 0.334     # Dim-wise partial RoPE: fraction of each head_dim that rotates (rest NoPE). 1.0=all-RoPE.
   max_position_embeddings: 2048
   mlp_only_layers: [0, 9]
   polyglu_expert_multiplier: 3    # 9 GLU experts (3 triplets of SiLU/ReLU²/Tanh) — param-matched to Qwen's 9

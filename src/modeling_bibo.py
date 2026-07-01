@@ -34,12 +34,9 @@ Usage:
 # Re-export all components for backward compatibility
 from src.modeling.norm import BiBoRMSNorm
 from src.modeling.embed import BiBoRotaryEmbedding, apply_rotary_pos_emb, rotate_half
-from src.modeling.masks import make_causal_mask, expand_mask, prepare_4d_causal_attention_mask
 from src.modeling.attn import BiBoAttention, repeat_kv, apply_ssmax_query_scaling
 from src.modeling.ffn import (
     BiBoMLP,
-    BiBoIdentityExpert,
-    BiBoZeroExpert,
     BiBoPolyGLUExpert,
     BiBoCausalConv1D,
     BiBoMoERouter,
@@ -56,18 +53,12 @@ __all__ = [
     'BiBoRotaryEmbedding',
     'apply_rotary_pos_emb',
     'rotate_half',
-    # Masks
-    'make_causal_mask',
-    'expand_mask',
-    'prepare_4d_causal_attention_mask',
     # Attention
     'BiBoAttention',
     'repeat_kv',
     'apply_ssmax_query_scaling',
     # FFN
     'BiBoMLP',
-    'BiBoIdentityExpert',
-    'BiBoZeroExpert',
     'BiBoPolyGLUExpert',
     'BiBoCausalConv1D',
     'BiBoMoERouter',

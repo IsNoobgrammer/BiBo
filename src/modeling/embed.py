@@ -59,17 +59,19 @@ class BiBoRotaryEmbedding(nn.Module):
         return self.base * scale ** (self.dim / (self.dim - 2))
 
     @torch.no_grad()
-    def _maybe_update_inv_freq(self, position_ids, device):
-        # ponytail: position_ids.max() forces one CPU<-GPU sync per forward. Negligible,
-        # and it's exactly what HF dynamic-NTK does. In-window (training) this only no-ops.
+    def _inv_freq_for(self, position_ids, device):
+        """STATELESS dynamic-NTK inv_freq for the CURRENT sequence length — order-independent:
+        identical inputs always yield identical frequencies (no grow/reset history that made the
+        result depend on prior batch lengths). In-window (seq_len <= original_max) returns the base
+        inv_freq unchanged (a no-op — no recompute); only out-of-window pays one small recompute.
+        ponytail: int(position_ids.max()) is one CPU<-GPU sync per dynamic forward — needed to know
+        the extent, and matches HF's dynamic-NTK; in-window it's the only added cost."""
+        if self.rope_type != "dynamic":
+            return self.inv_freq
         seq_len = int(position_ids.max()) + 1
-        if seq_len > self.max_seq_len_cached:                       # grow
-            inv_freq = self._compute_inv_freq(self._ntk_base(seq_len), device)
-            self.register_buffer("inv_freq", inv_freq, persistent=False)
-            self.max_seq_len_cached = seq_len
-        elif self.max_seq_len_cached > self.original_max_seq_len and seq_len <= self.original_max_seq_len:  # reset
-            self.register_buffer("inv_freq", self.original_inv_freq.to(device), persistent=False)
-            self.max_seq_len_cached = self.original_max_seq_len
+        if seq_len <= self.original_max_seq_len:
+            return self.original_inv_freq.to(device)
+        return self._compute_inv_freq(self._ntk_base(seq_len), device)
 
     @torch.no_grad()
     def forward(self, x, position_ids):
@@ -80,10 +82,9 @@ class BiBoRotaryEmbedding(nn.Module):
         Returns:
             (cos, sin) with shape (batch, seq_len, dim)
         """
-        if self.rope_type == "dynamic":
-            self._maybe_update_inv_freq(position_ids, x.device)
+        inv_freq = self._inv_freq_for(position_ids, x.device)
 
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"

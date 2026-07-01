@@ -11,7 +11,7 @@ from transformers.modeling_outputs import (
 )
 from transformers.modeling_utils import PreTrainedModel
 from transformers.generation.utils import GenerationMixin
-from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.utils import logging
 
 from src.configuration_bibo import BiBoConfig
@@ -37,10 +37,16 @@ class BiBoPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
+        elif isinstance(module, nn.Conv1d):          # conv router / conv shared-expert kernels
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, BiBoRMSNorm):        # RMSNorm gain -> 1.0 (Qwen3 parity; needed on
+            module.weight.data.fill_(1.0)            # meta-init / from_pretrained-with-missing-keys)
 
 
 class BiBoModel(BiBoPreTrainedModel):
@@ -66,8 +72,10 @@ class BiBoModel(BiBoPreTrainedModel):
         # (self.norm) is always present regardless.
         self.embed_norm = (BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
                            if getattr(config, "exp_post_embed_norm", False) else None)
+        # Dim-wise partial RoPE: cos/sin are sized rope_dim (the rotated slice of each head),
+        # NOT the full head_dim. Attention rotates q/k[..., :rope_dim] for every head.
         self.rotary_emb = BiBoRotaryEmbedding(
-            config.hidden_size // config.num_attention_heads,
+            config.rope_dim,
             max_position_embeddings=config.max_position_embeddings,
             base=config.rope_theta,
             rope_type=config.rope_scaling["type"],
@@ -116,15 +124,9 @@ class BiBoModel(BiBoPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        # Cache handling
-        return_legacy_cache = False
-        if use_cache and not isinstance(past_key_values, Cache):
-            return_legacy_cache = True
-            if past_key_values is None:
-                past_key_values = DynamicCache()
-            else:
-                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-                logger.warning_once("Passing `past_key_values` as tuple deprecated. Use `Cache` class.")
+        # Cache handling (transformers 5.x: Cache objects only — no legacy tuple support).
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache()
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -192,13 +194,7 @@ class BiBoModel(BiBoPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        next_cache = next_decoder_cache if use_cache else None
-        if return_legacy_cache and next_cache is not None:
-            if hasattr(next_cache, 'to_legacy_cache'):
-                next_cache = next_cache.to_legacy_cache()
-            else:
-                # Fallback for older transformers
-                next_cache = None
+        next_cache = next_decoder_cache if use_cache else None   # Cache object, returned as-is
 
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
@@ -313,66 +309,3 @@ class BiBoForCausalLM(BiBoPreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
-    def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        past_key_values=None,
-        attention_mask=None,
-        inputs_embeds=None,
-        cache_position=None,
-        position_ids=None,
-        use_cache=True,
-        **kwargs,
-    ):
-        """Prepare inputs for generation"""
-        if past_key_values is not None:
-            if inputs_embeds is not None:
-                input_ids = input_ids[:, -cache_position.shape[0] :]
-            elif input_ids.shape[1] != cache_position.shape[0]:
-                input_ids = input_ids[:, cache_position]
-
-        if attention_mask is not None and position_ids is None:
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1] :]
-                position_ids = position_ids.clone(memory_format=torch.contiguous_format)
-
-        if inputs_embeds is not None and cache_position[0] == 0:
-            model_inputs = {"inputs_embeds": inputs_embeds, "input_ids": None}
-        else:
-            model_inputs = {"input_ids": input_ids.clone(memory_format=torch.contiguous_format), "inputs_embeds": None}
-
-        if isinstance(past_key_values, StaticCache) and attention_mask.ndim == 2:
-            if model_inputs["inputs_embeds"] is not None:
-                batch_size, sequence_length, _ = model_inputs["inputs_embeds"].shape
-                device = model_inputs["inputs_embeds"].device
-            else:
-                batch_size, sequence_length = model_inputs["input_ids"].shape
-                device = model_inputs["input_ids"].device
-
-            dtype = self.lm_head.weight.dtype
-            min_dtype = torch.finfo(dtype).min
-
-            attention_mask = _prepare_4d_causal_attention_mask_with_cache_position(
-                attention_mask,
-                sequence_length=sequence_length,
-                target_length=past_key_values.get_max_length(),
-                dtype=dtype,
-                device=device,
-                min_dtype=min_dtype,
-                cache_position=cache_position,
-                batch_size=batch_size,
-            )
-
-        model_inputs.update(
-            {
-                "position_ids": position_ids,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-                "use_cache": use_cache,
-                "attention_mask": attention_mask,
-            }
-        )
-        return model_inputs

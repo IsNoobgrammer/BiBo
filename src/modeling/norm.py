@@ -6,11 +6,11 @@ __all__ = ['BiBoRMSNorm']
 
 
 class BiBoRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-5):
+    def __init__(self, hidden_size, eps=1e-6):
         """
         Args:
             hidden_size (int): Size of last dim
-            eps (float): Numerical stability. Default: 1e-5
+            eps (float): Numerical stability. Default: 1e-6 (matches BiBoConfig.rms_norm_eps)
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))

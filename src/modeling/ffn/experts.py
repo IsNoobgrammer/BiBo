@@ -7,28 +7,12 @@ from transformers.activations import ACT2FN
 from src.configuration_bibo import BiBoConfig
 
 __all__ = [
-    'BiBoIdentityExpert',
-    'BiBoZeroExpert',
     'BiBoPolyGLUExpert',
     'BiBoCausalConv1D',
 ]
 
-
-class BiBoIdentityExpert(nn.Module):
-    """Identity/residual expert — passes input through unchanged."""
-    def __init__(self, config: BiBoConfig, *args, **kwargs): 
-        super().__init__()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x
-
-
-class BiBoZeroExpert(nn.Module):
-    """Returns x * 0 (preserves shape/dtype/device/sharding)."""
-    def __init__(self, config: BiBoConfig, *args, **kwargs):
-        super().__init__()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        zero = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-        return x * zero
+# Note: the Identity ("pass x through") and Zero ("x*0") experts are NOT separate classes — the
+# fused MoE path (BiBoFusedExperts in moe.py) handles them inline (weighted passthrough / skip).
 
 
 class BiBoPolyGLUExpert(nn.Module):
@@ -65,7 +49,8 @@ class BiBoPolyGLUExpert(nn.Module):
         if self.activation_name == "silu":
             return F.silu(x)
         elif self.activation_name == "relu2":
-            return F.relu(x).square()
+            r = F.relu(x)
+            return (r.float() * r.float()).to(x.dtype)   # fp32 square: avoid fp16 overflow (>256 -> inf)
         elif self.activation_name == "tanh":
             return torch.tanh(x)
 

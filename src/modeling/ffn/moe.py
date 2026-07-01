@@ -51,13 +51,9 @@ class BiBoFusedExperts(nn.Module):
         nn.init.normal_(self.gate_up_proj, mean=0.0, std=config.initializer_range)
         nn.init.normal_(self.down_proj, mean=0.0, std=config.initializer_range)
         
-        # Pre-compute activation name for each expert index
-        # Layout: [SiLU_0, ReLU²_0, Tanh_0, SiLU_1, ReLU²_1, Tanh_1, ...]
-        self._expert_activations = []
-        for _ in range(config.polyglu_expert_multiplier):
-            for act in _POLYGLU_ACTIVATIONS:
-                self._expert_activations.append(act)
-        
+        # Activation for expert e is _POLYGLU_ACTIVATIONS[e % 3]
+        # (layout: [SiLU_0, ReLU²_0, Tanh_0, SiLU_1, ReLU²_1, Tanh_1, ...]) — single source of truth.
+
         # Identity indices: [num_polyglu, num_polyglu + pairs)
         # Zero indices: [num_polyglu + pairs, num_routed)
         self.identity_start = self.num_polyglu_experts
@@ -104,17 +100,20 @@ class BiBoFusedExperts(nn.Module):
         expert_counts = torch.bincount(sorted_expert_indices, minlength=num_routed)
         boundaries = torch.zeros(num_routed + 1, dtype=torch.long, device=hidden_states.device)
         boundaries[1:] = torch.cumsum(expert_counts, dim=0)
-        
+        bounds = boundaries.tolist()   # ONE device->host sync; avoids a sync per expert on the slices
+
         # Process each expert's chunk. fp32 accumulator (MiMo-style): weights are fp32 and the
-        # weighted index_add accumulates in fp32, cast back to hidden dtype at the end — keeps the
-        # whole router→combine path fp32 for precision.
-        output = torch.zeros(num_tokens, hidden_size, device=hidden_states.device, dtype=torch.float32)
+        # weighted index_add accumulates in >=fp32, cast back to hidden dtype at the end — keeps the
+        # whole router→combine path fp32 for precision. promote_types keeps fp32 for fp16/bf16/fp32
+        # (the training dtypes) and only widens to fp64 if the model itself runs fp64 (else index_add_
+        # would hit a Double-source vs Float-buffer dtype mismatch).
+        acc_dtype = torch.promote_types(torch.float32, hidden_states.dtype)
+        output = torch.zeros(num_tokens, hidden_size, device=hidden_states.device, dtype=acc_dtype)
         
         for expert_idx in range(num_routed):
-            # Use tensor indexing instead of .item() to avoid graph breaks
-            start = boundaries[expert_idx]
-            end = boundaries[expert_idx + 1]
-            
+            start = bounds[expert_idx]
+            end = bounds[expert_idx + 1]
+
             token_idx = sorted_token_indices[start:end]
             if token_idx.shape[0] == 0:
                 continue
@@ -126,11 +125,12 @@ class BiBoFusedExperts(nn.Module):
                 gate_up = F.linear(current_state, self.gate_up_proj[expert_idx])
                 gate, up = gate_up.chunk(2, dim=-1)
                 
-                act_name = self._expert_activations[expert_idx]
+                act_name = _POLYGLU_ACTIVATIONS[expert_idx % 3]
                 if act_name == "silu":
                     activated = F.silu(gate)
                 elif act_name == "relu2":
-                    activated = F.relu(gate).square()
+                    r = F.relu(gate)
+                    activated = (r.float() * r.float()).to(gate.dtype)  # fp32 square: fp16 overflow guard
                 else:  # tanh
                     activated = torch.tanh(gate)
                 
@@ -167,9 +167,13 @@ class BiBoMoELayer(nn.Module):
         self.bias_update_threshold = config.bias_update_threshold
         self.load_balance_strategy = getattr(config, 'load_balance_strategy', 'none')
 
-        # Token counter + accumulated TPE for threshold-based bias updates (only for strategy="bias")
-        self.register_buffer("tokens_processed", torch.tensor(0, dtype=torch.long))
+        # Accumulated per-expert token counts for threshold-based bias updates (strategy="bias").
         self.register_buffer("accumulated_tpe", torch.zeros(config.num_routed_experts, dtype=torch.float))
+        # DDP-safe trigger state (plain ints, host-side — no CUDA buffer, no per-step .item() sync).
+        # Counting FORWARD STEPS (identical across ranks in lockstep) instead of device tokens means
+        # every rank fires update_bias on the SAME step → the all_reduce never desyncs/hangs.
+        self._fwd_step = 0
+        self._update_every = None   # step interval, derived once from the token threshold
         
         # Fused experts
         self.experts = BiBoFusedExperts(config)
@@ -225,19 +229,20 @@ class BiBoMoELayer(nn.Module):
                 rearrange(top_k_indices, 'b s k -> (b s k)'),
                 minlength=self.num_routed_experts
             )
-            
-            self.tokens_processed += num_tokens
-            self.accumulated_tpe += current_tpe.float()
-            
-            if self.tokens_processed >= self.bias_update_threshold:
-                # DDP: each rank only counts its own data shard. All-reduce the per-expert token
-                # counts so the bias balances on the GLOBAL load (all ranks). sign()-based update
-                # (see update_bias) is scale-invariant, so SUM is fine. All ranks hit the threshold
-                # the same step (identical per-step token count) → this collective stays in lockstep.
+            self.accumulated_tpe += current_tpe.float()   # in-place, no host sync
+
+            # Convert the token threshold to a step interval once (num_tokens is uniform across DDP
+            # ranks in the packed pipeline, so every rank derives the same interval).
+            if self._update_every is None:
+                self._update_every = max(1, round(self.bias_update_threshold / max(num_tokens, 1)))
+            self._fwd_step += 1
+            if self._fwd_step % self._update_every == 0:
+                # All-reduce the per-expert counts so the bias balances GLOBAL load (sign()-based
+                # update is scale-invariant → SUM is fine). Step-based trigger => all ranks are here
+                # on the same step => the collective stays in lockstep (no ragged-batch deadlock).
                 if dist.is_available() and dist.is_initialized():
                     dist.all_reduce(self.accumulated_tpe, op=dist.ReduceOp.SUM)
                 tokens_per_expert = self.accumulated_tpe.clone()
-                self.tokens_processed.zero_()
                 self.accumulated_tpe.zero_()
 
         # Flatten: (B*S, H) and (B*S, top_k)

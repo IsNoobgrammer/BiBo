@@ -1,5 +1,4 @@
 """MoE router — MiMo-V2.5 / DeepSeek-V3 auxiliary-loss-free sigmoid gating (verbatim routing)."""
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,9 +36,10 @@ class BiBoMoERouter(nn.Module):
         self.kernel_size = config.kernel_size
         self.causal_padding = self.kernel_size - 1
 
-        # Configurable options
+        # Configurable options — getattr fallbacks MATCH the BiBoConfig defaults so a partial/stale
+        # config can't silently flip behavior (norm_topk_prob especially: config default is True).
         self.router_activation = getattr(config, 'router_activation', 'none')
-        self.norm_topk_prob = getattr(config, 'norm_topk_prob', False)
+        self.norm_topk_prob = getattr(config, 'norm_topk_prob', True)
         self.gate_type = getattr(config, 'gate_type', 'sigmoid')  # 'sigmoid' or 'softmax'
         self.routed_scaling_factor = getattr(config, 'routed_scaling_factor', 1.0)  # MiMo/DeepSeek-V3
 

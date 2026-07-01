@@ -138,7 +138,12 @@ BiBoForCausalLM
 | ~~`use_router_logit_norm` / `router_lambda`~~ | removed | **Skywork logit-norm REMOVED (Jun 28 2026)** — MiMo has none. Router is pure MiMo. |
 | ~~`moe_shared_scaling`~~ | removed | **DEPRECATED (Jun 28 2026)** — shared expert adds directly (DeepSeek-V3/Gemma), no learned/MC scalar. |
 | `mlp_only_layers` | [0, N-1] | Which layers use dense MLP instead of MoE (first + last) |
-| `rope_nope_ratio` | 0.5 | Fraction of attention heads that are NoPE (no positional encoding). 0.5 = 2:2 (6 RoPE+NTK heads, 6 NoPE content heads at the 12h/2kv default). 0.0 = all RoPE (original). Must align with KV group boundaries. |
+| `partial_rotary_factor` | 0.334 | **Dim-wise** partial RoPE: fraction of EACH head's `head_dim` that rotates; the rest is NoPE. Replaces head-wise `rope_nope_ratio` (Jul 1 2026). `rope_dim=even(round(factor·head_dim))`. 1.0 = full RoPE. No KV-alignment constraint (applies to all heads uniformly). |
+| `rope_theta` | 1e7 | RoPE base. Default raised 10000→1e7 (matched to dim-wise partial RoPE / MiMo-V2.5). |
+| `hybrid_layer_pattern` | None | Per-layer list: 1=sliding-window (SWA), 0=full/global. None = all-global (current). |
+| `sliding_window` | 128 | SWA window `W` (keys visible per query on windowed layers). |
+| `add_swa_attention_sink_bias` | True | Learnable per-head attention sink on SWA layers (unscaled; the norm). |
+| `add_full_attention_sink_bias` | False | Sink on global layers (True → G1/G3; False → G2, current). |
 
 ---
 
@@ -276,6 +281,35 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 ---
 
 ## Known Quirks / TODOs
+
+- **(July 1 2026) Full-codebase code-review fix batch.** Fixed across `src/`:
+  (1) **transformers 5.x port** — the model targets HF 5.x now: the custom `prepare_inputs_for_generation`
+  + legacy-cache (`to/from_legacy_cache`) + the broken StaticCache mask branch (undefined
+  `_prepare_4d_causal_attention_mask_with_cache_position`, removed `get_max_length`) were deleted;
+  `BiBoModel.forward` returns the `Cache` object directly and relies on `GenerationMixin`'s default
+  prepare-inputs. **`model.generate()` and `use_cache=True` now work** (verified).
+  (2) **`num_experts`/`num_shared_experts` config knobs removed** — `num_experts` is now derived
+  ≡ `num_routed_experts` (all PolyGLU + specials); the shared expert is a single always-on module.
+  (3) **top-k validation** now checks `num_experts_per_tok ≤ num_routed_experts` (was `num_experts`,
+  which over-allowed and crashed `torch.topk`).
+  (4) **config `head_dim`/`rope_dim` derived AFTER `super().__init__`** so a stale serialized value
+  can't survive a `config.json` edit of `partial_rotary_factor`/dims.
+  (5) **SWA sliding-window now enforced at `q_len==1` decode**; **SDPA cached-prefill** (`q_len>1,
+  kv_len>q_len`) uses an explicit bottom-right mask (is_causal is top-left-wrong there).
+  (6) **XSA aligns V to the query positions** (`value_states[..., -q_len:, :]`) — fixes a decode-time
+  `q_len!=kv_len` crash.
+  (7) **ReLU² expert squares in fp32** (fp16 overflow→NaN guard on T4).
+  (8) **DDP bias-update is step-triggered** (host-side forward-step counter, no per-step `.item()`
+  sync, no ragged-batch `all_reduce` deadlock); MoE boundary slices use one `.tolist()` (was a sync
+  per expert).
+  (9) **dynamic-NTK is stateless** (order-independent `inv_freq`; in-window it's a no-op).
+  (10) **G1 (global sink + SSMax) is GUARDED** (config raises) — the C-scaled sink is NOT implemented
+  yet; enable only when it lands. (11) `_init_weights` now resets RMSNorm(→1.0)/Conv1d; RMSNorm eps
+  default 1e-5→1e-6; router `getattr` fallbacks match config defaults; dead `masks.py` + unused
+  imports/attrs removed; new config guards (`num_key_value_heads>0`, `bias_update_threshold>0`,
+  SWA requires positive `sliding_window`, `mlp_only_layers` deduped).
+  ⚠️ **Requires transformers ≥5** (installed 5.7.0). ⚠️ Existing checkpoints incompatible. NOT done
+  (optional perf): building the SWA mask / SSMax `log_n` once at model level instead of per-layer.
 
 - **(June 30 2026) ALL custom kernels REMOVED — BiBo + bench run pure PyTorch eager + torch.compile.**
   The entire `src/kernels/` tree (MoE dispatch, XSA, fused-linear CE, fused conv-router, Liger
@@ -518,7 +552,8 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   (the last is a stale divergent 16L config — bumped for layout consistency only). ⚠️ Existing
   8-expert checkpoints are now architecture-incompatible (router/expert dims changed) — retrain.
 - **(June 24 2026; REMOVED Jun 28 — per-expert is the only MoE path) `patch_moe_auto`** — per-call dispatch: grouped path for `n_tokens >= GROUPED_MIN_TOKENS` (default 4096), else the fixed per-expert path. Beats PyTorch eager across all token regimes by construction (both branches grad-verified). Tune `GROUPED_MIN_TOKENS` after T4 cert.
-- **(June 26 2026) Partial RoPE head-split (`rope_nope_ratio=0.5` = 2:2, DEFAULT)** — first `round(num_heads*(1-ratio))` query heads + corresponding KV heads get full RoPE+NTK; the remaining heads are NoPE (no positional encoding). At the **12h/2kv default**: 6 RoPE+NTK heads (1 RoPE KV group) + 6 NoPE content heads (1 NoPE KV group) — clean KV-group split, no GQA geometry change needed (group size 6; 6%6=0). Empirical (synthetic passkey + MQAR length-gen, train@128, eval to 32×, 3 seeds): more NoPE monotonically improves extrapolation — pure NoPE hits XG=1.000 on both tasks vs full-RoPE+NTK 0.93 (passkey) / 0.33 (MQAR); 2:2 gets 0.99 (passkey) / 0.50 (MQAR). **2:2 chosen as the default** (not higher NoPE): our retrieval evals treat position as *noise* (RoPE's worst case), so they overstate NoPE's value for a general LM where position is signal — 2:2 keeps half the heads positional, and is the only partial ratio that's KV-aligned at 12h/2kv without changing GQA. Mechanism: RoPE position-encodes key tokens by *where* they're planted → breaks key-matching; NoPE heads match position-independently; SSMax sharpens; causal mask gives implicit scale-free position. **The boundary must align with KV groups** (config validation enforced; only {0.0, 0.5} valid at 12h/2kv). `rope_nope_ratio=0.0` restores original all-RoPE. **IID/downstream cost of NoPE is UNMEASURED** (our synthetic evals saturate to 1.00 at train length) — Kaggle ablation on real-LM perplexity needed before pushing the ratio higher (would require changing GQA geometry to unlock 0.25/0.75). See `src/.autoresearch/FINDINGS.md` (2026-06-26 V10 + MQAR).
+- **(July 1 2026) Hybrid SWA + attention sink + DIM-WISE partial RoPE implemented.** Per-layer attention type via `hybrid_layer_pattern` (1=SWA, 0=global; None=all-global). **SWA layers** = sliding-window band mask (`sliding_window`, default 128) + a learnable per-head **attention sink** (unscaled, appended as a value-less softmax column, dropped before the V matmul) + **SSMax forced OFF** (window caps `n` → SSMax redundant). **Global layers** = current behavior (G2: SSMax on, no sink) unless `add_full_attention_sink_bias`. Single parameterized `BiBoAttention` (NOT subclasses): global-no-sink keeps the SDPA `is_causal` fast path; anything with a sink/window/`output_attentions` runs the **eager core** (`_attn_bias_mask` builds causal-or-band; matches `src/.autoresearch/ssmax_sink_ref.py` / MiMo `eager_attention_forward`). QK-norm, XSA, GQA, cache shared across both. **Partial RoPE switched head-wise → dim-wise** (`partial_rotary_factor`, default 0.334): the first `rope_dim` of EVERY head rotates, rest NoPE; model-level rotary emits `rope_dim`-sized cos/sin; `rope_theta` default 10000→1e7. Removes the KV-group-alignment constraint entirely. Verified: all-global builds with 0 sink params; hybrid puts sink params + SSMax-off only on SWA layers; fwd+bwd NaN-free; SWA window exact in `output_attentions` (q=20,W=8 → keys 13–20). Full spec: `docs/attention_layers.md`. ⚠️ Existing checkpoints incompatible (RoPE layout + new params). Sink is ON for SWA by default per the verdict; global sink is opt-in (G1/G3 not wired into bench configs).
+- **(June 26 2026; head-wise SUPERSEDED Jul 1 2026 — see above; kept for its ablation data) Partial RoPE head-split (`rope_nope_ratio=0.5` = 2:2, DEFAULT)** — first `round(num_heads*(1-ratio))` query heads + corresponding KV heads get full RoPE+NTK; the remaining heads are NoPE (no positional encoding). At the **12h/2kv default**: 6 RoPE+NTK heads (1 RoPE KV group) + 6 NoPE content heads (1 NoPE KV group) — clean KV-group split, no GQA geometry change needed (group size 6; 6%6=0). Empirical (synthetic passkey + MQAR length-gen, train@128, eval to 32×, 3 seeds): more NoPE monotonically improves extrapolation — pure NoPE hits XG=1.000 on both tasks vs full-RoPE+NTK 0.93 (passkey) / 0.33 (MQAR); 2:2 gets 0.99 (passkey) / 0.50 (MQAR). **2:2 chosen as the default** (not higher NoPE): our retrieval evals treat position as *noise* (RoPE's worst case), so they overstate NoPE's value for a general LM where position is signal — 2:2 keeps half the heads positional, and is the only partial ratio that's KV-aligned at 12h/2kv without changing GQA. Mechanism: RoPE position-encodes key tokens by *where* they're planted → breaks key-matching; NoPE heads match position-independently; SSMax sharpens; causal mask gives implicit scale-free position. **The boundary must align with KV groups** (config validation enforced; only {0.0, 0.5} valid at 12h/2kv). `rope_nope_ratio=0.0` restores original all-RoPE. **IID/downstream cost of NoPE is UNMEASURED** (our synthetic evals saturate to 1.00 at train length) — Kaggle ablation on real-LM perplexity needed before pushing the ratio higher (would require changing GQA geometry to unlock 0.25/0.75). See `src/.autoresearch/FINDINGS.md` (2026-06-26 V10 + MQAR).
 
 ---
 

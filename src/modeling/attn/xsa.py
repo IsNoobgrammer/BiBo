@@ -27,12 +27,16 @@ def apply_xsa(attn_output: torch.Tensor, value_states: torch.Tensor,
     Returns:
         XSA-corrected attention output (B, H, S, D)
     """
-    B, n_heads, S, D = attn_output.shape
+    B, n_heads, S, D = attn_output.shape           # S = q_len (query positions)
     n_kv = value_states.shape[1]
     g = n_heads // n_kv
     if not enable_gqa and g != 1:
         value_states = repeat_kv(value_states, g)
         n_kv, g = n_heads, 1
+    # Align V to the QUERY positions: each query rejects along ITS OWN value. value_states holds
+    # all kv_len positions; the queries are the last q_len of them (packed training: q_len==kv_len,
+    # a no-op; cached decode: q_len==1 -> the newest token's value). Fixes the q_len!=kv_len case.
+    v_aligned = value_states[:, :, -S:, :]
     Yg = attn_output.view(B, n_kv, g, S, D)
-    Vn = F.normalize(value_states, dim=-1).unsqueeze(2)        # (B, n_kv, 1, S, D)
+    Vn = F.normalize(v_aligned, dim=-1).unsqueeze(2)          # (B, n_kv, 1, S, D)
     return (Yg - (Yg * Vn).sum(dim=-1, keepdim=True) * Vn).reshape(B, n_heads, S, D)

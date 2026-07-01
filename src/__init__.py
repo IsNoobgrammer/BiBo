@@ -9,9 +9,6 @@ from .modeling import (
     BiBoMoELayer,
     BiBoFusedExperts,
     BiBoRMSNorm,
-    make_causal_mask,
-    expand_mask,
-    prepare_4d_causal_attention_mask,
 )
 
 __all__ = [
@@ -24,7 +21,4 @@ __all__ = [
     'BiBoMoELayer',
     'BiBoFusedExperts',
     'BiBoRMSNorm',
-    'make_causal_mask',
-    'expand_mask',
-    'prepare_4d_causal_attention_mask',
 ]
