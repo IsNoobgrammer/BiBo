@@ -122,10 +122,6 @@ class BiBoConfig(PretrainedConfig):
         self.special_expert_pairs = special_expert_pairs
         # experts = polyglu_multiplier * 3 (SiLU, ReLU², Tanh) + special_pairs * 2 (Identity, Zero)
         self.num_routed_experts = (polyglu_expert_multiplier * 3) + (special_expert_pairs * 2)
-        # num_experts == the full routed set (all PolyGLU + special experts). Alias kept for HF
-        # tooling/logging; there is no separate shared-expert count knob — the shared expert, when
-        # enabled, is a single always-on module (see BiBoMoELayer).
-        self.num_experts = self.num_routed_experts
 
         # ── Shared expert ────────────────────────────────────────
         self.use_shared_expert = use_shared_expert
@@ -291,6 +287,18 @@ class BiBoConfig(PretrainedConfig):
                     "hybrid_layer_pattern marks SWA layers (1) but sliding_window is not a positive "
                     "int — SWA layers require a window size (else they silently run full-attention)."
                 )
+        # No SWA layer anywhere -> serialize sliding_window=None. HF machinery (cache selection,
+        # mask utils, third-party tooling) keys off config.sliding_window; a non-None value would
+        # advertise windowed attention for a fully-global model.
+        _has_swa = self.hybrid_layer_pattern is not None and any(self.hybrid_layer_pattern)
+        if not _has_swa:
+            self.sliding_window = None
+        # Standard HF per-layer attention types — lets DynamicCache(config=...) build
+        # window-evicting sliding layers for SWA and unbounded layers for global.
+        self.layer_types = (
+            ["sliding_attention" if v else "full_attention" for v in self.hybrid_layer_pattern]
+            if _has_swa else ["full_attention"] * self.num_hidden_layers
+        )
         for idx in self.mlp_only_layers:
             if not (0 <= idx < self.num_hidden_layers):
                 raise ValueError(

@@ -1,46 +1,21 @@
-"""BiBoAttention — Standard softmax + SSMax + hybrid SWA / attention sink"""
+"""BiBoAttention — minimal shared shell: projections, QK-norm, partial RoPE, KV cache, SSMax,
+per-layer dispatch to the SWA or full-attention flavor module, XSA, output projection.
+The attention flavors themselves live in swa.py (eager-only band + sink) and
+full_attention.py (SDPA fast path / mask path)."""
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional, Tuple
 from transformers.cache_utils import Cache
 from src.configuration_bibo import BiBoConfig
 from ..norm import BiBoRMSNorm
 from ..embed import apply_rotary_pos_emb
-from .utils import repeat_kv
 from .ssmax import apply_ssmax_query_scaling
 from .xsa import apply_xsa
+from .swa import swa_attention
+from .full_attention import full_attention
 
-__all__ = ['BiBoAttention', 'eager_attention_forward']
-
-
-def eager_attention_forward(module, query, key, value, attention_mask, scaling, dropout=0.0, sinks=None):
-    """Eager attention core — faithful to MiMo-V2.5 `eager_attention_forward` (GPT-OSS-style sink).
-
-    Verbatim except the final `.transpose(1,2)` is deferred to the caller (BiBo runs XSA on the
-    (B,H,q,d) output first, then the shared tail transposes). `key`/`value` are GROUPED (GQA) and
-    repeated here. `attention_mask` is additive (0 / -inf), broadcast over (B,H). `sinks` is
-    `module.attention_sink_bias` (or None): when set, one value-less per-head sink column is
-    concatenated AFTER the mask, included in the softmax denominator, then dropped before the V
-    matmul. Returns (attn_output (B,H,q,d), probs (real weights, sink dropped))."""
-    key_states = repeat_kv(key, module.num_key_value_groups)
-    value_states = repeat_kv(value, module.num_key_value_groups)
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-    if sinks is not None:
-        s = module.attention_sink_bias.reshape(1, -1, 1, 1).to(attn_weights.dtype).expand(
-            query.shape[0], -1, query.shape[-2], -1)
-        attn_weights = torch.cat([attn_weights, s], dim=-1)
-    attn_weights = attn_weights - attn_weights.max(dim=-1, keepdim=True).values
-    probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    if sinks is not None:
-        probs = probs[..., :-1]
-    probs = F.dropout(probs, p=dropout, training=module.training)
-    attn_output = torch.matmul(probs, value_states)
-    return attn_output, probs
+__all__ = ['BiBoAttention']
 
 
 class BiBoAttention(nn.Module):
@@ -58,7 +33,7 @@ class BiBoAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        self.head_dim = config.head_dim   # derived + validated in BiBoConfig
         self.layer_idx = layer_idx
         self.use_xsa = config.use_xsa
         self.attention_dropout = config.attention_dropout
@@ -88,15 +63,6 @@ class BiBoAttention(nn.Module):
                 requires_grad=True
             )
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got hidden_size={self.hidden_size}, num_heads={self.num_heads})"
-            )
-        if self.num_heads % self.num_key_value_heads != 0:
-            raise ValueError(
-                f"num_attention_heads ({self.num_heads}) must be divisible by num_key_value_heads ({self.num_key_value_heads})"
-            )
-
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
@@ -107,20 +73,6 @@ class BiBoAttention(nn.Module):
         self.q_norm = BiBoRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = BiBoRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-    def _attn_bias_mask(self, q_len, kv_len, dtype, device):
-        """Additive attention mask (0 / -inf), shape (1, 1, q_len, kv_len) — broadcasts over (B,H).
-        Causal, plus a sliding-window band when this is an SWA layer. Bottom-right aligned via
-        absolute query positions, so it's correct for packed training (q_len==kv_len) and cached
-        decode (q_len==1, kv_len large) alike."""
-        i = torch.arange(q_len, device=device).unsqueeze(1) + (kv_len - q_len)   # abs query pos
-        j = torch.arange(kv_len, device=device).unsqueeze(0)
-        allow = j <= i                                                            # causal
-        if self.sliding_window is not None:
-            allow = allow & ((i - j) < self.sliding_window)                       # window band
-        mask = torch.where(allow, torch.zeros((), dtype=dtype, device=device),
-                           torch.full((), float("-inf"), dtype=dtype, device=device))
-        return mask[None, None]                                                    # (1,1,q,kv)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -130,7 +82,7 @@ class BiBoAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         output_attentions: bool = False,
         **kwargs
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -156,53 +108,37 @@ class BiBoAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        # SSMax query scaling
+        # SSMax query scaling. With a padding mask, n must count REAL keys only (grid positions
+        # over-count by the pad width): mask.cumsum at each query's grid position == real causal
+        # context length. SSMax runs only on global layers, whose KV is never window-cropped, so
+        # the mask always covers the full kv_len.
         kv_len = key_states.shape[-2]
-        q = query_states
         if self.use_ssmax:
-            q = apply_ssmax_query_scaling(q, kv_len, self.ssmax_scale)
+            context_lens = (attention_mask.cumsum(-1)[:, -query_states.shape[-2]:]
+                            if attention_mask is not None else None)
+            query_states = apply_ssmax_query_scaling(query_states, kv_len, self.ssmax_scale, context_lens)
 
-        # Attention. Global + no-sink + no-attn-weights -> SDPA fast path (is_causal lets the backend
-        # SKIP the upper triangle; see AGENTS.md decision 9b). Anything needing a sink column, a
-        # sliding-window band, or attention weights -> the eager core (matches ssmax_sink_ref.py /
-        # MiMo eager_attention_forward). value_states stays GROUPED (un-repeated) so XSA's enable_gqa
-        # broadcast below is consistent across both paths.
-        q_len = q.shape[-2]
-        need_sink = self.attention_sink_bias is not None
-        use_eager = need_sink or self.is_swa or output_attentions
-        if not use_eager:
-            # Global + no-sink fast path. value_states stays grouped for XSA's enable_gqa below.
-            k_rep = repeat_kv(key_states, self.num_key_value_groups)
-            v_rep = repeat_kv(value_states, self.num_key_value_groups)
-            if q_len > 1 and kv_len > q_len:
-                # Cached multi-token prefill: SDPA is_causal is TOP-LEFT aligned (wrong when a cache
-                # is present) — pass an explicit bottom-right causal mask instead (F9).
-                sdpa_mask = self._attn_bias_mask(q_len, kv_len, q.dtype, q.device)
-                attn_output = nn.functional.scaled_dot_product_attention(
-                    q, k_rep, v_rep, attn_mask=sdpa_mask, is_causal=False,
-                    dropout_p=self.attention_dropout if self.training else 0.0, scale=self.scaling)
-            else:
-                # Training (q_len==kv_len) and single-token decode: is_causal is correct and lets the
-                # backend SKIP the upper triangle (AGENTS.md decision 9b).
-                attn_output = nn.functional.scaled_dot_product_attention(
-                    q, k_rep, v_rep, attn_mask=None, is_causal=q_len > 1,
-                    dropout_p=self.attention_dropout if self.training else 0.0, scale=self.scaling)
-            attn_weights = None
-        else:
-            # Eager core (MiMo eager_attention_forward): causal-or-sliding mask + optional per-head
-            # sink. SWA sink is UNSCALED (no SSMax on SWA — docs/attention_layers.md §3); the sink is
-            # appended AFTER the mask so it's never masked out. Pass grouped key/value (repeated inside).
-            # Build the mask whenever q_len>1 OR this is a windowed layer — the latter so SWA enforces
-            # its band even at q_len==1 single-token decode (F5); a global no-sink q_len==1 never lands
-            # here, and would need no mask anyway.
-            attn_mask = (self._attn_bias_mask(q_len, kv_len, q.dtype, q.device)
-                         if (q_len > 1 or self.sliding_window is not None) else None)
-            attn_output, probs = eager_attention_forward(
-                self, q, key_states, value_states, attn_mask, self.scaling,
-                dropout=self.attention_dropout if self.training else 0.0,
-                sinks=self.attention_sink_bias,
-            )
+        # Dispatch to the per-layer attention flavor. All masking (band/causal/padding) and sink
+        # handling lives inside the flavor modules; attention_mask here is the raw 2D (B, K_total)
+        # padding mask (1=real, 0=pad) or None. value_states stays GROUPED (un-repeated) so XSA's
+        # enable_gqa broadcast below is consistent across all paths.
+        if self.is_swa:
+            # Eager only, by design — the fast path for SWA is a dedicated sink-aware banded
+            # kernel (not SDPA); this eager core is its exact numerics target.
+            attn_output, probs = swa_attention(
+                query_states, key_states, value_states, self.attention_sink_bias,
+                sliding_window=self.sliding_window,
+                num_key_value_groups=self.num_key_value_groups, scaling=self.scaling,
+                padding_mask=attention_mask,
+                dropout=self.attention_dropout, training=self.training)
             attn_weights = probs if output_attentions else None
+        else:
+            attn_output, attn_weights = full_attention(
+                query_states, key_states, value_states, self.attention_sink_bias,
+                num_key_value_groups=self.num_key_value_groups, scaling=self.scaling,
+                padding_mask=attention_mask,
+                dropout=self.attention_dropout, training=self.training,
+                output_attentions=output_attentions)
 
         # XSA: enable_gqa broadcasts V across the query group (no repeat_kv copy).
         if self.use_xsa:
@@ -213,4 +149,6 @@ class BiBoAttention(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1)
         attn_output = self.o_proj(attn_output)
 
-        return attn_output, attn_weights, past_key_value
+        # No cache in the return: past_key_value is a shared object mutated in place by
+        # .update() — threading it back through every layer return is HF-legacy ritual.
+        return attn_output, attn_weights

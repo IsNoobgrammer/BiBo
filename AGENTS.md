@@ -36,10 +36,12 @@ src/
     ├── norm.py                    # BiBoRMSNorm
     ├── embed.py                   # BiBoRotaryEmbedding (Qwen3-compatible RoPE)
     ├── attn/
-    │   ├── base.py                # BiBoAttention (SDPA + SSMax, fallback manual)
-    │   ├── ssmax.py               # apply_ssmax_query_scaling
+    │   ├── base.py                # BiBoAttention — minimal shell: proj/QK-norm/RoPE/cache/SSMax → flavor dispatch → XSA
+    │   ├── swa.py                 # swa_attention — SWA flavor (EAGER ONLY: band mask + sink; kernel target)
+    │   ├── full_attention.py      # full_attention — global flavor (SDPA is_causal fast path / mask path)
+    │   ├── ssmax.py               # apply_ssmax_query_scaling (mask-aware context_lens)
     │   ├── xsa.py                  # apply_xsa (Exclusive Self Attention rejection)
-    │   └── utils.py               # repeat_kv
+    │   └── utils.py               # repeat_kv, causal_band_mask, padding_bias, eager_attention_forward
     ├── ffn/
     │   ├── mlp.py                 # BiBoMLP (SwiGLU)
     │   ├── experts.py             # Identity, ReLU², Zero, CausalConv1D
@@ -198,7 +200,7 @@ BiBoForCausalLM
 
 ## Important Design Decisions
 
-1. **No sliding window / recurrent attention** — removed. Only standard softmax + SSMax. **BINDING VERDICT for when SWA returns (2026-07-01): SWA layers use ONLY an (unscaled) attention sink — no SSMax, no value-scaling; global layers pick one of {SSMax+sink, SSMax-only, sink-only}, value-scaling never used. Full rationale (why SSMax is redundant on windowed layers, the SSMax×sink coupling / Option A, the head_dim-based escape analysis, why we skip value-scale and a per-dim sink) + reference impl in `docs/attention_layers.md`.** See also `docs/ssmax.md`.
+1. **Hybrid SWA + global attention — IMPLEMENTED (Jul 1 2026)** via `hybrid_layer_pattern` (1=SWA, 0=global; None=all-global G2, the bench default). **BINDING VERDICT (2026-07-01), honored by the implementation: SWA layers use ONLY an (unscaled) per-head attention sink — no SSMax, no value-scaling; global layers pick one of {SSMax+sink, SSMax-only, sink-only}, value-scaling never used** (G1 = sink+SSMax is config-guarded until the C-scaled sink lands). Full rationale (why SSMax is redundant on windowed layers, the SSMax×sink coupling / Option A, the head_dim-based escape analysis, why we skip value-scale and a per-dim sink) + reference impl in `docs/attention_layers.md`. See also `docs/ssmax.md`.
 2. **SSMax init**: `1.0 / log(max_pos_emb / 2)` — ensures attention starts ~neutral, not 6× sharper than standard.
 3. **Shared expert is NOT routed** — when enabled it's always active. **OFF by default (Jun 27 2026)**; `use_shared_expert=False` is the `BiBoConfig` default and `moe.py`'s fallback. The `moe_shared_scaling` 10K-iter MC in config init is now guarded by `use_shared_expert` (no wasted sim when off).
 4. **`output_attentions=True`** works (falls back to manual attention).
@@ -216,8 +218,9 @@ BiBoForCausalLM
     explicit float mask makes the mem-efficient cutlass FMHA compute all S² blocks; `is_causal`
     lets it SKIP the upper triangle — **confirmed on T4 sm_75: attention backward 100ms→47ms**,
     step 727→599ms, MFU 13.9%→16.8%. Bit-equivalent (is_causal vs manual-causal logits Δ3e-6).
-    `_update_causal_mask` removed; `masks.py` dormant (re-exported only). ⚠️ **No padded-batch
-    support** in this path — the pipeline is packed (no pad); revisit if padding is ever needed.
+    `_update_causal_mask` removed; `masks.py` dormant (re-exported only). Padded batches ARE
+    supported since Jul 2 2026 (2D mask threaded to attention; None keeps this fast path) — the
+    packed training pipeline still passes no mask, so the is_causal skip is unchanged there.
     **optmaxx arc (T4, B16/H512): morning 2.4s/~5% MFU → now 599ms/16.8%** (hidden 320→512+head_dim
     128, tl.dot-CE→cuBLAS-chunked-CE, additive-mask→is_causal). Now GEMM-bound (~69% cuBLAS); near
     the practical T4 ceiling for this size. Next lever = flash-attention-turing (attention 8%→~4%).
@@ -282,6 +285,40 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 
 ## Known Quirks / TODOs
 
+- **(July 2 2026) Attention/infra review-fix batch (10 findings).** Fixed across `src/`:
+  (1) **Padded batches now WORK** — `BiBoModel.forward` threads a 2D (B,K) padding mask to every
+  layer (was hardcoded `None` → masks silently ignored, verified bit-identical before the fix);
+  attention folds it into its causal/band mask (`finfo.min`, NaN-safe), position_ids are
+  mask-aware (cumsum−1, left-pad safe), and **SSMax's per-query `n` counts REAL keys only**
+  (`context_lens = mask.cumsum` — grid positions over-counted by the pad width). All-ones masks
+  (generate's default) short-circuit to `None` so the packed/unpadded is_causal fast path is
+  untouched. Verified: padded forward == unpadded reference (4e-7), padded greedy generate ==
+  unpadded generate. Only 2D masks accepted (4D raises).
+  (2) **Attention modularized into per-flavor files (same day):** `base.py` is now a minimal
+  shell (proj → QK-norm → partial RoPE → cache → SSMax → flavor dispatch → XSA → o_proj);
+  the flavors live in `attn/swa.py` and `attn/full_attention.py` (imported like ssmax/xsa),
+  with shared helpers (`causal_band_mask`, `padding_bias`, `eager_attention_forward`) in
+  `attn/utils.py`. **SWA is EAGER-ONLY by design** — no SDPA/mem-efficient on windowed layers;
+  the eager core is the exact numerics target for a future dedicated sink-aware banded kernel.
+  **Global layers** keep the SDPA `is_causal` fast path; padding / cached prefill / G3 sink use
+  SDPA with an explicit mask — the per-head sink rides as one extra additive-mask column (β_h)
+  + a zero K/V column (no fp32 S² prob materialization; sink grads flow through the mask,
+  Δ9e-10 vs eager). All flavor masking is built INSIDE the flavor modules; base passes only
+  q/k/v/sinks + the raw 2D padding mask.
+  (3) **SWA KV cache is window-evicted**: `DynamicCache(config=...)` + new `config.layer_types`
+  builds `DynamicSlidingWindowLayer` for SWA layers → O(W) decode memory (verified swa_kv=7 vs
+  global_kv=24 at W=8; incremental decode == full forward 3.7e-7). Bottom-right mask slices
+  (`[..., -kv_len:]`) keep geometry correct for the cropped window.
+  (4) **Dynamic-NTK no longer syncs per step**: the model passes `seq_len` as a host int
+  (`get_seq_length()+q_len`) to the rotary — no `int(position_ids.max())` GPU sync / compile
+  graph break on the default path; the sync survives only as a fallback for external callers.
+  (5) `config.sliding_window` serializes as **None when no layer is SWA** (interop: HF machinery
+  keys off it); `config.layer_types` always emitted. (6) `eager_attention_forward` uses its
+  `sinks` param (was reading the module attr). (7) type hints are `Optional[Cache]` (legacy
+  tuple lie removed); (8) both forwards take `**kwargs` (GenerationMixin 5.x injects unfiltered
+  model inputs); (9) deprecated `config.use_return_dict` dropped (`return_dict` defaults True).
+  (10) this file's Design Decision #1 updated (SWA is implemented, not "removed"). All verified:
+  24/24 checks + fp16-autocast hybrid+padding fwd/bwd NaN-free (RTX 3050, torch 2.6).
 - **(July 1 2026) Full-codebase code-review fix batch.** Fixed across `src/`:
   (1) **transformers 5.x port** — the model targets HF 5.x now: the custom `prepare_inputs_for_generation`
   + legacy-cache (`to/from_legacy_cache`) + the broken StaticCache mask branch (undefined

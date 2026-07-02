@@ -4,7 +4,8 @@ import torch
 __all__ = ['apply_ssmax_query_scaling']
 
 
-def apply_ssmax_query_scaling(query_states: torch.Tensor, kv_len: int, ssmax_scale: torch.nn.Parameter) -> torch.Tensor:
+def apply_ssmax_query_scaling(query_states: torch.Tensor, kv_len: int, ssmax_scale: torch.nn.Parameter,
+                              context_lens: torch.Tensor = None) -> torch.Tensor:
     """
     Apply SSMax query scaling — PER CAUSAL POSITION (paper: arXiv:2501.19399, Eq. 2).
 
@@ -31,13 +32,19 @@ def apply_ssmax_query_scaling(query_states: torch.Tensor, kv_len: int, ssmax_sca
         query_states: Query tensor (B, H, q_len, D)
         kv_len: total key/value length (past + current)
         ssmax_scale: Learnable per-head scale param, shape (1, H, 1, 1)
+        context_lens: optional (B, q_len) REAL causal context length per query — used with a
+            padding mask, where masked pad keys must not count toward n (grid positions would
+            over-count by the pad width and shift the temperature)
 
     Returns:
         Scaled query states (B, H, q_len, D)
     """
     q_len = query_states.shape[-2]
-    # Causal context length per query position: n_j = (kv_len - q_len) + j + 1
-    n = torch.arange(kv_len - q_len + 1, kv_len + 1,
-                     device=query_states.device, dtype=torch.float32)
-    log_n = torch.log(n.clamp(min=1.0)).to(query_states.dtype).view(1, 1, q_len, 1)
+    if context_lens is not None:
+        n = context_lens.to(torch.float32).view(context_lens.shape[0], 1, q_len, 1)
+    else:
+        # Causal context length per query position: n_j = (kv_len - q_len) + j + 1
+        n = torch.arange(kv_len - q_len + 1, kv_len + 1,
+                         device=query_states.device, dtype=torch.float32).view(1, 1, q_len, 1)
+    log_n = torch.log(n.clamp(min=1.0)).to(query_states.dtype)
     return query_states * ssmax_scale * log_n

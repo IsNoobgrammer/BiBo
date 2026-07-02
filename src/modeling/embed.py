@@ -59,30 +59,34 @@ class BiBoRotaryEmbedding(nn.Module):
         return self.base * scale ** (self.dim / (self.dim - 2))
 
     @torch.no_grad()
-    def _inv_freq_for(self, position_ids, device):
+    def _inv_freq_for(self, position_ids, device, seq_len=None):
         """STATELESS dynamic-NTK inv_freq for the CURRENT sequence length — order-independent:
         identical inputs always yield identical frequencies (no grow/reset history that made the
         result depend on prior batch lengths). In-window (seq_len <= original_max) returns the base
         inv_freq unchanged (a no-op — no recompute); only out-of-window pays one small recompute.
-        ponytail: int(position_ids.max()) is one CPU<-GPU sync per dynamic forward — needed to know
-        the extent, and matches HF's dynamic-NTK; in-window it's the only added cost."""
+        `seq_len` is a host int (past + current tokens) supplied by the model so the extent is known
+        WITHOUT a CPU<-GPU sync / torch.compile graph break; the int(position_ids.max()) fallback
+        (one sync per dynamic forward, matches HF's dynamic-NTK) only runs for external callers."""
         if self.rope_type != "dynamic":
             return self.inv_freq
-        seq_len = int(position_ids.max()) + 1
+        if seq_len is None:
+            seq_len = int(position_ids.max()) + 1
         if seq_len <= self.original_max_seq_len:
             return self.original_inv_freq.to(device)
         return self._compute_inv_freq(self._ntk_base(seq_len), device)
 
     @torch.no_grad()
-    def forward(self, x, position_ids):
+    def forward(self, x, position_ids, seq_len=None):
         """
         Args:
             x: Input tensor (for device/dtype)
             position_ids: (batch, seq_len) position indices
+            seq_len: optional host int = total positions (past + current); avoids a GPU sync
+                on the dynamic-NTK path
         Returns:
             (cos, sin) with shape (batch, seq_len, dim)
         """
-        inv_freq = self._inv_freq_for(position_ids, x.device)
+        inv_freq = self._inv_freq_for(position_ids, x.device, seq_len)
 
         inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()

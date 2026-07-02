@@ -61,8 +61,8 @@ class BiBoDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        # Self attention
-        attn_output, self_attn_weights, present_key_value = self.self_attn(
+        # Self attention (the KV cache is mutated in place by attention; not returned)
+        attn_output, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
@@ -81,7 +81,5 @@ class BiBoDecoderLayer(nn.Module):
         outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights,)
-        if use_cache:
-            outputs += (present_key_value,)
 
         return outputs

@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 from torch.nn import CrossEntropyLoss
 
 from transformers.modeling_outputs import (
@@ -29,7 +29,6 @@ class BiBoPreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["BiBoDecoderLayer"]
-    _supports_cache_class = True
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -95,18 +94,19 @@ class BiBoModel(BiBoPreTrainedModel):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,  # tolerate extra model inputs injected by GenerationMixin across HF 5.x versions
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else True
 
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("Cannot specify both input_ids and inputs_embeds")
@@ -125,32 +125,50 @@ class BiBoModel(BiBoPreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         # Cache handling (transformers 5.x: Cache objects only — no legacy tuple support).
+        # config-aware: SWA layers (config.layer_types) get window-evicting sliding layers, so
+        # windowed layers hold O(sliding_window) KV during decode instead of O(total_len).
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache()
+            past_key_values = DynamicCache(config=self.config)
 
+        # get_seq_length() is a host int (no GPU sync) — also feeds the rotary extent below.
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + seq_length, device=inputs_embeds.device
             )
 
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+        # Padding: a 2D (B, K_total) mask (1=real, 0=pad) is threaded to every layer; attention
+        # folds it into its own causal/band mask. None (packed training / single sequence) keeps
+        # the SDPA is_causal fast path — no precomputed mask, the backend does the causal skip.
+        if attention_mask is not None:
+            if attention_mask.dim() != 2:
+                raise ValueError(
+                    f"attention_mask must be a 2D (batch, seq) padding mask or None, "
+                    f"got {attention_mask.dim()}D"
+                )
+            if bool(attention_mask.all()):
+                attention_mask = None   # all-ones (generate's default) -> keep the fast path
 
-        # No precomputed causal mask: attention uses is_causal=True (packed training, no padding).
-        # See BiBoAttention — the SDPA backend does the causal skip itself; building an explicit
-        # additive mask here both costs time and defeats that skip.
+        if position_ids is None:
+            if attention_mask is not None:
+                # Mask-aware positions: pads don't advance the position counter (left-pad safe).
+                position_ids = (attention_mask.long().cumsum(-1) - 1).clamp_(min=0)
+                position_ids = position_ids[:, -seq_length:]
+            else:
+                position_ids = cache_position.unsqueeze(0)
+
         hidden_states = inputs_embeds
         if self.embed_norm is not None:          # EXPERIMENTAL post-embedding norm (BLOOM-style)
             hidden_states = self.embed_norm(hidden_states)
 
-        # Position embeddings (Qwen-style: use position_ids)
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # Position embeddings (Qwen-style: use position_ids). seq_len as a host int keeps the
+        # dynamic-NTK path free of a per-step GPU sync / compile graph break.
+        position_embeddings = self.rotary_emb(
+            hidden_states, position_ids, seq_len=past_seen_tokens + seq_length)
 
         # Decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-        next_decoder_cache = None
 
         for decoder_layer in self.layers:
             if output_hidden_states:
@@ -161,7 +179,7 @@ class BiBoModel(BiBoPreTrainedModel):
                     decoder_layer.__call__,
                     hidden_states,
                     position_embeddings,
-                    None,                       # attention_mask: is_causal handled in attention
+                    attention_mask,             # 2D padding mask or None (None -> is_causal path)
                     None,
                     cache_position,
                     output_attentions,
@@ -171,21 +189,15 @@ class BiBoModel(BiBoPreTrainedModel):
                 layer_outputs = decoder_layer(
                     hidden_states,
                     position_embeddings=position_embeddings,
-                    attention_mask=None,        # is_causal handled in attention (packed, no padding)
+                    attention_mask=attention_mask,   # 2D padding mask or None (None -> is_causal path)
                     past_key_value=past_key_values,
                     cache_position=cache_position,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                 )
 
-            # layer_outputs: (hidden_states, [attn_weights], [cache])
+            # layer_outputs: (hidden_states, [attn_weights]) — the cache is mutated in place
             hidden_states = layer_outputs[0]
-
-            # Cache is after hidden_states (idx 1) or after attn_weights (idx 2)
-            if use_cache:
-                cache_idx = 2 if output_attentions else 1
-                next_decoder_cache = layer_outputs[cache_idx]
-
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
@@ -194,7 +206,7 @@ class BiBoModel(BiBoPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        next_cache = next_decoder_cache if use_cache else None   # Cache object, returned as-is
+        next_cache = past_key_values if use_cache else None   # Cache object, returned as-is
 
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
@@ -255,7 +267,7 @@ class BiBoForCausalLM(BiBoPreTrainedModel, GenerationMixin):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -263,10 +275,11 @@ class BiBoForCausalLM(BiBoPreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,  # tolerate extra model inputs injected by GenerationMixin across HF 5.x versions
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else True
 
         # Decoder output
         outputs = self.model(
