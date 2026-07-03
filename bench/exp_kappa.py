@@ -3,7 +3,8 @@
   1. Muon    -> triton-kernel-fused FusedMuon, arm selected by KAPPA_ARM env:
                   default : _DSV4_COEFFS (10 it) + aurora_k1     (repo default; r=1 kappa ~40-450 lottery)
                   b12     : KJ x10 + pinned x2 (12 it) + aurora_k1 (r=1 kappa ~1.3-11, no dither)
-                  champ   : b12 + signed-perm dither eps=0.05 on SQUARE slices (r=1 kappa 1.00 always)
+                  k2      : _DSV4_COEFFS + aurora_k2 (2 polars, 20 it) — FAITHFUL kappa 1.00 at r=1
+                  champ   : b12 + signed-perm dither eps=0.05 on SQUARE slices (kappa 1.00 via perturbation)
   2. CE loss -> fused_linear_cross_entropy (never materializes the (N, 81000) logits)
   3. MoE     -> kernels.sm75.moe (sorted dispatch + fused PolyGLU; handles Identity/Zero specials)
 
@@ -27,7 +28,7 @@ from kernels.sm75.cross_entropy import fused_linear_cross_entropy
 from kernels.sm75.moe import moe as moe_fused
 
 ARM = os.environ.get("KAPPA_ARM", "default")
-assert ARM in ("default", "b12", "champ"), ARM
+assert ARM in ("default", "b12", "k2", "champ"), ARM
 KJ = (3.4445, -4.775, 2.0315)
 PIN = (2.0, -1.5, 0.5)
 B12 = (KJ,) * 10 + (PIN,) * 2
@@ -36,9 +37,10 @@ B12 = (KJ,) * 10 + (PIN,) * 2
 # ── 1. Muon arm ──────────────────────────────────────────────────────────────
 class KappaMuon(FusedMuon):
     def __init__(self, params, lr=3e-4, momentum=0.95, weight_decay=0.0, **_ignored):
-        coeffs = _DSV4_COEFFS if ARM == "default" else B12
+        coeffs = _DSV4_COEFFS if ARM in ("default", "k2") else B12
         super().__init__(params, lr=lr, momentum=momentum, weight_decay=weight_decay,
-                         coeffs=coeffs, ns_dtype=torch.float16)
+                         coeffs=coeffs, ns_dtype=torch.float16,
+                         aurora_k=2 if ARM == "k2" else None)
 
     def _polar(self, u):
         if ARM == "champ" and u.shape[-2] == u.shape[-1]:
