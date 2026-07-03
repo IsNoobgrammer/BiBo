@@ -28,19 +28,32 @@ from kernels.sm75.cross_entropy import fused_linear_cross_entropy
 from kernels.sm75.moe import moe as moe_fused
 
 ARM = os.environ.get("KAPPA_ARM", "default")
-assert ARM in ("default", "b12", "k2", "champ"), ARM
 KJ = (3.4445, -4.775, 2.0315)
 PIN = (2.0, -1.5, 0.5)
 B12 = (KJ,) * 10 + (PIN,) * 2
+ARMS = {
+    "default": dict(coeffs=_DSV4_COEFFS),                    # KJ x8 + pin x2 (10 it)
+    "b12":     dict(coeffs=B12),                             # KJ x10 + pin x2 (12 it)
+    "k2":      dict(coeffs=_DSV4_COEFFS, aurora_k=2),        # faithful kappa 1.00 (20 it)
+    "champ":   dict(coeffs=B12, dither=True),                # DEMOTED; kept for reproducibility
+    # perf-per-flop round: ns8 matches dsv4_10 on ALL tested spectra incl. power-law decay
+    # (smin/smax 2e-3); ns6 under-converges there (11% Fro err) — fidelity trade, screen decides.
+    "ns6":     dict(coeffs=(KJ,) * 4 + (PIN,) * 2),          # compressed 6 it
+    "ns8":     dict(coeffs=(KJ,) * 6 + (PIN,) * 2),          # compressed 8 it
+    "normuon": dict(coeffs=_DSV4_COEFFS, scale_mode="normuon"),  # per-row 2nd-moment rescale
+}
+assert ARM in ARMS, ARM
 
 
 # ── 1. Muon arm ──────────────────────────────────────────────────────────────
 class KappaMuon(FusedMuon):
     def __init__(self, params, lr=3e-4, momentum=0.95, weight_decay=0.0, **_ignored):
-        coeffs = _DSV4_COEFFS if ARM in ("default", "k2") else B12
-        super().__init__(params, lr=lr, momentum=momentum, weight_decay=weight_decay,
-                         coeffs=coeffs, ns_dtype=torch.float16,
-                         aurora_k=2 if ARM == "k2" else None)
+        spec = ARMS[ARM]
+        kw = dict(coeffs=spec["coeffs"], ns_dtype=torch.float16,
+                  aurora_k=spec.get("aurora_k"))
+        if "scale_mode" in spec:
+            kw["scale_mode"] = spec["scale_mode"]
+        super().__init__(params, lr=lr, momentum=momentum, weight_decay=weight_decay, **kw)
 
     def _polar(self, u):
         if ARM == "champ" and u.shape[-2] == u.shape[-1]:
