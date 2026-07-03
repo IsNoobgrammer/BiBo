@@ -313,8 +313,12 @@ def estimate_mfu(active_params, tokens_per_sec, device):
         peak_tflops = 312.0      # A100 fp16 tensor cores
     elif "4090" in gpu_name:
         peak_tflops = 330.0      # RTX 4090 fp16 tensor cores
+    elif "PRO 6000" in gpu_name or "5090" in gpu_name:
+        peak_tflops = 500.0      # Blackwell GB202 dense fp16/bf16 tensor cores
+    elif "L4" in gpu_name:
+        peak_tflops = 121.0      # L4 fp16 tensor cores
     else:
-        peak_tflops = 65.0
+        peak_tflops = 65.0       # unknown -> T4 assumption; MFU is WRONG on faster parts (add an entry!)
 
     return achieved_flops / (peak_tflops * 1e12)
 
