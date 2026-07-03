@@ -100,9 +100,9 @@ def _moe_forward(self, hidden_states, top_k_indices, top_k_weights):
                + [4] * (self.zero_end - self.zero_start))
         codes = torch.tensor(lst, dtype=torch.int32, device=hidden_states.device)
         self._act_codes = codes
+    # raw params: the kernel Functions are AMP-aware (custom_fwd cast_inputs=fp16)
     return moe_fused(hidden_states, top_k_indices, top_k_weights,
-                     self.gate_up_proj.to(hidden_states.dtype),
-                     self.down_proj.to(hidden_states.dtype), codes)
+                     self.gate_up_proj, self.down_proj, codes)
 
 
 BiBoFusedExperts.forward = _moe_forward
