@@ -107,6 +107,40 @@ def _moe_forward(self, hidden_states, top_k_indices, top_k_weights):
 
 BiBoFusedExperts.forward = _moe_forward
 
+# ── 4. fused XSA (one Triton kernel fwd+bwd, GQA broadcast in-kernel) ────────
+from kernels.sm75.xsa import fused_xsa  # noqa: E402
+import src.modeling.attn.base as bibo_attn_base  # noqa: E402
+
+
+def _xsa_patch(attn_output, value_states, enable_gqa=True):
+    return fused_xsa(attn_output, value_states)
+
+
+bibo_attn_base.apply_xsa = _xsa_patch
+
+# ── 5. fused conv router (cuDNN conv + fused sigmoid/bias/top-k epilogue) ────
+from kernels.sm75.router import fused_router  # noqa: E402
+from src.modeling.ffn.router import BiBoMoERouter  # noqa: E402
+
+_orig_router_forward = BiBoMoERouter.forward
+
+
+def _router_forward(self, hidden_states):
+    if (self.router_type != "conv" or self.gate_type != "sigmoid"
+            or self.router_activation != "none"):
+        return _orig_router_forward(self, hidden_states)
+    return fused_router(hidden_states, self.gate_conv.weight, self.bias, self.top_k,
+                        self.num_routed_experts, self.norm_topk_prob, self.routed_scaling_factor)
+
+
+BiBoMoERouter.forward = _router_forward
+
+# ── 6. attention: pin fast SDPA backends (training hot path is mask-free is_causal ->
+#    flash; keep mem-efficient as the fallback for masked eval paths, drop math) ──────
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+torch.backends.cuda.enable_math_sdp(False)
+
 # ── run the unmodified trainer (bf16 autocast: Blackwell-native, no GradScaler pressure;
 #    the fused kernels follow the active autocast dtype automatically) ─────────────────
 import train as bibo_train  # noqa: E402
