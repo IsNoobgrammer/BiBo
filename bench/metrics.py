@@ -158,7 +158,9 @@ def init_wandb(config, project="bibo-bench", name="baseline", notes=""):
 
 
 def log_train_metrics(step, loss, lr, grad_norm, tokens_per_sec, step_time, extra=None):
-    """Log training metrics to WandB."""
+    """Log training metrics to WandB. No-op when wandb.init was never called (--no_wandb)."""
+    if wandb.run is None:
+        return
     d = {
         "train/step": step,
         "train/loss": loss,
@@ -178,6 +180,8 @@ def log_train_metrics(step, loss, lr, grad_norm, tokens_per_sec, step_time, extr
 def log_eval_metrics(step, eval_results, tokens=None):
     """Log eval results (val_loss, val_ppl, benchmarks). `tokens` = tokens_trained so far,
     logged as val/tokens_trained for the loss-vs-tokens (sample-efficiency) curve (#2)."""
+    if wandb.run is None:
+        return
     d = {
         "val/step": step,
         "val/loss": eval_results.get("val_loss", 0),
@@ -206,7 +210,9 @@ def log_eval_metrics(step, eval_results, tokens=None):
 
 
 def log_samples(step, samples):
-    """Log generated samples as WandB Table."""
+    """Log generated samples as WandB Table. No-op when wandb.init was never called (--no_wandb)."""
+    if wandb.run is None:
+        return
     table = wandb.Table(columns=["prompt", "generated", "top1_prob", "entropy", "first_token"])
     for s in samples:
         table.add_data(s["prompt"], s["generated"][:200],
