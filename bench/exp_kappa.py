@@ -77,11 +77,11 @@ def _ce_forward(self, input_ids=None, labels=None, **kw):
         **{k: v for k, v in kw.items() if k in ("attention_mask", "position_ids", "inputs_embeds")},
     )
     h = out.last_hidden_state
-    # fp16 explicitly: the CE kernel runs autocast-DISABLED inside (out=/addmm_ GEMMs), so we pick
-    # the AMP dtype here; lse/loss accumulate fp32 in-kernel, grads flow back through the casts.
-    hs = h[:, :-1, :].reshape(-1, h.shape[-1]).half()
+    # raw tensors: the CE kernel is AMP-aware (casts to the active autocast dtype internally);
+    # lse/loss accumulate fp32 in-kernel regardless.
+    hs = h[:, :-1, :].reshape(-1, h.shape[-1])
     ls = labels[:, 1:].reshape(-1).to(h.device)
-    loss = fused_linear_cross_entropy(hs, self.lm_head.weight.half(), ls)
+    loss = fused_linear_cross_entropy(hs, self.lm_head.weight, ls)
     return bibo_models.CausalLMOutputWithPast(loss=loss, logits=None,
                                               past_key_values=out.past_key_values)
 
@@ -107,8 +107,11 @@ def _moe_forward(self, hidden_states, top_k_indices, top_k_weights):
 
 BiBoFusedExperts.forward = _moe_forward
 
-# ── run the unmodified trainer ───────────────────────────────────────────────
+# ── run the unmodified trainer (bf16 autocast: Blackwell-native, no GradScaler pressure;
+#    the fused kernels follow the active autocast dtype automatically) ─────────────────
 import train as bibo_train  # noqa: E402
+
+bibo_train.AMP_DTYPE = torch.bfloat16
 
 if __name__ == "__main__":
     print(f"[exp_kappa] arm={ARM} | fused CE + fused MoE + KappaMuon active")
