@@ -77,9 +77,11 @@ def _ce_forward(self, input_ids=None, labels=None, **kw):
         **{k: v for k, v in kw.items() if k in ("attention_mask", "position_ids", "inputs_embeds")},
     )
     h = out.last_hidden_state
-    hs = h[:, :-1, :].reshape(-1, h.shape[-1])
+    # fp16 explicitly: the CE kernel runs autocast-DISABLED inside (out=/addmm_ GEMMs), so we pick
+    # the AMP dtype here; lse/loss accumulate fp32 in-kernel, grads flow back through the casts.
+    hs = h[:, :-1, :].reshape(-1, h.shape[-1]).half()
     ls = labels[:, 1:].reshape(-1).to(h.device)
-    loss = fused_linear_cross_entropy(hs, self.lm_head.weight.to(hs.dtype), ls)
+    loss = fused_linear_cross_entropy(hs, self.lm_head.weight.half(), ls)
     return bibo_models.CausalLMOutputWithPast(loss=loss, logits=None,
                                               past_key_values=out.past_key_values)
 
