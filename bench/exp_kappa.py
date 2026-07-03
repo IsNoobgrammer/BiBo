@@ -41,6 +41,7 @@ ARMS = {
     "ns6":     dict(coeffs=(KJ,) * 4 + (PIN,) * 2),          # compressed 6 it
     "ns8":     dict(coeffs=(KJ,) * 6 + (PIN,) * 2),          # compressed 8 it
     "normuon": dict(coeffs=_DSV4_COEFFS, scale_mode="normuon"),  # per-row 2nd-moment rescale
+    "gram":    dict(coeffs=_DSV4_COEFFS, gram=True),         # sm120 gram-space NS, restart@(4,6)
 }
 assert ARM in ARMS, ARM
 
@@ -56,6 +57,9 @@ class KappaMuon(FusedMuon):
         super().__init__(params, lr=lr, momentum=momentum, weight_decay=weight_decay, **kw)
 
     def _polar(self, u):
+        if ARMS[ARM].get("gram"):
+            from kernels.sm120.newton_schulz_gram import newton_schulz_gram
+            return newton_schulz_gram(u, self.coeffs, self.ns_dtype)
         if ARM == "champ" and u.shape[-2] == u.shape[-1]:
             n = u.shape[-1]
             g = torch.Generator(device=u.device).manual_seed(999)
