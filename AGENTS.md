@@ -17,7 +17,7 @@ BiBo is a **Mixture-of-Experts (MoE) Transformer** for causal language modeling.
 
 **Key differentiators from vanilla MoE (like Qwen3MoE):**
 1. **SSMax** — learnable per-head query scaling (`scale * log(n)`, where `n` is each query's **causal context length** `(kv_len − q_len) + t + 1`, not a global `kv_len`) that prevents attention fading at long sequences
-2. **Diverse experts** — PolyGLU layout: groups of 3 GLU experts with different activations (SiLU, ReLU², Tanh) + Identity/Zero special experts
+2. **Diverse experts** — PolyGLU layout: groups of 3 GLU experts with different activations (SiLU, ReLU², NormSiLU) + Identity/Zero special experts. **NormSiLU replaced Tanh (Jul 7 2026)**: `SiLU(gate/rms(gate))`, gain-free, eps 1e-6 — DECO's (arXiv:2605.10933) intra-expert normalization adapted to the GLU gate branch (inter-expert mean stage skipped: it couples all experts' grads and breaks per-expert dispatch). Tanh was a poor "norm expert": saturation ≠ normalization and down_proj rescales it away anyway.
 3. **Shared Conv1D expert** — causal convolution (gated, SwiGLU-style), always-active WHEN enabled. **OFF by default (since Jun 27 2026)** so BiBo stays param-matched to a no-shared baseline; opt in with `use_shared_expert=true`.
 4. **MiMo-V2.5 / DeepSeek-V3 router** — sigmoid scoring, auxiliary-loss-free bias (selection-only) updated by `b += u·sign(mean−load)`, `norm_topk_prob` (top-k sum-to-1), `routed_scaling_factor`. Verified bit-equivalent to MiMo's gate (`src/.autoresearch/bench_router_vs_mimo.py`). No Skywork logit-norm.
 5. **Flash Attention (SDPA)** — uses `F.scaled_dot_product_attention` when `output_attentions=False`
@@ -106,7 +106,7 @@ BiBoForCausalLM
 │   │   ├── RMSNorm → BiBoAttention (GQA + SSMax + SDPA)
 │   │   └── RMSNorm → BiBoMoELayer (or dense BiBoMLP for first/last layers)
 │   │       ├── BiBoMoERouter (conv or mlp, logit norm)
-│   │       ├── Routed: PolyGLU groups (SiLU + ReLU² + Tanh GLU) + Identity + Zero
+│   │       ├── Routed: PolyGLU groups (SiLU + ReLU² + NormSiLU GLU) + Identity + Zero
 │   │       └── Shared: 1 MLP-SwiGLU or CausalConv1D (always active, scaled by moe_shared_scaling)
 │   └── Final RMSNorm
 └── LM Head
@@ -116,7 +116,7 @@ BiBoForCausalLM
 
 **MoE**: First and last layers are dense MLP (layers 0 and N-1; `mlp_only_layers=[0, N-1]`). All remaining layers are MoE. Router = MiMo/DeepSeek-V3 sigmoid gate (no logit-norm). Bias heuristics for load balancing. Router bias is `requires_grad=False` (not optimizer-managed, updated heuristically).
 
-**Expert layout (PolyGLU)**: `polyglu_expert_multiplier` groups of 3 (SiLU-GLU, ReLU²-GLU, Tanh-GLU) + `special_expert_pairs` × (Identity, Zero). Config default: 2×3 + 1×2 = 8 routed. **Bench configs (Jun 27 2026): 3×3 + 1×2 = 9 GLU + 2 specials = 11 routed**, shared expert OFF — param-matched to Qwen's 9 experts on BOTH total (137.5M) and active (71.4M).
+**Expert layout (PolyGLU)**: `polyglu_expert_multiplier` groups of 3 (SiLU-GLU, ReLU²-GLU, NormSiLU-GLU; NormSiLU replaced Tanh Jul 7 2026) + `special_expert_pairs` × (Identity, Zero). Config default: 2×3 + 1×2 = 8 routed. **Bench configs (Jun 27 2026): 3×3 + 1×2 = 9 GLU + 2 specials = 11 routed**, shared expert OFF — param-matched to Qwen's 9 experts on BOTH total (137.5M) and active (71.4M).
 
 ---
 
@@ -126,7 +126,7 @@ BiBoForCausalLM
 |-------|---------|-------------|
 | `use_ssmax` | True | Enable SSMax query scaling |
 | `use_xsa` | True | Exclusive Self Attention: reject attn output from its own value vector |
-| `polyglu_expert_multiplier` | 2 | Groups of 3 GLU experts (SiLU, ReLU², Tanh) |
+| `polyglu_expert_multiplier` | 2 | Groups of 3 GLU experts (SiLU, ReLU², NormSiLU) |
 | `special_expert_pairs` | 1 | Pairs of (Identity, Zero) special experts |
 | `num_experts_per_tok` | 6 | Top-K routing |
 | `router_type` | "mlp" | Router architecture ("mlp" or "conv") |
@@ -285,6 +285,109 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 
 ## Known Quirks / TODOs
 
+- **(July 7 2026) ManasOptimizer (tkf `kernels/sm75/manas.py`) — aurora-K1 Muon (NS-8) + rolling-probe
+  gradient alignment (Nexus-adapted, arXiv:2604.09258).** Probe: `d ← ρ·d − (γ/‖g‖)·g` (short-memory
+  NORMALIZED heavy ball, ρ=0.85 default), gradients evaluated AT θ+d via `with opt.probe():` around
+  fwd/bwd — `g(θ+d) ≈ g + H·d` injects the pairwise cross-batch gradient-alignment force
+  (Nexus's common-minima regularizer with an exponential window; probe chain momentum-free per the
+  paper's requirement; Muon's polar can only ROTATE the update, sidestepping the paper's reported
+  Muon incompatibility). Two probe-memory modes: full (one fp32 model-shape buffer) or
+  `probe_rank=r` LoRA-sketch (d = Q·C, r(m+n) floats, GaLore-style basis refresh every
+  `probe_refresh` updates + first update; old d re-projected on swap). Safety, all sync-free:
+  ‖d‖ ≤ γ/(1−ρ) by construction (globally normalized increments); inf/nan/zero grad norms zero the
+  increment (nan_to_num on the operand — inf·0=NaN guard) so bad steps only DECAY d; step() raises
+  under an applied probe. VERIFIED (RTX 3050, 20 checks, NO training): EMA converges to
+  −γ/(1−ρ)·ĝ (1.5e-7) + exact ρ^k decay; probe apply/restore bit-exact (fp32 foreach path);
+  probe grad == g + H·d EXACT on a quadratic (1e-7); cross-source grad cosine rises vs plain Muon
+  in 10 toy steps; low-rank d matches full d at 2.7e-7 on subspace-confined grads at 14.6% state;
+  d finite+bounded through 1e8/inf/nan/zero grads and recovers; state_dict round-trips; tiny-BiBo
+  fp16-autocast 5-step smoke clean (full + rank-8). NOT yet trained/validated — the go/no-go is
+  the paper's own diagnostic (cross-source CosSim at matched train loss) on the OLM proxy.
+  **MNIST toy (tkf `.autoresearch/manas_mnist.py`, 11 arms, Jul 7 2026): mechanism-safe but
+  effect-unresolvable at toy scale.** All Muon arms (base/γ1e-3/γ3e-3/ρ.99/ρ.5/impure/rank-8)
+  train identically (acc ~0.968, xsrc-cos deltas ±0.003 = noise) → the probe costs nothing and
+  harms nothing, but MNIST saturates and late-training cross-source cosine measures
+  distance-from-optimum, not basin geometry (AdamW arms show cos +0.41 simply because they are
+  less converged, loss 0.29 vs 0.10). Claims 1–3 (staleness/purity/outer) need the OLM proxy.
+  **Low-rank richness (rank-8 shadow on real gradients): captures ~0.92 of grad energy EARLY
+  (structured phase, where the alignment force matters), decaying to ~0.25 late (noise phase);
+  mean 0.45, cos(d_r8, d_full) ~0.5.** Results: `.autoresearch/manas_mnist_results.json` + `.png`.
+  **MNIST-1D conclusive test (`.autoresearch/manas_mnist1d.py`, Jul 7 2026): CONCLUSIVE NULL at toy
+  scale.** Non-saturating task, 3 heterogeneous training regimes + 1 held-out OOD regime, diagnostic
+  = OOD loss at MATCHED train loss (the paper's actual claim; doesn't go blind at convergence),
+  3-seed. Base-Muon and Manas (γ1.5e-3) trace the SAME OOD-vs-train curve to ±0.002 across the
+  mid/high-train-loss range; per-seed deltas at matched train loss are ~0 or slightly favor BASE;
+  the only nonzero points sit at the extreme overfit endpoint (+0.26 at train 0.09, −0.34 at 0.86 =
+  adjacent-grid noise). Mean gap −0.003, 53% of grid (coin flip). γ∈{5e-4,3e-3} and rank∈{32,frac.25}
+  didn't change it. Honest read: ‖d‖≤γ/(1−ρ)=0.01 is second-order-small, so the alignment force is
+  real but below noise at ~0.5M params — consistent with the paper's effect only appearing ≥130M.
+  The diagnostic now WORKS (curves overlap cleanly, unlike MNIST's blind cosine); it says no effect
+  HERE. Verdict: mechanism verified + harmless; common-minima payoff UNPROVEN below LM scale —
+  decide it on the OLM proxy / real LM, not toys.
+  ⚠️ Params poisoned by a nonfinite grad in the BASE step are the grad scaler's contract (it skips
+  those steps in real training), not Manas's — documented in the module.
+- **(July 7 2026) Muon (tkf): aurora-K1/aurora_ema/normuon FUSED; xorth batched + E-scalable NS-rsqrt
+  backend.** (1) `apply_perrow` (normuon), `aurora_update` K=1/beta=0 (the default), and
+  `aurora_ema_update` now compute all stats from fp32-accumulating `vector_norm` row norms and fold
+  everything into ONE prescale/postscale multiplier — no fp32 copies of the update (aurora's fro
+  normalize CANCELS at K=1: polar input = tgt·M/rownorm(M)). Mode overhead over polar (RTX 3050,
+  BiBo-ish shapes): normuon +21.7→+2.9ms, aurora +24→+3.9ms, aurora_ema +47→+3.8ms/step.
+  (2) xorth: per-member Python loop (one cuSOLVER eigh PER expert stack) → per-chunk batched
+  `_whiten_chunk`, default backend **'ns'** = coupled Denman–Beavers C^{-1/2} (pure batched bmm, no
+  cuSOLVER, ridge 1e-3 instead of the eigenvalue clamp — bounds null-direction amplification at ~31×
+  vs the clamp's ~1000×, and scales to ANY E; torch's batched eigh serializes per-matrix above E=32,
+  which at 256-expert/80-layer scale would be hundreds of ms). `xorth_backend="eigh"` reproduces the
+  legacy path. Verified: fused fns vs old refs ≤1.7e-3 fp16 (states 1e-7); NS-vs-ridge-eigh 6.6e-8;
+  NS-vs-legacy-clamp-eigh 5.2e-6 on realistic grams (clamp never binds there → OLM-measured algo
+  numerically preserved); rank-deficient E=256 finite; ns-vs-eigh end-to-end 4.2e-7. Standalone
+  whiten: ns = 2.0×@E64, 5.7×@E256 vs eigh. xorth step overhead 48→~17ms on the 3050 (now
+  bandwidth-bound on fp32 staging of big-D stacks, not eigh latency); memory streams per chunk
+  (bounded by ns_batch_elems — no group staging blowup at scale).
+  (3) **xorth is now EMA'd + GATED** (`xorth_whiten_gated`, the 'ns'-backend default): the whitening
+  target is a persistent per-stack (E,E) fp32 EMA gram (identity-init, `xorth_ema=0.95`, param-keyed
+  state → state_dict round-trip; +E² floats/stack ≈ 5KB on BiBo, nothing next to the row-EMA's
+  ~0.2%), and the strength is `β_t = xorth_post·clamp(offdiagRMS(C_ema)/xorth_gate_ref, 0, 1)`
+  per stack, GPU-resident. Rationale: a one-step gram's off-diagonals are batch noise — whiten only
+  PERSISTENT correlation, only when evidence exists, ramping from an exact no-op (verified: step-1
+  == xorth-off bit-exact; uncorrelated stream → T≈I at 2.7e-8; persistent-corr stream → gate opens
+  offdiagRMS 0.04→0.80 and whitening engages; one transient correlated batch → EMA stays 0.025,
+  gate closed). `xorth_ema=0`/`xorth_gate_ref=0` recover instantaneous/ungated.
+  ⚠️ This CHANGES the measured OLM combo's semantics (aurora_ema+xorth 0.01 was instantaneous,
+  ungated) — deliberate redesign (Jul 7 2026), re-validate on the LM bench; `xorth_backend="eigh"`
+  reproduces the legacy behavior exactly.
+  (4) **xorth_post is GROUP-SCOPED** (like lr/wd): the constructor value is only the default —
+  pass `FusedMuon([{"params": expert_stacks, "xorth_post": 0.01}, {"params": rest}], ...)` to
+  whiten ONLY params whose leading dim is an expert axis. Replaces the implicit "any 3D param"
+  rule, which would silently whiten across e.g. (H,d,d) stacked attention heads if such a param
+  ever reached Muon. Verified: non-xorth groups bit-identical to xorth-off (0.0), expert group
+  whitened. BiBo's `bench/optim.py` passes a flat list (xorth unused in bench arms) — when
+  enabling xorth there, split the expert stacks into their own group. tkf gained
+  `fused_mlp_router` (cuBLAS logits GEMM + the SAME grad-verified epilogue as the conv router — the
+  production `router_type="mlp"` path was previously fully eager incl. the ~295µs torch.topk seam),
+  and `norm_topk_prob`/`routed_scaling_factor` are now FOLDED into the epilogue kernels on BOTH
+  arches (fwd normalizes in-register; bwd applies the combined Jacobian `c/T·(G_j − ⟨G,w⟩/T)`;
+  sm120 drops its `_TopkNormalize` round-trip). `bench/exp_kappa.py` router patch now covers mlp AND
+  conv. Verified (RTX 3050, TF32 off): all routers vs eager `BiBoMoERouter` ≤1e-6 fp32 (w/gx/gw,
+  norm×scale grid), tkf `parity_bibo.py` PASS, fp16 idx-agree 1.0000; mlp fused = **1.14× fwd+bwd**
+  vs uncompiled eager at B16/S1024/H512/E11/k2 (same class as the conv router's T4 1.11–1.17×).
+  ⚠️ TF32 note: with `cudnn.allow_tf32=True` the conv-router grad compare shows ~1e-4 (TF32
+  amplifies benign 1e-7 grad_logits rounding); bench runs disable TF32 (train.py) so this never
+  bites in training.
+- **(July 7 2026) PolyGLU slot 3: Tanh → NormSiLU (code 2), BOTH repos.** `SiLU(gate/rms(gate))` — per-row
+  RMS over the intermediate dim, gain-free (param count unchanged → Qwen match intact), eps 1e-6
+  (`_NORMSILU_EPS` in `ffn/moe.py` == `_NS_EPS` in tkf `kernels/sm75/moe.py` — keep synced). DECO
+  (arXiv:2605.10933) intra-expert stage adapted to the GLU gate; the inter-expert mean stage is
+  deliberately SKIPPED (its gradient couples all experts' up-weights → breaks per-expert dispatch).
+  Changed: `ffn/moe.py` (`_POLYGLU_ACTIVATIONS` + eager branch), `ffn/experts.py`, config comments;
+  tkf `kernels/sm75/moe.py` (act code 2 in `_glu_fwd/bwd_kernel` + new one-program-per-row pre-passes
+  `_row_rms_kernel` fwd / `_row_s_kernel` bwd for the RMS reduction; `libdevice.tanh` import gone;
+  `_glu_fwd/_glu_bwd` signatures unchanged — rms recomputed in bwd from saved gate_up). Verified
+  (RTX 3050): fused-vs-eager fp32 grads ≤3e-7 (9GLU+specials & normsilu-only), fp16 autocast ≤1.2e-3
+  NaN-free, BiBo-eager-vs-tkf ≤2.3e-7, full-model fp16 fwd+bwd NaN-free. Grouped path unchanged in
+  behavior (its ~2e-3 fp32 error is pre-existing tl.dot TF32, measured identical on all-SiLU).
+  ⚠️ Tanh-trained checkpoints are architecture-incompatible (activation mismatch on every 3rd GLU
+  expert). ⚠️ `src/.autoresearch/bench_moe_vs_tkf.py` still imports removed `src.kernels` (dead
+  since Jun 30) — its tanh references were left as-is.
 - **(July 2 2026) Attention/infra review-fix batch (10 findings).** Fixed across `src/`:
   (1) **Padded batches now WORK** — `BiBoModel.forward` threads a 2D (B,K) padding mask to every
   layer (was hardcoded `None` → masks silently ignored, verified bit-identical before the fix);

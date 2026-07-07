@@ -21,18 +21,18 @@ class BiBoPolyGLUExpert(nn.Module):
     
     PolyGLU idea: diverse activations across experts in the same MoE layer.
     Each expert uses a different activation in the GLU gate:
-      - "silu"  → SiLU (SwiGLU, standard)
-      - "relu2" → ReLU² (ReGLU², sparse + sharp)
-      - "tanh"  → Tanh (TanhGLU, bounded + smooth)
-    
+      - "silu"     → SiLU (SwiGLU, standard)
+      - "relu2"    → ReLU² (ReGLU², sparse + sharp)
+      - "normsilu" → SiLU(RMS-normed gate) (DECO-style norm expert, scale-invariant gate)
+
     Architecture: down_proj( act(gate_proj(x)) * up_proj(x) )
     Same structure as BiBoMLP but with explicit activation choice.
-    
+
     Args:
         config: Model config
-        activation: One of "silu", "relu2", "tanh"
+        activation: One of "silu", "relu2", "normsilu"
     """
-    VALID_ACTIVATIONS = ("silu", "relu2", "tanh")
+    VALID_ACTIVATIONS = ("silu", "relu2", "normsilu")
 
     def __init__(self, config: BiBoConfig, activation: str = "silu"):
         super().__init__()
@@ -51,8 +51,11 @@ class BiBoPolyGLUExpert(nn.Module):
         elif self.activation_name == "relu2":
             r = F.relu(x)
             return (r.float() * r.float()).to(x.dtype)   # fp32 square: avoid fp16 overflow (>256 -> inf)
-        elif self.activation_name == "tanh":
-            return torch.tanh(x)
+        elif self.activation_name == "normsilu":
+            # SiLU(RMS-normed gate), gain-free — eps matches _NORMSILU_EPS in moe.py / tkf kernel
+            g = x.float()
+            g = g * torch.rsqrt(g.square().mean(-1, keepdim=True) + 1e-6)
+            return F.silu(g).to(x.dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(self._activate(self.gate_proj(x)) * self.up_proj(x))

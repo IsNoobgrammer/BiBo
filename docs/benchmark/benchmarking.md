@@ -181,7 +181,7 @@ MY_CONFIG = BiBoConfig(
     max_position_embeddings=2048,
     use_ssmax=True,
     # MoE — PolyGLU layout (not baseline)
-    polyglu_expert_multiplier=2,     # 2 groups = 6 experts (SiLU, ReLU², Tanh × 2)
+    polyglu_expert_multiplier=2,     # 2 groups = 6 experts (SiLU, ReLU², NormSiLU × 2)
     special_expert_pairs=1,          # + Identity + Zero = 8 total
     num_experts_per_tok=3,           # Top-3 routing
     moe_intermediate_size=256,
@@ -367,7 +367,7 @@ To test BiBo with the full PolyGLU layout instead of baseline SwiGLU:
 %%writefile bench/config.py
 """
 BiBo Benchmark — PolyGLU Config
-Full diverse expert layout: SiLU + ReLU² + Tanh + Identity + Zero
+Full diverse expert layout: SiLU + ReLU² + NormSiLU + Identity + Zero
 """
 
 import sys, os

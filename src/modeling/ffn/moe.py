@@ -15,7 +15,8 @@ __all__ = ['BiBoMoELayer']
 
 
 # PolyGLU activation cycle: each group of 3 experts gets one of each
-_POLYGLU_ACTIVATIONS = ("silu", "relu2", "tanh")
+_POLYGLU_ACTIVATIONS = ("silu", "relu2", "normsilu")
+_NORMSILU_EPS = 1e-6  # rms eps — must match the tkf kernel (_NS_EPS in kernels/sm75/moe.py)
 
 
 class BiBoFusedExperts(nn.Module):
@@ -52,7 +53,7 @@ class BiBoFusedExperts(nn.Module):
         nn.init.normal_(self.down_proj, mean=0.0, std=config.initializer_range)
         
         # Activation for expert e is _POLYGLU_ACTIVATIONS[e % 3]
-        # (layout: [SiLU_0, ReLU²_0, Tanh_0, SiLU_1, ReLU²_1, Tanh_1, ...]) — single source of truth.
+        # (layout: [SiLU_0, ReLU²_0, NormSiLU_0, SiLU_1, ReLU²_1, NormSiLU_1, ...]) — single source of truth.
 
         # Identity indices: [num_polyglu, num_polyglu + pairs)
         # Zero indices: [num_polyglu + pairs, num_routed)
@@ -131,8 +132,10 @@ class BiBoFusedExperts(nn.Module):
                 elif act_name == "relu2":
                     r = F.relu(gate)
                     activated = (r.float() * r.float()).to(gate.dtype)  # fp32 square: fp16 overflow guard
-                else:  # tanh
-                    activated = torch.tanh(gate)
+                else:  # normsilu: SiLU(RMS-normed gate) — scale-invariant gate branch (DECO intra-expert stage; inter-expert mean stage skipped, it couples all experts' grads)
+                    g = gate.float()
+                    g = g * torch.rsqrt(g.square().mean(-1, keepdim=True) + _NORMSILU_EPS)
+                    activated = F.silu(g).to(gate.dtype)
                 
                 expert_output = F.linear(activated * up, self.down_proj[expert_idx])
                 output.index_add_(0, token_idx, expert_output * weights)
@@ -153,7 +156,7 @@ class BiBoMoELayer(nn.Module):
     MoE layer with sorted PolyGLU expert dispatch.
     
     Expert layout:
-      - polyglu_expert_multiplier groups × 3 activations (SiLU, ReLU², Tanh) GLU experts
+      - polyglu_expert_multiplier groups × 3 activations (SiLU, ReLU², NormSiLU) GLU experts
       - special_expert_pairs × (Identity + Zero) experts
     
     Total routed = polyglu_expert_multiplier * 3 + special_expert_pairs * 2

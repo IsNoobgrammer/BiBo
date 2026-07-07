@@ -57,7 +57,7 @@ class BiBoConfig(PretrainedConfig):
         mlp_only_layers=None,  # Auto: [0, num_hidden_layers - 1] (first + last dense)
         moe_intermediate_size=None,  # Auto: intermediate_size // num_experts_per_tok
         num_experts_per_tok=6,
-        polyglu_expert_multiplier=2,  # Groups of 3 (SiLU, ReLU², Tanh) GLU experts
+        polyglu_expert_multiplier=2,  # Groups of 3 (SiLU, ReLU², NormSiLU) GLU experts
         special_expert_pairs=1,       # Pairs of (Identity, Zero) experts
         # ── Shared expert ────────────────────────────────────────
         use_shared_expert=False,    # Off by default (param-match Qwen3MoE — no shared expert)
@@ -120,7 +120,7 @@ class BiBoConfig(PretrainedConfig):
         self.num_experts_per_tok = num_experts_per_tok
         self.polyglu_expert_multiplier = polyglu_expert_multiplier
         self.special_expert_pairs = special_expert_pairs
-        # experts = polyglu_multiplier * 3 (SiLU, ReLU², Tanh) + special_pairs * 2 (Identity, Zero)
+        # experts = polyglu_multiplier * 3 (SiLU, ReLU², NormSiLU) + special_pairs * 2 (Identity, Zero)
         self.num_routed_experts = (polyglu_expert_multiplier * 3) + (special_expert_pairs * 2)
 
         # ── Shared expert ────────────────────────────────────────
@@ -235,7 +235,7 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError(f"shared_expert_type must be 'mlp' or 'conv', got '{self.shared_expert_type}'")
         if self.polyglu_expert_multiplier < 1:
             raise ValueError(
-                "polyglu_expert_multiplier must be >= 1 (need at least one group of SiLU/ReLU²/Tanh GLU experts)"
+                "polyglu_expert_multiplier must be >= 1 (need at least one group of SiLU/ReLU²/NormSiLU GLU experts)"
             )
         if self.special_expert_pairs < 0:
             raise ValueError("special_expert_pairs must be >= 0")

@@ -68,7 +68,7 @@ The bench suite does this in one call: `apply_triton_kernels(model, config, use_
 - **How it saves:** three things — (a) the live dispatch wrapper used to compare CUDA *scalar*
   tensors per expert, forcing an implicit GPU→CPU **sync every expert**; pulling boundaries to CPU
   ints once removed it (the biggest small-scale win); (b) a **fused GLU activation** kernel
-  (SiLU / ReLU² / Tanh dispatch) avoids writing the `gate_up` intermediate; (c) the grouped path
+  (SiLU / ReLU² / NormSiLU dispatch) avoids writing the `gate_up` intermediate; (c) the grouped path
   avoids per-expert kernel-launch overhead at scale.
 - **Results (fp16):** per-expert **1.42× fwd / 1.40× fwd+bwd** (was a 0.84× *regression* before the
   sync fix); grouped path **~2–2.5× fwd** at 4k–8k tok (*16k T4-cert pending*). Profiler: eager

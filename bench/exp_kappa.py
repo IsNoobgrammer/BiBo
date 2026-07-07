@@ -137,19 +137,22 @@ def _xsa_patch(attn_output, value_states, enable_gqa=True):
 
 bibo_attn_base.apply_xsa = _xsa_patch
 
-# ── 5. fused conv router (cuDNN conv + fused sigmoid/bias/top-k epilogue) ────
-from kernels.sm75.router import fused_router  # noqa: E402
+# ── 5. fused router — conv (cuDNN + fused epilogue) AND mlp (cuBLAS + same epilogue).
+#    norm_topk/routed_scaling are folded IN the epilogue kernels (fwd value + bwd Jacobian). ────
+from kernels.sm75.router import fused_router, fused_mlp_router  # noqa: E402
 from src.modeling.ffn.router import BiBoMoERouter  # noqa: E402
 
 _orig_router_forward = BiBoMoERouter.forward
 
 
 def _router_forward(self, hidden_states):
-    if (self.router_type != "conv" or self.gate_type != "sigmoid"
-            or self.router_activation != "none"):
+    if self.gate_type != "sigmoid" or self.router_activation != "none":
         return _orig_router_forward(self, hidden_states)
-    return fused_router(hidden_states, self.gate_conv.weight, self.bias, self.top_k,
-                        self.num_routed_experts, self.norm_topk_prob, self.routed_scaling_factor)
+    if self.router_type == "conv":
+        return fused_router(hidden_states, self.gate_conv.weight, self.bias, self.top_k,
+                            self.num_routed_experts, self.norm_topk_prob, self.routed_scaling_factor)
+    return fused_mlp_router(hidden_states, self.gate_proj.weight, self.bias, self.top_k,
+                            self.num_routed_experts, self.norm_topk_prob, self.routed_scaling_factor)
 
 
 BiBoMoERouter.forward = _router_forward
