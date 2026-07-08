@@ -48,6 +48,15 @@ for p in (REPO, BENCH, TKF):
 
 import torch
 
+# no-compile boundary: dynamo GRAPH-BREAKS at these, running the wrapped fn eager while it still
+# compiles everything AROUND it. The tkf/Liger Triton kernels are custom autograd.Functions; letting
+# inductor trace into / feed them transformed layouts is what triggers the CUDA illegal access. Wrap
+# every kernel patch so the full model compiles but each kernel stays an opaque eager island.
+try:
+    _nc = torch.compiler.disable          # public API (torch >= 2.1)
+except AttributeError:
+    _nc = torch._dynamo.disable
+
 from kernels.sm75.muon import FusedMuon
 from kernels.sm75.manas import ManasOptimizer, NS8_COEFFS
 from kernels.sm75.cross_entropy import fused_linear_cross_entropy
@@ -106,11 +115,14 @@ def _ce_forward(self, input_ids=None, labels=None, **kw):
     h = out.last_hidden_state
     hs = h[:, :-1, :].reshape(-1, h.shape[-1])
     ls = labels[:, 1:].reshape(-1).to(h.device)
-    loss = fused_linear_cross_entropy(hs, self.lm_head.weight, ls)
+    loss = _ce_kernel(hs, self.lm_head.weight, ls)   # eager island (disabled below)
     return bibo_models.CausalLMOutputWithPast(loss=loss, logits=None,
                                               past_key_values=out.past_key_values)
 
 
+# CE forward stays traceable (it's the top-level fwd we WANT compiled around the model body); only the
+# custom-kernel call is a no-compile island.
+_ce_kernel = _nc(fused_linear_cross_entropy)
 bibo_models.BiBoForCausalLM.forward = _ce_forward
 
 # ── 3. fused MoE experts (per-expert path; Identity/Zero act codes) ─────────
@@ -129,7 +141,7 @@ def _moe_forward(self, hidden_states, top_k_indices, top_k_weights):
                      self.gate_up_proj, self.down_proj, codes)
 
 
-BiBoFusedExperts.forward = _moe_forward
+BiBoFusedExperts.forward = _nc(_moe_forward)
 
 # ── 4. fused XSA (one triton kernel fwd+bwd, GQA broadcast in-kernel) ───────
 import src.modeling.attn.base as bibo_attn_base  # noqa: E402
@@ -139,7 +151,7 @@ def _xsa_patch(attn_output, value_states, enable_gqa=True):
     return fused_xsa(attn_output, value_states)
 
 
-bibo_attn_base.apply_xsa = _xsa_patch
+bibo_attn_base.apply_xsa = _nc(_xsa_patch)
 
 # ── 5. fused router — conv (cuDNN) AND mlp (cuBLAS), norm_topk/scaling folded in ──
 from src.modeling.ffn.router import BiBoMoERouter  # noqa: E402
@@ -157,7 +169,7 @@ def _router_forward(self, hidden_states):
                             self.num_routed_experts, self.norm_topk_prob, self.routed_scaling_factor)
 
 
-BiBoMoERouter.forward = _router_forward
+BiBoMoERouter.forward = _nc(_router_forward)
 
 # ── 6. Liger RMSNorm — replaces BiBoRMSNorm everywhere (input/post-attn/q/k/final norms).
 #    "llama" casting_mode + offset 0 == BiBoRMSNorm exactly (verified fwd+bwd ~1e-6); in_place=False
@@ -170,7 +182,7 @@ def _liger_rms(self, hidden_states):
                                       0.0, "llama", False)
 
 
-BiBoRMSNorm.forward = _liger_rms
+BiBoRMSNorm.forward = _nc(_liger_rms)
 
 # ── 7. Liger (partial) RoPE — patches base.py's apply_rotary_pos_emb name. cos/sin collapse to
 #    (1,S,rd): Liger's kernel indexes cos by SEQUENCE POSITION only (batch-shared), which is exact
@@ -180,7 +192,7 @@ def _liger_rope(q, k, cos, sin, unsqueeze_dim=1):
     return LigerRopeFunction.apply(q, k, cos[:1], sin[:1], None, unsqueeze_dim)
 
 
-bibo_attn_base.apply_rotary_pos_emb = _liger_rope
+bibo_attn_base.apply_rotary_pos_emb = _nc(_liger_rope)
 
 # ── 8. attention: pin fast SDPA backends (mask-free is_causal -> flash; mem-eff fallback; no math) ──
 torch.backends.cuda.enable_flash_sdp(True)
