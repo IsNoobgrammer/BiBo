@@ -5,7 +5,8 @@ Hindi amalgamation). Streams packed sequences and emits (batch, seq_len) token b
 from . import _paths  # noqa: F401
 import torch
 
-TRAIN_DATASET = "tinycompany/Instruct-packed-2K-Context-tk-QTK-81K"
+# QTK-81K packed instruct (verified: decodes to ChatML + Hindi, ids < 81920). Override via train.py --dataset.
+TRAIN_DATASET = "tinycompany/Better-Instruct-packed-2"
 
 
 def token_batches(batch, seq_len, device, dataset=TRAIN_DATASET, synthetic=False,

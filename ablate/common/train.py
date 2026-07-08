@@ -18,7 +18,7 @@ from .models import build_arm, count_params
 from . import patches as patchmod
 from .optim import build_optimizers
 from .schedule import make_wsd
-from .data import token_batches
+from .data import token_batches, TRAIN_DATASET
 from .evaluate import evaluate, Tok, summarize
 from .eval.sample import generate_samples
 from kernels.sm75.cross_entropy import fused_linear_cross_entropy
@@ -77,6 +77,7 @@ def main():
     ap.add_argument("--decay_frac", type=float, default=0.20)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--data", choices=["real", "synthetic"], default="real")
+    ap.add_argument("--dataset", default=TRAIN_DATASET)          # QTK-81K packed instruct corpus (HF id)
     ap.add_argument("--max_steps", type=int, default=0)      # >0 overrides token budget (smoke)
     ap.add_argument("--log_every", type=int, default=20)
     ap.add_argument("--ckpt_every", type=int, default=2000)
@@ -136,8 +137,8 @@ def main():
           f"tok/step={tok_per_step} patches={patch_list} {args.precision} attn={args.attn} "
           f"muon_mats={n_mat} eval_every={args.eval_every if do_eval else 'off'}", flush=True)
 
-    gen = token_batches(args.batch, args.seq_len, DEV, synthetic=(args.data == "synthetic"),
-                        vocab=cfg.vocab_size, seed=args.seed)
+    gen = token_batches(args.batch, args.seq_len, DEV, dataset=args.dataset,
+                        synthetic=(args.data == "synthetic"), vocab=cfg.vocab_size, seed=args.seed)
     # MFU denominator: measured achievable GEMM peak, or --peak_tflops (theoretical). FLOPs/token = 6N + attn.
     measured_peak = _measure_peak_tflops(DEV, dt)
     peak_tflops = args.peak_tflops if args.peak_tflops > 0 else measured_peak
