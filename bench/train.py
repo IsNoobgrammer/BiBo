@@ -432,6 +432,11 @@ def train(args):
     micro_step = 0
     optimizer.zero_grad(set_to_none=True)
 
+    # Lookahead-optimizer probe (ManasOptimizer): fwd/bwd must run at theta+d. Bracket each micro
+    # fwd/bwd with apply/remove; the offset d is constant within a step so re-applying per micro is a
+    # no-op cost but keeps the probe strictly bracketed. hasattr-guarded → nothing for plain Muon/AdamW.
+    _has_probe = hasattr(optimizer, "apply_probe")
+
     # ── Fairness: Qwen gets its Switch-Transformer aux load-balancing loss.
     #    BiBo uses its own router-bias heuristic (no loss term). We log the
     #    pure LM loss for both so the loss curves stay apples-to-apples.
@@ -467,6 +472,8 @@ def train(args):
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
 
+        if _has_probe:
+            optimizer.apply_probe()          # theta += d for this fwd/bwd
         with torch.autocast("cuda", dtype=AMP_DTYPE):
             outputs = model(input_ids=input_ids, labels=labels, use_cache=False,
                             **fwd_kwargs)
@@ -486,6 +493,8 @@ def train(args):
             loss = loss_val / accum_steps
 
         scaler.scale(loss).backward()
+        if _has_probe:
+            optimizer.remove_probe()         # theta -= d (exact inverse) before the step
         micro_step += 1
 
         if micro_step % accum_steps == 0:

@@ -300,6 +300,17 @@ class _CombinedOptimizer(optim.Optimizer):
         self.muon.step(closure)
         self.adamw.step(closure)
 
+    # Probe support for lookahead optimizers (e.g. ManasOptimizer): forward/backward must run
+    # at theta+d, so the trainer brackets each micro fwd/bwd with apply_probe/remove_probe.
+    # No-op when the Muon sub-optimizer has no probe (plain Muon/FusedMuon) — zero behavior change.
+    def apply_probe(self):
+        if hasattr(self.muon, "apply_probe"):
+            self.muon.apply_probe()
+
+    def remove_probe(self):
+        if hasattr(self.muon, "remove_probe"):
+            self.muon.remove_probe()
+
     def state_dict(self):
         return {"muon": self.muon.state_dict(), "adamw": self.adamw.state_dict()}
 
