@@ -46,7 +46,10 @@ def patch_liger_rope():
 
 # ───────────────────────── fused MoE ─────────────────────────
 def patch_fused_moe():
-    from kernels.sm120.moe import moe as moe_fused   # sm120 (Blackwell); MoE is byte-identical to sm75
+    # FORCE per-expert: measured 2.31x faster than grouped on Blackwell at our expert size (H=512, I=768)
+    # -- grouped's tl.dot only wins for large experts -- AND per-expert is the only path that handles the
+    # Identity/Zero special experts correctly. (moe() auto-dispatch would wrongly pick grouped at >=4096 tok.)
+    from kernels.sm120.moe import moe_per_expert as moe_fused
 
     # BiBo: diverse PolyGLU activations (silu/relu2/normsilu cycled) + optional Identity/Zero specials
     def _bibo_moe(self, hidden_states, top_k_indices, top_k_weights):
