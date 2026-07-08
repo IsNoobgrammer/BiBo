@@ -36,6 +36,22 @@ def _ce(model, ids, vocab, use_fused):
     return torch.nn.functional.cross_entropy(model.lm_head(sh), tgt)
 
 
+def _measure_peak_tflops(device, dtype, n=8192, iters=30):
+    """Self-calibrating MFU denominator: achievable dense matmul TFLOPS on THIS gpu/dtype."""
+    if device != "cuda":
+        return 0.0
+    a = torch.randn(n, n, device=device, dtype=dtype)
+    b = torch.randn(n, n, device=device, dtype=dtype)
+    for _ in range(5):
+        _ = a @ b
+    torch.cuda.synchronize()
+    t = time.time()
+    for _ in range(iters):
+        _ = a @ b
+    torch.cuda.synchronize()
+    return (2 * n ** 3 * iters) / (time.time() - t) / 1e12
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", choices=["qwen", "bibo_min"], required=True)
@@ -107,8 +123,13 @@ def main():
 
     gen = token_batches(args.batch, args.seq_len, DEV, synthetic=(args.data == "synthetic"),
                         vocab=cfg.vocab_size, seed=args.seed)
+    # measured device peak (self-calibrating MFU denominator) + FLOPs/token (fwd+bwd 6N + attention term)
+    peak_tflops = _measure_peak_tflops(DEV, dt)
+    flops_per_token = 6 * active + 12 * cfg.num_hidden_layers * cfg.hidden_size * args.seq_len
+    print(f"[{run_name}] measured peak {args.precision} matmul ~{peak_tflops:.0f} TFLOPS | "
+          f"flops/token ~{flops_per_token/1e9:.2f} GFLOP", flush=True)
     model.train()
-    t0 = time.time()
+    t0 = time.time(); _last_t = t0; _last_tok = 0
     for step in range(total_steps):
         for o in opts:
             o.zero_grad(set_to_none=True)
@@ -129,11 +150,18 @@ def main():
             lv, gn = loss_val, float(gnorm)
             lr = opts[0].param_groups[0]["lr"]
             toks = (step + 1) * tok_per_step
+            _now = time.time(); _dt = _now - _last_t
+            tps = (toks - _last_tok) / _dt if _dt > 0 else 0.0                 # tokens/sec this interval
+            mfu = 100.0 * flops_per_token * tps / (peak_tflops * 1e12) if peak_tflops > 0 else 0.0
+            _last_t, _last_tok = _now, toks
+            mem = torch.cuda.max_memory_allocated() / 1e9 if DEV == "cuda" else 0.0
             fin = math.isfinite(lv)
-            print(f"  step {step}/{total_steps} loss={lv:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M"
+            print(f"  step {step}/{total_steps} loss={lv:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
+                  f"tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G"
                   f"{'' if fin else '  <<NON-FINITE>>'}", flush=True)
             if wb:
-                wb.log({"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "tokens": toks}, step=step)
+                wb.log({"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "train/tps": tps,
+                        "train/mfu": mfu, "train/mem_gb": mem, "tokens": toks}, step=step)
         if do_eval and step % args.eval_every == 0:            # periodic eval -> W&B curves
             _, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.eval_mcq_n,
                                bpb_n=args.eval_bpb_n, extrap_lengths=ev_extrap, device=DEV, dtype=dt)
