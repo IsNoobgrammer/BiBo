@@ -64,7 +64,10 @@ logging:
   log_internal_metrics: false
 
 hardware:
-  compile: true
+  compile: false               # tkf fused kernels are validated EAGER (like exp_kappa). torch.compile
+                               # feeds the custom Triton autograd.Functions non-guarded layouts ->
+                               # CUDA illegal memory access. The kernels ARE the fusion; compile adds
+                               # little here. (Old compile-works runs used the deleted in-repo Liger set.)
   compile_optimizer: false     # exp_manas builds FusedMuon/Manas directly (this key is unused here)
   grad_checkpoint: false
   fsdp: true

@@ -28,6 +28,15 @@ Local smoke (RTX 3050, compile broken locally so pass --no_compile):
 import os
 import sys
 
+# Stream output line-by-line: Kaggle %%bash (and pipes/redirects) block-buffer stdout otherwise,
+# so per-step logs don't appear until the buffer fills. Belt-and-suspenders with `python -u`;
+# flushes on every newline so `tail -f logfile` shows each step live.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 import yaml
 
 BENCH = os.path.dirname(os.path.abspath(__file__))
@@ -45,6 +54,10 @@ from kernels.sm75.cross_entropy import fused_linear_cross_entropy
 from kernels.sm75.moe import moe as moe_fused
 from kernels.sm75.xsa import fused_xsa
 from kernels.sm75.router import fused_router, fused_mlp_router
+# Liger norm/RoPE come from the ops layer (pure Triton) — liger_kernel.transformers fails to import
+# against this transformers version, but ops has no transformers dependency.
+from liger_kernel.ops.rms_norm import LigerRMSNormFunction
+from liger_kernel.ops.rope import LigerRopeFunction
 
 # ── arm state (populated from the config in __main__ before train() builds the optimizer) ──
 _ARM = "muon"
@@ -146,7 +159,30 @@ def _router_forward(self, hidden_states):
 
 BiBoMoERouter.forward = _router_forward
 
-# ── 6. attention: pin fast SDPA backends (mask-free is_causal -> flash; mem-eff fallback; no math) ──
+# ── 6. Liger RMSNorm — replaces BiBoRMSNorm everywhere (input/post-attn/q/k/final norms).
+#    "llama" casting_mode + offset 0 == BiBoRMSNorm exactly (verified fwd+bwd ~1e-6); in_place=False
+#    so it never mutates the residual-stream input. ─────────────────────────────────────────────
+from src.modeling.norm import BiBoRMSNorm  # noqa: E402
+
+
+def _liger_rms(self, hidden_states):
+    return LigerRMSNormFunction.apply(hidden_states, self.weight, self.variance_epsilon,
+                                      0.0, "llama", False)
+
+
+BiBoRMSNorm.forward = _liger_rms
+
+# ── 7. Liger (partial) RoPE — patches base.py's apply_rotary_pos_emb name. cos/sin collapse to
+#    (1,S,rd): Liger's kernel indexes cos by SEQUENCE POSITION only (batch-shared), which is exact
+#    for the packed/unpadded bench (position_ids identical across the batch). ⚠ Would be WRONG under
+#    left-padding / per-row position_ids — the bench never pads. Matches BiBo eager to ~2e-7. ─────
+def _liger_rope(q, k, cos, sin, unsqueeze_dim=1):
+    return LigerRopeFunction.apply(q, k, cos[:1], sin[:1], None, unsqueeze_dim)
+
+
+bibo_attn_base.apply_rotary_pos_emb = _liger_rope
+
+# ── 8. attention: pin fast SDPA backends (mask-free is_causal -> flash; mem-eff fallback; no math) ──
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 torch.backends.cuda.enable_math_sdp(False)
