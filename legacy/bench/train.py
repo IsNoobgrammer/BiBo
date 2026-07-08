@@ -50,9 +50,22 @@ from metrics import (
 )
 
 
-# Training precision. T4 (Turing) has no bf16, so fp16 is the only AMP option
-# on the target hardware — kept explicit so a run never silently drifts to fp32/bf16.
-AMP_DTYPE = torch.float16
+# Training precision: BF16 (default) or FP32 only — FP16 is REMOVED.
+# FP16's 5-bit exponent (max 65504) overflows inside the MoE PolyGLU experts once Muon
+# grows the weights: Muon's updates are orthogonalized so their magnitude is gradient-
+# INDEPENDENT and don't shrink as the loss plateaus; with no weight bound they creep up
+# until a forward activation exceeds 65504 -> inf -> NaN "after a certain point", with NO
+# gradient blow-up. BF16 shares fp32's 8-bit exponent range (~3e38) so it is stable, and
+# a bf16-trained model also quantizes cleaner for FP8/FP4 deployment. Override with
+# BIBO_AMP_DTYPE=bf16|fp32.
+_AMP_CHOICES = {"bf16": torch.bfloat16, "fp32": torch.float32}
+_amp_name = os.environ.get("BIBO_AMP_DTYPE", "bf16").lower()
+if _amp_name in ("fp16", "float16", "half"):
+    raise ValueError("FP16 training is disabled for BiBo (MoE PolyGLU expert fp16 overflow "
+                     "under Muon). Set BIBO_AMP_DTYPE=bf16 (default) or fp32.")
+if _amp_name not in _AMP_CHOICES:
+    raise ValueError(f"BIBO_AMP_DTYPE must be one of {list(_AMP_CHOICES)}, got {_amp_name!r}")
+AMP_DTYPE = _AMP_CHOICES[_amp_name]
 
 
 def set_deterministic(seed, strict=False):
@@ -448,7 +461,9 @@ def train(args):
         print(f"\n{TAG} Starting training from step {start_step}...")
         print(f"{TAG} {len(train_ds)} train, {len(val_ds)} val samples")
 
-    scaler = torch.amp.GradScaler()
+    # GradScaler is only meaningful for fp16 (gradient underflow); bf16/fp32 have the
+    # exponent range, so it is disabled — a no-op pass-through around the optimizer step.
+    scaler = torch.amp.GradScaler(enabled=(AMP_DTYPE == torch.float16))
     throughput = ThroughputMeter(warmup=3)
     model.train()
     epoch = 0

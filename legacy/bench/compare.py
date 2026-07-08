@@ -49,7 +49,7 @@ def per_seq_bpb(model, loader, tokenizer, device, max_batches):
         if nb >= max_batches:
             break
         ids = batch["input_ids"].to(device); labels = batch["labels"].to(device)
-        with torch.autocast("cuda", dtype=torch.float16):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             logits = model(input_ids=ids).logits              # (B,S,V) — labels omitted ⇒ logits returned
         B, S, V = logits.shape
         nll = F.cross_entropy(logits.float().view(-1, V), labels.view(-1),

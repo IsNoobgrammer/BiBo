@@ -61,7 +61,7 @@ def evaluate(model, val_ds, batch_size=32, device="cuda", max_batches=None,
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
 
-        with torch.autocast("cuda", dtype=torch.float16):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             # output_router_logits omitted -> pure LM cross-entropy for BiBo and Qwen alike
             outputs = model(input_ids=input_ids, labels=labels, use_cache=False)
             loss = outputs.loss
@@ -162,7 +162,7 @@ def _score_multiple_choice(model, tokenizer, device, dataset, ctx_key, batch_siz
         for j, s in enumerate(chunk):
             inp[j, :len(s["full"])] = torch.tensor(s["full"], dtype=torch.long)
         inp = inp.to(device)
-        with torch.autocast("cuda", dtype=torch.float16):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             logits = model(input_ids=inp).logits                 # (b, maxlen, V)
         logprobs = F.log_softmax(logits.float(), dim=-1)
         for j, s in enumerate(chunk):
@@ -281,7 +281,7 @@ def generate_samples(model, prompts=None, max_new_tokens=100, temperature=0.8,
 
         ent_sum, top1_sum, n_steps, first_token = 0.0, 0.0, 0, None
         for _ in range(max_new_tokens):
-            with torch.autocast("cuda", dtype=torch.float16):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
                 outputs = model(input_ids=generated_ids)
                 last_logits = outputs.logits[:, -1, :]
             # Collapse diagnostic on the RAW (temp=1, un-truncated) distribution: top-1 prob ~0.95+
