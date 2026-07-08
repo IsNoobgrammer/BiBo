@@ -62,8 +62,8 @@ def main():
     ap.add_argument("--seq_len", type=int, default=1024)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")  # NEVER fp16
     ap.add_argument("--attn", choices=["sdpa", "flash_attention_4"], default="sdpa")
-    ap.add_argument("--load_balance", choices=["none", "bias"], default="none")   # BiBo router balancing (off=match Qwen)
-    ap.add_argument("--bias_update_threshold", type=int, default=8000)            # tokens between bias updates (if bias)
+    ap.add_argument("--load_balance", choices=["none", "bias"], default="bias")   # bias=DeepSeek sigmoid+balance; none=softmax(Qwen)
+    ap.add_argument("--bias_update_threshold", type=int, default=10240)           # tokens between bias updates (if bias)
     ap.add_argument("--bias_update_factor", type=float, default=-1.0)             # <0 = auto Hill (~0.175 for 9 experts)
     ap.add_argument("--compile", action="store_true")           # torch.compile the transformer body
     ap.add_argument("--peak_tflops", type=float, default=0.0)   # MFU denominator: 0=auto-measure achievable GEMM;

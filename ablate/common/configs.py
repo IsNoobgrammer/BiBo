@@ -53,12 +53,15 @@ def make_qwen_config(attn_impl="sdpa"):
     return cfg
 
 
-def make_bibo_min_config(load_balance="none", bias_update_threshold=8000, bias_update_factor=None):
+def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_update_factor=None):
     from src.configuration_bibo import BiBoConfig
+    # DeepSeek-style aux-loss-free balancing pairs with SIGMOID gating (bias added to sigmoid scores);
+    # with no balancing we use softmax (Qwen-matched). So gate_type follows load_balance.
+    gate = "sigmoid" if load_balance == "bias" else "softmax"
     return BiBoConfig(
-        load_balance_strategy=load_balance,         # "none" (matches Qwen aux-loss-off) | "bias" (DeepSeek-style)
+        load_balance_strategy=load_balance,         # "bias" (DeepSeek-style, sigmoid) | "none" (softmax, Qwen-matched)
         bias_update_threshold=bias_update_threshold,  # tokens between router-bias updates (only if load_balance="bias")
-        bias_update_factor=bias_update_factor,        # None = auto Hill 0.35*n^2/(n^2+81); ~0.175 for 9 experts
+        bias_update_factor=bias_update_factor,        # None = auto Hill (~0.08 for 9 experts)
         vocab_size=SHARED["vocab_size"], hidden_size=SHARED["hidden_size"],
         intermediate_size=SHARED["intermediate_size"], num_hidden_layers=SHARED["num_hidden_layers"],
         num_attention_heads=SHARED["num_attention_heads"], num_key_value_heads=SHARED["num_key_value_heads"],
@@ -74,7 +77,7 @@ def make_bibo_min_config(load_balance="none", bias_update_threshold=8000, bias_u
         use_xsa=False, use_ssmax=False,
         add_full_attention_sink_bias=False, add_swa_attention_sink_bias=False,
         hybrid_layer_pattern=None,        # all-global attention (no SWA)
-        router_type="mlp", gate_type="softmax", router_activation="none",
+        router_type="mlp", gate_type=gate, router_activation="none",
         routed_scaling_factor=1.0,
         use_shared_expert=False,
     )
