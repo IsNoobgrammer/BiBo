@@ -108,6 +108,8 @@ def parse_args():
                    help="Manas: u-buffer strength in units of gamma when ON (overrides training.probe.comp; default 1.0).")
     p.add_argument("--probe_from_start", action="store_true",
                    help="Manas: start probing at step 0 (disables the default 'probe only after warmup').")
+    p.add_argument("--no_tkf", "--no-tkf", dest="no_tkf", action="store_true",
+                   help="exp_manas: run the EAGER model (no fused CE/MoE/XSA/router/Liger); keeps FusedMuon/Manas + probe. Isolates the kernels.")
     p.add_argument("--max_eval_examples", type=int, default=None,
                    help="Cap HellaSwag/ARC examples per eval (default 500 via config). Keeps eval fast.")
     p.add_argument("--wandb_name", type=str, default=None)
