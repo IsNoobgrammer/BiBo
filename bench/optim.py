@@ -288,6 +288,7 @@ class _CombinedOptimizer(optim.Optimizer):
     def __init__(self, muon, adamw):
         self.muon = muon
         self.adamw = adamw
+        self._probe_off = False
         # Build param_groups from both sub-optimizers
         all_groups = muon.param_groups + adamw.param_groups
         super().__init__(all_groups, {})
@@ -310,6 +311,21 @@ class _CombinedOptimizer(optim.Optimizer):
     def remove_probe(self):
         if hasattr(self.muon, "remove_probe"):
             self.muon.remove_probe()
+
+    def set_probe_enabled(self, enabled):
+        """Gate Manas probing (used to defer it until after LR warmup). When disabled, zero the probe
+        dose (probe_gamma) and u-buffer (comp) so step()/_update_probe build NO d/u buffers; restore
+        the targets when re-enabled. No-op if the Muon sub-optimizer has no probe."""
+        m = self.muon
+        if not hasattr(m, "probe_gamma"):
+            return
+        if not enabled and not self._probe_off:
+            self._probe_targets = (m.probe_gamma, getattr(m, "comp", None))
+            m.probe_gamma, m.comp = 0.0, None
+            self._probe_off = True
+        elif enabled and self._probe_off:
+            m.probe_gamma, m.comp = self._probe_targets
+            self._probe_off = False
 
     def state_dict(self):
         return {"muon": self.muon.state_dict(), "adamw": self.adamw.state_dict()}

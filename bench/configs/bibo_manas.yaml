@@ -45,6 +45,7 @@ training:
   deterministic: true
   optimizer: "muon_adamw" # routes to Muon+AdamW; exp_manas overrides the Muon sub-optimizer
   muon_optimizer: "manas" # ARM: ManasOptimizer (ns8 aurora-K1 + rolling probe)
+  probe_after_warmup: true # defer probing (no d/u buffers) until LR warmup ends, then probe fresh. warmup end = whd:5% / whd5:10% / cosine:warmup_steps of total. --probe_from_start disables.
   probe: # ⚠ module defaults — gamma/rho are scale-dependent, SWEEP on the LM
     gamma: 0.08 #   probe dose (couples to LR/weight-norm/curvature; re-sweep per scale)
     rho: 0.98 #   probe memory in SAMPLES (rho* ~= 1 - batch/N_mem; re-derive per batch)

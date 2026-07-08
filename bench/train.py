@@ -103,6 +103,8 @@ def parse_args():
                    help="Manas: low-rank probe rank (overrides training.probe.rank). Pass -1 for full-d.")
     p.add_argument("--probe_comp", type=float, default=None,
                    help="Manas: u-buffer strength in units of gamma (overrides training.probe.comp).")
+    p.add_argument("--probe_from_start", action="store_true",
+                   help="Manas: start probing at step 0 (disables the default 'probe only after warmup').")
     p.add_argument("--max_eval_examples", type=int, default=None,
                    help="Cap HellaSwag/ARC examples per eval (default 500 via config). Keeps eval fast.")
     p.add_argument("--wandb_name", type=str, default=None)
@@ -173,6 +175,8 @@ def load_config(args):
         cfg["eval"]["sample_every"] = args.sample_every
     if args.log_every is not None:
         cfg["logging"]["log_every"] = args.log_every
+    if args.probe_from_start:
+        cfg["training"]["probe_after_warmup"] = False
     if args.max_eval_examples is not None:
         cfg["eval"]["max_eval_examples"] = args.max_eval_examples
     if args.wandb_name is not None:
@@ -454,6 +458,24 @@ def train(args):
     # no-op cost but keeps the probe strictly bracketed. hasattr-guarded → nothing for plain Muon/AdamW.
     _has_probe = hasattr(optimizer, "apply_probe")
 
+    # Defer probing until LR warmup ends: no d/u buffers build during warmup, probing starts fresh
+    # after. probe_start MUST match the warmup used by create_scheduler() — whd: wsd_fracs[0]=0.05,
+    # whd5: whd5_fracs[0]=0.1, cosine: warmup_steps. --probe_from_start disables the gate.
+    _probe_start = 0
+    if _has_probe and train_cfg.get("probe_after_warmup", True):
+        _sched = train_cfg.get("scheduler", "cosine")
+        _tot = train_cfg.get("total_steps", 50000)
+        if _sched == "whd":
+            _probe_start = int(0.05 * _tot)
+        elif _sched == "whd5":
+            _probe_start = int(0.1 * _tot)
+        else:
+            _probe_start = int(train_cfg.get("warmup_steps", 1000))
+    if _has_probe:
+        optimizer.set_probe_enabled(_probe_start == 0)   # off while deferring; on immediately otherwise
+        if is_main:
+            print(f"{TAG} Manas probe: {'from step 0' if _probe_start == 0 else f'starts at step {_probe_start} (after warmup)'}")
+
     # ── Fairness: Qwen gets its Switch-Transformer aux load-balancing loss.
     #    BiBo uses its own router-bias heuristic (no loss term). We log the
     #    pure LM loss for both so the loss curves stay apples-to-apples.
@@ -489,7 +511,10 @@ def train(args):
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
 
+        _probing = _has_probe and step >= _probe_start
         if _has_probe:
+            optimizer.set_probe_enabled(_probing)   # flips gamma/comp on at the warmup boundary
+        if _probing:
             optimizer.apply_probe()          # theta += d for this fwd/bwd
         with torch.autocast("cuda", dtype=AMP_DTYPE):
             outputs = model(input_ids=input_ids, labels=labels, use_cache=False,
@@ -510,7 +535,7 @@ def train(args):
             loss = loss_val / accum_steps
 
         scaler.scale(loss).backward()
-        if _has_probe:
+        if _probing:
             optimizer.remove_probe()         # theta -= d (exact inverse) before the step
         micro_step += 1
 
