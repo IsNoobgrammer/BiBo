@@ -48,7 +48,7 @@ training:
   muon_lr: 3.0e-4
   scheduler: "whd"
   muon_ns_steps: 5              # IGNORED by exp_manas (fixed ns8 schedule)
-  modded_muon: true             # IGNORED by exp_manas
+  modded_muon: false            # IGNORED by exp_manas for coeffs; false only suppresses the misleading "[Turbo-NS Nit]" name suffix. Actual NS = ns8 (6 KJ + 2 pin, 8 it).
   decay_frac: 0.05
 
 eval:

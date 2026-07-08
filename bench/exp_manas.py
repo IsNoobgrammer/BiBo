@@ -225,6 +225,8 @@ if __name__ == "__main__":
             print(f"[exp_manas] note: u shares d's basis -> u runs at d_rank={_PROBE['rank']} "
                   f"(u_rank={_ur} treated as ON; an independent u rank needs a Manas change)")
     assert _ARM in ("muon", "manas"), f"training.muon_optimizer must be muon|manas, got {_ARM}"
-    print(f"[exp_manas] arm={_ARM} | fused CE + MoE + XSA + router active"
+    print(f"[exp_manas] arm={_ARM} | fused CE + MoE + XSA + router active "
+          f"| NS=ns8 (6 KJ + 2 pin, 8 it), aurora-K1 "
+          f"[ignore any '[Turbo-NS Nit]' suffix in the optimizer name — that's cosmetic]"
           + (f" | probe={_PROBE}" if _ARM == "manas" else ""))
     bibo_train.train(args)
