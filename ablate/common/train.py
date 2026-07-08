@@ -1,0 +1,167 @@
+"""Ablation trainer — one arm, one seed, one run (~6h on RTX 6000). W&B for graphs/logs.
+
+  python -m ablate.common.train --arm bibo_min --seed 0 --tokens 1_000_000_000 \
+      --batch 40 --seq_len 1024 --precision bf16 --patches liger_norm,liger_rope,ce,moe --wandb
+
+Local smoke:  --data synthetic --max_steps 5 --batch 2 --seq_len 128  (no --wandb)
+No seed aggregation / variance machinery by design: pass --seed, read W&B; compare seeds there.
+"""
+from . import _paths  # noqa: F401
+import os
+import json
+import time
+import math
+import argparse
+import contextlib
+import torch
+from .models import build_arm, count_params
+from . import patches as patchmod
+from .optim import build_optimizers
+from .schedule import make_wsd
+from .data import token_batches
+from .evaluate import evaluate, Tok, summarize
+from kernels.sm75.cross_entropy import fused_linear_cross_entropy
+
+DEV = "cuda"
+_DT = {"bf16": torch.bfloat16, "fp32": torch.float32}
+
+
+def _ce(model, ids, vocab, use_fused):
+    inp, tgt = ids[:, :-1], ids[:, 1:].reshape(-1)
+    out = model.model(input_ids=inp, use_cache=False)
+    h = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+    sh = h.reshape(-1, h.shape[-1])
+    if use_fused:
+        return fused_linear_cross_entropy(sh, model.lm_head.weight, tgt)
+    return torch.nn.functional.cross_entropy(model.lm_head(sh), tgt)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--arm", choices=["qwen", "bibo_min"], required=True)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--tokens", type=int, default=1_000_000_000)
+    ap.add_argument("--batch", type=int, default=40)             # per micro-step
+    ap.add_argument("--grad_accum", type=int, default=1)          # global batch = batch * grad_accum
+    ap.add_argument("--seq_len", type=int, default=1024)
+    ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")  # NEVER fp16
+    ap.add_argument("--attn", choices=["sdpa", "flash_attention_4"], default="sdpa")
+    ap.add_argument("--patches", default="liger_norm,liger_rope,ce,moe")
+    ap.add_argument("--muon_lr", type=float, default=3e-4)
+    ap.add_argument("--adam_lr", type=float, default=3e-4)
+    ap.add_argument("--wd", type=float, default=0.1)
+    ap.add_argument("--warmup_frac", type=float, default=0.05)
+    ap.add_argument("--decay_frac", type=float, default=0.20)
+    ap.add_argument("--grad_clip", type=float, default=1.0)
+    ap.add_argument("--data", choices=["real", "synthetic"], default="real")
+    ap.add_argument("--max_steps", type=int, default=0)      # >0 overrides token budget (smoke)
+    ap.add_argument("--log_every", type=int, default=20)
+    ap.add_argument("--ckpt_every", type=int, default=2000)
+    # in-training eval -> W&B curves (this is the point; not a post-hoc-only eval)
+    ap.add_argument("--eval_every", type=int, default=500)       # 0 disables; try 200/500/1000
+    ap.add_argument("--eval_mcq_n", type=int, default=200)       # cheap periodic MCQ sample
+    ap.add_argument("--eval_bpb_n", type=int, default=200)       # cheap periodic bpb sample/source
+    ap.add_argument("--eval_extrap", default="")                 # periodic length-extrap (default off; e.g. 1024,2048,4096)
+    ap.add_argument("--final_mcq_n", type=int, default=500)      # full final eval
+    ap.add_argument("--final_extrap", default="1024,2048,4096")
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--wandb", action="store_true")
+    ap.add_argument("--wandb_project", default="bibo-qwen-ablate")
+    args = ap.parse_args()
+
+    torch.manual_seed(args.seed)
+    dt = _DT[args.precision]
+    patch_list = [p.strip() for p in args.patches.split(",") if p.strip()]
+    use_fused_ce = "ce" in patch_list
+
+    model, cfg = build_arm(args.arm, device=DEV, dtype=torch.float32, attn_impl=args.attn)  # fp32 master weights
+    total, trainable, active = count_params(model)
+    patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
+    opts, n_mat, n_oth = build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt)
+
+    tok_per_step = args.batch * args.seq_len * args.grad_accum   # global batch
+    total_steps = args.max_steps or (args.tokens // tok_per_step)
+    scheds = make_wsd(opts, total_steps, args.warmup_frac, args.decay_frac)
+    amp = contextlib.nullcontext() if args.precision == "fp32" else torch.autocast("cuda", dtype=dt)
+    run_name = f"{args.arm}_seed{args.seed}"
+    out_dir = args.out or os.path.join(os.path.dirname(__file__), "..", "runs")
+    os.makedirs(out_dir, exist_ok=True)
+
+    wb = None
+    if args.wandb:
+        import wandb
+        wb = wandb.init(project=args.wandb_project, name=run_name,
+                        config={**vars(args), "total_steps": total_steps,
+                                "params_total": total, "params_active": active})
+
+    # in-training eval (needs the real corpus/tokenizer + benchmark datasets)
+    do_eval = args.eval_every > 0 and args.data == "real"
+    tok = Tok() if do_eval else None
+    if args.eval_every > 0 and not do_eval:
+        print("[eval] disabled: --data synthetic (benchmark eval needs the real corpus + downloads)", flush=True)
+    ev_extrap = tuple(int(x) for x in args.eval_extrap.split(",") if x.strip()) or None
+
+    print(f"[{run_name}] params total={total/1e6:.2f}M active={active/1e6:.2f}M | steps={total_steps} "
+          f"tok/step={tok_per_step} patches={patch_list} {args.precision} attn={args.attn} "
+          f"muon_mats={n_mat} eval_every={args.eval_every if do_eval else 'off'}", flush=True)
+
+    gen = token_batches(args.batch, args.seq_len, DEV, synthetic=(args.data == "synthetic"),
+                        vocab=cfg.vocab_size, seed=args.seed)
+    model.train()
+    t0 = time.time()
+    for step in range(total_steps):
+        for o in opts:
+            o.zero_grad(set_to_none=True)
+        loss_val = 0.0
+        for _ in range(args.grad_accum):                 # gradient accumulation -> global batch
+            ids = next(gen)
+            with amp:
+                loss = _ce(model, ids, cfg.vocab_size, use_fused_ce) / args.grad_accum
+            loss.backward()
+            loss_val += loss.item()
+        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) if args.grad_clip > 0 else \
+            torch.sqrt(sum(p.grad.float().pow(2).sum() for p in model.parameters() if p.grad is not None))
+        for o in opts:
+            o.step()
+        for s in scheds:
+            s.step()
+        if step % args.log_every == 0 or step == total_steps - 1:
+            lv, gn = loss_val, float(gnorm)
+            lr = opts[0].param_groups[0]["lr"]
+            toks = (step + 1) * tok_per_step
+            fin = math.isfinite(lv)
+            print(f"  step {step}/{total_steps} loss={lv:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M"
+                  f"{'' if fin else '  <<NON-FINITE>>'}", flush=True)
+            if wb:
+                wb.log({"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "tokens": toks}, step=step)
+        if do_eval and step % args.eval_every == 0:            # periodic eval -> W&B curves
+            _, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.eval_mcq_n,
+                               bpb_n=args.eval_bpb_n, extrap_lengths=ev_extrap, device=DEV, dtype=dt)
+            if wb:
+                wb.log(flat, step=step)
+            print(f"  [eval @{step}] {summarize(flat)}", flush=True)
+        if args.ckpt_every and step > 0 and step % args.ckpt_every == 0:
+            torch.save(model.state_dict(), os.path.join(out_dir, f"{run_name}_step{step}.pt"))
+
+    ckpt = os.path.join(out_dir, f"{run_name}_final.pt")
+    torch.save(model.state_dict(), ckpt)
+    final_eval = None
+    if do_eval:
+        fe = tuple(int(x) for x in args.final_extrap.split(",") if x.strip()) or None
+        final_eval, full_flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.final_mcq_n,
+                                         extrap_lengths=fe, device=DEV, dtype=dt)
+        if wb:
+            wb.log(full_flat, step=total_steps)
+        print(f"  [final eval] {summarize(full_flat)}", flush=True)
+    res = {"arm": args.arm, "seed": args.seed, "steps": total_steps, "tokens": total_steps * tok_per_step,
+           "final_loss": loss_val, "params_total": total, "params_active": active,
+           "ckpt": ckpt, "wall_s": time.time() - t0, "eval": final_eval, "config": vars(args)}
+    with open(os.path.join(out_dir, f"{run_name}_result.json"), "w") as f:
+        json.dump(res, f, indent=2)
+    if wb:
+        wb.finish()
+    print(f"[{run_name}] DONE final_loss={loss_val:.4f} ckpt={ckpt}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
