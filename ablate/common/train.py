@@ -20,6 +20,7 @@ from .optim import build_optimizers
 from .schedule import make_wsd
 from .data import token_batches
 from .evaluate import evaluate, Tok, summarize
+from .eval.sample import generate_samples
 from kernels.sm75.cross_entropy import fused_linear_cross_entropy
 
 DEV = "cuda"
@@ -81,6 +82,7 @@ def main():
     ap.add_argument("--ckpt_every", type=int, default=2000)
     # in-training eval -> W&B curves (this is the point; not a post-hoc-only eval)
     ap.add_argument("--eval_every", type=int, default=500)       # 0 disables; try 200/500/1000
+    ap.add_argument("--sample_every", type=int, default=0)       # 0 = same as eval_every; steps between 2en+2hi samples
     ap.add_argument("--eval_mcq_n", type=int, default=200)       # cheap periodic MCQ sample
     ap.add_argument("--eval_bpb_n", type=int, default=200)       # cheap periodic bpb sample/source
     ap.add_argument("--eval_extrap", default="")                 # periodic length-extrap (default off; e.g. 1024,2048,4096)
@@ -128,6 +130,7 @@ def main():
     if args.eval_every > 0 and not do_eval:
         print("[eval] disabled: --data synthetic (benchmark eval needs the real corpus + downloads)", flush=True)
     ev_extrap = tuple(int(x) for x in args.eval_extrap.split(",") if x.strip()) or None
+    sample_every = args.sample_every if args.sample_every > 0 else args.eval_every   # default: sample when we eval
 
     print(f"[{run_name}] params total={total/1e6:.2f}M active={active/1e6:.2f}M | steps={total_steps} "
           f"tok/step={tok_per_step} patches={patch_list} {args.precision} attn={args.attn} "
@@ -171,20 +174,25 @@ def main():
             mfu = 100.0 * flops_per_token * tps / (peak_tflops * 1e12) if peak_tflops > 0 else 0.0
             _last_t, _last_tok, _last_step = _now, toks, step
             mem = torch.cuda.max_memory_allocated() / 1e9 if DEV == "cuda" else 0.0
+            elapsed = _now - t0                                                # total wall time so far
+            eta = (total_steps - step - 1) * elapsed / max(step + 1, 1)        # est. time remaining
             fin = math.isfinite(lv)
             print(f"  step {step}/{total_steps} loss={lv:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
-                  f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G dt={_dt:.1f}s"
+                  f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
+                  f"elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"
                   f"{'' if fin else '  <<NON-FINITE>>'}", flush=True)
             if wb:
                 wb.log({"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "train/ms_per_step": ms_per_step,
-                        "train/tps": tps, "train/mfu": mfu, "train/mem_gb": mem, "tokens": toks}, step=step)
+                        "train/tps": tps, "train/mfu": mfu, "train/mem_gb": mem, "train/elapsed_s": elapsed,
+                        "tokens": toks}, step=step)
         if do_eval and step % args.eval_every == 0:            # periodic eval -> W&B curves
-            res_ev, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.eval_mcq_n,
-                                    bpb_n=args.eval_bpb_n, extrap_lengths=ev_extrap, device=DEV, dtype=dt)
+            _, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.eval_mcq_n, bpb_n=args.eval_bpb_n,
+                               extrap_lengths=ev_extrap, do_samples=False, device=DEV, dtype=dt)
             if wb:
                 wb.log(flat, step=step)
             print(f"  [eval @{step}] {summarize(flat)}", flush=True)
-            for s in res_ev.get("samples", []):                # 2 en + 2 hi samples (KV-cache) every eval
+        if do_eval and sample_every > 0 and step % sample_every == 0:   # samples on their own cadence (default = eval_every)
+            for s in generate_samples(model, tok, device=DEV, dtype=dt):
                 print(f"    [sample {s['lang']}] {s['prompt']} -> {s['completion']}", flush=True)
         if args.ckpt_every and step > 0 and step % args.ckpt_every == 0:
             torch.save(model.state_dict(), os.path.join(out_dir, f"{run_name}_step{step}.pt"))
@@ -199,6 +207,8 @@ def main():
         if wb:
             wb.log(full_flat, step=total_steps)
         print(f"  [final eval] {summarize(full_flat)}", flush=True)
+        for s in final_eval.get("samples", []):
+            print(f"    [sample {s['lang']}] {s['prompt']} -> {s['completion']}", flush=True)
     res = {"arm": args.arm, "seed": args.seed, "steps": total_steps, "tokens": total_steps * tok_per_step,
            "final_loss": loss_val, "params_total": total, "params_active": active,
            "ckpt": ckpt, "wall_s": time.time() - t0, "eval": final_eval, "config": vars(args)}
