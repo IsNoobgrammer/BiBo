@@ -37,7 +37,7 @@ SHARED = dict(
 PARTIAL_ROPE = 0.334              # BiBo-min partial rotary; 1.0 == Qwen full RoPE (flip to isolate)
 
 
-def make_qwen_config(attn_impl="sdpa"):
+def make_qwen_config(attn_impl="sdpa", aux_coef=0.001):
     from baseline.qwen3moe.config import Qwen3MoeConfig
     cfg = Qwen3MoeConfig(
         vocab_size=SHARED["vocab_size"], hidden_size=SHARED["hidden_size"],
@@ -47,7 +47,7 @@ def make_qwen_config(attn_impl="sdpa"):
         moe_intermediate_size=SHARED["moe_intermediate_size"], norm_topk_prob=SHARED["norm_topk_prob"],
         max_position_embeddings=SHARED["max_position_embeddings"], mlp_only_layers=SHARED["mlp_only_layers"],
         rms_norm_eps=SHARED["rms_norm_eps"], rope_theta=SHARED["rope_theta"],
-        tie_word_embeddings=SHARED["tie_word_embeddings"], router_aux_loss_coef=0.0,   # aux loss OFF (clean match)
+        tie_word_embeddings=SHARED["tie_word_embeddings"], router_aux_loss_coef=aux_coef,  # Switch aux LB loss (Qwen native)
     )
     cfg._attn_implementation = attn_impl        # "sdpa" | "flash_attention_4" (native HF dispatch)
     return cfg

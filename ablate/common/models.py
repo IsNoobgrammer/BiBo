@@ -6,14 +6,14 @@ from . import patches
 
 
 def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
-              load_balance="bias", bias_update_threshold=10240, bias_update_factor=None):
+              load_balance="bias", bias_update_threshold=10240, bias_update_factor=None, aux_coef=0.001):
     """arm in {'qwen','bibo_min'} -> (model, config). Params in `dtype` (fp32 master; bf16 via autocast).
-    attn_impl: 'sdpa' | 'flash_attention_4' (auto-downgrades to sdpa if flash_attn missing, e.g. T4/local).
-    load_balance/bias_update_*: BiBo router balancing (default off to match Qwen); Qwen ignores them."""
+    Balancing (fair, each native): BiBo uses bias updates (load_balance/bias_update_*); Qwen uses the
+    Switch aux load-balancing loss (aux_coef). Each arm ignores the other's balancing knobs."""
     eff = patches.resolve_attn(attn_impl)
     if arm == "qwen":
         from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
-        cfg = make_qwen_config(eff)
+        cfg = make_qwen_config(eff, aux_coef=aux_coef)
         model = Qwen3MoeForCausalLM(cfg)
     elif arm == "bibo_min":
         from src.modeling.models import BiBoForCausalLM

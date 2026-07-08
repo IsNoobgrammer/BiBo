@@ -27,14 +27,35 @@ DEV = "cuda"
 _DT = {"bf16": torch.bfloat16, "fp32": torch.float32}
 
 
-def _ce(model, ids, vocab, use_fused):
+class _QwenAuxCollector:
+    """Hooks Qwen's routers to grab per-layer gate logits (the vendored Qwen3MoeModel doesn't return them),
+    so we can add the Switch-style load-balancing aux loss ourselves (Qwen's native balancing = fair vs
+    BiBo's bias balancing). No-op for BiBo."""
+    def __init__(self, model):
+        self.logits = []
+        self._handles = [m.register_forward_hook(self._hook)
+                         for _, m in model.named_modules() if m.__class__.__name__ == "Qwen3MoeTopKRouter"]
+
+    def _hook(self, module, inp, out):
+        self.logits.append(out[0])           # (num_tokens, num_experts)
+
+    def reset(self):
+        self.logits = []
+
+
+def _ce(model, ids, use_fused, aux=None, aux_coef=0.0, num_experts=9, top_k=2):
     inp, tgt = ids[:, :-1], ids[:, 1:].reshape(-1)
+    if aux is not None:
+        aux.reset()
     out = model.model(input_ids=inp, use_cache=False)
     h = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
     sh = h.reshape(-1, h.shape[-1])
-    if use_fused:
-        return fused_linear_cross_entropy(sh, model.lm_head.weight, tgt)
-    return torch.nn.functional.cross_entropy(model.lm_head(sh), tgt)
+    loss = (fused_linear_cross_entropy(sh, model.lm_head.weight, tgt) if use_fused
+            else torch.nn.functional.cross_entropy(model.lm_head(sh), tgt))
+    if aux is not None and aux_coef > 0 and aux.logits:      # Qwen aux load-balancing loss
+        from baseline.qwen3moe.modeling import load_balancing_loss_func
+        loss = loss + aux_coef * load_balancing_loss_func(tuple(aux.logits), num_experts, top_k)
+    return loss
 
 
 def _measure_peak_tflops(device, dtype, n=8192, iters=30):
@@ -63,7 +84,8 @@ def main():
     ap.add_argument("--seq_len", type=int, default=1024)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")  # NEVER fp16
     ap.add_argument("--attn", choices=["sdpa", "flash_attention_4"], default="sdpa")
-    ap.add_argument("--load_balance", choices=["none", "bias"], default="bias")   # bias=DeepSeek sigmoid+balance; none=softmax(Qwen)
+    ap.add_argument("--load_balance", choices=["none", "bias"], default="bias")   # BiBo: bias=DeepSeek sigmoid+balance; none=softmax
+    ap.add_argument("--aux_coef", type=float, default=0.001)                      # Qwen aux load-balancing loss coef (0=off; paper 0.001)
     ap.add_argument("--bias_update_threshold", type=int, default=10240)           # tokens between bias updates (if bias)
     ap.add_argument("--bias_update_factor", type=float, default=-1.0)             # <0 = auto Hill (~0.175 for 9 experts)
     ap.add_argument("--compile", action="store_true")           # torch.compile the transformer body
@@ -101,7 +123,9 @@ def main():
 
     model, cfg = build_arm(args.arm, device=DEV, dtype=torch.float32, attn_impl=args.attn,  # fp32 master weights
                            load_balance=args.load_balance, bias_update_threshold=args.bias_update_threshold,
-                           bias_update_factor=(None if args.bias_update_factor < 0 else args.bias_update_factor))
+                           bias_update_factor=(None if args.bias_update_factor < 0 else args.bias_update_factor),
+                           aux_coef=args.aux_coef)
+    aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
     total, trainable, active = count_params(model)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
     opts, n_mat, n_oth = build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt)
@@ -155,7 +179,8 @@ def main():
         for _ in range(args.grad_accum):                 # gradient accumulation -> global batch
             ids = next(gen)
             with amp:
-                loss = _ce(model, ids, cfg.vocab_size, use_fused_ce) / args.grad_accum
+                loss = _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
+                           getattr(cfg, "num_experts", 9), cfg.num_experts_per_tok) / args.grad_accum
             loss.backward()
             loss_val += loss.item()
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) if args.grad_clip > 0 else \
