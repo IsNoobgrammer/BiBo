@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from .models import build_arm, count_params
 from . import patches
-from kernels.sm75.cross_entropy import fused_linear_cross_entropy
+from kernels.sm120.cross_entropy import fused_linear_cross_entropy
 
 DEV = "cuda"
 PATCH = ["liger_norm", "liger_rope", "moe"]

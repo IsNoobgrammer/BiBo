@@ -8,13 +8,14 @@ NS8 = (_KJ,) * 6 + (_PIN,) * 2
 
 
 def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, ns_dtype=torch.bfloat16):
-    from kernels.sm75.muon import FusedMuon
+    from kernels.sm120.muon import FusedMuon   # Blackwell: gram-NS (self-gates to symmul/cuBLAS on small mats) + 8M knee
     matrix, other = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
         (matrix if (p.ndim in (2, 3) and "embed" not in n) else other).append(p)
+    # gram_restarts=[4,5] = the NS8-schedule fp16 autotune winner (gram only activates for dim>=2048; harmless below)
     muon = FusedMuon(matrix, lr=muon_lr, momentum=momentum, weight_decay=wd,
-                     coeffs=NS8, ns_dtype=ns_dtype, aurora_k=1)
+                     coeffs=NS8, ns_dtype=ns_dtype, aurora_k=1, gram_restarts=[4, 5])
     adamw = torch.optim.AdamW(other, lr=adam_lr, weight_decay=wd)
     return [muon, adamw], len(matrix), len(other)

@@ -21,7 +21,7 @@ from .schedule import make_wsd
 from .data import token_batches, TRAIN_DATASET
 from .evaluate import evaluate, Tok, summarize
 from .eval.sample import generate_samples
-from kernels.sm75.cross_entropy import fused_linear_cross_entropy
+from kernels.sm120.cross_entropy import fused_linear_cross_entropy   # sm120 (Blackwell); CE byte-identical to sm75
 
 DEV = "cuda"
 _DT = {"bf16": torch.bfloat16, "fp32": torch.float32}

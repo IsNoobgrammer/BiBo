@@ -46,7 +46,7 @@ def patch_liger_rope():
 
 # ───────────────────────── fused MoE ─────────────────────────
 def patch_fused_moe():
-    from kernels.sm75.moe import moe as moe_fused
+    from kernels.sm120.moe import moe as moe_fused   # sm120 (Blackwell); MoE is byte-identical to sm75
 
     # BiBo: diverse PolyGLU activations (silu/relu2/normsilu cycled) + optional Identity/Zero specials
     def _bibo_moe(self, hidden_states, top_k_indices, top_k_weights):
