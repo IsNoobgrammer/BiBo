@@ -129,7 +129,7 @@ def main():
     print(f"[{run_name}] measured peak {args.precision} matmul ~{peak_tflops:.0f} TFLOPS | "
           f"flops/token ~{flops_per_token/1e9:.2f} GFLOP", flush=True)
     model.train()
-    t0 = time.time(); _last_t = t0; _last_tok = 0
+    t0 = time.time(); _last_t = t0; _last_tok = 0; _last_step = 0
     for step in range(total_steps):
         for o in opts:
             o.zero_grad(set_to_none=True)
@@ -151,17 +151,19 @@ def main():
             lr = opts[0].param_groups[0]["lr"]
             toks = (step + 1) * tok_per_step
             _now = time.time(); _dt = _now - _last_t
+            _steps_since = max(step - _last_step, 1)
+            ms_per_step = 1000.0 * _dt / _steps_since                          # wall time per step
             tps = (toks - _last_tok) / _dt if _dt > 0 else 0.0                 # tokens/sec this interval
             mfu = 100.0 * flops_per_token * tps / (peak_tflops * 1e12) if peak_tflops > 0 else 0.0
-            _last_t, _last_tok = _now, toks
+            _last_t, _last_tok, _last_step = _now, toks, step
             mem = torch.cuda.max_memory_allocated() / 1e9 if DEV == "cuda" else 0.0
             fin = math.isfinite(lv)
             print(f"  step {step}/{total_steps} loss={lv:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
-                  f"tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G"
+                  f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G dt={_dt:.1f}s"
                   f"{'' if fin else '  <<NON-FINITE>>'}", flush=True)
             if wb:
-                wb.log({"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "train/tps": tps,
-                        "train/mfu": mfu, "train/mem_gb": mem, "tokens": toks}, step=step)
+                wb.log({"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "train/ms_per_step": ms_per_step,
+                        "train/tps": tps, "train/mfu": mfu, "train/mem_gb": mem, "tokens": toks}, step=step)
         if do_eval and step % args.eval_every == 0:            # periodic eval -> W&B curves
             _, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.eval_mcq_n,
                                bpb_n=args.eval_bpb_n, extrap_lengths=ev_extrap, device=DEV, dtype=dt)
