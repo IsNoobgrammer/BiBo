@@ -99,7 +99,8 @@ def main():
     opts, n_mat, n_oth = build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt)
     if args.compile:                                            # compile the transformer body only; the
         model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
-        print(f"[{run_name}] torch.compile(model.model) on; fused CE + liger/moe/flash kernels stay eager", flush=True)
+        print(f"[{args.arm}_seed{args.seed}] torch.compile(model.model) on; fused CE + liger/moe/flash kernels stay eager",
+              flush=True)
 
     tok_per_step = args.batch * args.seq_len * args.grad_accum   # global batch
     total_steps = args.max_steps or (args.tokens // tok_per_step)
