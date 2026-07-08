@@ -77,6 +77,10 @@ def main():
         print("=== capability probes (en+hi) ===", flush=True)
         for lang in sorted(res["probes"]["per_language"]):
             print(f"  probe_acc[{lang}] = {res['probes']['per_language'][lang]['acc']:.4f}", flush=True)
+    if res.get("samples"):
+        print("=== samples (2 en + 2 hi, KV-cache decode) ===", flush=True)
+        for s in res["samples"]:
+            print(f"  [{s['lang']}] {s['prompt']} -> {s['completion']}", flush=True)
 
     if args.wandb:
         import wandb

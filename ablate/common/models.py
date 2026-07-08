@@ -5,10 +5,11 @@ from .configs import ARMS, SHARED, make_qwen_config, make_bibo_min_config
 from . import patches
 
 
-def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa"):
+def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
+              load_balance="none", bias_update_threshold=8000, bias_update_factor=None):
     """arm in {'qwen','bibo_min'} -> (model, config). Params in `dtype` (fp32 master; bf16 via autocast).
     attn_impl: 'sdpa' | 'flash_attention_4' (auto-downgrades to sdpa if flash_attn missing, e.g. T4/local).
-    Qwen uses HF's native dispatch; BiBo is routed through flash via a patched hot path."""
+    load_balance/bias_update_*: BiBo router balancing (default off to match Qwen); Qwen ignores them."""
     eff = patches.resolve_attn(attn_impl)
     if arm == "qwen":
         from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
@@ -16,7 +17,7 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa"):
         model = Qwen3MoeForCausalLM(cfg)
     elif arm == "bibo_min":
         from src.modeling.models import BiBoForCausalLM
-        cfg = make_bibo_min_config()
+        cfg = make_bibo_min_config(load_balance, bias_update_threshold, bias_update_factor)
         model = BiBoForCausalLM(cfg)
         if eff.startswith("flash"):
             patches.patch_bibo_flash()

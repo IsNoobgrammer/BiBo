@@ -62,6 +62,9 @@ def main():
     ap.add_argument("--seq_len", type=int, default=1024)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")  # NEVER fp16
     ap.add_argument("--attn", choices=["sdpa", "flash_attention_4"], default="sdpa")
+    ap.add_argument("--load_balance", choices=["none", "bias"], default="none")   # BiBo router balancing (off=match Qwen)
+    ap.add_argument("--bias_update_threshold", type=int, default=8000)            # tokens between bias updates (if bias)
+    ap.add_argument("--bias_update_factor", type=float, default=-1.0)             # <0 = auto Hill (~0.175 for 9 experts)
     ap.add_argument("--compile", action="store_true")           # torch.compile the transformer body
     ap.add_argument("--peak_tflops", type=float, default=0.0)   # MFU denominator: 0=auto-measure achievable GEMM;
     #                                                             else theoretical, e.g. 480 (dense bf16) / 960 (sparse)
@@ -93,7 +96,9 @@ def main():
     patch_list = [p.strip() for p in args.patches.split(",") if p.strip()]
     use_fused_ce = "ce" in patch_list
 
-    model, cfg = build_arm(args.arm, device=DEV, dtype=torch.float32, attn_impl=args.attn)  # fp32 master weights
+    model, cfg = build_arm(args.arm, device=DEV, dtype=torch.float32, attn_impl=args.attn,  # fp32 master weights
+                           load_balance=args.load_balance, bias_update_threshold=args.bias_update_threshold,
+                           bias_update_factor=(None if args.bias_update_factor < 0 else args.bias_update_factor))
     total, trainable, active = count_params(model)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
     opts, n_mat, n_oth = build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt)
@@ -174,11 +179,13 @@ def main():
                 wb.log({"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "train/ms_per_step": ms_per_step,
                         "train/tps": tps, "train/mfu": mfu, "train/mem_gb": mem, "tokens": toks}, step=step)
         if do_eval and step % args.eval_every == 0:            # periodic eval -> W&B curves
-            _, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.eval_mcq_n,
-                               bpb_n=args.eval_bpb_n, extrap_lengths=ev_extrap, device=DEV, dtype=dt)
+            res_ev, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.eval_mcq_n,
+                                    bpb_n=args.eval_bpb_n, extrap_lengths=ev_extrap, device=DEV, dtype=dt)
             if wb:
                 wb.log(flat, step=step)
             print(f"  [eval @{step}] {summarize(flat)}", flush=True)
+            for s in res_ev.get("samples", []):                # 2 en + 2 hi samples (KV-cache) every eval
+                print(f"    [sample {s['lang']}] {s['prompt']} -> {s['completion']}", flush=True)
         if args.ckpt_every and step > 0 and step % args.ckpt_every == 0:
             torch.save(model.state_dict(), os.path.join(out_dir, f"{run_name}_step{step}.pt"))
 
