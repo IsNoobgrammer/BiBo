@@ -16,7 +16,8 @@ from . import _paths  # noqa: F401  (sys.path bootstrap)
 
 # ---- shared, matched dimensions (team-standard 137M total / 71M active) ----
 SHARED = dict(
-    vocab_size=81000,             # QTK-81K tokenizer
+    vocab_size=81920,             # QTK-81K tokenizer: real len(tokenizer)=81920 (ids up to 81919 in the
+                                  # packed corpus). NOT 81000 (that old-bench value overflows the embedding).
     hidden_size=512,
     num_hidden_layers=10,
     num_attention_heads=4,
