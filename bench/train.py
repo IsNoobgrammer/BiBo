@@ -90,6 +90,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=None,
                    help="Override training.seed (data order, init). Use distinct seeds for multi-seed runs.")
     p.add_argument("--eval_every", type=int, default=None)
+    p.add_argument("--sample_every", type=int, default=None,
+                   help="Steps between sample-generation logs (overrides eval.sample_every).")
     p.add_argument("--max_eval_examples", type=int, default=None,
                    help="Cap HellaSwag/ARC examples per eval (default 500 via config). Keeps eval fast.")
     p.add_argument("--wandb_name", type=str, default=None)
@@ -156,6 +158,8 @@ def load_config(args):
         t["muon_ns_steps"] = args.muon_ns_steps
     if args.eval_every is not None:
         cfg["eval"]["eval_every"] = args.eval_every
+    if args.sample_every is not None:
+        cfg["eval"]["sample_every"] = args.sample_every
     if args.max_eval_examples is not None:
         cfg["eval"]["max_eval_examples"] = args.max_eval_examples
     if args.wandb_name is not None:
