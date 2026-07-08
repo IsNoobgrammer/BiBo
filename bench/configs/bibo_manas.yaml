@@ -46,12 +46,13 @@ training:
   optimizer: "muon_adamw" # routes to Muon+AdamW; exp_manas overrides the Muon sub-optimizer
   muon_optimizer: "manas" # ARM: ManasOptimizer (ns8 aurora-K1 + rolling probe)
   probe_after_warmup: true # defer probing (no d/u buffers) until LR warmup ends, then probe fresh. warmup end = whd:5% / whd5:10% / cosine:warmup_steps of total. --probe_from_start disables.
-  probe: # ⚠ module defaults — gamma/rho are scale-dependent, SWEEP on the LM
+  probe: # ⚠ gamma/rho scale-dependent — SWEEP on the LM. CLI: --probe_gamma/--probe_rho/--d_rank/--u_rank/--probe_comp
     gamma: 0.08 #   probe dose (couples to LR/weight-norm/curvature; re-sweep per scale)
-    rho: 0.98 #   probe memory in SAMPLES (rho* ~= 1 - batch/N_mem; re-derive per batch)
-    rank: 8 #   low-rank d basis (None = full model-shaped fp32 d)
-    refresh: 200 #   GaLore-style basis refresh interval (probe updates)
-    # comp:                     #   u-buffer strength in units of gamma (omit/None = off)
+    rho: 0.85 #     probe memory/decay in [0,1). ⚠ scaling law rho*≈1-batch/N_mem suggests HIGHER for this small batch; 0.85 per request.
+    d_rank: 8 #     rank of the d probe buffer (low-rank basis; -1 = full model-shaped fp32 d)
+    u_rank: 8 #     u-buffer ON (0 = OFF). u SHARES d's basis -> runs at d_rank; value>0 is on/off only.
+    comp: 1.0 #     u-buffer strength in units of gamma (only when u_rank>0). u ON by default now.
+    refresh: 200 #  GaLore-style basis refresh interval (probe updates)
   muon_lr: 3.0e-4
   scheduler: "whd"
   muon_ns_steps: 5 # IGNORED by exp_manas (fixed ns8 schedule)

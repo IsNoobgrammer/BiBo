@@ -99,10 +99,13 @@ def parse_args():
                    help="Manas: probe dose (overrides training.probe.gamma). Sweep this to tune.")
     p.add_argument("--probe_rho", type=float, default=None,
                    help="Manas: probe memory/decay in [0,1) (overrides training.probe.rho).")
-    p.add_argument("--probe_rank", type=int, default=None,
-                   help="Manas: low-rank probe rank (overrides training.probe.rank). Pass -1 for full-d.")
+    p.add_argument("--d_rank", "--probe_rank", dest="d_rank", type=int, default=None,
+                   help="Manas: rank of the d probe buffer (overrides training.probe.d_rank). -1 = full-d.")
+    p.add_argument("--u_rank", type=int, default=None,
+                   help="Manas: u-buffer on/off (overrides training.probe.u_rank). 0 = OFF; >0 = ON. "
+                        "u SHARES d's basis, so it runs at d_rank — the value beyond 0 is on/off only.")
     p.add_argument("--probe_comp", type=float, default=None,
-                   help="Manas: u-buffer strength in units of gamma (overrides training.probe.comp).")
+                   help="Manas: u-buffer strength in units of gamma when ON (overrides training.probe.comp; default 1.0).")
     p.add_argument("--probe_from_start", action="store_true",
                    help="Manas: start probing at step 0 (disables the default 'probe only after warmup').")
     p.add_argument("--max_eval_examples", type=int, default=None,

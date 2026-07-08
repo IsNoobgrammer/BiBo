@@ -208,11 +208,22 @@ if __name__ == "__main__":
         _cfg = yaml.safe_load(f)
     _ARM = _cfg["training"].get("muon_optimizer", "muon").lower()
     _PROBE = dict(_cfg["training"].get("probe", {}) or {})
-    # CLI overrides (for hand-tuning gamma/rho without editing the config): --probe_gamma/_rho/_rank/_comp
+    # CLI overrides for hand-tuning: --probe_gamma/--probe_rho/--d_rank/--u_rank/--probe_comp
     if args.probe_gamma is not None: _PROBE["gamma"] = args.probe_gamma
     if args.probe_rho is not None:   _PROBE["rho"] = args.probe_rho
-    if args.probe_rank is not None:  _PROBE["rank"] = None if args.probe_rank < 0 else args.probe_rank
+    if args.d_rank is not None:      _PROBE["d_rank"] = args.d_rank
+    if args.u_rank is not None:      _PROBE["u_rank"] = args.u_rank
     if args.probe_comp is not None:  _PROBE["comp"] = args.probe_comp
+    # Map friendly d_rank/u_rank -> Manas ground-truth (probe_rank + comp). Manas shares ONE low-rank
+    # basis between d and u, so u runs at d_rank; u_rank is on/off only (0 disables the u-buffer).
+    _dr = _PROBE.get("d_rank", _PROBE.get("rank", 8))
+    _PROBE["rank"] = None if (_dr is None or (isinstance(_dr, (int, float)) and _dr < 0)) else int(_dr)
+    _ur = _PROBE.get("u_rank", None)
+    if _ur is not None:
+        _PROBE["comp"] = float(_PROBE.get("comp", 1.0)) if int(_ur) > 0 else None
+        if int(_ur) > 0 and _PROBE["rank"] is not None and int(_ur) != _PROBE["rank"]:
+            print(f"[exp_manas] note: u shares d's basis -> u runs at d_rank={_PROBE['rank']} "
+                  f"(u_rank={_ur} treated as ON; an independent u rank needs a Manas change)")
     assert _ARM in ("muon", "manas"), f"training.muon_optimizer must be muon|manas, got {_ARM}"
     print(f"[exp_manas] arm={_ARM} | fused CE + MoE + XSA + router active"
           + (f" | probe={_PROBE}" if _ARM == "manas" else ""))
