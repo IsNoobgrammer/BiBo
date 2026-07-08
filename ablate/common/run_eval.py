@@ -50,7 +50,9 @@ def main():
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"arm": args.arm, "ckpt": args.ckpt, **res}, f, indent=2, ensure_ascii=False)
 
-    print("=== bits-per-byte (lower=better) ===", flush=True)
+    print("=== bits-per-byte (lower=better; se from per-text variance) ===", flush=True)
+    for name, d in res["bpb"]["per_source"].items():
+        print(f"  {name:12s} bpb={d['bpb']:.4f} +-{d['se']:.4f}  ({d['n_texts']} texts, {d['tokens']} tok)", flush=True)
     for lang in sorted(res["bpb"]["per_language"]):
         print(f"  bpb[{lang}] = {res['bpb']['per_language'][lang]:.4f}", flush=True)
     if "length_extrap" in res:
@@ -59,13 +61,22 @@ def main():
             d = res["length_extrap"][lang]
             print(f"  {lang}: " + "  ".join(f"L{L}={d[L]:.3f}" for L in lengths)
                   + f"  degradation={d['degradation']:.3f}", flush=True)
-    print("=== LL-MCQ accuracy (higher=better) ===", flush=True)
+    print("=== LL-MCQ accuracy (acc [95% CI] vs chance; z = sigmas above chance) ===", flush=True)
     for lang in sorted(res["mcq"]["per_language"]):
-        print(f"  acc[{lang}] = {res['mcq']['per_language'][lang]:.4f}", flush=True)
+        d = res["mcq"]["per_language"][lang]
+        print(f"  {lang}: acc={d['acc']:.3f} CI{d['ci95']} n={d['n']} chance={d['chance']:.3f} z={d['z_vs_chance']}", flush=True)
+    for name, d in res["mcq"]["per_source"].items():
+        print(f"    {name:12s} acc={d['acc']:.3f} CI{d['ci95']} ({d['n']}x{d['n_options']}-way, z={d['z_vs_chance']})", flush=True)
+    it = res["interp"]
+    print("=== MoE interp (expert utilization + router confidence) ===", flush=True)
+    print(f"  balance_entropy={it['balance_entropy']} (1=balanced,0=collapsed)  load_cov={it['load_cov']}"
+          f"  max/min load={it['max_expert_load']}/{it['min_expert_load']}", flush=True)
+    print(f"  router: top1_weight={it['router_top1_weight']} entropy={it['router_entropy']} "
+          f"frac(top1>0.5)={it['router_frac_top1_gt_0.5']}  | expert_load={it['expert_load']}", flush=True)
     if res.get("probes"):
         print("=== capability probes (en+hi) ===", flush=True)
         for lang in sorted(res["probes"]["per_language"]):
-            print(f"  probe_acc[{lang}] = {res['probes']['per_language'][lang]:.4f}", flush=True)
+            print(f"  probe_acc[{lang}] = {res['probes']['per_language'][lang]['acc']:.4f}", flush=True)
 
     if args.wandb:
         import wandb

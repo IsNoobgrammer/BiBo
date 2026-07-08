@@ -8,6 +8,7 @@ from .eval.manifest import MANIFEST
 from .eval.mcq import run_mcq, default_sources as mcq_sources
 from .eval.length_extrap import run_length_extrap
 from .eval.probes import run_probes
+from .eval import interp as interp_mod
 
 TOKENIZER = "fhai50032/QTK-81K"
 
@@ -28,8 +29,12 @@ def evaluate(model, tokenizer, *, seq_len=1024, mcq_n=200, bpb_n=None, extrap_le
     was_training = model.training
     model.eval()
     res = {}
-    res["bpb"] = run_bpb(model, tokenizer, MANIFEST, seq_len=seq_len, device=device, dtype=dtype,
-                         n_override=bpb_n)
+    num_experts = getattr(model.config, "num_routed_experts", None) or getattr(model.config, "num_experts", 9)
+    # collect MoE interp (expert utilization + router confidence) FOR FREE during the bpb forwards
+    with interp_mod.collect(model, num_experts) as moe:
+        res["bpb"] = run_bpb(model, tokenizer, MANIFEST, seq_len=seq_len, device=device, dtype=dtype,
+                             n_override=bpb_n)
+    res["interp"] = moe.result()
     res["mcq"] = run_mcq(model, tokenizer, mcq_sources(mcq_n, with_global_mmlu), device=device, dtype=dtype)
     if do_probes:
         res["probes"] = run_probes(model, tokenizer, device=device, dtype=dtype)
@@ -41,9 +46,12 @@ def evaluate(model, tokenizer, *, seq_len=1024, mcq_n=200, bpb_n=None, extrap_le
 
     flat = {f"eval/bpb_{k}": v for k, v in res["bpb"]["per_language"].items()}
     flat["eval/bpb_overall"] = res["bpb"]["overall"]
-    flat.update({f"eval/acc_{k}": v for k, v in res["mcq"]["per_language"].items()})
+    flat.update({f"eval/acc_{k}": d["acc"] for k, d in res["mcq"]["per_language"].items()})
+    it = res["interp"]
+    flat.update({"eval/expert_balance_entropy": it["balance_entropy"], "eval/max_expert_load": it["max_expert_load"],
+                 "eval/router_top1_weight": it["router_top1_weight"], "eval/router_entropy": it["router_entropy"]})
     if "probes" in res:
-        flat.update({f"eval/probe_{k}": v for k, v in res["probes"]["per_language"].items()})
+        flat.update({f"eval/probe_{k}": d["acc"] for k, d in res["probes"]["per_language"].items()})
     if "length_extrap" in res:
         flat.update({f"eval/extrap_degradation_{k}": v["degradation"]
                      for k, v in res["length_extrap"].items()})

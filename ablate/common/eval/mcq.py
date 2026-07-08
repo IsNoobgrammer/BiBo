@@ -6,8 +6,28 @@ Run offline self-check (no downloads):  python -m ablate.common.eval.mcq
 """
 from .. import _paths  # noqa: F401
 import functools
+import math
 import torch
 import torch.nn.functional as F
+
+
+def _wilson(k, n, z=1.96):
+    """95% Wilson score interval for a binomial proportion (better than normal approx at small n)."""
+    if n == 0:
+        return (0.0, 0.0)
+    p = k / n
+    d = 1.0 + z * z / n
+    center = (p + z * z / (2 * n)) / d
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return (round(max(0.0, center - half), 4), round(min(1.0, center + half), 4))
+
+
+def _z_vs_chance(k, n, chance):
+    """z-score of the observed accuracy above the chance baseline (one-sample proportion test)."""
+    if n == 0 or chance in (0.0, 1.0):
+        return 0.0
+    se = math.sqrt(chance * (1 - chance) / n)
+    return round((k / n - chance) / se, 2) if se > 0 else 0.0
 
 
 @torch.no_grad()
@@ -40,20 +60,29 @@ def run_mcq(model, tokenizer, sources, device="cuda", dtype=torch.bfloat16):
     for src in sources:
         correct = 0
         items = src["items"]
+        n_opt = len(items[0]["options"]) if items else 0
+        chance = 1.0 / n_opt if n_opt else 0.0
         for it in items:
             scores = [_cont_logprob(model, tokenizer, it["context"], " " + opt, device, dtype)
                       for opt in it["options"]]
             correct += int(int(torch.tensor(scores).argmax()) == it["gold"])
-        acc = correct / max(len(items), 1)
-        per_source[src["name"]] = {"acc": acc, "lang": src["lang"], "n": len(items),
-                                   "n_options": len(items[0]["options"]) if items else 0}
-        a = lang_acc.setdefault(src["lang"], [0, 0])
-        a[0] += correct; a[1] += len(items)
-        tot_correct += correct; tot_n += len(items)
+        n = len(items)
+        per_source[src["name"]] = {
+            "acc": round(correct / max(n, 1), 4), "lang": src["lang"], "n": n, "n_options": n_opt,
+            "chance": round(chance, 4), "ci95": _wilson(correct, n), "z_vs_chance": _z_vs_chance(correct, n, chance),
+        }
+        a = lang_acc.setdefault(src["lang"], [0, 0, 0.0])
+        a[0] += correct; a[1] += n; a[2] += chance * n            # expected-chance-weighted by n
+        tot_correct += correct; tot_n += n
+    per_language = {}
+    for lang, (k, n, exp_chance) in lang_acc.items():
+        c = exp_chance / max(n, 1)
+        per_language[lang] = {"acc": round(k / max(n, 1), 4), "n": n, "chance": round(c, 4),
+                              "ci95": _wilson(k, n), "z_vs_chance": _z_vs_chance(k, n, c)}
     return {
         "per_source": per_source,
-        "per_language": {k: v[0] / max(v[1], 1) for k, v in lang_acc.items()},   # includes "hi"
-        "overall": tot_correct / max(tot_n, 1),
+        "per_language": per_language,                            # includes "hi" (acc + n + ci95 + z_vs_chance)
+        "overall": round(tot_correct / max(tot_n, 1), 4),
     }
 
 
@@ -150,9 +179,8 @@ def _selfcheck():
     ]
     r = run_mcq(_Model().eval(), _CharTok(), srcs, device="cpu", dtype=torch.float32)
     assert "hi" in r["per_language"], "Hindi segment missing"
-    assert all(0.0 <= v <= 1.0 for v in r["per_language"].values())
-    print(f"[mcq self-check] per_language={r['per_language']} overall={r['overall']:.3f}  "
-          f"langs={list(r['per_language'])}  OK", flush=True)
+    assert all(0.0 <= d["acc"] <= 1.0 and "ci95" in d and "z_vs_chance" in d for d in r["per_language"].values())
+    print(f"[mcq self-check] hi={r['per_language']['hi']} overall={r['overall']:.3f}  OK", flush=True)
 
 
 if __name__ == "__main__":

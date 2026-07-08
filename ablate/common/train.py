@@ -62,6 +62,9 @@ def main():
     ap.add_argument("--seq_len", type=int, default=1024)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")  # NEVER fp16
     ap.add_argument("--attn", choices=["sdpa", "flash_attention_4"], default="sdpa")
+    ap.add_argument("--compile", action="store_true")           # torch.compile the transformer body
+    ap.add_argument("--peak_tflops", type=float, default=0.0)   # MFU denominator: 0=auto-measure achievable GEMM;
+    #                                                             else theoretical, e.g. 480 (dense bf16) / 960 (sparse)
     ap.add_argument("--patches", default="liger_norm,liger_rope,ce,moe")
     ap.add_argument("--muon_lr", type=float, default=3e-4)
     ap.add_argument("--adam_lr", type=float, default=3e-4)
@@ -94,6 +97,9 @@ def main():
     total, trainable, active = count_params(model)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
     opts, n_mat, n_oth = build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt)
+    if args.compile:                                            # compile the transformer body only; the
+        model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
+        print(f"[{run_name}] torch.compile(model.model) on; fused CE + liger/moe/flash kernels stay eager", flush=True)
 
     tok_per_step = args.batch * args.seq_len * args.grad_accum   # global batch
     total_steps = args.max_steps or (args.tokens // tok_per_step)
@@ -123,10 +129,12 @@ def main():
 
     gen = token_batches(args.batch, args.seq_len, DEV, synthetic=(args.data == "synthetic"),
                         vocab=cfg.vocab_size, seed=args.seed)
-    # measured device peak (self-calibrating MFU denominator) + FLOPs/token (fwd+bwd 6N + attention term)
-    peak_tflops = _measure_peak_tflops(DEV, dt)
+    # MFU denominator: measured achievable GEMM peak, or --peak_tflops (theoretical). FLOPs/token = 6N + attn.
+    measured_peak = _measure_peak_tflops(DEV, dt)
+    peak_tflops = args.peak_tflops if args.peak_tflops > 0 else measured_peak
     flops_per_token = 6 * active + 12 * cfg.num_hidden_layers * cfg.hidden_size * args.seq_len
-    print(f"[{run_name}] measured peak {args.precision} matmul ~{peak_tflops:.0f} TFLOPS | "
+    print(f"[{run_name}] MFU peak={peak_tflops:.0f} TFLOPS "
+          f"({'set' if args.peak_tflops > 0 else 'measured GEMM'}); measured GEMM={measured_peak:.0f} | "
           f"flops/token ~{flops_per_token/1e9:.2f} GFLOP", flush=True)
     model.train()
     t0 = time.time(); _last_t = t0; _last_tok = 0; _last_step = 0

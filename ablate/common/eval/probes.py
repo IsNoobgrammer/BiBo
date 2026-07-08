@@ -78,8 +78,8 @@ def _selfcheck():
 
     r = run_probes(_Model().eval(), _CharTok(), n=10, device="cpu", dtype=torch.float32)
     assert "hi" in r["per_language"] and "en" in r["per_language"], "need en+hi probe segments"
-    assert all(0.0 <= v <= 1.0 for v in r["per_language"].values())
-    print(f"[probes self-check] per_language={r['per_language']} langs={list(r['per_language'])}  OK", flush=True)
+    assert all(0.0 <= d["acc"] <= 1.0 for d in r["per_language"].values())
+    print(f"[probes self-check] en_acc={r['per_language']['en']['acc']} hi_acc={r['per_language']['hi']['acc']}  OK", flush=True)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ Run standalone self-check (no data/tokenizer download):  python -m ablate.common
 """
 from .. import _paths  # noqa: F401
 import math
+import statistics
 import torch
 import torch.nn.functional as F
 
@@ -48,6 +49,7 @@ def run_bpb(model, tokenizer, manifest, seq_len=1024, device="cuda", dtype=torch
     tot_nll = tot_bytes = 0.0
     for src in manifest:
         s_nll = s_bytes = s_tok = 0.0
+        per_text_bpb = []
         n = min(src.n, n_override) if n_override else src.n
         try:
             texts = src.loader(n)
@@ -57,8 +59,14 @@ def run_bpb(model, tokenizer, manifest, seq_len=1024, device="cuda", dtype=torch
         for text in texts:
             nll, nb, nt = _text_nll_bytes(model, tokenizer, text, seq_len, device, dtype)
             s_nll += nll; s_bytes += nb; s_tok += nt
+            if nb > 0 and nt > 0:
+                per_text_bpb.append((nll / LN2) / nb)
         bpb = (s_nll / LN2) / max(s_bytes, 1)
-        per_source[src.name] = {"bpb": bpb, "lang": src.lang, "domain": src.domain, "tokens": int(s_tok)}
+        # SE across texts (bpb is per-token-dense, so this is tiny -> that's the point)
+        m = len(per_text_bpb)
+        se = (statistics.pstdev(per_text_bpb) / (m ** 0.5)) if m > 1 else 0.0
+        per_source[src.name] = {"bpb": round(bpb, 4), "lang": src.lang, "domain": src.domain,
+                                "tokens": int(s_tok), "n_texts": m, "se": round(se, 4)}
         for acc, key in ((lang_acc, src.lang), (dom_acc, src.domain)):
             a = acc.setdefault(key, [0.0, 0.0])
             a[0] += s_nll; a[1] += s_bytes
