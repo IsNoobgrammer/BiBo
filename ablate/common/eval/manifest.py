@@ -44,13 +44,38 @@ def _hf(repo, config, split, to_text, streaming=True):
     return load
 
 
+def _belebele_passages(lang_cfg):
+    """Parallel en/hi raw text via Belebele's flores_passage (== FLORES text, but OPEN — facebook/flores
+    itself is gated). Deduped (passages repeat across questions). Cached like _hf."""
+    cache = {}
+    def load(n):
+        for m, v in cache.items():
+            if m >= n:
+                return v[:n]
+        from datasets import load_dataset
+        ds = load_dataset("facebook/belebele", lang_cfg, split="test", streaming=True)
+        seen, out = set(), []
+        for ex in ds:
+            p = ex.get("flores_passage")
+            if p and p not in seen:
+                seen.add(p); out.append(p)
+            if len(out) >= n:
+                break
+        if not out:
+            raise RuntimeError(f"no passages from belebele:{lang_cfg}")
+        cache[n] = out
+        return out
+    return load
+
+
 _qa = lambda e: (e.get("question", "") + "\n" + e.get("answer", "")).strip()
 
+# All OPEN (no HF gate): Belebele flores_passage for parallel en/hi text, GSM8K for math text.
 MANIFEST = [
-    Source("flores_en", "en", "text", _hf("facebook/flores", "eng_Latn", "devtest", lambda e: e["sentence"]), n=500),
-    Source("flores_hi", "hi", "text", _hf("facebook/flores", "hin_Deva", "devtest", lambda e: e["sentence"]), n=500),
-    Source("gsm8k_en",  "en", "math", _hf("openai/gsm8k", "main", "test", _qa), n=300),
-    Source("gsm8k_hi",  "hi", "math", _hf("bingbangboom/gsm8k-hindi", None, "test_main", _qa), n=300),
+    Source("belebele_en", "en", "text", _belebele_passages("eng_Latn"), n=300),
+    Source("belebele_hi", "hi", "text", _belebele_passages("hin_Deva"), n=300),
+    Source("gsm8k_en",    "en", "math", _hf("openai/gsm8k", "main", "test", _qa), n=300),
+    Source("gsm8k_hi",    "hi", "math", _hf("bingbangboom/gsm8k-hindi", None, "test_main", _qa), n=300),
 ]
 
 

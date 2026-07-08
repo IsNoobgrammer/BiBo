@@ -49,7 +49,12 @@ def run_bpb(model, tokenizer, manifest, seq_len=1024, device="cuda", dtype=torch
     for src in manifest:
         s_nll = s_bytes = s_tok = 0.0
         n = min(src.n, n_override) if n_override else src.n
-        for text in src.loader(n):
+        try:
+            texts = src.loader(n)
+        except Exception as e:                       # skip an unavailable/gated source, don't crash eval
+            print(f"[bpb] skip {src.name}: {type(e).__name__}: {str(e)[:100]}", flush=True)
+            continue
+        for text in texts:
             nll, nb, nt = _text_nll_bytes(model, tokenizer, text, seq_len, device, dtype)
             s_nll += nll; s_bytes += nb; s_tok += nt
         bpb = (s_nll / LN2) / max(s_bytes, 1)

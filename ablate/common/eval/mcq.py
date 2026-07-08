@@ -104,16 +104,21 @@ def global_mmlu_items(lang, n=500):                      # 4-way knowledge (expe
 
 
 def default_sources(n=500, with_global_mmlu=False):
-    """Parallel En+Hi MCQ sources. Global-MMLU off by default (gated + near-chance at this scale)."""
-    srcs = [
-        {"name": "belebele_en", "lang": "en", "items": belebele_items("eng_Latn", n)},
-        {"name": "belebele_hi", "lang": "hi", "items": belebele_items("hin_Deva", n)},
-        {"name": "xnli_en", "lang": "en", "items": xnli_items("en", n)},
-        {"name": "xnli_hi", "lang": "hi", "items": xnli_items("hi", n)},
-    ]
+    """Parallel En+Hi MCQ sources. Each built defensively — an unavailable/gated source is skipped
+    (warned) rather than crashing the eval. Global-MMLU opt-in (near-chance at this scale)."""
+    specs = [("belebele_en", "en", belebele_items, "eng_Latn"),
+             ("belebele_hi", "hi", belebele_items, "hin_Deva"),
+             ("xnli_en", "en", xnli_items, "en"),
+             ("xnli_hi", "hi", xnli_items, "hi")]
     if with_global_mmlu:
-        srcs += [{"name": "gmmlu_en", "lang": "en", "items": global_mmlu_items("en", n)},
-                 {"name": "gmmlu_hi", "lang": "hi", "items": global_mmlu_items("hi", n)}]
+        specs += [("gmmlu_en", "en", global_mmlu_items, "en"),
+                  ("gmmlu_hi", "hi", global_mmlu_items, "hi")]
+    srcs = []
+    for name, lang, builder, arg in specs:
+        try:
+            srcs.append({"name": name, "lang": lang, "items": builder(arg, n)})
+        except Exception as e:
+            print(f"[mcq] skip {name}: {type(e).__name__}: {str(e)[:100]}", flush=True)
     return srcs
 
 
