@@ -37,13 +37,14 @@ SHARED = dict(
 PARTIAL_ROPE = 0.334              # BiBo-min partial rotary; 1.0 == Qwen full RoPE (flip to isolate)
 
 
-def make_qwen_config(attn_impl="sdpa", aux_coef=0.001):
+def make_qwen_config(attn_impl="sdpa", aux_coef=0.001, num_experts=None):
     from baseline.qwen3moe.config import Qwen3MoeConfig
     cfg = Qwen3MoeConfig(
         vocab_size=SHARED["vocab_size"], hidden_size=SHARED["hidden_size"],
         intermediate_size=SHARED["intermediate_size"], num_hidden_layers=SHARED["num_hidden_layers"],
         num_attention_heads=SHARED["num_attention_heads"], num_key_value_heads=SHARED["num_key_value_heads"],
-        num_experts=SHARED["num_experts"], num_experts_per_tok=SHARED["num_experts_per_tok"],
+        num_experts=num_experts or SHARED["num_experts"],   # == BiBo GLU count (polyglu_mult*3) -> param-matched
+        num_experts_per_tok=SHARED["num_experts_per_tok"],
         moe_intermediate_size=SHARED["moe_intermediate_size"], norm_topk_prob=SHARED["norm_topk_prob"],
         max_position_embeddings=SHARED["max_position_embeddings"], mlp_only_layers=SHARED["mlp_only_layers"],
         rms_norm_eps=SHARED["rms_norm_eps"], rope_theta=SHARED["rope_theta"],
@@ -53,7 +54,8 @@ def make_qwen_config(attn_impl="sdpa", aux_coef=0.001):
     return cfg
 
 
-def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_update_factor=None):
+def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_update_factor=None,
+                         polyglu_mult=3, special_pairs=0):
     from src.configuration_bibo import BiBoConfig
     # DeepSeek-style aux-loss-free balancing pairs with SIGMOID gating (bias added to sigmoid scores);
     # with no balancing we use softmax (Qwen-matched). So gate_type follows load_balance.
@@ -70,8 +72,8 @@ def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_
         rms_norm_eps=SHARED["rms_norm_eps"], rope_theta=SHARED["rope_theta"],
         tie_word_embeddings=SHARED["tie_word_embeddings"], norm_topk_prob=SHARED["norm_topk_prob"],
         # --- the ablation delta: PolyGLU experts + partial RoPE ---
-        polyglu_expert_multiplier=3,      # 9 PolyGLU experts (silu/relu2/normsilu cycled) == Qwen's 9
-        special_expert_pairs=0,           # pure PolyGLU, no Identity/Zero specials
+        polyglu_expert_multiplier=polyglu_mult,  # GLU experts = polyglu_mult*3 (silu/relu2/normsilu); == Qwen num_experts
+        special_expert_pairs=special_pairs,      # param-FREE Identity/Zero pairs (specials = special_pairs*2); the extra to test
         partial_rotary_factor=PARTIAL_ROPE,
         # --- everything else stripped to Qwen-equivalence ---
         use_xsa=False, use_ssmax=False,

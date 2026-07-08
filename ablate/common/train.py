@@ -86,6 +86,8 @@ def main():
     ap.add_argument("--attn", choices=["sdpa", "flash_attention_4"], default="sdpa")
     ap.add_argument("--load_balance", choices=["none", "bias"], default="bias")   # BiBo: bias=DeepSeek sigmoid+balance; none=softmax
     ap.add_argument("--aux_coef", type=float, default=0.001)                      # Qwen aux load-balancing loss coef (0=off; paper 0.001)
+    ap.add_argument("--polyglu_mult", type=int, default=3)                        # BiBo GLU experts = polyglu_mult*3 (= Qwen num_experts)
+    ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free Identity/Zero pairs (specials = *2)
     ap.add_argument("--bias_update_threshold", type=int, default=10240)           # tokens between bias updates (if bias)
     ap.add_argument("--bias_update_factor", type=float, default=-1.0)             # <0 = auto Hill (~0.175 for 9 experts)
     ap.add_argument("--compile", action="store_true")           # torch.compile the transformer body
@@ -124,7 +126,7 @@ def main():
     model, cfg = build_arm(args.arm, device=DEV, dtype=torch.float32, attn_impl=args.attn,  # fp32 master weights
                            load_balance=args.load_balance, bias_update_threshold=args.bias_update_threshold,
                            bias_update_factor=(None if args.bias_update_factor < 0 else args.bias_update_factor),
-                           aux_coef=args.aux_coef)
+                           aux_coef=args.aux_coef, polyglu_mult=args.polyglu_mult, special_pairs=args.special_pairs)
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
     total, trainable, active = count_params(model)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
