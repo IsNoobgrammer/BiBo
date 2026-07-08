@@ -94,6 +94,15 @@ def parse_args():
                    help="Steps between sample-generation logs (overrides eval.sample_every).")
     p.add_argument("--log_every", type=int, default=None,
                    help="Steps between train-metric logs (overrides logging.log_every). Set 1 to see every step (smoke).")
+    # Manas probe overrides (only read by bench/exp_manas.py; ignored by plain train.py runs).
+    p.add_argument("--probe_gamma", type=float, default=None,
+                   help="Manas: probe dose (overrides training.probe.gamma). Sweep this to tune.")
+    p.add_argument("--probe_rho", type=float, default=None,
+                   help="Manas: probe memory/decay in [0,1) (overrides training.probe.rho).")
+    p.add_argument("--probe_rank", type=int, default=None,
+                   help="Manas: low-rank probe rank (overrides training.probe.rank). Pass -1 for full-d.")
+    p.add_argument("--probe_comp", type=float, default=None,
+                   help="Manas: u-buffer strength in units of gamma (overrides training.probe.comp).")
     p.add_argument("--max_eval_examples", type=int, default=None,
                    help="Cap HellaSwag/ARC examples per eval (default 500 via config). Keeps eval fast.")
     p.add_argument("--wandb_name", type=str, default=None)

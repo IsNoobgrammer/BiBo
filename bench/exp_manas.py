@@ -207,7 +207,12 @@ if __name__ == "__main__":
     with open(args.config) as f:
         _cfg = yaml.safe_load(f)
     _ARM = _cfg["training"].get("muon_optimizer", "muon").lower()
-    _PROBE = _cfg["training"].get("probe", {}) or {}
+    _PROBE = dict(_cfg["training"].get("probe", {}) or {})
+    # CLI overrides (for hand-tuning gamma/rho without editing the config): --probe_gamma/_rho/_rank/_comp
+    if args.probe_gamma is not None: _PROBE["gamma"] = args.probe_gamma
+    if args.probe_rho is not None:   _PROBE["rho"] = args.probe_rho
+    if args.probe_rank is not None:  _PROBE["rank"] = None if args.probe_rank < 0 else args.probe_rank
+    if args.probe_comp is not None:  _PROBE["comp"] = args.probe_comp
     assert _ARM in ("muon", "manas"), f"training.muon_optimizer must be muon|manas, got {_ARM}"
     print(f"[exp_manas] arm={_ARM} | fused CE + MoE + XSA + router active"
           + (f" | probe={_PROBE}" if _ARM == "manas" else ""))
