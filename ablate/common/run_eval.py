@@ -27,6 +27,8 @@ def main():
     ap.add_argument("--mcq_n", type=int, default=500)
     ap.add_argument("--extrap_lengths", default="1024,2048,4096")
     ap.add_argument("--no_probes", action="store_true")
+    ap.add_argument("--icl", action="store_true", help="also run the separate ICL-slope metric (eval/icl_*)")
+    ap.add_argument("--icl_n", type=int, default=100)
     ap.add_argument("--with_global_mmlu", action="store_true")
     ap.add_argument("--out", default=None)
     ap.add_argument("--wandb", action="store_true")
@@ -43,7 +45,7 @@ def main():
     print(f"[eval {args.arm}] ckpt={args.ckpt} full suite (en+hi)...", flush=True)
     res, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.mcq_n, extrap_lengths=lengths,
                          do_probes=not args.no_probes, with_global_mmlu=args.with_global_mmlu,
-                         device=DEV, dtype=dt)
+                         do_icl=args.icl, icl_n=args.icl_n, device=DEV, dtype=dt)
 
     out_dir = args.out or os.path.dirname(os.path.abspath(args.ckpt))
     out_path = os.path.join(out_dir, f"{args.arm}_eval.json")
@@ -77,6 +79,17 @@ def main():
         print("=== capability probes (en+hi) ===", flush=True)
         for lang in sorted(res["probes"]["per_language"]):
             print(f"  probe_acc[{lang}] = {res['probes']['per_language'][lang]['acc']:.4f}", flush=True)
+    if res.get("icl"):
+        print("=== ICL curve (SEPARATE metric; acc/nll vs shots; chance="
+              f"{res['icl']['chance']}) ===", flush=True)
+        for lang in sorted(res["icl"]["per_language"]):
+            d = res["icl"]["per_language"][lang]
+            accs = "  ".join(f"k{k}={d['acc'][k]:.3f}" for k in res["icl"]["shots"])
+            nlls = "  ".join(f"k{k}={d['nll'][k]:.2f}" for k in res["icl"]["shots"])
+            print(f"  [{lang}] acc: {accs}", flush=True)
+            print(f"  [{lang}] nll: {nlls}", flush=True)
+            print(f"  [{lang}] jump_acc(0->1)={d['jump_acc']}  slope_acc={d['slope_acc']}  "
+                  f"slope_nll={d['slope_nll']}", flush=True)
     if res.get("samples"):
         print("=== samples (2 en + 2 hi, KV-cache decode) ===", flush=True)
         for s in res["samples"]:

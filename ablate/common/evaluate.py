@@ -8,6 +8,7 @@ from .eval.manifest import MANIFEST
 from .eval.mcq import run_mcq, default_sources as mcq_sources
 from .eval.length_extrap import run_length_extrap
 from .eval.probes import run_probes
+from .eval.icl import run_icl
 from .eval import interp as interp_mod
 from .eval.sample import generate_samples
 
@@ -28,8 +29,10 @@ class Tok:
 
 
 def evaluate(model, tokenizer, *, seq_len=1024, mcq_n=200, bpb_n=None, extrap_lengths=None,
-             do_probes=True, with_global_mmlu=False, do_samples=True, device="cuda", dtype=torch.bfloat16):
-    """Periodic (cheap): small mcq_n/bpb_n, extrap_lengths=None. Final (full): larger mcq_n, extrap set."""
+             do_probes=True, with_global_mmlu=False, do_samples=True, do_icl=False, icl_n=100,
+             device="cuda", dtype=torch.bfloat16):
+    """Periodic (cheap): small mcq_n/bpb_n, extrap_lengths=None, do_icl=False. Final (full): larger
+    mcq_n, extrap set, do_icl=True. ICL is a SEPARATE metric (own eval/icl_* keys), off by default."""
     was_training = model.training
     model.eval()
     res = {}
@@ -45,6 +48,8 @@ def evaluate(model, tokenizer, *, seq_len=1024, mcq_n=200, bpb_n=None, extrap_le
     if extrap_lengths:
         res["length_extrap"] = run_length_extrap(model, tokenizer, MANIFEST, lengths=extrap_lengths,
                                                  train_len=seq_len, device=device, dtype=dtype)
+    if do_icl:                                              # SEPARATE metric — own eval/icl_* namespace
+        res["icl"] = run_icl(model, tokenizer, n=icl_n, device=device, dtype=dtype)
     if do_samples:                                           # 2 en + 2 hi qualitative samples (KV-cache decode)
         res["samples"] = generate_samples(model, tokenizer, device=device, dtype=dtype)
     if was_training:
@@ -61,6 +66,8 @@ def evaluate(model, tokenizer, *, seq_len=1024, mcq_n=200, bpb_n=None, extrap_le
     if "length_extrap" in res:
         flat.update({f"eval/extrap_degradation_{k}": v["degradation"]
                      for k, v in res["length_extrap"].items()})
+    if "icl" in res:                                        # separate eval/icl_* keys (slopes + per-shot curve)
+        flat.update(res["icl"]["flat"])
     return res, flat
 
 

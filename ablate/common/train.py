@@ -140,7 +140,8 @@ def main():
     total_steps = args.max_steps or (args.tokens // tok_per_step)
     scheds = make_wsd(opts, total_steps, args.warmup_frac, args.decay_frac)
     amp = contextlib.nullcontext() if args.precision == "fp32" else torch.autocast("cuda", dtype=dt)
-    run_name = f"{args.arm}_seed{args.seed}"
+    # include special_pairs so SE vs no-SE runs don't collide on ckpt/log/run names (they share arm+seed)
+    run_name = f"{args.arm}_seed{args.seed}" + (f"_se{args.special_pairs}" if args.special_pairs else "")
     out_dir = args.out or os.path.join(os.path.dirname(__file__), "..", "runs")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -231,7 +232,7 @@ def main():
     if do_eval:
         fe = tuple(int(x) for x in args.final_extrap.split(",") if x.strip()) or None
         final_eval, full_flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.final_mcq_n,
-                                         extrap_lengths=fe, device=DEV, dtype=dt)
+                                         extrap_lengths=fe, do_icl=True, device=DEV, dtype=dt)
         if wb:
             wb.log(full_flat, step=total_steps)
         print(f"  [final eval] {summarize(full_flat)}", flush=True)
