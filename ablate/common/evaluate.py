@@ -72,7 +72,11 @@ def evaluate(model, tokenizer, *, seq_len=1024, mcq_n=200, bpb_n=None, extrap_le
 
 
 def summarize(flat):
-    """One-line en/hi summary for the training log."""
+    """One-line en/hi summary for the training log (adds ICL slope/jump when present)."""
     g = lambda k: flat.get(k, float("nan"))
-    return (f"bpb hi={g('eval/bpb_hi'):.3f} en={g('eval/bpb_en'):.3f} | "
-            f"acc hi={g('eval/acc_hi'):.3f} en={g('eval/acc_en'):.3f}")
+    s = (f"bpb hi={g('eval/bpb_hi'):.3f} en={g('eval/bpb_en'):.3f} | "
+         f"acc hi={g('eval/acc_hi'):.3f} en={g('eval/acc_en'):.3f}")
+    if "eval/icl_slope_acc_en" in flat:
+        s += (f" | icl slope en={g('eval/icl_slope_acc_en'):.3f} hi={g('eval/icl_slope_acc_hi'):.3f}"
+              f" jump en={g('eval/icl_jump_acc_en'):.3f} hi={g('eval/icl_jump_acc_hi'):.3f}")
+    return s
