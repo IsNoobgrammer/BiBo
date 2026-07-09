@@ -156,6 +156,7 @@ def main():
     # names (they otherwise share arm+seed): e.g. bibo_min_seed2307_se1_conv5
     run_name = (f"{args.arm}_seed{args.seed}"
                 + (f"_se{args.special_pairs}" if args.special_pairs else "")
+                + ("_xsp" if args.balance_exclude_specials else "")
                 + (f"_conv{args.kernel_size}" if args.router_type == "conv" else ""))
     out_dir = args.out or os.path.join(os.path.dirname(__file__), "..", "runs")
     os.makedirs(out_dir, exist_ok=True)
