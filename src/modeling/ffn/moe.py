@@ -169,6 +169,7 @@ class BiBoMoELayer(nn.Module):
         self.bias_update_factor = config.bias_update_factor
         self.bias_update_threshold = config.bias_update_threshold
         self.load_balance_strategy = getattr(config, 'load_balance_strategy', 'none')
+        self.balance_exclude_specials = getattr(config, 'balance_exclude_specials', False)
 
         # Accumulated per-expert token counts for threshold-based bias updates (strategy="bias").
         self.register_buffer("accumulated_tpe", torch.zeros(config.num_routed_experts, dtype=torch.float))
@@ -207,9 +208,15 @@ class BiBoMoELayer(nn.Module):
             return
 
         tpe = tokens_per_expert.detach().float()
-        if self.num_routed_experts > 0:
-            mean_tpe = tpe.mean()
-            deviation = mean_tpe - tpe
+        # By default balance ALL routed experts. If balance_exclude_specials, balance ONLY the
+        # PolyGLU experts among themselves (the leading contiguous block [0, num_polyglu)) and leave
+        # the Identity/Zero biases frozen at 0 — so the router chooses specials from raw scores rather
+        # than being forced toward them by the load balancer. No-op when there are no specials.
+        n_balanced = self.experts.num_polyglu_experts if self.balance_exclude_specials else self.num_routed_experts
+        if n_balanced > 0:
+            balanced = tpe[:n_balanced]
+            deviation = torch.zeros_like(tpe)
+            deviation[:n_balanced] = balanced.mean() - balanced
         else:
             deviation = torch.zeros_like(tpe)
 

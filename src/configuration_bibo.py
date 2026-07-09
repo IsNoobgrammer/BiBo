@@ -73,6 +73,9 @@ class BiBoConfig(PretrainedConfig):
         load_balance_strategy="bias",  # "none" or "bias" (heuristic aux-loss-free bias updates)
         bias_update_factor=None,    # Auto: Hill function of num_routed_experts
         bias_update_threshold=8000,  # tokens between bias updates
+        balance_exclude_specials=False,  # if True, the bias balancer ignores Identity/Zero experts
+                                         # (balances GLU experts among themselves, freezes special biases
+                                         # at 0) so the router learns special usage instead of being forced
         **kwargs,
     ):
         # ── Core dimensions ──────────────────────────────────────
@@ -164,6 +167,7 @@ class BiBoConfig(PretrainedConfig):
 
         # bias_update_threshold: tokens to accumulate before applying a bias update
         self.bias_update_threshold = bias_update_threshold if bias_update_threshold is not None else 8000
+        self.balance_exclude_specials = balance_exclude_specials
 
         # rope_scaling: dynamic NTK-aware by default — identity within the trained window,
         # smooth base growth beyond it. type="none" for plain RoPE; factor=1.0 = pure dynamic.
