@@ -90,6 +90,8 @@ def main():
     ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free Identity/Zero pairs (specials = *2)
     ap.add_argument("--router_type", choices=["mlp", "conv"], default="mlp")       # BiBo router; conv -> sm120 fused-Triton conv kernel
     ap.add_argument("--kernel_size", type=int, default=3)                         # conv-router kernel width (only used when router_type=conv)
+    ap.add_argument("--use_ssmax", action="store_true")                           # ablation axis: SSMax scalable softmax (default OFF)
+    ap.add_argument("--use_xsa", action="store_true")                             # ablation axis: XSA exclusive self-attention (default OFF)
     ap.add_argument("--bias_update_threshold", type=int, default=10240)           # tokens between bias updates (if bias)
     ap.add_argument("--bias_update_factor", type=float, default=-1.0)             # <0 = auto Hill (~0.175 for 9 experts)
     ap.add_argument("--compile", action="store_true")           # torch.compile the transformer body
@@ -133,7 +135,8 @@ def main():
                            load_balance=args.load_balance, bias_update_threshold=args.bias_update_threshold,
                            bias_update_factor=(None if args.bias_update_factor < 0 else args.bias_update_factor),
                            aux_coef=args.aux_coef, polyglu_mult=args.polyglu_mult, special_pairs=args.special_pairs,
-                           router_type=args.router_type, kernel_size=args.kernel_size)
+                           router_type=args.router_type, kernel_size=args.kernel_size,
+                           use_ssmax=args.use_ssmax, use_xsa=args.use_xsa)
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
     total, trainable, active = count_params(model)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()

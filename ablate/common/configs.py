@@ -55,7 +55,8 @@ def make_qwen_config(attn_impl="sdpa", aux_coef=0.001, num_experts=None):
 
 
 def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_update_factor=None,
-                         polyglu_mult=3, special_pairs=0, router_type="mlp", kernel_size=3):
+                         polyglu_mult=3, special_pairs=0, router_type="mlp", kernel_size=3,
+                         use_ssmax=False, use_xsa=False):
     from src.configuration_bibo import BiBoConfig
     # DeepSeek-style aux-loss-free balancing pairs with SIGMOID gating (bias added to sigmoid scores);
     # with no balancing we use softmax (Qwen-matched). So gate_type follows load_balance.
@@ -76,7 +77,7 @@ def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_
         special_expert_pairs=special_pairs,      # param-FREE Identity/Zero pairs (specials = special_pairs*2); the extra to test
         partial_rotary_factor=PARTIAL_ROPE,
         # --- everything else stripped to Qwen-equivalence ---
-        use_xsa=False, use_ssmax=False,
+        use_xsa=use_xsa, use_ssmax=use_ssmax,    # ablation axes (default OFF): XSA + scalable-softmax
         add_full_attention_sink_bias=False, add_swa_attention_sink_bias=False,
         hybrid_layer_pattern=None,        # all-global attention (no SWA)
         router_type=router_type, gate_type=gate, router_activation="none",
