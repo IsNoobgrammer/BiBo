@@ -19,8 +19,14 @@ def token_batches(batch, seq_len, device, dataset=TRAIN_DATASET, synthetic=False
             yield torch.randint(0, vocab, (batch, seq_len + 1), generator=gen, device=device)
         return
     from datasets import load_dataset
+    import os, glob
+    # if `dataset` is a local dir of pre-downloaded .arrow shards, stream from DISK (robust — no HTTP
+    # range reads that time out; download them with hf_transfer/xet first). Else stream from the Hub.
+    local_files = sorted(glob.glob(os.path.join(dataset, "**", "*.arrow"), recursive=True)) \
+        if os.path.isdir(dataset) else None
     while True:                                    # loop the stream for multi-epoch token budgets
-        ds = load_dataset(dataset, split="train", streaming=True)
+        ds = (load_dataset("arrow", data_files=local_files, split="train", streaming=True)
+              if local_files else load_dataset(dataset, split="train", streaming=True))
         buf = []
         for ex in ds:
             ids = ex.get(field) or next(v for v in ex.values() if isinstance(v, list))
