@@ -147,8 +147,11 @@ def main():
     total_steps = args.max_steps or (args.tokens // tok_per_step)
     scheds = make_wsd(opts, total_steps, args.warmup_frac, args.decay_frac)
     amp = contextlib.nullcontext() if args.precision == "fp32" else torch.autocast("cuda", dtype=dt)
-    # include special_pairs so SE vs no-SE runs don't collide on ckpt/log/run names (they share arm+seed)
-    run_name = f"{args.arm}_seed{args.seed}" + (f"_se{args.special_pairs}" if args.special_pairs else "")
+    # include special_pairs + conv kernel so SE / conv-router variants don't collide on ckpt/log/run
+    # names (they otherwise share arm+seed): e.g. bibo_min_seed2307_se1_conv5
+    run_name = (f"{args.arm}_seed{args.seed}"
+                + (f"_se{args.special_pairs}" if args.special_pairs else "")
+                + (f"_conv{args.kernel_size}" if args.router_type == "conv" else ""))
     out_dir = args.out or os.path.join(os.path.dirname(__file__), "..", "runs")
     os.makedirs(out_dir, exist_ok=True)
 
