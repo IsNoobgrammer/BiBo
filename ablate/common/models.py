@@ -7,7 +7,7 @@ from . import patches
 
 def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
               load_balance="bias", bias_update_threshold=10240, bias_update_factor=None, aux_coef=0.001,
-              polyglu_mult=3, special_pairs=0):
+              polyglu_mult=3, special_pairs=0, router_type="mlp", kernel_size=3):
     """arm in {'qwen','bibo_min'} -> (model, config). Params in `dtype` (fp32 master; bf16 via autocast).
     Balancing (fair, each native): BiBo bias updates (load_balance/bias_update_*); Qwen Switch aux loss (aux_coef).
     PARAM MATCH: BiBo GLU experts = polyglu_mult*3; Qwen num_experts is set to the SAME so they're matched, and
@@ -21,7 +21,8 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
     elif arm == "bibo_min":
         from src.modeling.models import BiBoForCausalLM
         cfg = make_bibo_min_config(load_balance, bias_update_threshold, bias_update_factor,
-                                   polyglu_mult=polyglu_mult, special_pairs=special_pairs)
+                                   polyglu_mult=polyglu_mult, special_pairs=special_pairs,
+                                   router_type=router_type, kernel_size=kernel_size)
         model = BiBoForCausalLM(cfg)
         if eff.startswith("flash"):
             patches.patch_bibo_flash()

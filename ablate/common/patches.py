@@ -78,6 +78,31 @@ def patch_fused_moe():
     Qwen3MoeExperts.forward = _nc(_qwen_moe)
 
 
+# ───────────────────────── fused conv router (BiBo only) ─────────────────────────
+def patch_conv_router():
+    """Route BiBo's CONV router through the sm120 fused-Triton conv kernel (no cuDNN).
+    Only fires for router_type='conv' + gate_type='sigmoid' + router_activation='none' (the kernel's
+    hardcoded pipeline: causal conv -> sigmoid -> +bias select -> top-k -> unbiased gather -> norm/scale).
+    Any other config (mlp router, softmax gate, relu/silu activation) falls through to the eager forward,
+    so this is safe to apply unconditionally (no-op for the qwen arm / mlp router)."""
+    from kernels.sm120.router import fused_router
+    import src.modeling.ffn.router as rmod
+    R = rmod.BiBoMoERouter
+    _orig = getattr(R, "_orig_forward", None) or R.forward
+    R._orig_forward = _orig
+
+    def _fwd(self, hidden_states):
+        if (self.router_type == "conv" and self.gate_type == "sigmoid"
+                and self.router_activation == "none"):
+            idx, w = fused_router(hidden_states, self.gate_conv.weight, self.bias,
+                                  self.top_k, self.num_routed_experts,
+                                  norm_topk_prob=self.norm_topk_prob,
+                                  routed_scaling_factor=self.routed_scaling_factor)
+            return idx.long(), w.float()
+        return _orig(self, hidden_states)
+    R.forward = _nc(_fwd)
+
+
 # ───────────────────────── FlashAttention (both arms) ─────────────────────────
 def flash_available():
     try:
@@ -125,7 +150,8 @@ def patch_bibo_flash():
     base.full_attention = _wrapped
 
 
-_APPLY = {"liger_norm": patch_liger_norm, "liger_rope": patch_liger_rope, "moe": patch_fused_moe}
+_APPLY = {"liger_norm": patch_liger_norm, "liger_rope": patch_liger_rope, "moe": patch_fused_moe,
+          "router": patch_conv_router}
 
 
 def apply(components):
