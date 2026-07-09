@@ -94,7 +94,10 @@ def patch_conv_router():
     def _fwd(self, hidden_states):
         if (self.router_type == "conv" and self.gate_type == "sigmoid"
                 and self.router_activation == "none"):
-            idx, w = fused_router(hidden_states, self.gate_conv.weight, self.bias,
+            # cast fp32 master conv weight to the (bf16 under autocast) input dtype so the kernel's
+            # tl.dot sees matching operands; the .to() is differentiable -> grad flows back to fp32 weight
+            w_conv = self.gate_conv.weight.to(hidden_states.dtype)
+            idx, w = fused_router(hidden_states, w_conv, self.bias,
                                   self.top_k, self.num_routed_experts,
                                   norm_topk_prob=self.norm_topk_prob,
                                   routed_scaling_factor=self.routed_scaling_factor)
