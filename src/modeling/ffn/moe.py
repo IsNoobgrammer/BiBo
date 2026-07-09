@@ -55,12 +55,14 @@ class BiBoFusedExperts(nn.Module):
         # Activation for expert e is _POLYGLU_ACTIVATIONS[e % 3]
         # (layout: [SiLU_0, ReLU²_0, NormSiLU_0, SiLU_1, ReLU²_1, NormSiLU_1, ...]) — single source of truth.
 
-        # Identity indices: [num_polyglu, num_polyglu + pairs)
-        # Zero indices: [num_polyglu + pairs, num_routed)
+        # GLU-first layout, then an Identity block, then a Zero block. Each special type is enabled
+        # independently (identity_expert / zero_expert) so a disabled type is simply a zero-width block.
+        num_identity = getattr(config, "num_identity_experts", self.special_expert_pairs)
+        num_zero = getattr(config, "num_zero_experts", self.special_expert_pairs)
         self.identity_start = self.num_polyglu_experts
-        self.identity_end = self.num_polyglu_experts + self.special_expert_pairs
+        self.identity_end = self.identity_start + num_identity
         self.zero_start = self.identity_end
-        self.zero_end = self.num_routed_experts
+        self.zero_end = self.zero_start + num_zero
 
     @torch._dynamo.disable
     def forward(

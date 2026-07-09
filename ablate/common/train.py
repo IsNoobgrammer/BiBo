@@ -87,7 +87,9 @@ def main():
     ap.add_argument("--load_balance", choices=["none", "bias"], default="bias")   # BiBo: bias=DeepSeek sigmoid+balance; none=softmax
     ap.add_argument("--aux_coef", type=float, default=0.001)                      # Qwen aux load-balancing loss coef (0=off; paper 0.001)
     ap.add_argument("--polyglu_mult", type=int, default=3)                        # BiBo GLU experts = polyglu_mult*3 (= Qwen num_experts)
-    ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free Identity/Zero pairs (specials = *2)
+    ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free special experts, per-type count
+    ap.add_argument("--no_identity_expert", dest="identity_expert", action="store_false")  # drop Identity (code 3); test Zero alone
+    ap.add_argument("--no_zero_expert", dest="zero_expert", action="store_false")          # drop Zero (code 4); test Identity alone
     ap.add_argument("--router_type", choices=["mlp", "conv"], default="mlp")       # BiBo router; conv -> sm120 fused-Triton conv kernel
     ap.add_argument("--kernel_size", type=int, default=3)                         # conv-router kernel width (only used when router_type=conv)
     ap.add_argument("--use_ssmax", action="store_true")                           # ablation axis: SSMax scalable softmax (default OFF)
@@ -138,7 +140,8 @@ def main():
                            aux_coef=args.aux_coef, polyglu_mult=args.polyglu_mult, special_pairs=args.special_pairs,
                            router_type=args.router_type, kernel_size=args.kernel_size,
                            use_ssmax=args.use_ssmax, use_xsa=args.use_xsa,
-                           balance_exclude_specials=args.balance_exclude_specials)
+                           balance_exclude_specials=args.balance_exclude_specials,
+                           identity_expert=args.identity_expert, zero_expert=args.zero_expert)
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
     total, trainable, active = count_params(model)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
@@ -156,6 +159,8 @@ def main():
     # names (they otherwise share arm+seed): e.g. bibo_min_seed2307_se1_conv5
     run_name = (f"{args.arm}_seed{args.seed}"
                 + (f"_se{args.special_pairs}" if args.special_pairs else "")
+                + (("_idonly" if not args.zero_expert else "") if args.special_pairs else "")
+                + (("_zeroonly" if not args.identity_expert else "") if args.special_pairs else "")
                 + ("_xsp" if args.balance_exclude_specials else "")
                 + (f"_conv{args.kernel_size}" if args.router_type == "conv" else ""))
     out_dir = args.out or os.path.join(os.path.dirname(__file__), "..", "runs")

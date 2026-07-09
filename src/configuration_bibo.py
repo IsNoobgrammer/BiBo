@@ -58,7 +58,9 @@ class BiBoConfig(PretrainedConfig):
         moe_intermediate_size=None,  # Auto: intermediate_size // num_experts_per_tok
         num_experts_per_tok=6,
         polyglu_expert_multiplier=2,  # Groups of 3 (SiLU, ReLU², NormSiLU) GLU experts
-        special_expert_pairs=1,       # Pairs of (Identity, Zero) experts
+        special_expert_pairs=1,       # Count of special experts PER TYPE (see identity_expert/zero_expert)
+        identity_expert=True,         # include the Identity special expert(s) (code 3, param-free passthrough)
+        zero_expert=True,             # include the Zero special expert(s)     (code 4, param-free drop)
         # ── Shared expert ────────────────────────────────────────
         use_shared_expert=False,    # Off by default (param-match Qwen3MoE — no shared expert)
         shared_expert_type="mlp",   # "mlp" (SwiGLU, like Qwen) or "conv" (CausalConv1D)
@@ -123,8 +125,15 @@ class BiBoConfig(PretrainedConfig):
         self.num_experts_per_tok = num_experts_per_tok
         self.polyglu_expert_multiplier = polyglu_expert_multiplier
         self.special_expert_pairs = special_expert_pairs
-        # experts = polyglu_multiplier * 3 (SiLU, ReLU², NormSiLU) + special_pairs * 2 (Identity, Zero)
-        self.num_routed_experts = (polyglu_expert_multiplier * 3) + (special_expert_pairs * 2)
+        self.identity_expert = identity_expert
+        self.zero_expert = zero_expert
+        # Identity/Zero enabled independently so each type can be ablated alone. special_expert_pairs is
+        # the per-type count; a disabled type contributes 0 experts. Layout stays GLU-first (kernel
+        # weight slot = expert index for GLU), then Identity block, then Zero block.
+        self.num_identity_experts = special_expert_pairs if identity_expert else 0
+        self.num_zero_experts = special_expert_pairs if zero_expert else 0
+        # experts = polyglu_multiplier * 3 (SiLU, ReLU², NormSiLU) + Identity block + Zero block
+        self.num_routed_experts = (polyglu_expert_multiplier * 3) + self.num_identity_experts + self.num_zero_experts
 
         # ── Shared expert ────────────────────────────────────────
         self.use_shared_expert = use_shared_expert

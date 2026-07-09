@@ -56,7 +56,8 @@ def make_qwen_config(attn_impl="sdpa", aux_coef=0.001, num_experts=None):
 
 def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_update_factor=None,
                          polyglu_mult=3, special_pairs=0, router_type="mlp", kernel_size=3,
-                         use_ssmax=False, use_xsa=False, balance_exclude_specials=False):
+                         use_ssmax=False, use_xsa=False, balance_exclude_specials=False,
+                         identity_expert=True, zero_expert=True):
     from src.configuration_bibo import BiBoConfig
     # DeepSeek-style aux-loss-free balancing pairs with SIGMOID gating (bias added to sigmoid scores);
     # with no balancing we use softmax (Qwen-matched). So gate_type follows load_balance.
@@ -75,7 +76,9 @@ def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_
         tie_word_embeddings=SHARED["tie_word_embeddings"], norm_topk_prob=SHARED["norm_topk_prob"],
         # --- the ablation delta: PolyGLU experts + partial RoPE ---
         polyglu_expert_multiplier=polyglu_mult,  # GLU experts = polyglu_mult*3 (silu/relu2/normsilu); == Qwen num_experts
-        special_expert_pairs=special_pairs,      # param-FREE Identity/Zero pairs (specials = special_pairs*2); the extra to test
+        special_expert_pairs=special_pairs,      # per-type count of param-FREE special experts
+        identity_expert=identity_expert,         # ablation: include Identity special expert(s) (code 3)
+        zero_expert=zero_expert,                 # ablation: include Zero special expert(s)     (code 4)
         partial_rotary_factor=PARTIAL_ROPE,
         # --- everything else stripped to Qwen-equivalence ---
         use_xsa=use_xsa, use_ssmax=use_ssmax,    # ablation axes (default OFF): XSA + scalable-softmax
