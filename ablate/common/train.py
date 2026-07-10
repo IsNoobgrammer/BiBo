@@ -74,6 +74,21 @@ def _measure_peak_tflops(device, dtype, n=8192, iters=30):
     return (2 * n ** 3 * iters) / (time.time() - t) / 1e12
 
 
+@torch.no_grad()
+def _expert_corr(model):
+    """Mean cross-expert off-diagonal |cosine| over the 3D MoE expert stacks (0 = orthogonal experts,
+    1 = identical). Diagnostic for xorth: does whitening actually decorrelate the experts over training?"""
+    vals = []
+    for n, p in model.named_parameters():
+        if p.ndim == 3 and ("expert" in n or "gate_up_proj" in n or "down_proj" in n) and p.shape[0] > 1:
+            e = p.shape[0]
+            x = p.detach().reshape(e, -1).float()
+            x = x / x.norm(dim=1, keepdim=True).clamp_min(1e-12)
+            m = x @ x.t()
+            vals.append((m - torch.diag(torch.diagonal(m))).abs().sum().item() / (e * e - e))
+    return sum(vals) / len(vals) if vals else 0.0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", choices=["qwen", "bibo_min"], required=True)
@@ -239,14 +254,19 @@ def main():
             elapsed = _now - t0                                                # total wall time so far
             eta = (total_steps - step - 1) * elapsed / max(step + 1, 1)        # est. time remaining
             fin = math.isfinite(lv)
+            ecorr = _expert_corr(model) if args.xorth_post > 0 else None   # log expert redundancy when xorth on
             print(f"  step {step}/{total_steps} loss={lv:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
+                  f"{f'xcorr={ecorr:.4f} ' if ecorr is not None else ''}"
                   f"elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"
                   f"{'' if fin else '  <<NON-FINITE>>'}", flush=True)
             if wb:
-                wb.log({"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "train/ms_per_step": ms_per_step,
-                        "train/tps": tps, "train/mfu": mfu, "train/mem_gb": mem, "train/elapsed_s": elapsed,
-                        "tokens": toks}, step=step)
+                _wl = {"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "train/ms_per_step": ms_per_step,
+                       "train/tps": tps, "train/mfu": mfu, "train/mem_gb": mem, "train/elapsed_s": elapsed,
+                       "tokens": toks}
+                if ecorr is not None:
+                    _wl["train/expert_corr"] = ecorr
+                wb.log(_wl, step=step)
         if do_eval and step % args.eval_every == 0:            # periodic eval -> W&B curves
             _, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.eval_mcq_n, bpb_n=args.eval_bpb_n,
                                extrap_lengths=ev_extrap, do_samples=False,
