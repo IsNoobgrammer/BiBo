@@ -116,6 +116,11 @@ def main():
     ap.add_argument("--peak_tflops", type=float, default=0.0)   # MFU denominator: 0=auto-measure achievable GEMM;
     #                                                             else theoretical, e.g. 480 (dense bf16) / 960 (sparse)
     ap.add_argument("--patches", default="liger_norm,liger_rope,ce,moe")
+    ap.add_argument("--optimizer", choices=["muon", "manas"], default="muon")  # manas = Muon + long-memory lookahead probe
+    ap.add_argument("--probe_gamma", type=float, default=0.08)     # Manas probe step (couples to LR/geometry)
+    ap.add_argument("--probe_rho", type=float, default=0.98)       # Manas probe memory (SAMPLES; re-derive for batch size)
+    ap.add_argument("--manas_rank", type=int, default=8)           # Manas low-rank probe rank
+    ap.add_argument("--probe_warmup_steps", type=int, default=0)   # skip probe (d) accumulation for first N steps
     ap.add_argument("--muon_scale_mode", choices=["polar", "normuon", "aurora", "aurora_ema", "aurora_ema_v2"],
                     default="aurora")  # post-NS row scaling; EMA variants: normuon / aurora_ema / aurora_ema_v2
     ap.add_argument("--xorth_post", type=float, default=0.0)       # cross-expert whitening MAX strength (0=off), scoped to MoE expert stacks
@@ -170,7 +175,11 @@ def main():
     opts, n_mat, n_oth = build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt,
                                           scale_mode=args.muon_scale_mode, xorth_post=args.xorth_post,
                                           xorth_gate_ref=args.xorth_gate_ref, xorth_ema=args.xorth_ema,
-                                          xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where)
+                                          xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where,
+                                          optimizer=args.optimizer, probe_gamma=args.probe_gamma,
+                                          probe_rho=args.probe_rho, manas_rank=args.manas_rank,
+                                          probe_warmup_steps=args.probe_warmup_steps)
+    manas = opts[0] if args.optimizer == "manas" else None   # needs probe() around fwd/bwd (see loop)
     if args.compile:                                            # compile the transformer body only; the
         model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
         print(f"[{args.arm}_seed{args.seed}] torch.compile(model.model) on; fused CE + liger/moe/flash kernels stay eager",
@@ -188,6 +197,8 @@ def main():
                 + (("_zeroonly" if not args.identity_expert else "") if args.special_pairs else "")
                 + ("_xsp" if args.balance_exclude_specials else "")
                 + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")
+                + (f"_manas_g{args.probe_gamma:g}r{args.probe_rho:g}" + (f"w{args.probe_warmup_steps}" if args.probe_warmup_steps else "")
+                   if args.optimizer == "manas" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + (f"_conv{args.kernel_size}" if args.router_type == "conv" else ""))
     out_dir = args.out or os.path.join(os.path.dirname(__file__), "..", "runs")
@@ -227,13 +238,17 @@ def main():
         for o in opts:
             o.zero_grad(set_to_none=True)
         loss_val = 0.0
-        for _ in range(args.grad_accum):                 # gradient accumulation -> global batch
-            ids = next(gen)
-            with amp:
-                loss = _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
-                           getattr(cfg, "num_experts", 9), cfg.num_experts_per_tok) / args.grad_accum
-            loss.backward()
-            loss_val += loss.item()
+        # Manas: run fwd/bwd at theta+d (probe); step() below applies the Muon update on the probe-point
+        # grads + updates d. No-op for plain Muon (nullcontext). The probe is applied ONCE around all
+        # grad_accum micro-batches, then removed before grad-clip/step.
+        with (manas.probe() if manas is not None else contextlib.nullcontext()):
+            for _ in range(args.grad_accum):                 # gradient accumulation -> global batch
+                ids = next(gen)
+                with amp:
+                    loss = _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
+                               getattr(cfg, "num_experts", 9), cfg.num_experts_per_tok) / args.grad_accum
+                loss.backward()
+                loss_val += loss.item()
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) if args.grad_clip > 0 else \
             torch.sqrt(sum(p.grad.float().pow(2).sum() for p in model.parameters() if p.grad is not None))
         for o in opts:

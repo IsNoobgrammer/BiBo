@@ -9,7 +9,8 @@ NS8 = (_KJ,) * 6 + (_PIN,) * 2
 
 def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, ns_dtype=torch.bfloat16,
                      scale_mode="aurora", xorth_post=0.0, xorth_gate_ref=0.3, xorth_ema=0.95,
-                     xorth_warmup_steps=0, xorth_where="post"):
+                     xorth_warmup_steps=0, xorth_where="post",
+                     optimizer="muon", probe_gamma=0.08, probe_rho=0.98, manas_rank=8, probe_warmup_steps=0):
     from kernels.sm120.muon import FusedMuon   # Blackwell: gram-NS (self-gates to symmul/cuBLAS on small mats) + 8M knee
     stacks, mats, other = [], [], []
     for n, p in model.named_parameters():
@@ -33,9 +34,20 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
         groups.append({"params": stacks, "xorth_post": xorth_post})
     if mats:
         groups.append({"params": mats, "xorth_post": 0.0})
-    muon = FusedMuon(groups, lr=muon_lr, momentum=momentum, weight_decay=wd,
-                     coeffs=NS8, ns_dtype=ns_dtype, aurora_k=1, gram_restarts=[4, 5], scale_mode=scale_mode,
-                     xorth_post=xorth_post, xorth_gate_ref=xorth_gate_ref, xorth_ema=xorth_ema,
-                     xorth_warmup_steps=xorth_warmup_steps, xorth_where=xorth_where)
+    _xo = dict(xorth_post=xorth_post, xorth_gate_ref=xorth_gate_ref, xorth_ema=xorth_ema,
+               xorth_warmup_steps=xorth_warmup_steps, xorth_where=xorth_where)
+    if optimizer == "manas":
+        # Manas = Muon + long-memory momentum-free lookahead PROBE. sm75-based (subclasses sm75 FusedMuon);
+        # at 137M the NS self-gates to cuBLAS so it matches sm120 numerically. ns_dtype=bf16 (NEVER fp16 on
+        # Blackwell). REQUIRES the train loop to wrap fwd/bwd in `with muon.probe():` (else lookahead is a no-op).
+        from kernels.sm75.manas import ManasOptimizer
+        muon = ManasOptimizer(groups, lr=muon_lr, momentum=momentum, weight_decay=wd,
+                              ns_dtype=ns_dtype, scale_mode=scale_mode, aurora_k=1,
+                              probe_gamma=probe_gamma, probe_rho=probe_rho, probe_rank=manas_rank,
+                              probe_warmup_steps=probe_warmup_steps, comp=None, **_xo)
+    else:
+        muon = FusedMuon(groups, lr=muon_lr, momentum=momentum, weight_decay=wd,
+                         coeffs=NS8, ns_dtype=ns_dtype, aurora_k=1, gram_restarts=[4, 5], scale_mode=scale_mode,
+                         **_xo)
     adamw = torch.optim.AdamW(other, lr=adam_lr, weight_decay=wd)
     return [muon, adamw], len(stacks) + len(mats), len(other)
