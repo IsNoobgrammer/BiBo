@@ -121,6 +121,7 @@ def main():
     ap.add_argument("--probe_rho", type=float, default=0.98)       # Manas probe memory (SAMPLES; re-derive for batch size)
     ap.add_argument("--manas_rank", type=int, default=8)           # Manas low-rank probe rank
     ap.add_argument("--probe_warmup_steps", type=int, default=0)   # skip probe (d) accumulation for first N steps
+    ap.add_argument("--manas_comp", type=float, default=0.0)       # Manas U buffer strength in units of gamma (0=off; +1=extend, toy champ)
     ap.add_argument("--muon_scale_mode", choices=["polar", "normuon", "aurora", "aurora_ema", "aurora_ema_v2"],
                     default="aurora")  # post-NS row scaling; EMA variants: normuon / aurora_ema / aurora_ema_v2
     ap.add_argument("--xorth_post", type=float, default=0.0)       # cross-expert whitening MAX strength (0=off), scoped to MoE expert stacks
@@ -178,7 +179,7 @@ def main():
                                           xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where,
                                           optimizer=args.optimizer, probe_gamma=args.probe_gamma,
                                           probe_rho=args.probe_rho, manas_rank=args.manas_rank,
-                                          probe_warmup_steps=args.probe_warmup_steps)
+                                          probe_warmup_steps=args.probe_warmup_steps, manas_comp=args.manas_comp)
     manas = opts[0] if args.optimizer == "manas" else None   # needs probe() around fwd/bwd (see loop)
     if args.compile:                                            # compile the transformer body only; the
         model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
@@ -198,6 +199,7 @@ def main():
                 + ("_xsp" if args.balance_exclude_specials else "")
                 + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")
                 + (f"_manas_g{args.probe_gamma:g}r{args.probe_rho:g}" + (f"w{args.probe_warmup_steps}" if args.probe_warmup_steps else "")
+                   + (f"c{args.manas_comp:g}" if args.manas_comp else "")
                    if args.optimizer == "manas" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + (f"_conv{args.kernel_size}" if args.router_type == "conv" else ""))
