@@ -124,6 +124,7 @@ def main():
     ap.add_argument("--manas_comp", type=float, default=0.0)       # Manas U buffer strength in units of gamma (0=off; +1=extend, toy champ)
     ap.add_argument("--rgd_tau", type=float, default=0.0)          # RGD loss-weighted probe voting (0=off/equal votes; e.g. 3.0)
     ap.add_argument("--probe_norm", choices=["global", "perparam"], default="global")  # probe grad-norm: global scalar | per-matrix (muP-ish)
+    ap.add_argument("--cos_beta", type=float, default=0.0)         # cos(g,d) vote weight: 0=off/equal; +sharpen agreeing, -favor novelty
     ap.add_argument("--muon_scale_mode", choices=["polar", "normuon", "aurora", "aurora_ema", "aurora_ema_v2"],
                     default="aurora")  # post-NS row scaling; EMA variants: normuon / aurora_ema / aurora_ema_v2
     ap.add_argument("--xorth_post", type=float, default=0.0)       # cross-expert whitening MAX strength (0=off), scoped to MoE expert stacks
@@ -182,7 +183,8 @@ def main():
                                           optimizer=args.optimizer, probe_gamma=args.probe_gamma,
                                           probe_rho=args.probe_rho, manas_rank=args.manas_rank,
                                           probe_warmup_steps=args.probe_warmup_steps, manas_comp=args.manas_comp,
-                                          rgd_tau=(args.rgd_tau or None), probe_norm=args.probe_norm)
+                                          rgd_tau=(args.rgd_tau or None), probe_norm=args.probe_norm,
+                                          cos_beta=args.cos_beta)
     manas = opts[0] if args.optimizer == "manas" else None   # needs probe() around fwd/bwd (see loop)
     if args.compile:                                            # compile the transformer body only; the
         model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
@@ -205,6 +207,7 @@ def main():
                    + (f"c{args.manas_comp:g}" if args.manas_comp else "")
                    + (f"rgd{args.rgd_tau:g}" if args.rgd_tau else "")
                    + ("pp" if args.probe_norm == "perparam" else "")
+                   + (f"cb{args.cos_beta:g}" if args.cos_beta else "")
                    if args.optimizer == "manas" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + (f"_conv{args.kernel_size}" if args.router_type == "conv" else ""))
