@@ -57,6 +57,8 @@ def evaluate(model, tokenizer, *, seq_len=1024, mcq_n=200, bpb_n=None, extrap_le
 
     flat = {f"eval/bpb_{k}": v for k, v in res["bpb"]["per_language"].items()}
     flat["eval/bpb_overall"] = res["bpb"]["overall"]
+    # per-subset bpb (each benchmark source), grouped by language -> eval/bpb/<lang>/<source>
+    flat.update({f"eval/bpb/{d['lang']}/{name}": d["bpb"] for name, d in res["bpb"]["per_source"].items()})
     flat.update({f"eval/acc_{k}": d["acc"] for k, d in res["mcq"]["per_language"].items()})
     it = res["interp"]
     flat.update({"eval/expert_balance_entropy": it["balance_entropy"], "eval/max_expert_load": it["max_expert_load"],
