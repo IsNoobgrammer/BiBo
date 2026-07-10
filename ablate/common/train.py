@@ -122,6 +122,8 @@ def main():
     ap.add_argument("--manas_rank", type=int, default=8)           # Manas low-rank probe rank
     ap.add_argument("--probe_warmup_steps", type=int, default=0)   # skip probe (d) accumulation for first N steps
     ap.add_argument("--manas_comp", type=float, default=0.0)       # Manas U buffer strength in units of gamma (0=off; +1=extend, toy champ)
+    ap.add_argument("--rgd_tau", type=float, default=0.0)          # RGD loss-weighted probe voting (0=off/equal votes; e.g. 3.0)
+    ap.add_argument("--probe_norm", choices=["global", "perparam"], default="global")  # probe grad-norm: global scalar | per-matrix (muP-ish)
     ap.add_argument("--muon_scale_mode", choices=["polar", "normuon", "aurora", "aurora_ema", "aurora_ema_v2"],
                     default="aurora")  # post-NS row scaling; EMA variants: normuon / aurora_ema / aurora_ema_v2
     ap.add_argument("--xorth_post", type=float, default=0.0)       # cross-expert whitening MAX strength (0=off), scoped to MoE expert stacks
@@ -179,7 +181,8 @@ def main():
                                           xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where,
                                           optimizer=args.optimizer, probe_gamma=args.probe_gamma,
                                           probe_rho=args.probe_rho, manas_rank=args.manas_rank,
-                                          probe_warmup_steps=args.probe_warmup_steps, manas_comp=args.manas_comp)
+                                          probe_warmup_steps=args.probe_warmup_steps, manas_comp=args.manas_comp,
+                                          rgd_tau=(args.rgd_tau or None), probe_norm=args.probe_norm)
     manas = opts[0] if args.optimizer == "manas" else None   # needs probe() around fwd/bwd (see loop)
     if args.compile:                                            # compile the transformer body only; the
         model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
@@ -200,6 +203,8 @@ def main():
                 + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")
                 + (f"_manas_g{args.probe_gamma:g}r{args.probe_rho:g}" + (f"w{args.probe_warmup_steps}" if args.probe_warmup_steps else "")
                    + (f"c{args.manas_comp:g}" if args.manas_comp else "")
+                   + (f"rgd{args.rgd_tau:g}" if args.rgd_tau else "")
+                   + ("pp" if args.probe_norm == "perparam" else "")
                    if args.optimizer == "manas" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + (f"_conv{args.kernel_size}" if args.router_type == "conv" else ""))
@@ -254,7 +259,7 @@ def main():
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) if args.grad_clip > 0 else \
             torch.sqrt(sum(p.grad.float().pow(2).sum() for p in model.parameters() if p.grad is not None))
         for o in opts:
-            o.step()
+            o.step(probe_loss=loss_val) if o is manas else o.step()   # probe_loss needed iff rgd_tau set; ignored otherwise
         for s in scheds:
             s.step()
         if step % args.log_every == 0 or step == total_steps - 1:
