@@ -106,6 +106,8 @@ def main():
     ap.add_argument("--xorth_post", type=float, default=0.0)       # cross-expert whitening MAX strength (0=off), scoped to MoE expert stacks
     ap.add_argument("--xorth_gate_ref", type=float, default=0.3)   # correlation gate: full whitening at off-diag RMS>=this; below it ramps to ~0; <=0 disables gate
     ap.add_argument("--xorth_ema", type=float, default=0.95)       # EMA decay of the persistent per-stack (E,E) gram
+    ap.add_argument("--xorth_warmup_steps", type=int, default=0)   # gate xorth OFF until step > this (0 = active from step 1)
+    ap.add_argument("--xorth_where", choices=["pre", "post"], default="post")  # whiten momentum PRE-NS or orthogonalized update POST-NS
     ap.add_argument("--muon_lr", type=float, default=3e-4)
     ap.add_argument("--adam_lr", type=float, default=3e-4)
     ap.add_argument("--wd", type=float, default=0.1)
@@ -152,7 +154,8 @@ def main():
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
     opts, n_mat, n_oth = build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt,
                                           scale_mode=args.muon_scale_mode, xorth_post=args.xorth_post,
-                                          xorth_gate_ref=args.xorth_gate_ref, xorth_ema=args.xorth_ema)
+                                          xorth_gate_ref=args.xorth_gate_ref, xorth_ema=args.xorth_ema,
+                                          xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where)
     if args.compile:                                            # compile the transformer body only; the
         model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
         print(f"[{args.arm}_seed{args.seed}] torch.compile(model.model) on; fused CE + liger/moe/flash kernels stay eager",
@@ -170,7 +173,7 @@ def main():
                 + (("_zeroonly" if not args.identity_expert else "") if args.special_pairs else "")
                 + ("_xsp" if args.balance_exclude_specials else "")
                 + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")
-                + (f"_xo{args.xorth_post:g}" if args.xorth_post > 0 else "")
+                + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + (f"_conv{args.kernel_size}" if args.router_type == "conv" else ""))
     out_dir = args.out or os.path.join(os.path.dirname(__file__), "..", "runs")
     os.makedirs(out_dir, exist_ok=True)

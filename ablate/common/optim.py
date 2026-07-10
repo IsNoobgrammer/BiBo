@@ -8,7 +8,8 @@ NS8 = (_KJ,) * 6 + (_PIN,) * 2
 
 
 def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, ns_dtype=torch.bfloat16,
-                     scale_mode="aurora", xorth_post=0.0, xorth_gate_ref=0.3, xorth_ema=0.95):
+                     scale_mode="aurora", xorth_post=0.0, xorth_gate_ref=0.3, xorth_ema=0.95,
+                     xorth_warmup_steps=0, xorth_where="post"):
     from kernels.sm120.muon import FusedMuon   # Blackwell: gram-NS (self-gates to symmul/cuBLAS on small mats) + 8M knee
     stacks, mats, other = [], [], []
     for n, p in model.named_parameters():
@@ -34,6 +35,7 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
         groups.append({"params": mats, "xorth_post": 0.0})
     muon = FusedMuon(groups, lr=muon_lr, momentum=momentum, weight_decay=wd,
                      coeffs=NS8, ns_dtype=ns_dtype, aurora_k=1, gram_restarts=[4, 5], scale_mode=scale_mode,
-                     xorth_post=xorth_post, xorth_gate_ref=xorth_gate_ref, xorth_ema=xorth_ema)
+                     xorth_post=xorth_post, xorth_gate_ref=xorth_gate_ref, xorth_ema=xorth_ema,
+                     xorth_warmup_steps=xorth_warmup_steps, xorth_where=xorth_where)
     adamw = torch.optim.AdamW(other, lr=adam_lr, weight_decay=wd)
     return [muon, adamw], len(stacks) + len(mats), len(other)
