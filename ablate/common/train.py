@@ -254,19 +254,15 @@ def main():
             elapsed = _now - t0                                                # total wall time so far
             eta = (total_steps - step - 1) * elapsed / max(step + 1, 1)        # est. time remaining
             fin = math.isfinite(lv)
-            ecorr = _expert_corr(model) if args.xorth_post > 0 else None   # log expert redundancy when xorth on
+            ecorr = _expert_corr(model)                                    # cross-expert redundancy — logged every run
             print(f"  step {step}/{total_steps} loss={lv:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
-                  f"{f'xcorr={ecorr:.4f} ' if ecorr is not None else ''}"
-                  f"elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"
+                  f"xcorr={ecorr:.4f} elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"
                   f"{'' if fin else '  <<NON-FINITE>>'}", flush=True)
             if wb:
-                _wl = {"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "train/ms_per_step": ms_per_step,
-                       "train/tps": tps, "train/mfu": mfu, "train/mem_gb": mem, "train/elapsed_s": elapsed,
-                       "tokens": toks}
-                if ecorr is not None:
-                    _wl["train/expert_corr"] = ecorr
-                wb.log(_wl, step=step)
+                wb.log({"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "train/ms_per_step": ms_per_step,
+                        "train/tps": tps, "train/mfu": mfu, "train/mem_gb": mem, "train/elapsed_s": elapsed,
+                        "train/expert_corr": ecorr, "tokens": toks}, step=step)
         if do_eval and step % args.eval_every == 0:            # periodic eval -> W&B curves
             _, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.eval_mcq_n, bpb_n=args.eval_bpb_n,
                                extrap_lengths=ev_extrap, do_samples=False,
