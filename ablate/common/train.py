@@ -125,6 +125,8 @@ def main():
     ap.add_argument("--rgd_tau", type=float, default=0.0)          # RGD loss-weighted probe voting (0=off/equal votes; e.g. 3.0)
     ap.add_argument("--probe_norm", choices=["global", "perparam"], default="global")  # probe grad-norm: global scalar | per-matrix (muP-ish)
     ap.add_argument("--cos_beta", type=float, default=0.0)         # cos(g,d) vote weight: 0=off/equal; +sharpen agreeing, -favor novelty
+    ap.add_argument("--micro_vote", action="store_true")           # manas: one probe vote per MICRO-batch (rho binds to micro batch); needs low-rank probe
+    ap.add_argument("--nexus_gamma", type=float, default=0.0)      # manas: common-basin walker strength (needs --micro_vote); ceiling = nexus_gamma*grad_accum
     ap.add_argument("--muon_scale_mode", choices=["polar", "normuon", "aurora", "aurora_ema", "aurora_ema_v2"],
                     default="aurora")  # post-NS row scaling; EMA variants: normuon / aurora_ema / aurora_ema_v2
     ap.add_argument("--xorth_post", type=float, default=0.0)       # cross-expert whitening MAX strength (0=off), scoped to MoE expert stacks
@@ -184,7 +186,8 @@ def main():
                                           probe_rho=args.probe_rho, manas_rank=args.manas_rank,
                                           probe_warmup_steps=args.probe_warmup_steps, manas_comp=args.manas_comp,
                                           rgd_tau=(args.rgd_tau or None), probe_norm=args.probe_norm,
-                                          cos_beta=args.cos_beta)
+                                          cos_beta=args.cos_beta, micro_vote=args.micro_vote,
+                                          nexus_gamma=args.nexus_gamma)
     manas = opts[0] if args.optimizer == "manas" else None   # needs probe() around fwd/bwd (see loop)
     if args.compile:                                            # compile the transformer body only; the
         model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
@@ -208,6 +211,8 @@ def main():
                    + (f"rgd{args.rgd_tau:g}" if args.rgd_tau else "")
                    + ("pp" if args.probe_norm == "perparam" else "")
                    + (f"cb{args.cos_beta:g}" if args.cos_beta else "")
+                   + ("mv" if args.micro_vote else "")
+                   + (f"nx{args.nexus_gamma:g}" if args.nexus_gamma else "")
                    if args.optimizer == "manas" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + (f"_conv{args.kernel_size}" if args.router_type == "conv" else ""))
@@ -248,17 +253,21 @@ def main():
         for o in opts:
             o.zero_grad(set_to_none=True)
         loss_val = 0.0
-        # Manas: run fwd/bwd at theta+d (probe); step() below applies the Muon update on the probe-point
-        # grads + updates d. No-op for plain Muon (nullcontext). The probe is applied ONCE around all
-        # grad_accum micro-batches, then removed before grad-clip/step.
-        with (manas.probe() if manas is not None else contextlib.nullcontext()):
-            for _ in range(args.grad_accum):                 # gradient accumulation -> global batch
-                ids = next(gen)
+        # Manas: run each micro-batch's fwd/bwd at theta+d (probe), then vote() OUTSIDE the probe so d
+        # (and the nexus walker) advance per micro-batch; step() below applies the Muon update on the
+        # accumulated probe-point grads. vote() is a no-op when micro_vote=False -> the same loop runs
+        # both modes, and step-voting is numerically unchanged (d is constant within a step, so per-micro
+        # apply/remove == one probe around all micros). Plain Muon uses nullcontext + no vote.
+        for _ in range(args.grad_accum):                     # gradient accumulation -> global batch
+            ids = next(gen)
+            with (manas.probe() if manas is not None else contextlib.nullcontext()):
                 with amp:
                     loss = _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
                                getattr(cfg, "num_experts", 9), cfg.num_experts_per_tok) / args.grad_accum
                 loss.backward()
-                loss_val += loss.item()
+            loss_val += loss.item()
+            if manas is not None:
+                manas.vote()                                 # no-op unless micro_vote=True
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) if args.grad_clip > 0 else \
             torch.sqrt(sum(p.grad.float().pow(2).sum() for p in model.parameters() if p.grad is not None))
         for o in opts:
