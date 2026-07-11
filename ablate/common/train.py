@@ -127,6 +127,7 @@ def main():
     ap.add_argument("--cos_beta", type=float, default=0.0)         # cos(g,d) vote weight: 0=off/equal; +sharpen agreeing, -favor novelty
     ap.add_argument("--micro_vote", action="store_true")           # manas: one probe vote per MICRO-batch (rho binds to micro batch); needs low-rank probe
     ap.add_argument("--nexus_gamma", type=float, default=0.0)      # manas: common-basin walker strength (needs --micro_vote); ceiling = nexus_gamma*grad_accum
+    ap.add_argument("--probe_rho_step", type=float, default=None)   # manas two-clock (needs --micro_vote): probe_rho=within-step vote decay, this=per-step-boundary block decay; reach=gamma/(1-rho_step)
     ap.add_argument("--muon_scale_mode", choices=["polar", "normuon", "aurora", "aurora_ema", "aurora_ema_v2"],
                     default="aurora")  # post-NS row scaling; EMA variants: normuon / aurora_ema / aurora_ema_v2
     ap.add_argument("--xorth_post", type=float, default=0.0)       # cross-expert whitening MAX strength (0=off), scoped to MoE expert stacks
@@ -187,7 +188,7 @@ def main():
                                           probe_warmup_steps=args.probe_warmup_steps, manas_comp=args.manas_comp,
                                           rgd_tau=(args.rgd_tau or None), probe_norm=args.probe_norm,
                                           cos_beta=args.cos_beta, micro_vote=args.micro_vote,
-                                          nexus_gamma=args.nexus_gamma)
+                                          nexus_gamma=args.nexus_gamma, probe_rho_step=args.probe_rho_step)
     manas = opts[0] if args.optimizer == "manas" else None   # needs probe() around fwd/bwd (see loop)
     if args.compile:                                            # compile the transformer body only; the
         model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
@@ -213,6 +214,7 @@ def main():
                    + (f"cb{args.cos_beta:g}" if args.cos_beta else "")
                    + ("mv" if args.micro_vote else "")
                    + (f"nx{args.nexus_gamma:g}" if args.nexus_gamma else "")
+                   + (f"rs{args.probe_rho_step:g}" if args.probe_rho_step else "")
                    if args.optimizer == "manas" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + (f"_conv{args.kernel_size}" if args.router_type == "conv" else ""))
