@@ -130,6 +130,7 @@ def main():
     ap.add_argument("--probe_rho_step", type=float, default=None)   # manas two-clock (needs --micro_vote): probe_rho=within-step vote decay, this=per-step-boundary block decay; reach=gamma/(1-rho_step)
     ap.add_argument("--probe_gamma_intra", type=float, default=None) # manas fresh-block (needs --probe_rho_step): per-vote weight of THIS step's fresh block; folds to history at probe_gamma. None/=gamma -> plain two-clock
     ap.add_argument("--probe_refresh", type=int, default=None)      # manas basis rebuild cadence (probe updates); None -> auto 2/(1-rho_step)
+    ap.add_argument("--probe_sketch_rho", type=float, default=None) # manas EMA-sketch window (needs low-rank): Q aims at where grads live (memory 1/(1-rho_q)); None -> one-sample snapshot
     ap.add_argument("--muon_scale_mode", choices=["polar", "normuon", "aurora", "aurora_ema", "aurora_ema_v2"],
                     default="aurora")  # post-NS row scaling; EMA variants: normuon / aurora_ema / aurora_ema_v2
     ap.add_argument("--xorth_post", type=float, default=0.0)       # cross-expert whitening MAX strength (0=off), scoped to MoE expert stacks
@@ -192,7 +193,8 @@ def main():
                                           cos_beta=args.cos_beta, micro_vote=args.micro_vote,
                                           nexus_gamma=args.nexus_gamma, probe_rho_step=args.probe_rho_step,
                                           probe_gamma_intra=args.probe_gamma_intra,
-                                          probe_refresh=args.probe_refresh)
+                                          probe_refresh=args.probe_refresh,
+                                          probe_sketch_rho=args.probe_sketch_rho)
     manas = opts[0] if args.optimizer == "manas" else None   # needs probe() around fwd/bwd (see loop)
     if args.compile:                                            # compile the transformer body only; the
         model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
@@ -221,6 +223,7 @@ def main():
                    + (f"rs{args.probe_rho_step:g}" if args.probe_rho_step else "")
                    + (f"gi{args.probe_gamma_intra:g}" if args.probe_gamma_intra else "")
                    + (f"rf{args.probe_refresh:g}" if args.probe_refresh else "")
+                   + (f"sk{args.probe_sketch_rho:g}" if args.probe_sketch_rho else "")
                    if args.optimizer == "manas" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + (f"_conv{args.kernel_size}" if args.router_type == "conv" else ""))
