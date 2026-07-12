@@ -13,7 +13,8 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
                      optimizer="muon", probe_gamma=0.08, probe_rho=0.98, manas_rank=8, probe_warmup_steps=0,
                      manas_comp=0.0, rgd_tau=None, probe_norm="global", cos_beta=0.0,
                      micro_vote=False, nexus_gamma=0.0, probe_rho_step=None, probe_gamma_intra=None,
-                     probe_refresh=None, probe_sketch_rho=None, probe_sketch_votes=False):
+                     probe_refresh=None, probe_sketch_rho=None, probe_sketch_votes=False,
+                     probe_sketch_min_votes=2):
     from kernels.sm120.muon import FusedMuon   # Blackwell: gram-NS (self-gates to symmul/cuBLAS on small mats) + 8M knee
     stacks, mats, other = [], [], []
     for n, p in model.named_parameters():
@@ -53,7 +54,8 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
                               micro_vote=micro_vote, nexus_gamma=nexus_gamma,
                               probe_rho_step=probe_rho_step, probe_gamma_intra=probe_gamma_intra,
                               probe_refresh=probe_refresh, probe_sketch_rho=probe_sketch_rho,
-                              probe_sketch_votes=probe_sketch_votes, **_xo)
+                              probe_sketch_votes=probe_sketch_votes,
+                              probe_sketch_min_votes=probe_sketch_min_votes, **_xo)
     else:
         muon = FusedMuon(groups, lr=muon_lr, momentum=momentum, weight_decay=wd,
                          coeffs=NS8, ns_dtype=ns_dtype, aurora_k=1, gram_restarts=[4, 5], scale_mode=scale_mode,

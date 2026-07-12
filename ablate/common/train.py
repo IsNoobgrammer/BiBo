@@ -132,6 +132,7 @@ def main():
     ap.add_argument("--probe_refresh", type=int, default=None)      # manas basis rebuild cadence (probe updates); None -> auto 2/(1-rho_step)
     ap.add_argument("--probe_sketch_rho", type=float, default=None) # manas EMA-sketch window (needs low-rank): Q aims at where grads live (memory 1/(1-rho_q)); None -> one-sample snapshot
     ap.add_argument("--probe_sketch_votes", action="store_true")    # manas two-clock window (needs --probe_sketch_rho --micro_vote): unit-normalized per-vote sketch covers vote distribution vs collapsed mean
+    ap.add_argument("--probe_sketch_min_votes", type=int, default=2) # manas GA1 gate: min votes/step for sketch aim (else snapshot); default 2, set 1 to force sketch at ga1
     ap.add_argument("--muon_scale_mode", choices=["polar", "normuon", "aurora", "aurora_ema", "aurora_ema_v2"],
                     default="aurora")  # post-NS row scaling; EMA variants: normuon / aurora_ema / aurora_ema_v2
     ap.add_argument("--xorth_post", type=float, default=0.0)       # cross-expert whitening MAX strength (0=off), scoped to MoE expert stacks
@@ -196,7 +197,8 @@ def main():
                                           probe_gamma_intra=args.probe_gamma_intra,
                                           probe_refresh=args.probe_refresh,
                                           probe_sketch_rho=args.probe_sketch_rho,
-                                          probe_sketch_votes=args.probe_sketch_votes)
+                                          probe_sketch_votes=args.probe_sketch_votes,
+                                          probe_sketch_min_votes=args.probe_sketch_min_votes)
     manas = opts[0] if args.optimizer == "manas" else None   # needs probe() around fwd/bwd (see loop)
     if args.compile:                                            # compile the transformer body only; the
         model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
@@ -227,6 +229,7 @@ def main():
                    + (f"rf{args.probe_refresh:g}" if args.probe_refresh else "")
                    + (f"sk{args.probe_sketch_rho:g}" if args.probe_sketch_rho else "")
                    + ("skv" if args.probe_sketch_votes else "")
+                   + (f"mv{args.probe_sketch_min_votes}" if args.probe_sketch_min_votes != 2 else "")
                    if args.optimizer == "manas" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + (f"_conv{args.kernel_size}" if args.router_type == "conv" else ""))
