@@ -137,6 +137,23 @@ def _push_hf_async(api, repo, local_dir, path_in_repo, tag):
     return fut
 
 
+@contextlib.contextmanager
+def _eager(model):
+    """Run eval / sampling on the UN-compiled module. torch.compile chokes on the eval and generation
+    shapes: recompile-limit churn, and an inductor crash ('SymFloat' has no attribute 'size') on the long
+    length-extrap sequences. Eval isn't perf-critical, so swap compiled -> orig for the duration and restore
+    after. No-op when compile is off (orig is None)."""
+    compiled = getattr(model, "model", None)
+    orig = getattr(compiled, "_orig_mod", None)
+    if orig is not None:
+        model.model = orig
+    try:
+        yield
+    finally:
+        if orig is not None:
+            model.model = compiled
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", choices=["qwen", "bibo_min"], required=True)
@@ -388,15 +405,17 @@ def main():
                         "train/tps": tps, "train/mfu": mfu, "train/mem_gb": mem, "train/elapsed_s": elapsed,
                         "train/expert_corr": ecorr, "tokens": toks}, step=step)
         if do_eval and step % args.eval_every == 0:            # periodic eval -> W&B curves
-            _, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.eval_mcq_n, bpb_n=args.eval_bpb_n,
-                               extrap_lengths=ev_extrap, do_samples=False,
-                               do_icl=not args.no_eval_icl, icl_n=args.eval_icl_n, device=DEV, dtype=dt)
+            with _eager(model):                                # eval on the un-compiled module (see _eager)
+                _, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.eval_mcq_n, bpb_n=args.eval_bpb_n,
+                                   extrap_lengths=ev_extrap, do_samples=False,
+                                   do_icl=not args.no_eval_icl, icl_n=args.eval_icl_n, device=DEV, dtype=dt)
             if wb:
                 wb.log(flat, step=step)
             print(f"  [eval @{step}] {summarize(flat)}", flush=True)
         if do_eval and sample_every > 0 and step % sample_every == 0:   # samples on their own cadence (default = eval_every)
-            for s in generate_samples(model, tok, device=DEV, dtype=dt):
-                print(f"    [sample {s['lang']}] {s['prompt']} -> {s['completion']}", flush=True)
+            with _eager(model):
+                for s in generate_samples(model, tok, device=DEV, dtype=dt):
+                    print(f"    [sample {s['lang']}] {s['prompt']} -> {s['completion']}", flush=True)
         if args.ckpt_every and step > 0 and step % args.ckpt_every == 0:
             if hf_api is not None:
                 _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_step{step}"))
@@ -412,15 +431,20 @@ def main():
         hf_futures.append(_push_hf_async(hf_api, args.hf_repo, _dir, "final", f"{run_name} final"))
     final_eval = None
     if do_eval:
-        fe = tuple(int(x) for x in args.final_extrap.split(",") if x.strip()) or None
-        final_eval, full_flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.final_mcq_n,
-                                         extrap_lengths=fe, do_icl=not args.no_eval_icl, icl_n=100,
-                                         device=DEV, dtype=dt)
-        if wb:
-            wb.log(full_flat, step=total_steps)
-        print(f"  [final eval] {summarize(full_flat)}", flush=True)
-        for s in final_eval.get("samples", []):
-            print(f"    [sample {s['lang']}] {s['prompt']} -> {s['completion']}", flush=True)
+        try:                                                   # best-effort: a final-eval failure must NOT
+            fe = tuple(int(x) for x in args.final_extrap.split(",") if x.strip()) or None   # abort the HF
+            with _eager(model):                                # drain / result.json / wb.finish below
+                final_eval, full_flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.final_mcq_n,
+                                                 extrap_lengths=fe, do_icl=not args.no_eval_icl, icl_n=100,
+                                                 device=DEV, dtype=dt)
+            if wb:
+                wb.log(full_flat, step=total_steps)
+            print(f"  [final eval] {summarize(full_flat)}", flush=True)
+            for s in final_eval.get("samples", []):
+                print(f"    [sample {s['lang']}] {s['prompt']} -> {s['completion']}", flush=True)
+        except Exception as e:
+            print(f"  [final eval] FAILED: {type(e).__name__}: {str(e)[:200]} (checkpoints already pushed)",
+                  flush=True)
     res = {"arm": args.arm, "seed": args.seed, "steps": total_steps, "tokens": total_steps * tok_per_step,
            "final_loss": loss_val, "params_total": total, "params_active": active,
            "ckpt": ckpt, "wall_s": time.time() - t0, "eval": final_eval, "config": vars(args)}

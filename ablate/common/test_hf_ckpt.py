@@ -7,7 +7,7 @@ restores config.torch_dtype.
   python -m ablate.common.test_hf_ckpt
 """
 import torch
-from .train import _save_hf_ckpt
+from .train import _save_hf_ckpt, _eager
 
 
 class _Orig:                       # stands in for the real (un-compiled) module
@@ -82,9 +82,26 @@ def test_no_compile_passthrough(tmp="/tmp/_hfckpt_selfcheck2"):
     print("OK: no-compile path saves model.model unchanged")
 
 
+def test_eager_swaps_and_restores():
+    orig = _Orig()
+    model = _FakeModel(_Compiled(orig))
+    with _eager(model):
+        assert model.model is orig, "eval must run on the un-compiled module"
+    assert isinstance(model.model, _Compiled), "compiled module must be restored after"
+    # even if the body raises, the compiled module must be restored
+    try:
+        with _eager(model):
+            raise ValueError("boom")
+    except ValueError:
+        pass
+    assert isinstance(model.model, _Compiled), "must restore compiled module even on exception"
+    print("OK: _eager swaps to orig, restores compiled (incl. on exception)")
+
+
 if __name__ == "__main__":
     import os
     os.makedirs("/tmp", exist_ok=True)
     test_unwrap_bf16_restore()
     test_no_compile_passthrough()
+    test_eager_swaps_and_restores()
     print("all self-checks passed")
