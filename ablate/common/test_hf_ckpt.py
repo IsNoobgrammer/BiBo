@@ -1,11 +1,13 @@
 """Self-check for the async HF checkpoint path in train.py — no GPU, no network.
-Covers the one trap: torch.compile wraps model.model with an `_orig_mod.`-prefixed state dict, so
-_save_hf_ckpt MUST unwrap it before save_pretrained (else the checkpoint is unloadable), and restore
-it after so training continues on the compiled module. Also checks the async push drains its dir.
+Covers the traps: (1) torch.compile wraps model.model with an `_orig_mod.`-prefixed state dict, so
+_save_hf_ckpt MUST unwrap before save (else unloadable) and restore after so training continues on the
+compiled module; (2) bf16 save casts WEIGHTS only in a COPY (live fp32 params + buffers untouched) and
+restores config.torch_dtype.
 
   python -m ablate.common.test_hf_ckpt
 """
-from .train import _save_hf_ckpt, _push_hf_async
+import torch
+from .train import _save_hf_ckpt
 
 
 class _Orig:                       # stands in for the real (un-compiled) module
@@ -17,13 +19,32 @@ class _Compiled:                   # stands in for torch.compile(model.model) (O
         self._orig_mod = orig
 
 
+class _Cfg:
+    def __init__(self):
+        self.torch_dtype = torch.float32
+
+
 class _FakeModel:
+    """One fp32 weight `w` and one fp32 buffer `buf`; live tensors must survive save untouched."""
     def __init__(self, compiled):
         self.model = compiled
+        self.config = _Cfg()
+        self.w = torch.ones(4, dtype=torch.float32)          # a parameter
+        self.buf = torch.ones(2, dtype=torch.float32) * 3    # a buffer (e.g. RoPE inv_freq)
         self.saved_model_at_save = None
+        self.saved_sd = None
+        self.dtype_at_save = None
 
-    def save_pretrained(self, out_dir, safe_serialization=True):
-        self.saved_model_at_save = self.model      # capture what model.model was AT save time
+    def named_parameters(self):
+        return [("w", self.w)]
+
+    def state_dict(self):
+        return {"w": self.w, "buf": self.buf}
+
+    def save_pretrained(self, out_dir, state_dict=None, safe_serialization=True):
+        self.saved_model_at_save = self.model
+        self.saved_sd = state_dict
+        self.dtype_at_save = self.config.torch_dtype
 
 
 class _FakeTok:
@@ -34,19 +55,21 @@ class _FakeTok:
         self.saved_to = out_dir
 
 
-def test_unwrap_then_restore(tmp="/tmp/_hfckpt_selfcheck"):
+def test_unwrap_bf16_restore(tmp="/tmp/_hfckpt_selfcheck"):
     orig = _Orig()
-    compiled = _Compiled(orig)
-    model = _FakeModel(compiled)
+    model = _FakeModel(_Compiled(orig))
     tok = _FakeTok()
+    _save_hf_ckpt(model, tok, tmp)
 
-    out = _save_hf_ckpt(model, tok, tmp)
-
-    assert model.saved_model_at_save is orig, "must save the UN-compiled module (clean state-dict keys)"
-    assert model.model is compiled, "must restore the compiled module so training continues on it"
-    assert tok.saved_to == tmp, "tokenizer must be written alongside the model"
-    assert out == tmp
-    print("OK: compile-unwrap saves orig, restores compiled, saves tokenizer")
+    assert model.saved_model_at_save is orig, "must save the UN-compiled module (clean keys)"
+    assert isinstance(model.model, _Compiled), "must restore the compiled module"
+    assert model.saved_sd["w"].dtype == torch.bfloat16, "weight must be saved as bf16"
+    assert model.saved_sd["buf"].dtype == torch.float32, "buffer must stay full precision"
+    assert model.w.dtype == torch.float32, "LIVE weight must remain fp32 (master weights untouched)"
+    assert model.dtype_at_save == torch.bfloat16, "config.torch_dtype must be bf16 at save time"
+    assert model.config.torch_dtype == torch.float32, "config.torch_dtype must be restored after"
+    assert tok.saved_to == tmp
+    print("OK: bf16 weights + fp32 buffers, live fp32 untouched, compile unwrap/restore, dtype restore")
 
 
 def test_no_compile_passthrough(tmp="/tmp/_hfckpt_selfcheck2"):
@@ -60,6 +83,6 @@ def test_no_compile_passthrough(tmp="/tmp/_hfckpt_selfcheck2"):
 if __name__ == "__main__":
     import os
     os.makedirs("/tmp", exist_ok=True)
-    test_unwrap_then_restore()
+    test_unwrap_bf16_restore()
     test_no_compile_passthrough()
     print("all self-checks passed")

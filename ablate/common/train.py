@@ -90,17 +90,25 @@ def _expert_corr(model):
 
 
 def _save_hf_ckpt(model, tokenizer, out_dir):
-    """Write a reload-ready HF checkpoint (config.json + safetensors + tokenizer) to out_dir. Runs on the
-    MAIN thread between steps (fast: just reads current weights). Unwraps torch.compile so the state-dict
-    keys are clean (compiled model.model has `_orig_mod.` prefixes that would make the checkpoint unloadable)."""
+    """Write a reload-ready bf16 HF checkpoint (config.json + safetensors + tokenizer) to out_dir. Runs on
+    the MAIN thread between steps (fast). Casts WEIGHTS to bf16 in a fresh state-dict COPY — the live fp32
+    master weights are untouched (casting them in place would corrupt training) — and leaves buffers (RoPE
+    inv_freq, router bias) at full precision. Unwraps torch.compile so the state-dict keys are clean
+    (compiled model.model has `_orig_mod.` prefixes that would make the checkpoint unloadable)."""
     os.makedirs(out_dir, exist_ok=True)
     compiled = getattr(model, "model", None)
     orig = getattr(compiled, "_orig_mod", None)   # set iff model.model was torch.compile'd
     if orig is not None:
         model.model = orig
+    prev_dtype = getattr(model.config, "torch_dtype", None)
     try:
-        model.save_pretrained(out_dir, safe_serialization=True)
+        _params = set(n for n, _ in model.named_parameters())        # cast weights only, not buffers
+        sd = {k: (v.to(torch.bfloat16) if (k in _params and v.is_floating_point()) else v)
+              for k, v in model.state_dict().items()}
+        model.config.torch_dtype = torch.bfloat16                    # so from_pretrained loads as bf16
+        model.save_pretrained(out_dir, state_dict=sd, safe_serialization=True)
     finally:
+        model.config.torch_dtype = prev_dtype
         if orig is not None:
             model.model = compiled
     tokenizer.save_pretrained(out_dir)
