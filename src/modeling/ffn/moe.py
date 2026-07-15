@@ -224,6 +224,32 @@ class BiBoMoELayer(nn.Module):
 
         self.gate.bias.add_(self.bias_update_factor * deviation.sign())
 
+    @torch._dynamo.disable   # host-side load-balance bookkeeping; keeps the per-forward int counter out of
+    def _balance_step(self, top_k_indices, num_tokens):   # the graph so Dynamo can't guard it -> no recompiles
+        """Accumulate per-expert token counts each forward; every _update_every forwards return the summed
+        counts (all-reduced across ranks) and reset, else None. Dynamo-disabled: the Python int counter
+        (_fwd_step) is otherwise baked in as a compile-time constant and recompiles the forward every step."""
+        current_tpe = torch.bincount(
+            rearrange(top_k_indices, 'b s k -> (b s k)'),
+            minlength=self.num_routed_experts
+        )
+        self.accumulated_tpe += current_tpe.float()   # in-place, no host sync
+        # Convert the token threshold to a step interval once (num_tokens is uniform across DDP ranks in
+        # the packed pipeline, so every rank derives the same interval).
+        if self._update_every is None:
+            self._update_every = max(1, round(self.bias_update_threshold / max(num_tokens, 1)))
+        self._fwd_step += 1
+        if self._fwd_step % self._update_every == 0:
+            # All-reduce the per-expert counts so the bias balances GLOBAL load (sign()-based update is
+            # scale-invariant → SUM is fine). Step-based trigger => all ranks are here on the same step
+            # => the collective stays in lockstep (no ragged-batch deadlock).
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(self.accumulated_tpe, op=dist.ReduceOp.SUM)
+            tpe = self.accumulated_tpe.clone()
+            self.accumulated_tpe.zero_()
+            return tpe
+        return None
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, hidden_dim = hidden_states.shape
         num_tokens = bsz * seq_len
@@ -237,25 +263,7 @@ class BiBoMoELayer(nn.Module):
             and self.load_balance_strategy == "bias"
             and hasattr(self.gate, 'bias') 
             and self.bias_update_factor > 0):
-            current_tpe = torch.bincount(
-                rearrange(top_k_indices, 'b s k -> (b s k)'),
-                minlength=self.num_routed_experts
-            )
-            self.accumulated_tpe += current_tpe.float()   # in-place, no host sync
-
-            # Convert the token threshold to a step interval once (num_tokens is uniform across DDP
-            # ranks in the packed pipeline, so every rank derives the same interval).
-            if self._update_every is None:
-                self._update_every = max(1, round(self.bias_update_threshold / max(num_tokens, 1)))
-            self._fwd_step += 1
-            if self._fwd_step % self._update_every == 0:
-                # All-reduce the per-expert counts so the bias balances GLOBAL load (sign()-based
-                # update is scale-invariant → SUM is fine). Step-based trigger => all ranks are here
-                # on the same step => the collective stays in lockstep (no ragged-batch deadlock).
-                if dist.is_available() and dist.is_initialized():
-                    dist.all_reduce(self.accumulated_tpe, op=dist.ReduceOp.SUM)
-                tokens_per_expert = self.accumulated_tpe.clone()
-                self.accumulated_tpe.zero_()
+            tokens_per_expert = self._balance_step(top_k_indices, num_tokens)
 
         # Flatten: (B*S, H) and (B*S, top_k)
         flat_hidden = rearrange(hidden_states, 'b s h -> (b s) h')
