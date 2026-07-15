@@ -17,7 +17,7 @@ import torch
 from .models import build_arm, count_params
 from . import patches as patchmod
 from .optim import build_optimizers
-from .schedule import make_wsd
+from .schedule import make_scheduler
 from .data import token_batches, TRAIN_DATASET
 from .evaluate import evaluate, Tok, summarize
 from .eval.sample import generate_samples
@@ -210,8 +210,9 @@ def main():
     ap.add_argument("--muon_lr", type=float, default=3e-4)
     ap.add_argument("--adam_lr", type=float, default=3e-4)
     ap.add_argument("--wd", type=float, default=0.1)
-    ap.add_argument("--warmup_frac", type=float, default=0.05)
-    ap.add_argument("--decay_frac", type=float, default=0.20)
+    ap.add_argument("--scheduler", choices=["wsd", "cosine"], default="wsd")  # LR schedule shape
+    ap.add_argument("--warmup_frac", type=float, default=0.05)   # both schedulers
+    ap.add_argument("--decay_frac", type=float, default=0.20)    # WSD only: fraction of steps in the final decay
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--data", choices=["real", "synthetic"], default="real")
     ap.add_argument("--dataset", default=TRAIN_DATASET)          # QTK-81K packed instruct corpus (HF id)
@@ -280,7 +281,7 @@ def main():
 
     tok_per_step = args.batch * args.seq_len * args.grad_accum   # global batch
     total_steps = args.max_steps or (args.tokens // tok_per_step)
-    scheds = make_wsd(opts, total_steps, args.warmup_frac, args.decay_frac)
+    scheds = make_scheduler(args.scheduler, opts, total_steps, args.warmup_frac, args.decay_frac)
     amp = contextlib.nullcontext() if args.precision == "fp32" else torch.autocast("cuda", dtype=dt)
     # include special_pairs + conv kernel so SE / conv-router variants don't collide on ckpt/log/run
     # names (they otherwise share arm+seed): e.g. bibo_min_seed2307_se1_conv5
@@ -306,7 +307,8 @@ def main():
                    + (f"sg{args.sketch_gate}" if args.sketch_gate is not None else "")
                    if args.optimizer == "manas" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
-                + (f"_conv{args.kernel_size}" if args.router_type == "conv" else ""))
+                + (f"_conv{args.kernel_size}" if args.router_type == "conv" else "")
+                + ("_cos" if args.scheduler == "cosine" else ""))
     out_dir = args.out or os.path.join(os.path.dirname(__file__), "..", "runs")
     os.makedirs(out_dir, exist_ok=True)
 
