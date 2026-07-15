@@ -91,10 +91,12 @@ def _expert_corr(model):
 
 def _save_hf_ckpt(model, tokenizer, out_dir):
     """Write a reload-ready bf16 HF checkpoint (config.json + safetensors + tokenizer) to out_dir. Runs on
-    the MAIN thread between steps (fast). Casts WEIGHTS to bf16 in a fresh state-dict COPY — the live fp32
-    master weights are untouched (casting them in place would corrupt training) — and leaves buffers (RoPE
-    inv_freq, router bias) at full precision. Unwraps torch.compile so the state-dict keys are clean
-    (compiled model.model has `_orig_mod.` prefixes that would make the checkpoint unloadable)."""
+    the MAIN thread between steps (fast). Casts only the big matrices (ndim>=2: linears, embeddings, expert
+    stacks) to bf16 in a fresh state-dict COPY — the live fp32 master weights are untouched (casting them in
+    place would corrupt training). Keeps 1D params (RMSNorm/LayerNorm gains, biases) and all buffers (RoPE
+    inv_freq, router bias) at fp32: they're precision-sensitive and tiny, so bf16 buys no size but loses
+    precision. Unwraps torch.compile so the state-dict keys are clean (compiled model.model has `_orig_mod.`
+    prefixes that would make the checkpoint unloadable)."""
     os.makedirs(out_dir, exist_ok=True)
     compiled = getattr(model, "model", None)
     orig = getattr(compiled, "_orig_mod", None)   # set iff model.model was torch.compile'd
@@ -102,8 +104,8 @@ def _save_hf_ckpt(model, tokenizer, out_dir):
         model.model = orig
     prev_dtype = getattr(model.config, "torch_dtype", None)
     try:
-        _params = set(n for n, _ in model.named_parameters())        # cast weights only, not buffers
-        sd = {k: (v.to(torch.bfloat16) if (k in _params and v.is_floating_point()) else v)
+        _params = set(n for n, _ in model.named_parameters())        # cast matrices only; not norms/biases/buffers
+        sd = {k: (v.to(torch.bfloat16) if (k in _params and v.is_floating_point() and v.ndim >= 2) else v)
               for k, v in model.state_dict().items()}
         model.config.torch_dtype = torch.bfloat16                    # so from_pretrained loads as bf16
         model.save_pretrained(out_dir, state_dict=sd, safe_serialization=True)

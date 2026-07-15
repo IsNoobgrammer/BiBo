@@ -29,17 +29,18 @@ class _FakeModel:
     def __init__(self, compiled):
         self.model = compiled
         self.config = _Cfg()
-        self.w = torch.ones(4, dtype=torch.float32)          # a parameter
-        self.buf = torch.ones(2, dtype=torch.float32) * 3    # a buffer (e.g. RoPE inv_freq)
+        self.w = torch.ones(4, 4, dtype=torch.float32)       # a 2D matrix param -> bf16
+        self.norm = torch.ones(4, dtype=torch.float32)       # a 1D RMSNorm gain -> stays fp32
+        self.buf = torch.ones(2, dtype=torch.float32) * 3    # a buffer (e.g. RoPE inv_freq) -> stays fp32
         self.saved_model_at_save = None
         self.saved_sd = None
         self.dtype_at_save = None
 
     def named_parameters(self):
-        return [("w", self.w)]
+        return [("w", self.w), ("norm", self.norm)]
 
     def state_dict(self):
-        return {"w": self.w, "buf": self.buf}
+        return {"w": self.w, "norm": self.norm, "buf": self.buf}
 
     def save_pretrained(self, out_dir, state_dict=None, safe_serialization=True):
         self.saved_model_at_save = self.model
@@ -63,13 +64,14 @@ def test_unwrap_bf16_restore(tmp="/tmp/_hfckpt_selfcheck"):
 
     assert model.saved_model_at_save is orig, "must save the UN-compiled module (clean keys)"
     assert isinstance(model.model, _Compiled), "must restore the compiled module"
-    assert model.saved_sd["w"].dtype == torch.bfloat16, "weight must be saved as bf16"
+    assert model.saved_sd["w"].dtype == torch.bfloat16, "2D matrix must be saved as bf16"
+    assert model.saved_sd["norm"].dtype == torch.float32, "1D norm gain must stay fp32"
     assert model.saved_sd["buf"].dtype == torch.float32, "buffer must stay full precision"
     assert model.w.dtype == torch.float32, "LIVE weight must remain fp32 (master weights untouched)"
     assert model.dtype_at_save == torch.bfloat16, "config.torch_dtype must be bf16 at save time"
     assert model.config.torch_dtype == torch.float32, "config.torch_dtype must be restored after"
     assert tok.saved_to == tmp
-    print("OK: bf16 weights + fp32 buffers, live fp32 untouched, compile unwrap/restore, dtype restore")
+    print("OK: bf16 matrices + fp32 norms/buffers, live fp32 untouched, compile unwrap/restore, dtype restore")
 
 
 def test_no_compile_passthrough(tmp="/tmp/_hfckpt_selfcheck2"):
