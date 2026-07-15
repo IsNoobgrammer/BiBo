@@ -99,7 +99,7 @@ def _take(ds, n):
 @functools.lru_cache(maxsize=None)                       # cached: periodic eval won't re-download
 def belebele_items(lang_cfg, n=500):                     # 4-way reading comprehension, parallel
     from datasets import load_dataset
-    ds = load_dataset("facebook/belebele", lang_cfg, split="test", streaming=True)
+    ds = load_dataset("facebook/belebele", lang_cfg, split="test", streaming=False)
     items = []
     for e in _take(ds, n):
         ctx = f"{e['flores_passage']}\nQuestion: {e['question']}\nAnswer:"
@@ -111,7 +111,7 @@ def belebele_items(lang_cfg, n=500):                     # 4-way reading compreh
 @functools.lru_cache(maxsize=None)
 def xnli_items(lang, n=500):                             # 3-way entailment, parallel (33% floor)
     from datasets import load_dataset
-    ds = load_dataset("facebook/xnli", lang, split="test", streaming=True)
+    ds = load_dataset("facebook/xnli", lang, split="test", streaming=False)
     verb = ["True", "Neither", "False"]                  # 0=entailment,1=neutral,2=contradiction
     items = []
     for e in _take(ds, n):
@@ -123,7 +123,7 @@ def xnli_items(lang, n=500):                             # 3-way entailment, par
 @functools.lru_cache(maxsize=None)
 def global_mmlu_items(lang, n=500):                      # 4-way knowledge (expect near-chance @137M)
     from datasets import load_dataset
-    ds = load_dataset("CohereLabs/Global-MMLU", lang, split="test", streaming=True)
+    ds = load_dataset("CohereLabs/Global-MMLU", lang, split="test", streaming=False)
     items = []
     for e in _take(ds, n):
         ctx = (f"{e['question']}\nA. {e['option_a']}\nB. {e['option_b']}\n"

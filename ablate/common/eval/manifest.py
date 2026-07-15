@@ -21,7 +21,7 @@ class Source:
     n: int = 300
 
 
-def _hf(repo, config, split, to_text, streaming=True):
+def _hf(repo, config, split, to_text, streaming=False):   # non-stream: HF streaming server 403s anon; file-resolve works + caches
     cache = {}                                   # {n: [texts]} — periodic eval reuses, no re-download
     def load(n):
         for m, v in cache.items():               # a bigger cached pull already covers a smaller n
@@ -53,7 +53,7 @@ def _belebele_passages(lang_cfg):
             if m >= n:
                 return v[:n]
         from datasets import load_dataset
-        ds = load_dataset("facebook/belebele", lang_cfg, split="test", streaming=True)
+        ds = load_dataset("facebook/belebele", lang_cfg, split="test", streaming=False)
         seen, out = set(), []
         for ex in ds:
             p = ex.get("flores_passage")

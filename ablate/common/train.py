@@ -89,6 +89,44 @@ def _expert_corr(model):
     return sum(vals) / len(vals) if vals else 0.0
 
 
+def _save_hf_ckpt(model, tokenizer, out_dir):
+    """Write a reload-ready HF checkpoint (config.json + safetensors + tokenizer) to out_dir. Runs on the
+    MAIN thread between steps (fast: just reads current weights). Unwraps torch.compile so the state-dict
+    keys are clean (compiled model.model has `_orig_mod.` prefixes that would make the checkpoint unloadable)."""
+    os.makedirs(out_dir, exist_ok=True)
+    compiled = getattr(model, "model", None)
+    orig = getattr(compiled, "_orig_mod", None)   # set iff model.model was torch.compile'd
+    if orig is not None:
+        model.model = orig
+    try:
+        model.save_pretrained(out_dir, safe_serialization=True)
+    finally:
+        if orig is not None:
+            model.model = compiled
+    tokenizer.save_pretrained(out_dir)
+    return out_dir
+
+
+def _push_hf_async(api, repo, local_dir, path_in_repo, tag):
+    """Fire-and-forget upload (rayon-style): upload_folder runs in a background thread (run_as_future), so
+    training continues immediately. On completion the local dir is reclaimed. Returns the Future to drain
+    at process exit — a detached nohup process would otherwise kill the upload thread on exit."""
+    fut = api.upload_folder(folder_path=local_dir, path_in_repo=path_in_repo, repo_id=repo,
+                            commit_message=f"checkpoint {tag}", run_as_future=True)
+
+    def _done(f, _d=local_dir, _t=tag):
+        try:
+            f.result()
+            print(f"  [hf] pushed {_t} -> done", flush=True)
+        except Exception as e:
+            print(f"  [hf] push {_t} FAILED: {type(e).__name__}: {str(e)[:160]}", flush=True)
+        finally:
+            import shutil
+            shutil.rmtree(_d, ignore_errors=True)   # reclaim disk once uploaded
+    fut.add_done_callback(_done)
+    return fut
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", choices=["qwen", "bibo_min"], required=True)
@@ -134,6 +172,7 @@ def main():
     ap.add_argument("--probe_sketch_votes", action="store_true")    # manas two-clock window (needs --probe_sketch_rho --micro_vote): unit-normalized per-vote sketch covers vote distribution vs collapsed mean
     ap.add_argument("--probe_sketch_min_votes", type=int, default=2) # manas GA1 gate: min votes/step for sketch aim (else snapshot); default 2, set 1 to force sketch at ga1
     ap.add_argument("--sketch_gate", type=int, default=None)        # manas: instance override of _sketch_gate (min votes/step for sketch aim); set 1 to force union window at ga1
+    ap.add_argument("--gamma_decay", action="store_true")           # manas: probe_gamma tracks the muon LR schedule (warmup+decay); default OFF = gamma constant over the run
     ap.add_argument("--muon_scale_mode", choices=["polar", "normuon", "aurora", "aurora_ema", "aurora_ema_v2"],
                     default="aurora")  # post-NS row scaling; EMA variants: normuon / aurora_ema / aurora_ema_v2
     ap.add_argument("--xorth_post", type=float, default=0.0)       # cross-expert whitening MAX strength (0=off), scoped to MoE expert stacks
@@ -152,6 +191,9 @@ def main():
     ap.add_argument("--max_steps", type=int, default=0)      # >0 overrides token budget (smoke)
     ap.add_argument("--log_every", type=int, default=20)
     ap.add_argument("--ckpt_every", type=int, default=2000)
+    ap.add_argument("--hf_repo", default="")     # if set, push model+tokenizer to this HF repo every --ckpt_every steps (async, non-blocking)
+    ap.add_argument("--hf_token", default="")    # HF WRITE token; falls back to $HF_TOKEN / $HUGGING_FACE_HUB_TOKEN
+    ap.add_argument("--hf_private", action="store_true")  # create the repo private
     # in-training eval -> W&B curves (this is the point; not a post-hoc-only eval)
     ap.add_argument("--eval_every", type=int, default=500)       # 0 disables; try 200/500/1000
     ap.add_argument("--sample_every", type=int, default=0)       # 0 = same as eval_every; steps between 2en+2hi samples
@@ -190,7 +232,8 @@ def main():
                                           xorth_gate_ref=args.xorth_gate_ref, xorth_ema=args.xorth_ema,
                                           xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where,
                                           optimizer=args.optimizer, probe_gamma=args.probe_gamma,
-                                          probe_rho=args.probe_rho, manas_rank=args.manas_rank,
+                                          probe_rho=args.probe_rho,
+                                          manas_rank=(args.manas_rank if args.manas_rank > 0 else None),  # 0 -> full rank (probe_rank=None)
                                           probe_warmup_steps=args.probe_warmup_steps, manas_comp=args.manas_comp,
                                           rgd_tau=(args.rgd_tau or None), probe_norm=args.probe_norm,
                                           cos_beta=args.cos_beta, micro_vote=args.micro_vote,
@@ -255,6 +298,20 @@ def main():
     ev_extrap = tuple(int(x) for x in args.eval_extrap.split(",") if x.strip()) or None
     sample_every = args.sample_every if args.sample_every > 0 else args.eval_every   # default: sample when we eval
 
+    # async HF checkpoint push: save_pretrained locally (main thread), then upload_folder in the background.
+    hf_api = hf_tok = None
+    hf_futures = []
+    if args.hf_repo:
+        from huggingface_hub import HfApi
+        from transformers import AutoTokenizer
+        from .evaluate import TOKENIZER
+        _hf_token = args.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        hf_api = HfApi(token=_hf_token)
+        hf_api.create_repo(args.hf_repo, private=args.hf_private, exist_ok=True)
+        hf_tok = tok._t if tok is not None else AutoTokenizer.from_pretrained(TOKENIZER)   # reuse the eval tokenizer
+        print(f"[{run_name}] HF push -> {args.hf_repo} every {args.ckpt_every} steps (async, non-blocking); "
+              f"periodic -> step<N>/, final -> repo root", flush=True)
+
     print(f"[{run_name}] params total={total/1e6:.2f}M active={active/1e6:.2f}M | steps={total_steps} "
           f"tok/step={tok_per_step} patches={patch_list} {args.precision} attn={args.attn} "
           f"muon_mats={n_mat} eval_every={args.eval_every if do_eval else 'off'}", flush=True)
@@ -273,6 +330,8 @@ def main():
     for step in range(total_steps):
         for o in opts:
             o.zero_grad(set_to_none=True)
+        if manas is not None and args.gamma_decay:       # probe dose tracks the muon LR schedule (else constant)
+            manas.probe_gamma = args.probe_gamma * (opts[0].param_groups[0]["lr"] / args.muon_lr)
         loss_val = 0.0
         # Manas: run each micro-batch's fwd/bwd at theta+d (probe), then vote() OUTSIDE the probe so d
         # (and the nexus walker) advance per micro-batch; step() below applies the Muon update on the
@@ -329,10 +388,18 @@ def main():
             for s in generate_samples(model, tok, device=DEV, dtype=dt):
                 print(f"    [sample {s['lang']}] {s['prompt']} -> {s['completion']}", flush=True)
         if args.ckpt_every and step > 0 and step % args.ckpt_every == 0:
-            torch.save(model.state_dict(), os.path.join(out_dir, f"{run_name}_step{step}.pt"))
+            if hf_api is not None:
+                _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_step{step}"))
+                hf_futures.append(_push_hf_async(hf_api, args.hf_repo, _dir, f"step{step}",
+                                                 f"{run_name} step{step}"))
+            else:
+                torch.save(model.state_dict(), os.path.join(out_dir, f"{run_name}_step{step}.pt"))
 
     ckpt = os.path.join(out_dir, f"{run_name}_final.pt")
     torch.save(model.state_dict(), ckpt)
+    if hf_api is not None:                                  # final -> repo root so `from_pretrained(repo)` just works
+        _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_final"))
+        hf_futures.append(_push_hf_async(hf_api, args.hf_repo, _dir, "final", f"{run_name} final"))
     final_eval = None
     if do_eval:
         fe = tuple(int(x) for x in args.final_extrap.split(",") if x.strip()) or None
@@ -349,6 +416,13 @@ def main():
            "ckpt": ckpt, "wall_s": time.time() - t0, "eval": final_eval, "config": vars(args)}
     with open(os.path.join(out_dir, f"{run_name}_result.json"), "w") as f:
         json.dump(res, f, indent=2)
+    if hf_futures:                                         # drain: block until every background upload lands,
+        print(f"[{run_name}] waiting on {len(hf_futures)} HF upload(s) before exit...", flush=True)
+        for f in hf_futures:                               # else this detached process exits and kills the threads
+            try:
+                f.result()
+            except Exception:
+                pass
     if wb:
         wb.finish()
     print(f"[{run_name}] DONE final_loss={loss_val:.4f} ckpt={ckpt}", flush=True)
