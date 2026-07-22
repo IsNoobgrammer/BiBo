@@ -170,8 +170,8 @@ def main():
     # PolyGLU activation subset (codes: silu=0, relu2=1, normsilu=2). The ENABLED set cycles across the
     # experts: only silu -> 000000; silu+relu2 -> 010101; all three -> 012012. Needs the 'moe' patch.
     ap.add_argument("--silu", type=int, default=1)
-    ap.add_argument("--relu2", type=int, default=1)
-    ap.add_argument("--normsilu", type=int, default=1)
+    ap.add_argument("--relu2", type=int, default=0)      # LOST the acts ablation (dose-response harmful); off by default
+    ap.add_argument("--normsilu", type=int, default=1)   # default menu = silu+normsilu (acts-sn, the ablation winner)
     ap.add_argument("--situ", type=int, default=0)   # code 5: tanh(g)*sigmoid(g), parameter-free (default OFF)
     ap.add_argument("--situ_learnable", type=int, default=0)   # per-expert gamma*tanh(alpha*g)*sigmoid(g); AdamW 1D params
     ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free special experts, per-type count
@@ -276,6 +276,7 @@ def main():
     run_name = (f"{args.arm}_seed{args.seed}"
                 + (f"_acts-{acts_tag}" if args.arm == "bibo_min" else "")
                 + ("_situL" if args.situ_learnable else "")
+                + (f"_e{args.polyglu_mult * 3}" if args.polyglu_mult != 2 else "")
                 + (f"_se{args.special_pairs}" if args.special_pairs else "")
                 + (("_idonly" if not args.zero_expert else "") if args.special_pairs else "")
                 + (("_zeroonly" if not args.identity_expert else "") if args.special_pairs else "")
