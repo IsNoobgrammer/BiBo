@@ -17,6 +17,10 @@ try:
 except AttributeError:
     _nc = torch._dynamo.disable
 
+# PolyGLU act-cycle override (codes: 0=silu, 1=relu2, 2=normsilu). None -> default (0,1,2) cycle.
+# train.py sets this from --silu/--relu2/--normsilu, e.g. [0] = all-SiLU experts, [0,1] = silu/relu2 alternating.
+ACT_CYCLE = None
+
 
 # ───────────────────────── liger norm ─────────────────────────
 def patch_liger_norm():
@@ -55,7 +59,8 @@ def patch_fused_moe():
     def _bibo_moe(self, hidden_states, top_k_indices, top_k_weights):
         codes = getattr(self, "_act_codes", None)
         if codes is None or codes.device != hidden_states.device:
-            lst = ([e % 3 for e in range(self.num_polyglu_experts)]
+            cyc = ACT_CYCLE or (0, 1, 2)
+            lst = ([cyc[e % len(cyc)] for e in range(self.num_polyglu_experts)]
                    + [3] * (self.identity_end - self.identity_start)
                    + [4] * (self.zero_end - self.zero_start))
             codes = torch.tensor(lst, dtype=torch.int32, device=hidden_states.device)

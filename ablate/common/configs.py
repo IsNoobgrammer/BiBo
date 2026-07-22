@@ -24,7 +24,8 @@ SHARED = dict(
     num_key_value_heads=2,        # GQA 2:1
     intermediate_size=1024,       # dense MLP (mlp_only_layers)
     moe_intermediate_size=768,
-    num_experts=9,                # == BiBo num_routed_experts
+    num_experts=6,                # == BiBo num_routed_experts (polyglu_mult=2 -> 6 GLU experts; LCM of 2,3
+                                  # so any enabled act subset {silu,relu2,normsilu} cycles evenly)
     num_experts_per_tok=2,        # top-k
     max_position_embeddings=2048,
     mlp_only_layers=[0, 9],       # first + last dense, rest MoE
@@ -55,7 +56,7 @@ def make_qwen_config(attn_impl="sdpa", aux_coef=0.001, num_experts=None):
 
 
 def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_update_factor=None,
-                         polyglu_mult=3, special_pairs=0, router_type="mlp", kernel_size=3,
+                         polyglu_mult=2, special_pairs=0, router_type="mlp", kernel_size=3,
                          use_ssmax=False, use_xsa=False, balance_exclude_specials=False,
                          identity_expert=True, zero_expert=True):
     from src.configuration_bibo import BiBoConfig

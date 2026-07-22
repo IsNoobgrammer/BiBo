@@ -92,7 +92,9 @@ fp16-divergence finding). Compare `bpb[hi]`/`bpb[en]` and `acc[hi]`/`acc[en]` be
 | `--eval_extrap` | "" | periodic length-extrap windows (default off; e.g. 1024,2048,4096) |
 | `--final_mcq_n` / `--final_extrap` | 500 / 1024,2048,4096 | full final eval |
 | `--out` | ../runs | output dir |
-| `--wandb` / `--wandb_project` | off / bibo-qwen-ablate | W&B logging |
+| `--wandb` / `--wandb_project` | off / polyglu-ablations | W&B logging |
+| `--silu` / `--relu2` / `--normsilu` | 1 / 1 / 1 | PolyGLU act subset (bibo_min): the ENABLED set cycles across the 6 experts (silu only -> 000000, silu+relu2 -> 010101, all -> 012012). Codes: silu=0, relu2=1, normsilu=2. Needs the `moe` patch. |
+| `--polyglu_mult` | 2 | GLU experts = mult*3 -> default 6 (LCM of 2,3: any act subset tiles evenly) |
 
 `python -m ablate.common.run_eval`
 | arg | default | meaning |

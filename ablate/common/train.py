@@ -43,7 +43,7 @@ class _QwenAuxCollector:
         self.logits = []
 
 
-def _ce(model, ids, use_fused, aux=None, aux_coef=0.0, num_experts=9, top_k=2):
+def _ce(model, ids, use_fused, aux=None, aux_coef=0.0, num_experts=6, top_k=2):
     inp, tgt = ids[:, :-1], ids[:, 1:].reshape(-1)
     if aux is not None:
         aux.reset()
@@ -166,7 +166,12 @@ def main():
     ap.add_argument("--attn", choices=["sdpa", "flash_attention_4"], default="sdpa")
     ap.add_argument("--load_balance", choices=["none", "bias"], default="bias")   # BiBo: bias=DeepSeek sigmoid+balance; none=softmax
     ap.add_argument("--aux_coef", type=float, default=0.001)                      # Qwen aux load-balancing loss coef (0=off; paper 0.001)
-    ap.add_argument("--polyglu_mult", type=int, default=3)                        # BiBo GLU experts = polyglu_mult*3 (= Qwen num_experts)
+    ap.add_argument("--polyglu_mult", type=int, default=2)                        # BiBo GLU experts = polyglu_mult*3 (= Qwen num_experts); default 6 experts
+    # PolyGLU activation subset (codes: silu=0, relu2=1, normsilu=2). The ENABLED set cycles across the
+    # experts: only silu -> 000000; silu+relu2 -> 010101; all three -> 012012. Needs the 'moe' patch.
+    ap.add_argument("--silu", type=int, default=1)
+    ap.add_argument("--relu2", type=int, default=1)
+    ap.add_argument("--normsilu", type=int, default=1)
     ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free special experts, per-type count
     ap.add_argument("--no_identity_expert", dest="identity_expert", action="store_false")  # drop Identity (code 3); test Zero alone
     ap.add_argument("--no_zero_expert", dest="zero_expert", action="store_false")          # drop Zero (code 4); test Identity alone
@@ -181,25 +186,6 @@ def main():
     ap.add_argument("--peak_tflops", type=float, default=0.0)   # MFU denominator: 0=auto-measure achievable GEMM;
     #                                                             else theoretical, e.g. 480 (dense bf16) / 960 (sparse)
     ap.add_argument("--patches", default="liger_norm,liger_rope,ce,moe")
-    ap.add_argument("--optimizer", choices=["muon", "manas"], default="muon")  # manas = Muon + long-memory lookahead probe
-    ap.add_argument("--probe_gamma", type=float, default=0.08)     # Manas probe step (couples to LR/geometry)
-    ap.add_argument("--probe_rho", type=float, default=0.98)       # Manas probe memory (SAMPLES; re-derive for batch size)
-    ap.add_argument("--manas_rank", type=int, default=8)           # Manas low-rank probe rank
-    ap.add_argument("--probe_warmup_steps", type=int, default=0)   # skip probe (d) accumulation for first N steps
-    ap.add_argument("--manas_comp", type=float, default=0.0)       # Manas U buffer strength in units of gamma (0=off; +1=extend, toy champ)
-    ap.add_argument("--rgd_tau", type=float, default=0.0)          # RGD loss-weighted probe voting (0=off/equal votes; e.g. 3.0)
-    ap.add_argument("--probe_norm", choices=["global", "perparam"], default="global")  # probe grad-norm: global scalar | per-matrix (muP-ish)
-    ap.add_argument("--cos_beta", type=float, default=0.0)         # cos(g,d) vote weight: 0=off/equal; +sharpen agreeing, -favor novelty
-    ap.add_argument("--micro_vote", action="store_true")           # manas: one probe vote per MICRO-batch (rho binds to micro batch); needs low-rank probe
-    ap.add_argument("--nexus_gamma", type=float, default=0.0)      # manas: common-basin walker strength (needs --micro_vote); ceiling = nexus_gamma*grad_accum
-    ap.add_argument("--probe_rho_step", type=float, default=None)   # manas two-clock (needs --micro_vote): probe_rho=within-step vote decay, this=per-step-boundary block decay; reach=gamma/(1-rho_step)
-    ap.add_argument("--probe_gamma_intra", type=float, default=None) # manas fresh-block (needs --probe_rho_step): per-vote weight of THIS step's fresh block; folds to history at probe_gamma. None/=gamma -> plain two-clock
-    ap.add_argument("--probe_refresh", type=int, default=None)      # manas basis rebuild cadence (probe updates); None -> auto 2/(1-rho_step)
-    ap.add_argument("--probe_sketch_rho", type=float, default=None) # manas EMA-sketch window (needs low-rank): Q aims at where grads live (memory 1/(1-rho_q)); None -> one-sample snapshot
-    ap.add_argument("--probe_sketch_votes", action="store_true")    # manas two-clock window (needs --probe_sketch_rho --micro_vote): unit-normalized per-vote sketch covers vote distribution vs collapsed mean
-    ap.add_argument("--probe_sketch_min_votes", type=int, default=2) # manas GA1 gate: min votes/step for sketch aim (else snapshot); default 2, set 1 to force sketch at ga1
-    ap.add_argument("--sketch_gate", type=int, default=None)        # manas: instance override of _sketch_gate (min votes/step for sketch aim); set 1 to force union window at ga1
-    ap.add_argument("--gamma_decay", action="store_true")           # manas: probe_gamma tracks the muon LR schedule (warmup+decay); default OFF = gamma constant over the run
     ap.add_argument("--muon_scale_mode", choices=["polar", "normuon", "aurora", "aurora_ema", "aurora_ema_v2"],
                     default="aurora")  # post-NS row scaling; EMA variants: normuon / aurora_ema / aurora_ema_v2
     ap.add_argument("--xorth_post", type=float, default=0.0)       # cross-expert whitening MAX strength (0=off), scoped to MoE expert stacks
@@ -234,7 +220,7 @@ def main():
     ap.add_argument("--eval_icl_n", type=int, default=50)        # periodic ICL items/lang/shot (final uses 100)
     ap.add_argument("--out", default=None)
     ap.add_argument("--wandb", action="store_true")
-    ap.add_argument("--wandb_project", default="bibo-qwen-ablate")
+    ap.add_argument("--wandb_project", default="polyglu-ablations")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -243,6 +229,12 @@ def main():
     use_fused_ce = "ce" in patch_list
     if args.router_type == "conv" and "router" not in patch_list:     # conv router -> use the fused sm120 kernel
         patch_list.append("router")
+    # PolyGLU activation subset -> act-code cycle for the fused moe patch (codes: 0=silu,1=relu2,2=normsilu)
+    act_cycle = [c for c, on in ((0, args.silu), (1, args.relu2), (2, args.normsilu)) if on]
+    assert act_cycle, "enable at least one of --silu/--relu2/--normsilu"
+    if act_cycle != [0, 1, 2]:
+        assert "moe" in patch_list, "custom act subset needs the 'moe' patch (eager experts keep the built-in triple)"
+    patchmod.ACT_CYCLE = act_cycle
 
     model, cfg = build_arm(args.arm, device=DEV, dtype=torch.float32, attn_impl=args.attn,  # fp32 master weights
                            load_balance=args.load_balance, bias_update_threshold=args.bias_update_threshold,
@@ -258,22 +250,7 @@ def main():
     opts, n_mat, n_oth = build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt,
                                           scale_mode=args.muon_scale_mode, xorth_post=args.xorth_post,
                                           xorth_gate_ref=args.xorth_gate_ref, xorth_ema=args.xorth_ema,
-                                          xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where,
-                                          optimizer=args.optimizer, probe_gamma=args.probe_gamma,
-                                          probe_rho=args.probe_rho,
-                                          manas_rank=(args.manas_rank if args.manas_rank > 0 else None),  # 0 -> full rank (probe_rank=None)
-                                          probe_warmup_steps=args.probe_warmup_steps, manas_comp=args.manas_comp,
-                                          rgd_tau=(args.rgd_tau or None), probe_norm=args.probe_norm,
-                                          cos_beta=args.cos_beta, micro_vote=args.micro_vote,
-                                          nexus_gamma=args.nexus_gamma, probe_rho_step=args.probe_rho_step,
-                                          probe_gamma_intra=args.probe_gamma_intra,
-                                          probe_refresh=args.probe_refresh,
-                                          probe_sketch_rho=args.probe_sketch_rho,
-                                          probe_sketch_votes=args.probe_sketch_votes,
-                                          probe_sketch_min_votes=args.probe_sketch_min_votes)
-    manas = opts[0] if args.optimizer == "manas" else None   # needs probe() around fwd/bwd (see loop)
-    if manas is not None and args.sketch_gate is not None:
-        manas._sketch_gate = args.sketch_gate                 # instance override of the ga1 sketch gate
+                                          xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where)
     if args.compile:                                            # compile the transformer body only; the
         model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
         print(f"[{args.arm}_seed{args.seed}] torch.compile(model.model) on; fused CE + liger/moe/flash kernels stay eager",
@@ -283,29 +260,16 @@ def main():
     total_steps = args.max_steps or (args.tokens // tok_per_step)
     scheds = make_scheduler(args.scheduler, opts, total_steps, args.warmup_frac, args.decay_frac)
     amp = contextlib.nullcontext() if args.precision == "fp32" else torch.autocast("cuda", dtype=dt)
-    # include special_pairs + conv kernel so SE / conv-router variants don't collide on ckpt/log/run
-    # names (they otherwise share arm+seed): e.g. bibo_min_seed2307_se1_conv5
+    # acts-<subset> is the primary axis of this ablation; special_pairs / conv kernel etc. keep
+    # their suffixes so variants don't collide on ckpt/log/run names (they otherwise share arm+seed)
+    acts_tag = "".join(n for n, on in (("s", args.silu), ("r", args.relu2), ("n", args.normsilu)) if on)
     run_name = (f"{args.arm}_seed{args.seed}"
+                + (f"_acts-{acts_tag}" if args.arm == "bibo_min" else "")
                 + (f"_se{args.special_pairs}" if args.special_pairs else "")
                 + (("_idonly" if not args.zero_expert else "") if args.special_pairs else "")
                 + (("_zeroonly" if not args.identity_expert else "") if args.special_pairs else "")
                 + ("_xsp" if args.balance_exclude_specials else "")
                 + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")
-                + (f"_manas_g{args.probe_gamma:g}r{args.probe_rho:g}" + (f"w{args.probe_warmup_steps}" if args.probe_warmup_steps else "")
-                   + (f"c{args.manas_comp:g}" if args.manas_comp else "")
-                   + (f"rgd{args.rgd_tau:g}" if args.rgd_tau else "")
-                   + ("pp" if args.probe_norm == "perparam" else "")
-                   + (f"cb{args.cos_beta:g}" if args.cos_beta else "")
-                   + ("mv" if args.micro_vote else "")
-                   + (f"nx{args.nexus_gamma:g}" if args.nexus_gamma else "")
-                   + (f"rs{args.probe_rho_step:g}" if args.probe_rho_step else "")
-                   + (f"gi{args.probe_gamma_intra:g}" if args.probe_gamma_intra else "")
-                   + (f"rf{args.probe_refresh:g}" if args.probe_refresh else "")
-                   + (f"sk{args.probe_sketch_rho:g}" if args.probe_sketch_rho else "")
-                   + ("skv" if args.probe_sketch_votes else "")
-                   + (f"mv{args.probe_sketch_min_votes}" if args.probe_sketch_min_votes != 2 else "")
-                   + (f"sg{args.sketch_gate}" if args.sketch_gate is not None else "")
-                   if args.optimizer == "manas" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + (f"_conv{args.kernel_size}" if args.router_type == "conv" else "")
                 + ("_cos" if args.scheduler == "cosine" else ""))
@@ -359,28 +323,18 @@ def main():
     for step in range(total_steps):
         for o in opts:
             o.zero_grad(set_to_none=True)
-        if manas is not None and args.gamma_decay:       # probe dose tracks the muon LR schedule (else constant)
-            manas.probe_gamma = args.probe_gamma * (opts[0].param_groups[0]["lr"] / args.muon_lr)
         loss_val = 0.0
-        # Manas: run each micro-batch's fwd/bwd at theta+d (probe), then vote() OUTSIDE the probe so d
-        # (and the nexus walker) advance per micro-batch; step() below applies the Muon update on the
-        # accumulated probe-point grads. vote() is a no-op when micro_vote=False -> the same loop runs
-        # both modes, and step-voting is numerically unchanged (d is constant within a step, so per-micro
-        # apply/remove == one probe around all micros). Plain Muon uses nullcontext + no vote.
         for _ in range(args.grad_accum):                     # gradient accumulation -> global batch
             ids = next(gen)
-            with (manas.probe() if manas is not None else contextlib.nullcontext()):
-                with amp:
-                    loss = _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
-                               getattr(cfg, "num_experts", 9), cfg.num_experts_per_tok) / args.grad_accum
-                loss.backward()
+            with amp:
+                loss = _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
+                           getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok) / args.grad_accum
+            loss.backward()
             loss_val += loss.item()
-            if manas is not None:
-                manas.vote()                                 # no-op unless micro_vote=True
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) if args.grad_clip > 0 else \
             torch.sqrt(sum(p.grad.float().pow(2).sum() for p in model.parameters() if p.grad is not None))
         for o in opts:
-            o.step(probe_loss=loss_val) if o is manas else o.step()   # probe_loss needed iff rgd_tau set; ignored otherwise
+            o.step()
         for s in scheds:
             s.step()
         if step % args.log_every == 0 or step == total_steps - 1:

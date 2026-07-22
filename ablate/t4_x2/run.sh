@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 2x T4 (16GB each): ONE ARM PER GPU in parallel (exp_manas pattern). Global batch 48 = micro 12 x
+# 2x T4 (16GB each): ONE ARM PER GPU in parallel (one-arm-per-GPU pattern). Global batch 48 = micro 12 x
 # grad_accum 4 -> IDENTICAL optimization to rtx_6000's batch-48 run, so the two hardware arms are
 # directly comparable. bf16 (T4 has no bf16 tensor cores -> slower, but numerically identical; NEVER fp16).
 # attn = sdpa: FlashAttention-4 is a Blackwell kernel and CANNOT run on Turing (sm75), so T4 uses SDPA.
