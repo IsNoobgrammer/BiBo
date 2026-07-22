@@ -22,6 +22,24 @@ except AttributeError:
 ACT_CYCLE = None
 
 
+def add_situ_params(model):
+    """Learnable SiTU: register per-expert (alpha, gamma) so code-5 experts compute
+    gamma*tanh(alpha*g)*sigmoid(g) instead of the parameter-free tanh(g)*sigmoid(g).
+    Two 1D (E,) params (not one (E,2)) so build_optimizers' ndim>=2 rule sends them to AdamW,
+    and the bf16-ckpt rule keeps them fp32. Call AFTER build_arm, BEFORE build_optimizers."""
+    import torch.nn as nn
+    from src.modeling.ffn.moe import BiBoFusedExperts
+    n = 0
+    for m in model.modules():
+        if isinstance(m, BiBoFusedExperts):
+            E = m.zero_end   # rows must match the codes tensor length (polyglu + specials)
+            dev = m.gate_up_proj.device
+            m.situ_alpha = nn.Parameter(torch.ones(E, device=dev))
+            m.situ_gamma = nn.Parameter(torch.ones(E, device=dev))
+            n += 1
+    return n
+
+
 # ───────────────────────── liger norm ─────────────────────────
 def patch_liger_norm():
     from liger_kernel.ops.rms_norm import LigerRMSNormFunction
@@ -65,8 +83,10 @@ def patch_fused_moe():
                    + [4] * (self.zero_end - self.zero_start))
             codes = torch.tensor(lst, dtype=torch.int32, device=hidden_states.device)
             self._act_codes = codes
+        ap = (torch.stack([self.situ_alpha, self.situ_gamma], dim=1)
+              if getattr(self, "situ_alpha", None) is not None else None)
         return moe_fused(hidden_states, top_k_indices, top_k_weights,
-                         self.gate_up_proj, self.down_proj, codes)
+                         self.gate_up_proj, self.down_proj, codes, act_params=ap)
 
     # Qwen: homogeneous SiLU (act code 0) for every expert
     def _qwen_moe(self, hidden_states, top_k_index, top_k_weights):

@@ -173,6 +173,7 @@ def main():
     ap.add_argument("--relu2", type=int, default=1)
     ap.add_argument("--normsilu", type=int, default=1)
     ap.add_argument("--situ", type=int, default=0)   # code 5: tanh(g)*sigmoid(g), parameter-free (default OFF)
+    ap.add_argument("--situ_learnable", type=int, default=0)   # per-expert gamma*tanh(alpha*g)*sigmoid(g); AdamW 1D params
     ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free special experts, per-type count
     ap.add_argument("--no_identity_expert", dest="identity_expert", action="store_false")  # drop Identity (code 3); test Zero alone
     ap.add_argument("--no_zero_expert", dest="zero_expert", action="store_false")          # drop Zero (code 4); test Identity alone
@@ -233,6 +234,8 @@ def main():
     # PolyGLU activation subset -> act-code cycle for the fused moe patch (codes: 0=silu,1=relu2,2=normsilu,5=situ)
     act_cycle = [c for c, on in ((0, args.silu), (1, args.relu2), (2, args.normsilu), (5, args.situ)) if on]
     assert act_cycle, "enable at least one of --silu/--relu2/--normsilu/--situ"
+    if args.situ_learnable:
+        assert args.situ, "--situ_learnable needs --situ 1"
     if act_cycle != [0, 1, 2]:
         assert "moe" in patch_list, "custom act subset needs the 'moe' patch (eager experts keep the built-in triple)"
     patchmod.ACT_CYCLE = act_cycle
@@ -249,6 +252,9 @@ def main():
                            balance_exclude_specials=args.balance_exclude_specials,
                            identity_expert=args.identity_expert, zero_expert=args.zero_expert)
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
+    if args.situ_learnable:
+        n_ap = patchmod.add_situ_params(model)
+        print(f"[acts] learnable SiTU: (alpha,gamma) registered on {n_ap} MoE layers", flush=True)
     total, trainable, active = count_params(model)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
     opts, n_mat, n_oth = build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt,
@@ -269,6 +275,7 @@ def main():
     acts_tag = "".join(n for n, on in (("s", args.silu), ("r", args.relu2), ("n", args.normsilu), ("t", args.situ)) if on)
     run_name = (f"{args.arm}_seed{args.seed}"
                 + (f"_acts-{acts_tag}" if args.arm == "bibo_min" else "")
+                + ("_situL" if args.situ_learnable else "")
                 + (f"_se{args.special_pairs}" if args.special_pairs else "")
                 + (("_idonly" if not args.zero_expert else "") if args.special_pairs else "")
                 + (("_zeroonly" if not args.identity_expert else "") if args.special_pairs else "")
