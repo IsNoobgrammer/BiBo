@@ -18,8 +18,8 @@ except AttributeError:
     _nc = torch._dynamo.disable
 
 # PolyGLU act-cycle override (codes: 0=silu, 1=relu2, 2=normsilu, 5=situ, 6=radial-normsilu, 7=ts_norm). None -> (0,1,2).
-# train.py sets this from --silu/--relu2/--normsilu/--situ/--nsr/--tsn. Code 7 (ts_norm) is EAGER-ONLY (no fused
-# kernel yet) — a code-7 stack routes the whole layer through moe_eager. e.g. [0]=all-SiLU, [0,1]=silu/relu2 alt.
+# train.py sets this from --silu/--relu2/--normsilu/--situ/--nsr/--tsn. Code 7 (ts_norm) uses the fused MoE path;
+# only its activation is eager (inside _glu_fwd/_glu_bwd). e.g. [0]=all-SiLU, [0,1]=silu/relu2 alternating.
 ACT_CYCLE = None
 
 
@@ -72,9 +72,11 @@ def patch_fused_moe():
     # FORCE per-expert: measured 2.31x faster than grouped on Blackwell at our expert size (H=512, I=768)
     # -- grouped's tl.dot only wins for large experts -- AND per-expert is the only path that handles the
     # Identity/Zero special experts correctly. (moe() auto-dispatch would wrongly pick grouped at >=4096 tok.)
-    from kernels.sm120.moe import moe_per_expert as moe_fused, moe_eager
+    from kernels.sm120.moe import moe_per_expert as moe_fused
 
-    # BiBo: diverse PolyGLU activations (silu/relu2/normsilu cycled) + optional Identity/Zero specials
+    # BiBo: diverse PolyGLU activations (silu/relu2/normsilu cycled) + optional Identity/Zero specials.
+    # ts_norm (code 7) runs on the SAME fused path — its activation is eager inside _glu_fwd/_glu_bwd,
+    # GEMMs/dispatch stay fused (no whole-layer eager fallback).
     def _bibo_moe(self, hidden_states, top_k_indices, top_k_weights):
         codes = getattr(self, "_act_codes", None)
         if codes is None or codes.device != hidden_states.device:
@@ -84,10 +86,6 @@ def patch_fused_moe():
                    + [4] * (self.zero_end - self.zero_start))
             codes = torch.tensor(lst, dtype=torch.int32, device=hidden_states.device)
             self._act_codes = codes
-            self._c7_eager = bool((codes == 7).any().item())   # ts_norm has no fused kernel yet -> eager path
-        if self._c7_eager:
-            return moe_eager(hidden_states, top_k_indices, top_k_weights,
-                             self.gate_up_proj, self.down_proj, codes)
         ap = (torch.stack([self.situ_alpha, self.situ_gamma], dim=1)
               if getattr(self, "situ_alpha", None) is not None else None)
         return moe_fused(hidden_states, top_k_indices, top_k_weights,
