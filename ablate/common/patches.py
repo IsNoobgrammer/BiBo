@@ -67,6 +67,40 @@ def patch_liger_rope():
 
 
 # ───────────────────────── fused MoE ─────────────────────────
+_LN2 = 0.6931471805599453
+
+
+def add_out_gains(model):
+    """Bounded per-expert output gain: gamma_e = exp(ln2*tanh(alpha_e)) in [0.5, 2], init 1 (alpha=0).
+    Decouples 'how loud' (amplitude) from 'who' (routing): under Muon the expert matrices cannot
+    rescale themselves (spectral norm pinned), so this is the only free per-expert amplitude
+    coordinate. Applied by scaling the top-k routing weights — w*gamma*f(x) == (w*gamma)*f(x),
+    so the fused kernel needs NO change and grads reach alpha through grad_topk_weights.
+    1D (E,) params -> AdamW group + fp32-ckpt rule. Call AFTER build_arm, BEFORE build_optimizers."""
+    import torch.nn as nn
+    from src.modeling.ffn.moe import BiBoFusedExperts
+    n = 0
+    for m in model.modules():
+        if isinstance(m, BiBoFusedExperts):
+            m.out_gain_alpha = nn.Parameter(torch.zeros(m.zero_end, device=m.gate_up_proj.device))
+            n += 1
+    return n
+
+
+def out_gain_stats(model):
+    """Per-expert-SLOT gamma, averaged across MoE layers. Slot e carries the same act code in every
+    layer (the cycle is identical per layer), so the mean never mixes activation types.
+    Returns {'gain/e<i>': mean_gamma_i} for wandb."""
+    from src.modeling.ffn.moe import BiBoFusedExperts
+    gs = [torch.exp(_LN2 * torch.tanh(m.out_gain_alpha.detach().float()))
+          for m in model.modules()
+          if isinstance(m, BiBoFusedExperts) and getattr(m, "out_gain_alpha", None) is not None]
+    if not gs:
+        return {}
+    mean = torch.stack(gs).mean(0)
+    return {f"gain/e{i}": v.item() for i, v in enumerate(mean)}
+
+
 def patch_fused_moe():
     # FORCE per-expert: measured 2.31x faster than grouped on Blackwell at our expert size (H=512, I=768)
     # -- grouped's tl.dot only wins for large experts -- AND per-expert is the only path that handles the
@@ -85,6 +119,9 @@ def patch_fused_moe():
             self._act_codes = codes
         ap = (torch.stack([self.situ_alpha, self.situ_gamma], dim=1)
               if getattr(self, "situ_alpha", None) is not None else None)
+        oga = getattr(self, "out_gain_alpha", None)
+        if oga is not None:                       # bounded loudness knob, see add_out_gains
+            top_k_weights = top_k_weights * torch.exp(_LN2 * torch.tanh(oga))[top_k_indices]
         return moe_fused(hidden_states, top_k_indices, top_k_weights,
                          self.gate_up_proj, self.down_proj, codes, act_params=ap)
 
