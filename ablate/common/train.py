@@ -174,8 +174,6 @@ def main():
     ap.add_argument("--normsilu", type=int, default=1)   # default menu = silu+normsilu (acts-sn, the ablation winner)
     ap.add_argument("--situ", type=int, default=0)   # code 5: tanh(g)*sigmoid(g), parameter-free (default OFF)
     ap.add_argument("--situ_learnable", type=int, default=0)   # per-expert gamma*tanh(alpha*g)*sigmoid(g); AdamW 1D params
-    ap.add_argument("--nsr", type=int, default=0)    # code 6: radial NormSiLU sqrt(r)*SiLU(g/r), parameter-free (toy +0.9 vs normsilu)
-    ap.add_argument("--tsn", type=int, default=0)    # code 7: ts_norm = tanh(sigmoid(g/rms(g))), EAGER-only (no fused kernel yet)
     ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free special experts, per-type count
     ap.add_argument("--no_identity_expert", dest="identity_expert", action="store_false")  # drop Identity (code 3); test Zero alone
     ap.add_argument("--no_zero_expert", dest="zero_expert", action="store_false")          # drop Zero (code 4); test Identity alone
@@ -234,8 +232,8 @@ def main():
     if args.router_type == "conv" and "router" not in patch_list:     # conv router -> use the fused sm120 kernel
         patch_list.append("router")
     # PolyGLU activation subset -> act-code cycle for the fused moe patch (codes: 0=silu,1=relu2,2=normsilu,5=situ)
-    act_cycle = [c for c, on in ((0, args.silu), (1, args.relu2), (2, args.normsilu), (5, args.situ), (6, args.nsr), (7, args.tsn)) if on]
-    assert act_cycle, "enable at least one of --silu/--relu2/--normsilu/--situ/--nsr/--tsn"
+    act_cycle = [c for c, on in ((0, args.silu), (1, args.relu2), (2, args.normsilu), (5, args.situ)) if on]
+    assert act_cycle, "enable at least one of --silu/--relu2/--normsilu/--situ"
     if args.situ_learnable:
         assert args.situ, "--situ_learnable needs --situ 1"
     if act_cycle != [0, 1, 2]:
@@ -274,7 +272,7 @@ def main():
     amp = contextlib.nullcontext() if args.precision == "fp32" else torch.autocast("cuda", dtype=dt)
     # acts-<subset> is the primary axis of this ablation; special_pairs / conv kernel etc. keep
     # their suffixes so variants don't collide on ckpt/log/run names (they otherwise share arm+seed)
-    acts_tag = "".join(n for n, on in (("s", args.silu), ("r", args.relu2), ("n", args.normsilu), ("t", args.situ), ("R", args.nsr), ("T", args.tsn)) if on)
+    acts_tag = "".join(n for n, on in (("s", args.silu), ("r", args.relu2), ("n", args.normsilu), ("t", args.situ)) if on)
     run_name = (f"{args.arm}_seed{args.seed}"
                 + (f"_acts-{acts_tag}" if args.arm == "bibo_min" else "")
                 + ("_situL" if args.situ_learnable else "")

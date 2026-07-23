@@ -17,9 +17,8 @@ try:
 except AttributeError:
     _nc = torch._dynamo.disable
 
-# PolyGLU act-cycle override (codes: 0=silu, 1=relu2, 2=normsilu, 5=situ, 6=radial-normsilu, 7=ts_norm). None -> (0,1,2).
-# train.py sets this from --silu/--relu2/--normsilu/--situ/--nsr/--tsn. Code 7 (ts_norm) uses the fused MoE path;
-# only its activation is eager (inside _glu_fwd/_glu_bwd). e.g. [0]=all-SiLU, [0,1]=silu/relu2 alternating.
+# PolyGLU act-cycle override (codes: 0=silu, 1=relu2, 2=normsilu, 5=situ). None -> default (0,1,2) cycle.
+# train.py sets this from --silu/--relu2/--normsilu/--situ, e.g. [0] = all-SiLU experts, [0,1] = silu/relu2 alternating.
 ACT_CYCLE = None
 
 
@@ -74,9 +73,7 @@ def patch_fused_moe():
     # Identity/Zero special experts correctly. (moe() auto-dispatch would wrongly pick grouped at >=4096 tok.)
     from kernels.sm120.moe import moe_per_expert as moe_fused
 
-    # BiBo: diverse PolyGLU activations (silu/relu2/normsilu cycled) + optional Identity/Zero specials.
-    # ts_norm (code 7) runs on the SAME fused path — its activation is eager inside _glu_fwd/_glu_bwd,
-    # GEMMs/dispatch stay fused (no whole-layer eager fallback).
+    # BiBo: diverse PolyGLU activations (silu/relu2/normsilu cycled) + optional Identity/Zero specials
     def _bibo_moe(self, hidden_states, top_k_indices, top_k_weights):
         codes = getattr(self, "_act_codes", None)
         if codes is None or codes.device != hidden_states.device:
