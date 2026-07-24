@@ -11,6 +11,7 @@ model monkeypatch. Call apply(components) once before training.
 """
 from . import _paths  # noqa: F401
 import torch
+import torch.nn.functional as F
 
 try:
     _nc = torch.compiler.disable
@@ -20,6 +21,24 @@ except AttributeError:
 # PolyGLU act-cycle override (codes: 0=silu, 1=relu2, 2=normsilu, 5=situ, 6=normrelu2, 7=normsitu). None -> default (0,1,2) cycle.
 # train.py sets this from --silu/--relu2/--normsilu/--situ, e.g. [0] = all-SiLU experts, [0,1] = silu/relu2 alternating.
 ACT_CYCLE = None
+
+# Router GATE override (the fn turning router logits into per-expert scores). 'sigmoid' = shipped
+# DeepSeek-V3 behavior; 'situ' = tanh(g)*sigmoid(g). train.py sets this from --router_gate.
+# CAUTION (situ): matches sigmoid's shape for g>0 but is NEGATIVE and NON-MONOTONIC for g<0
+# (min ~-0.205 at g~-1.2). Two consequences vs sigmoid: (a) top-k selection stops being monotonic
+# in the logit -- a very negative logit scores HIGHER (closer to 0) than a mildly negative one;
+# (b) norm_topk_prob divides by sum(top_k_weights), which with mixed signs can approach 0 and blow
+# up (or flip sign). Ablation-only knob; keep 'sigmoid' for real runs until an A/B says otherwise.
+ROUTER_GATE = "sigmoid"
+
+
+def _gate_scores(router_logits, gate_type):
+    """Router logits -> per-expert scores. Mirrors router.py Step 4 + the 'situ' ablation arm."""
+    if ROUTER_GATE == "situ":
+        return torch.tanh(router_logits) * torch.sigmoid(router_logits)
+    if gate_type == "sigmoid":
+        return torch.sigmoid(router_logits)
+    return torch.softmax(router_logits, dim=1)
 
 
 def add_situ_params(model):
@@ -103,6 +122,46 @@ def patch_fused_moe():
     Qwen3MoeExperts.forward = _nc(_qwen_moe)
 
 
+# ───────────────────────── router gate ablation (BiBo only) ─────────────────────────
+def patch_router_gate():
+    """Swap the router's score fn (Step 4) for ROUTER_GATE, leaving every other step verbatim.
+    Body mirrors src/modeling/ffn/router.py forward EXACTLY except the one gating line, so the
+    bias/selection/unbiased-gather/norm/scaling semantics stay bit-identical on the sigmoid path."""
+    from einops import rearrange
+    import src.modeling.ffn.router as rmod
+    R = rmod.BiBoMoERouter
+
+    def _fwd(self, hidden_states):
+        batch_size, seq_len, _ = hidden_states.shape
+        if self.router_type == "mlp":
+            flat_hidden = rearrange(hidden_states, 'b s h -> (b s) h')
+            router_logits = self.gate_proj(flat_hidden).float()
+        else:
+            x_perm = rearrange(hidden_states, 'b s h -> b h s')
+            x_padded = F.pad(x_perm, (self.causal_padding, 0))
+            router_logits = rearrange(self.gate_conv(x_padded), 'b e s -> (b s) e').float()
+        router_logits = self._apply_router_activation(router_logits)
+        scores = _gate_scores(router_logits, self.gate_type)          # <<< the ONLY change
+        selection_scores = scores + self.bias                          # bias: SELECTION only
+        _, top_k_indices = torch.topk(selection_scores, self.top_k, dim=-1, sorted=False)
+        top_k_weights = scores.gather(-1, top_k_indices)               # UNBIASED weights
+        if self.top_k > 1 and self.norm_topk_prob:
+            # L1 divisor. For a NON-NEGATIVE gate (sigmoid, always) sum|w| == sum(w), so this is
+            # bit-identical to the shipped norm. It only differs for a SIGNED gate (situ), where
+            # plain sum(w) can cancel toward 0 -> weights explode, or go negative -> all weights
+            # flip sign. sum|w| >= max|w| keeps every normalized weight in [-1,1]. The +1e-20 is
+            # the shipped epsilon, kept so the sigmoid path stays bit-exact.
+            norm_weights = top_k_weights / (top_k_weights.abs().sum(-1, keepdim=True) + 1e-20)
+        else:
+            norm_weights = top_k_weights
+        norm_weights = norm_weights * self.routed_scaling_factor
+        top_k_indices = rearrange(top_k_indices, '(b s) k -> b s k', b=batch_size)
+        norm_weights = rearrange(norm_weights, '(b s) k -> b s k', b=batch_size)
+        return top_k_indices.long(), norm_weights.float()
+
+    R.forward = _nc(_fwd)
+
+
 # ───────────────────────── fused conv router (BiBo only) ─────────────────────────
 def patch_conv_router():
     """Route BiBo's CONV router through the sm120 fused-Triton conv kernel (no cuDNN).
@@ -117,8 +176,10 @@ def patch_conv_router():
     R._orig_forward = _orig
 
     def _fwd(self, hidden_states):
+        # ROUTER_GATE guard: the kernel hardcodes sigmoid, so a non-sigmoid gate MUST fall through
+        # to the eager forward (else it would silently compute the wrong gate).
         if (self.router_type == "conv" and self.gate_type == "sigmoid"
-                and self.router_activation == "none"):
+                and self.router_activation == "none" and ROUTER_GATE == "sigmoid"):
             # cast fp32 master conv weight to the (bf16 under autocast) input dtype so the kernel's
             # tl.dot sees matching operands; the .to() is differentiable -> grad flows back to fp32 weight
             w_conv = self.gate_conv.weight.to(hidden_states.dtype)
@@ -179,13 +240,15 @@ def patch_bibo_flash():
 
 
 _APPLY = {"liger_norm": patch_liger_norm, "liger_rope": patch_liger_rope, "moe": patch_fused_moe,
-          "router": patch_conv_router}
+          "router": patch_conv_router, "router_gate": patch_router_gate}
 
 
 def apply(components):
     """components: iterable subset of {'liger_norm','liger_rope','moe'}. Returns the list applied."""
     done = []
-    for c in components:
+    # router_gate first (stable sort keeps the rest in order): patch_conv_router wraps whatever
+    # forward is current, so the gate swap must already be installed for conv's fallback to use it.
+    for c in sorted(components, key=lambda c: c != "router_gate"):
         if c == "ce":
             continue  # CE lives in the training loop
         if c not in _APPLY:

@@ -179,6 +179,7 @@ def main():
     ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free special experts, per-type count
     ap.add_argument("--no_identity_expert", dest="identity_expert", action="store_false")  # drop Identity (code 3); test Zero alone
     ap.add_argument("--no_zero_expert", dest="zero_expert", action="store_false")          # drop Zero (code 4); test Identity alone
+    ap.add_argument("--router_gate", choices=["sigmoid", "situ"], default="sigmoid")  # router score fn; situ = tanh(g)*sig(g) (run tag _rt-situ)
     ap.add_argument("--router_type", choices=["mlp", "conv"], default="mlp")       # BiBo router; conv -> sm120 fused-Triton conv kernel
     ap.add_argument("--kernel_size", type=int, default=3)                         # conv-router kernel width (only used when router_type=conv)
     ap.add_argument("--use_ssmax", action="store_true")                           # ablation axis: SSMax scalable softmax (default OFF)
@@ -233,6 +234,9 @@ def main():
     use_fused_ce = "ce" in patch_list
     if args.router_type == "conv" and "router" not in patch_list:     # conv router -> use the fused sm120 kernel
         patch_list.append("router")
+    patchmod.ROUTER_GATE = args.router_gate                            # router score fn (sigmoid | situ)
+    if args.router_gate != "sigmoid" and "router_gate" not in patch_list:
+        patch_list.append("router_gate")                               # eager gate swap (fused conv kernel is sigmoid-only)
     # PolyGLU activation subset -> act-code cycle for the fused moe patch (codes: 0=silu,1=relu2,2=normsilu,5=situ,6=normrelu2)
     act_cycle = [c for c, on in ((0, args.silu), (1, args.relu2), (2, args.normsilu), (5, args.situ),
                                  (6, args.normrelu2), (7, args.normsitu)) if on]
@@ -288,6 +292,7 @@ def main():
                 + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + (f"_conv{args.kernel_size}" if args.router_type == "conv" else "")
+                + (f"_rt-{args.router_gate}" if args.router_gate != "sigmoid" else "")
                 + ("_cos" if args.scheduler == "cosine" else ""))
     out_dir = args.out or os.path.join(os.path.dirname(__file__), "..", "runs")
     os.makedirs(out_dir, exist_ok=True)
