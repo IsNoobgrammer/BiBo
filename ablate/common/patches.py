@@ -27,9 +27,12 @@ ACT_CYCLE = None
 # CAUTION (situ): matches sigmoid's shape for g>0 but is NEGATIVE and NON-MONOTONIC for g<0
 # (min ~-0.205 at g~-1.2). Two consequences vs sigmoid: (a) top-k selection stops being monotonic
 # in the logit -- a very negative logit scores HIGHER (closer to 0) than a mildly negative one;
-# (b) norm_topk_prob divides by sum(top_k_weights), which with mixed signs can approach 0 and blow
-# up (or flip sign). Ablation-only knob; keep 'sigmoid' for real runs until an A/B says otherwise.
+# (b) the shipped sum(w) weight norm no longer sums to 1 (see _norm_topk) -- pair a signed gate
+# with ROUTER_NORM='softmax'. Ablation-only knob; keep 'sigmoid' until an A/B says otherwise.
 ROUTER_GATE = "sigmoid"
+
+
+ROUTER_NORM = "sum"
 
 
 def _gate_scores(router_logits, gate_type):
@@ -39,6 +42,26 @@ def _gate_scores(router_logits, gate_type):
     if gate_type == "sigmoid":
         return torch.sigmoid(router_logits)
     return torch.softmax(router_logits, dim=1)
+
+
+def _norm_topk(top_k_weights):
+    """Top-k SCORES -> combine WEIGHTS. The whole point of this step is sum(weights) == 1.
+
+      'sum'     shipped: w / sum(w). Sums to 1 ONLY if every w >= 0 (true for sigmoid). For a
+                SIGNED gate it breaks: sum(w) can cancel toward 0 (weights explode) or go
+                negative (every weight flips sign).
+      'softmax' softmax over the selected top-k scores: all-positive and sums to EXACTLY 1 for
+                ANY real scores, so it is the correct partner for a signed gate (situ). Cost:
+                it compresses dynamic range -- situ scores live in [-0.21, 1), so a top-2 gap of
+                at most ~1.2 logits maps to weights within ~[0.23, 0.77] (flatter routing).
+      'l1'      w / sum|w|. Bounds each weight to [-1,1] and cannot explode, but does NOT sum to
+                1 for signed w (e.g. [0.8,-0.2] -> sums to 0.6). Kept only as an ablation arm.
+    """
+    if ROUTER_NORM == "softmax":
+        return torch.softmax(top_k_weights, dim=-1)
+    if ROUTER_NORM == "l1":
+        return top_k_weights / (top_k_weights.abs().sum(-1, keepdim=True) + 1e-20)
+    return top_k_weights / (top_k_weights.sum(-1, keepdim=True) + 1e-20)
 
 
 def add_situ_params(model):
@@ -146,12 +169,7 @@ def patch_router_gate():
         _, top_k_indices = torch.topk(selection_scores, self.top_k, dim=-1, sorted=False)
         top_k_weights = scores.gather(-1, top_k_indices)               # UNBIASED weights
         if self.top_k > 1 and self.norm_topk_prob:
-            # L1 divisor. For a NON-NEGATIVE gate (sigmoid, always) sum|w| == sum(w), so this is
-            # bit-identical to the shipped norm. It only differs for a SIGNED gate (situ), where
-            # plain sum(w) can cancel toward 0 -> weights explode, or go negative -> all weights
-            # flip sign. sum|w| >= max|w| keeps every normalized weight in [-1,1]. The +1e-20 is
-            # the shipped epsilon, kept so the sigmoid path stays bit-exact.
-            norm_weights = top_k_weights / (top_k_weights.abs().sum(-1, keepdim=True) + 1e-20)
+            norm_weights = _norm_topk(top_k_weights)   # ROUTER_NORM: sum (shipped) | softmax | l1
         else:
             norm_weights = top_k_weights
         norm_weights = norm_weights * self.routed_scaling_factor
