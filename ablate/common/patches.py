@@ -17,7 +17,7 @@ try:
 except AttributeError:
     _nc = torch._dynamo.disable
 
-# PolyGLU act-cycle override (codes: 0=silu, 1=relu2, 2=normsilu, 5=situ). None -> default (0,1,2) cycle.
+# PolyGLU act-cycle override (codes: 0=silu, 1=relu2, 2=normsilu, 5=situ, 6=normrelu2). None -> default (0,1,2) cycle.
 # train.py sets this from --silu/--relu2/--normsilu/--situ, e.g. [0] = all-SiLU experts, [0,1] = silu/relu2 alternating.
 ACT_CYCLE = None
 
