@@ -20,6 +20,7 @@ from .optim import build_optimizers
 from .schedule import make_scheduler
 from .data import token_batches, TRAIN_DATASET
 from .evaluate import evaluate, Tok, summarize
+from .eval.interp import RouterTrace
 from .eval.sample import generate_samples
 from kernels.sm120.cross_entropy import fused_linear_cross_entropy   # sm120 (Blackwell); CE byte-identical to sm75
 
@@ -182,6 +183,7 @@ def main():
     ap.add_argument("--router_gate", choices=["sigmoid", "situ"], default="sigmoid")  # router score fn; situ = tanh(g)*sig(g) (run tag _rt-situ)
     ap.add_argument("--router_norm", choices=["auto", "sum", "softmax", "l1"], default="auto")  # auto: sum for sigmoid, softmax for situ (the sum-to-1 pick per gate)
     ap.add_argument("--norm_topk_prob", type=int, default=1)  # 1 = normalize top-k weights to sum to 1 (BiBo model default). 0 = raw scores as weights (old ablate behavior)
+    ap.add_argument("--router_log", type=int, default=1)      # per-step router mechanics (GPU-accumulated, 1 sync per log_every)
     ap.add_argument("--router_type", choices=["mlp", "conv"], default="mlp")       # BiBo router; conv -> sm120 fused-Triton conv kernel
     ap.add_argument("--kernel_size", type=int, default=3)                         # conv-router kernel width (only used when router_type=conv)
     ap.add_argument("--use_ssmax", action="store_true")                           # ablation axis: SSMax scalable softmax (default OFF)
@@ -281,6 +283,10 @@ def main():
         print(f"[acts] learnable SiTU: (alpha,gamma) registered on {n_ap} MoE layers", flush=True)
     total, trainable, active = count_params(model)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
+    # router mechanics traced on the TRAINING stream (eval-time MoEStats sees eval data only, every
+    # eval_every steps). GPU-resident accumulators -> one device->host transfer per log_every.
+    _n_exp = getattr(cfg, "num_routed_experts", None) or getattr(cfg, "num_experts", 0)
+    rtrace = RouterTrace(model, _n_exp, DEV) if (args.router_log and _n_exp >= 2) else None
     opts, n_mat, n_oth = build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt,
                                           scale_mode=args.muon_scale_mode, xorth_post=args.xorth_post,
                                           xorth_gate_ref=args.xorth_gate_ref, xorth_ema=args.xorth_ema,
@@ -392,14 +398,17 @@ def main():
             eta = (total_steps - step - 1) * elapsed / max(step + 1, 1)        # est. time remaining
             fin = math.isfinite(lv)
             ecorr = _expert_corr(model)                                    # cross-expert redundancy — logged every run
+            rt = rtrace.flush() if rtrace else {}                          # router mechanics over the interval
+            rt_s = (f" top1w={rt['train/router_top1_weight']:.3f} rent={rt['train/router_entropy']:.3f}"
+                    f" bal={rt['train/balance_entropy']:.3f}") if rt else ""
             print(f"  step {step}/{total_steps} loss={lv:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
-                  f"xcorr={ecorr:.4f} elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"
+                  f"xcorr={ecorr:.4f}{rt_s} elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"
                   f"{'' if fin else '  <<NON-FINITE>>'}", flush=True)
             if wb:
                 wb.log({"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "train/ms_per_step": ms_per_step,
                         "train/tps": tps, "train/mfu": mfu, "train/mem_gb": mem, "train/elapsed_s": elapsed,
-                        "train/expert_corr": ecorr, "tokens": toks}, step=step)
+                        "train/expert_corr": ecorr, "tokens": toks, **rt}, step=step)
         if do_eval and step % args.eval_every == 0:            # periodic eval -> W&B curves
             with _eager(model):                                # eval on the un-compiled module (see _eager)
                 _, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.eval_mcq_n, bpb_n=args.eval_bpb_n,

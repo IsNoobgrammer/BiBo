@@ -58,6 +58,63 @@ class MoEStats:
             h.remove()
 
 
+class RouterTrace:
+    """Router mechanics DURING TRAINING, with no GPU->CPU sync in the hot path.
+
+    MoEStats above is eval-only because its hook calls .cpu() on every MoE layer of every forward --
+    that is a device sync per layer per step, which would badly slow training. Here everything
+    accumulates into DEVICE buffers and there is exactly ONE transfer per flush() (i.e. per
+    log_every), not one per layer per step.
+
+    Hooks are the same point as MoEStats: forward_pre_hook on the expert module, whose args are
+    (hidden_states, top_k_index, top_k_weights). Eval forwards are skipped (module.training False)
+    so the training trace is not polluted by eval-distribution routing. Under gradient checkpointing
+    a layer may be hooked twice per step; every reported number is a ratio, so double-counting
+    cancels."""
+
+    def __init__(self, model, num_experts, device):
+        self.E = int(num_experts)
+        self.counts = torch.zeros(self.E, device=device, dtype=torch.float32)
+        self.acc = torch.zeros(3, device=device, dtype=torch.float32)   # [top1_sum, entropy_sum, tokens]
+        self._handles = []
+        for _, mod in model.named_modules():
+            if mod.__class__.__name__ in _EXPERT_CLASSES:
+                self._handles.append(mod.register_forward_pre_hook(self._hook))
+
+    @torch.no_grad()
+    def _hook(self, module, args):
+        if not module.training:
+            return                                    # eval forwards use MoEStats, not this
+        idx, w = args[1], args[2]
+        self.counts += torch.bincount(idx.detach().reshape(-1), minlength=self.E).to(self.counts.dtype)
+        p = w.detach().float()
+        p = p / p.sum(-1, keepdim=True).clamp_min(1e-9)     # norm-invariant: comparable across router_norm
+        self.acc[0] += p.max(-1).values.sum()
+        self.acc[1] += (-(p * p.clamp_min(1e-12).log()).sum(-1)).sum()
+        self.acc[2] += p.shape[0]
+
+    @torch.no_grad()
+    def flush(self):
+        """Return the metrics for the interval and reset. Exactly one device->host transfer."""
+        if float(self.E) < 2:
+            return {}
+        load = self.counts / self.counts.sum().clamp_min(1.0)
+        bal = -(load * load.clamp_min(1e-12).log()).sum() / math.log(self.E)   # 0*log0 == 0, as intended
+        n = self.acc[2].clamp_min(1.0)
+        packed = torch.stack([bal, self.acc[0] / n, self.acc[1] / n, load.max(), self.acc[2]])
+        b, t1, ent, mx, ntok = packed.cpu().tolist()      # <-- THE ONLY SYNC
+        self.counts.zero_(); self.acc.zero_()
+        if ntok < 1:
+            return {}                                     # nothing accumulated (e.g. logged before a step)
+        return {"train/balance_entropy": b, "train/router_top1_weight": t1,
+                "train/router_entropy": ent, "train/max_expert_load": mx}
+
+    def close(self):
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+
+
 class collect:
     """Context manager: `with collect(model, num_experts) as c: <eval forwards>; stats = c.result()`."""
     def __init__(self, model, num_experts):
