@@ -180,8 +180,8 @@ def main():
     ap.add_argument("--no_identity_expert", dest="identity_expert", action="store_false")  # drop Identity (code 3); test Zero alone
     ap.add_argument("--no_zero_expert", dest="zero_expert", action="store_false")          # drop Zero (code 4); test Identity alone
     ap.add_argument("--router_gate", choices=["sigmoid", "situ"], default="sigmoid")  # router score fn; situ = tanh(g)*sig(g) (run tag _rt-situ)
-    ap.add_argument("--router_norm", choices=["sum", "softmax", "l1"], default="sum")  # top-k score->weight norm; softmax = sum-to-1 for signed gates
-    ap.add_argument("--norm_topk_prob", type=int, default=0)  # 0 = ablation default (NO top-k norm: raw scores ARE the weights, so --router_norm is inert)
+    ap.add_argument("--router_norm", choices=["auto", "sum", "softmax", "l1"], default="auto")  # auto: sum for sigmoid, softmax for situ (the sum-to-1 pick per gate)
+    ap.add_argument("--norm_topk_prob", type=int, default=1)  # 1 = normalize top-k weights to sum to 1 (BiBo model default). 0 = raw scores as weights (old ablate behavior)
     ap.add_argument("--router_type", choices=["mlp", "conv"], default="mlp")       # BiBo router; conv -> sm120 fused-Triton conv kernel
     ap.add_argument("--kernel_size", type=int, default=3)                         # conv-router kernel width (only used when router_type=conv)
     ap.add_argument("--use_ssmax", action="store_true")                           # ablation axis: SSMax scalable softmax (default OFF)
@@ -237,22 +237,22 @@ def main():
     if args.router_type == "conv" and "router" not in patch_list:     # conv router -> use the fused sm120 kernel
         patch_list.append("router")
     patchmod.ROUTER_GATE = args.router_gate                            # router score fn (sigmoid | situ)
-    patchmod.ROUTER_NORM = args.router_norm                            # top-k score->weight norm
+    # 'auto' picks the norm that actually sums to 1 for the chosen gate: sigmoid is non-negative so
+    # the shipped w/sum(w) is proper; situ is SIGNED, where only softmax is all-positive + sum-to-1.
+    router_norm = args.router_norm
+    if router_norm == "auto":
+        router_norm = "softmax" if args.router_gate == "situ" else "sum"
+    patchmod.ROUTER_NORM = router_norm
     from . import configs as _cfgmod
-    _cfgmod.SHARED["norm_topk_prob"] = bool(args.norm_topk_prob)       # OFF by default in this harness
+    _cfgmod.SHARED["norm_topk_prob"] = bool(args.norm_topk_prob)
     if not args.norm_topk_prob:
-        if args.router_norm != "sum":
-            print(f"[router] warning: --router_norm {args.router_norm} is INERT because norm_topk_prob=0 "
-                  "(no top-k normalization at all -- raw gate scores are the combine weights). "
-                  "Pass --norm_topk_prob 1 to enable it.", flush=True)
-        if args.router_gate == "situ":
-            print("[router] note: gate 'situ' with norm_topk_prob=0 -> raw SIGNED scores are used as combine "
-                  "weights (situ range [-0.21, 1)); an expert can be subtracted. Measured 0% negative among "
-                  "selected top-2 at init, but it is unguarded during training.", flush=True)
-    elif args.router_gate == "situ" and args.router_norm == "sum":
+        print("[router] warning: norm_topk_prob=0 -> NO top-k normalization; raw gate scores are the "
+              f"combine weights (they will NOT sum to 1) and --router_norm {router_norm} is INERT.", flush=True)
+    elif args.router_gate == "situ" and router_norm == "sum":
         print("[router] warning: signed gate 'situ' with norm 'sum' -- weights escape [0,1], can flip sign "
-              "and explode on near-cancel; --router_norm softmax is the all-positive sum-to-1 choice", flush=True)
-    if (args.router_gate != "sigmoid" or args.router_norm != "sum") and "router_gate" not in patch_list:
+              "and explode on near-cancel; 'softmax' is the all-positive sum-to-1 choice", flush=True)
+    print(f"[router] gate={args.router_gate} norm={router_norm} norm_topk_prob={bool(args.norm_topk_prob)}", flush=True)
+    if (args.router_gate != "sigmoid" or router_norm != "sum") and "router_gate" not in patch_list:
         patch_list.append("router_gate")                               # eager gate swap (fused conv kernel is sigmoid-only)
     # PolyGLU activation subset -> act-code cycle for the fused moe patch (codes: 0=silu,1=relu2,2=normsilu,5=situ,6=normrelu2)
     act_cycle = [c for c, on in ((0, args.silu), (1, args.relu2), (2, args.normsilu), (5, args.situ),
@@ -309,9 +309,9 @@ def main():
                 + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + (f"_conv{args.kernel_size}" if args.router_type == "conv" else "")
-                + (f"_rt-{args.router_gate}-{args.router_norm}"
-                   if (args.router_gate != "sigmoid" or args.router_norm != "sum") else "")
-                + ("_ntp" if args.norm_topk_prob else "")
+                + (f"_rt-{args.router_gate}-{router_norm}"
+                   if (args.router_gate != "sigmoid" or router_norm != "sum") else "")
+                + ("" if args.norm_topk_prob else "_nontp")   # normalization is now the default; mark when OFF
                 + ("_cos" if args.scheduler == "cosine" else ""))
     out_dir = args.out or os.path.join(os.path.dirname(__file__), "..", "runs")
     os.makedirs(out_dir, exist_ok=True)

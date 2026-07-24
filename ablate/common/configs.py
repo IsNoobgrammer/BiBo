@@ -32,7 +32,9 @@ SHARED = dict(
     rms_norm_eps=1e-6,
     rope_theta=10000.0,
     tie_word_embeddings=True,     # SAME on both -> param match holds; tied -> ~137M total / ~71M active
-    norm_topk_prob=False,
+    norm_topk_prob=True,          # renormalize top-k weights to sum to 1 (matches the BiBo model default).
+                                  # WAS False -> every run before Jul 24 2026 used RAW gate scores as combine
+                                  # weights (measured sum ~1.34, never 1). train.py --norm_topk_prob overrides.
 )
 
 PARTIAL_ROPE = 0.334              # BiBo-min partial rotary; 1.0 == Qwen full RoPE (flip to isolate)
