@@ -175,6 +175,7 @@ def main():
     ap.add_argument("--situ", type=int, default=0)   # code 5: tanh(g)*sigmoid(g), parameter-free (default OFF)
     ap.add_argument("--situ_learnable", type=int, default=0)   # per-expert gamma*tanh(alpha*g)*sigmoid(g); AdamW 1D params
     ap.add_argument("--normrelu2", type=int, default=0)   # code 6 (tag Z): relu(g/rms(g))², RMS-normed ReLU² (default OFF)
+    ap.add_argument("--normsitu", type=int, default=0)   # code 7 (tag X): tanh(g/rms(g))*sig(g/rms(g)), RMS-normed SiTU (default OFF)
     ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free special experts, per-type count
     ap.add_argument("--no_identity_expert", dest="identity_expert", action="store_false")  # drop Identity (code 3); test Zero alone
     ap.add_argument("--no_zero_expert", dest="zero_expert", action="store_false")          # drop Zero (code 4); test Identity alone
@@ -233,8 +234,9 @@ def main():
     if args.router_type == "conv" and "router" not in patch_list:     # conv router -> use the fused sm120 kernel
         patch_list.append("router")
     # PolyGLU activation subset -> act-code cycle for the fused moe patch (codes: 0=silu,1=relu2,2=normsilu,5=situ,6=normrelu2)
-    act_cycle = [c for c, on in ((0, args.silu), (1, args.relu2), (2, args.normsilu), (5, args.situ), (6, args.normrelu2)) if on]
-    assert act_cycle, "enable at least one of --silu/--relu2/--normsilu/--situ/--normrelu2"
+    act_cycle = [c for c, on in ((0, args.silu), (1, args.relu2), (2, args.normsilu), (5, args.situ),
+                                 (6, args.normrelu2), (7, args.normsitu)) if on]
+    assert act_cycle, "enable at least one of --silu/--relu2/--normsilu/--situ/--normrelu2/--normsitu"
     if args.situ_learnable:
         assert args.situ, "--situ_learnable needs --situ 1"
     if act_cycle != [0, 1, 2]:
@@ -274,7 +276,7 @@ def main():
     # acts-<subset> is the primary axis of this ablation; special_pairs / conv kernel etc. keep
     # their suffixes so variants don't collide on ckpt/log/run names (they otherwise share arm+seed)
     acts_tag = "".join(n for n, on in (("s", args.silu), ("r", args.relu2), ("n", args.normsilu),
-                                       ("t", args.situ), ("Z", args.normrelu2)) if on)
+                                       ("t", args.situ), ("Z", args.normrelu2), ("X", args.normsitu)) if on)
     run_name = (f"{args.arm}_seed{args.seed}"
                 + (f"_acts-{acts_tag}" if args.arm == "bibo_min" else "")
                 + ("_situL" if args.situ_learnable else "")
