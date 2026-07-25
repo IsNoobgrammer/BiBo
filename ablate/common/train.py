@@ -75,7 +75,6 @@ def _measure_peak_tflops(device, dtype, n=8192, iters=30):
     return (2 * n ** 3 * iters) / (time.time() - t) / 1e12
 
 
-@torch.no_grad()
 def _bool(v):
     """argparse bool that still accepts the repo's `--flag 1` / `--flag 0` convention."""
     if isinstance(v, bool):
@@ -83,6 +82,7 @@ def _bool(v):
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+@torch.no_grad()
 def _expert_corr(model):
     """Mean cross-expert off-diagonal |cosine| over the 3D MoE expert stacks (0 = orthogonal experts,
     1 = identical). Diagnostic for xorth: does whitening actually decorrelate the experts over training?"""
