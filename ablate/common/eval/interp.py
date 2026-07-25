@@ -79,7 +79,8 @@ class RouterTrace:
     def __init__(self, model, num_experts, device):
         self.E = int(num_experts)
         self.counts = torch.zeros(self.E, device=device, dtype=torch.float32)
-        self.acc = torch.zeros(3, device=device, dtype=torch.float32)   # [top1_sum, entropy_sum, tokens]
+        # [split_top1, entropy, tokens, RAW_top1, RAW_sum, RAW_min]
+        self.acc = torch.zeros(6, device=device, dtype=torch.float32)
         self._handles = []
         for _, mod in model.named_modules():
             if mod.__class__.__name__ in _EXPERT_CLASSES:
@@ -91,12 +92,17 @@ class RouterTrace:
             return                                    # eval forwards use MoEStats, not this
         idx, w = args[1], args[2]
         self.counts += torch.bincount(idx.detach().reshape(-1), minlength=self.E).to(self.counts.dtype)
-        p = w.detach().float()
-        # L1 divisor (see MoEStats): sum(w) explodes for a SIGNED gate; sum|w| is identical for any
-        # non-negative gate and keeps this bounded. Norm-invariant either way.
-        p = p / p.abs().sum(-1, keepdim=True).clamp_min(1e-9)
+        wr = w.detach().float()
+        # RAW weights, exactly as the MoE consumes them -- no rescaling, so these are the ground truth
+        # (bounded by the gate: sigmoid (0,1), situ [-0.207,1)). router_w_sum IS the branch-magnitude
+        # channel: ~1.0 when norm_topk_prob=1, ~1.34 for un-normalized sigmoid.
+        self.acc[3] += wr.max(-1).values.sum()
+        self.acc[4] += wr.sum()
+        self.acc[5] += wr.min(-1).values.sum()
+        # derived SPLIT (how lopsided the mixture is), L1-normalized so a signed gate can't explode it
+        p = wr / wr.abs().sum(-1, keepdim=True).clamp_min(1e-9)
         self.acc[0] += p.max(-1).values.sum()
-        self.acc[1] += (-(p * p.clamp_min(1e-12).log()).sum(-1)).sum()
+        self.acc[1] += (-(p.abs() * p.abs().clamp_min(1e-12).log()).sum(-1)).sum()
         self.acc[2] += p.shape[0]
 
     @torch.no_grad()
@@ -107,13 +113,17 @@ class RouterTrace:
         load = self.counts / self.counts.sum().clamp_min(1.0)
         bal = -(load * load.clamp_min(1e-12).log()).sum() / math.log(self.E)   # 0*log0 == 0, as intended
         n = self.acc[2].clamp_min(1.0)
-        packed = torch.stack([bal, self.acc[0] / n, self.acc[1] / n, load.max(), self.acc[2]])
-        b, t1, ent, mx, ntok = packed.cpu().tolist()      # <-- THE ONLY SYNC
+        packed = torch.stack([bal, self.acc[0] / n, self.acc[1] / n, load.max(), self.acc[2],
+                              self.acc[3] / n, self.acc[4] / n, self.acc[5] / n])
+        b, t1, ent, mx, ntok, rw1, rws, rwmin = packed.cpu().tolist()   # <-- THE ONLY SYNC
         self.counts.zero_(); self.acc.zero_()
         if ntok < 1:
             return {}                                     # nothing accumulated (e.g. logged before a step)
         return {"train/balance_entropy": b, "train/router_top1_weight": t1,
-                "train/router_entropy": ent, "train/max_expert_load": mx}
+                "train/router_entropy": ent, "train/max_expert_load": mx,
+                "train/router_w_top1": rw1,      # RAW top-1 weight (gate-bounded)
+                "train/router_w_sum": rws,       # RAW sum over top-k = the branch magnitude channel
+                "train/router_w_min": rwmin}     # RAW min weight (negative => an expert is SUBTRACTED)
 
     def close(self):
         for h in self._handles:
