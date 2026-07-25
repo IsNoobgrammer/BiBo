@@ -29,7 +29,11 @@ class MoEStats:
         idx, w = args[1], args[2]
         self.counts += torch.bincount(idx.reshape(-1).to("cpu"), minlength=self.E).double()
         w = w.detach().float().cpu()
-        p = w / w.sum(-1, keepdim=True).clamp_min(1e-9)           # normalize the top-k weights per token
+        # L1 divisor, NOT sum(w): identical for a non-negative gate (sigmoid), but a SIGNED gate (situ
+        # with norm_topk_prob=0) can drive sum(w) through ~0 and the ratio explodes -- measured
+        # top1_weight of -2.2e6 on a real run. sum|w| >= max|w| keeps this diagnostic in [-1,1].
+        # The MODEL is unaffected either way; this is only the measurement.
+        p = w / w.abs().sum(-1, keepdim=True).clamp_min(1e-9)
         self.top1_sum += p.max(-1).values.sum().item()
         self.entropy_sum += (-(p * (p.clamp_min(1e-12)).log()).sum(-1)).sum().item()
         self.top1_gt_half += (p.max(-1).values > 0.5).sum().item()
