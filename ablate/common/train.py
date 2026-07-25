@@ -184,6 +184,10 @@ def main():
     ap.add_argument("--router_norm", choices=["auto", "sum", "softmax", "l1"], default="auto")  # auto: sum for sigmoid, softmax for situ (the sum-to-1 pick per gate)
     ap.add_argument("--norm_topk_prob", type=int, default=1)  # 1 = normalize top-k weights to sum to 1 (BiBo model default). 0 = raw scores as weights (old ablate behavior)
     ap.add_argument("--router_log", type=int, default=1)      # per-step router mechanics (GPU-accumulated, 1 sync per log_every)
+    # MoE-branch magnitude knobs (applied AFTER the top-k norm; normalization sets the SPLIT, these set LOUDNESS)
+    ap.add_argument("--routed_scaling_factor", type=float, default=1.0)   # fixed global scale (1.0 = no-op); tag _rs<val>
+    ap.add_argument("--routed_scaling_learnable", type=int, default=0)    # learnable per-LAYER scalar, init 1.0; tag _rsL
+    ap.add_argument("--expert_scale_learnable", type=int, default=0)      # learnable per-EXPERT vector, init 1.0; tag _esL
     ap.add_argument("--router_type", choices=["mlp", "conv"], default="mlp")       # BiBo router; conv -> sm120 fused-Triton conv kernel
     ap.add_argument("--kernel_size", type=int, default=3)                         # conv-router kernel width (only used when router_type=conv)
     ap.add_argument("--use_ssmax", action="store_true")                           # ablation axis: SSMax scalable softmax (default OFF)
@@ -254,8 +258,11 @@ def main():
         print("[router] warning: signed gate 'situ' with norm 'sum' -- weights escape [0,1], can flip sign "
               "and explode on near-cancel; 'softmax' is the all-positive sum-to-1 choice", flush=True)
     print(f"[router] gate={args.router_gate} norm={router_norm} norm_topk_prob={bool(args.norm_topk_prob)}", flush=True)
-    if (args.router_gate != "sigmoid" or router_norm != "sum") and "router_gate" not in patch_list:
-        patch_list.append("router_gate")                               # eager gate swap (fused conv kernel is sigmoid-only)
+    patchmod.ROUTER_SCALE = args.routed_scaling_factor
+    _scale_on = (args.routed_scaling_factor != 1.0 or args.routed_scaling_learnable
+                 or args.expert_scale_learnable)
+    if (args.router_gate != "sigmoid" or router_norm != "sum" or _scale_on) and "router_gate" not in patch_list:
+        patch_list.append("router_gate")            # eager router swap (also carries the magnitude scales)
     # PolyGLU activation subset -> act-code cycle for the fused moe patch (codes: 0=silu,1=relu2,2=normsilu,5=situ,6=normrelu2)
     act_cycle = [c for c, on in ((0, args.silu), (1, args.relu2), (2, args.normsilu), (5, args.situ),
                                  (6, args.normrelu2), (7, args.normsitu)) if on]
@@ -281,6 +288,12 @@ def main():
     if args.situ_learnable:
         n_ap = patchmod.add_situ_params(model)
         print(f"[acts] learnable SiTU: (alpha,gamma) registered on {n_ap} MoE layers", flush=True)
+    if args.routed_scaling_learnable or args.expert_scale_learnable:
+        n_rs = patchmod.add_router_scales(model, bool(args.routed_scaling_learnable),
+                                          bool(args.expert_scale_learnable))
+        print(f"[router] learnable scales on {n_rs} routers: "
+              f"layer={bool(args.routed_scaling_learnable)} per-expert={bool(args.expert_scale_learnable)}",
+              flush=True)
     total, trainable, active = count_params(model)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
     # router mechanics traced on the TRAINING stream (eval-time MoEStats sees eval data only, every
@@ -318,6 +331,9 @@ def main():
                 + (f"_rt-{args.router_gate}-{router_norm}"
                    if (args.router_gate != "sigmoid" or router_norm != "sum") else "")
                 + ("" if args.norm_topk_prob else "_nontp")   # normalization is now the default; mark when OFF
+                + (f"_rs{args.routed_scaling_factor:g}" if args.routed_scaling_factor != 1.0 else "")
+                + ("_rsL" if args.routed_scaling_learnable else "")
+                + ("_esL" if args.expert_scale_learnable else "")
                 + ("_cos" if args.scheduler == "cosine" else ""))
     out_dir = args.out or os.path.join(os.path.dirname(__file__), "..", "runs")
     os.makedirs(out_dir, exist_ok=True)
@@ -399,6 +415,8 @@ def main():
             fin = math.isfinite(lv)
             ecorr = _expert_corr(model)                                    # cross-expert redundancy — logged every run
             rt = rtrace.flush() if rtrace else {}                          # router mechanics over the interval
+            if args.routed_scaling_learnable or args.expert_scale_learnable:
+                rt.update(patchmod.router_scale_stats(model))               # where the learned magnitude landed
             rt_s = (f" top1w={rt['train/router_top1_weight']:.3f} rent={rt['train/router_entropy']:.3f}"
                     f" bal={rt['train/balance_entropy']:.3f}") if rt else ""
             print(f"  step {step}/{total_steps} loss={lv:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "

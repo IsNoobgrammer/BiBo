@@ -34,6 +34,51 @@ ROUTER_GATE = "sigmoid"
 
 ROUTER_NORM = "sum"
 
+# MoE-branch magnitude control (all applied AFTER the top-k norm, so they deliberately break the
+# sum-to-1 property -- that is the point: normalization fixes the SPLIT, these set the MAGNITUDE).
+#   ROUTER_SCALE      fixed global scalar (--routed_scaling_factor), 1.0 = no-op.
+#   router_scale      learnable per-LAYER scalar (--routed_scaling_learnable), init 1.0.
+#   expert_scale      learnable per-EXPERT vector (--expert_scale_learnable), init 1.0.
+# The per-expert vector is out_gain's mechanism, but out_gain was tested WITHOUT normalization, where
+# the router's un-normalized weight sum was already a free per-token magnitude channel -- so it was
+# redundant and did nothing. With sum-to-1 normalization that channel is gone, so the scale is now the
+# ONLY magnitude control: router picks + splits, scale sets loudness. Unbounded on purpose (init 1.0)
+# so the learned value REPORTS how much magnitude the model actually wants; bound it only if it drifts.
+ROUTER_SCALE = 1.0
+
+
+def add_router_scales(model, learn_layer=False, learn_expert=False):
+    """Register the learnable magnitude params on every BiBoMoERouter. 1D so build_optimizers' ndim>=2
+    rule routes them to AdamW (and the bf16-ckpt rule keeps them fp32). Call AFTER build_arm, BEFORE
+    build_optimizers. Returns the number of routers touched."""
+    import torch.nn as nn
+    import src.modeling.ffn.router as rmod
+    n = 0
+    for m in model.modules():
+        if isinstance(m, rmod.BiBoMoERouter):
+            dev = m.bias.device
+            if learn_layer:
+                m.router_scale = nn.Parameter(torch.ones(1, device=dev))
+            if learn_expert:
+                m.expert_scale = nn.Parameter(torch.ones(m.num_routed_experts, device=dev))
+            n += 1
+    return n
+
+
+def router_scale_stats(model):
+    """(mean, min, max) of the learned scales, for logging. Empty dict when none are enabled."""
+    import src.modeling.ffn.router as rmod
+    out = {}
+    for tag in ("router_scale", "expert_scale"):
+        vals = [getattr(m, tag) for m in model.modules()
+                if isinstance(m, rmod.BiBoMoERouter) and getattr(m, tag, None) is not None]
+        if vals:
+            v = torch.cat([p.detach().reshape(-1) for p in vals]).float()
+            out[f"train/{tag}_mean"] = v.mean().item()
+            out[f"train/{tag}_min"] = v.min().item()
+            out[f"train/{tag}_max"] = v.max().item()
+    return out
+
 
 def _gate_scores(router_logits, gate_type):
     """Router logits -> per-expert scores. Mirrors router.py Step 4 + the 'situ' ablation arm."""
@@ -173,6 +218,15 @@ def patch_router_gate():
         else:
             norm_weights = top_k_weights
         norm_weights = norm_weights * self.routed_scaling_factor
+        # magnitude control (deliberately after the norm -> sum is no longer 1; see ROUTER_SCALE notes)
+        if ROUTER_SCALE != 1.0:
+            norm_weights = norm_weights * ROUTER_SCALE
+        _rs = getattr(self, "router_scale", None)
+        if _rs is not None:
+            norm_weights = norm_weights * _rs                       # per-layer learnable scalar
+        _es = getattr(self, "expert_scale", None)
+        if _es is not None:
+            norm_weights = norm_weights * _es[top_k_indices]        # per-expert learnable vector
         top_k_indices = rearrange(top_k_indices, '(b s) k -> b s k', b=batch_size)
         norm_weights = rearrange(norm_weights, '(b s) k -> b s k', b=batch_size)
         return top_k_indices.long(), norm_weights.float()
