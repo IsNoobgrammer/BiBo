@@ -76,6 +76,13 @@ def _measure_peak_tflops(device, dtype, n=8192, iters=30):
 
 
 @torch.no_grad()
+def _bool(v):
+    """argparse bool that still accepts the repo's `--flag 1` / `--flag 0` convention."""
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def _expert_corr(model):
     """Mean cross-expert off-diagonal |cosine| over the 3D MoE expert stacks (0 = orthogonal experts,
     1 = identical). Diagnostic for xorth: does whitening actually decorrelate the experts over training?"""
@@ -183,11 +190,12 @@ def main():
     ap.add_argument("--router_gate", choices=["sigmoid", "situ"], default="sigmoid")  # router score fn; situ = tanh(g)*sig(g) (run tag _rt-situ)
     ap.add_argument("--router_norm", choices=["auto", "sum", "softmax", "l1"], default="auto")  # auto: sum for sigmoid, softmax for situ (the sum-to-1 pick per gate)
     ap.add_argument("--norm_topk_prob", type=int, default=1)  # 1 = normalize top-k weights to sum to 1 (BiBo model default). 0 = raw scores as weights (old ablate behavior)
-    ap.add_argument("--router_log", type=int, default=1)      # per-step router mechanics (GPU-accumulated, 1 sync per log_every)
+    ap.add_argument("--router_log", type=int, default=1)
+    ap.add_argument("--router_optim", choices=["muon","adamw"], default="muon")  # router proj optimizer; muon = current default (2D -> Muon by the ndim rule); tag _radamw      # per-step router mechanics (GPU-accumulated, 1 sync per log_every)
     # MoE-branch magnitude knobs (applied AFTER the top-k norm; normalization sets the SPLIT, these set LOUDNESS)
-    ap.add_argument("--routed_scaling_factor", type=float, default=1.0)   # fixed global scale (1.0 = no-op); tag _rs<val>
-    ap.add_argument("--routed_scaling_learnable", type=int, default=0)    # learnable per-LAYER scalar, init 1.0; tag _rsL
-    ap.add_argument("--expert_scale_learnable", type=int, default=0)      # learnable per-EXPERT vector, init 1.0; tag _esL
+    ap.add_argument("--routed_scaling_factor", type=float, default=1.0)          # fixed global scale (1.0 = no-op); tag _rs<val>
+    ap.add_argument("--routed_scaling_learnable", type=_bool, default=False)     # learnable per-LAYER scalar, init 1.0; tag _rsL
+    ap.add_argument("--expert_scale_learnable", type=_bool, default=False)       # learnable per-EXPERT vector, init 1.0; tag _esL
     ap.add_argument("--router_type", choices=["mlp", "conv"], default="mlp")       # BiBo router; conv -> sm120 fused-Triton conv kernel
     ap.add_argument("--kernel_size", type=int, default=3)                         # conv-router kernel width (only used when router_type=conv)
     ap.add_argument("--use_ssmax", action="store_true")                           # ablation axis: SSMax scalable softmax (default OFF)
@@ -303,7 +311,8 @@ def main():
     opts, n_mat, n_oth = build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt,
                                           scale_mode=args.muon_scale_mode, xorth_post=args.xorth_post,
                                           xorth_gate_ref=args.xorth_gate_ref, xorth_ema=args.xorth_ema,
-                                          xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where)
+                                          xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where,
+                                          router_adamw=(args.router_optim == "adamw"))
     if args.compile:                                            # compile the transformer body only; the
         model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
         print(f"[{args.arm}_seed{args.seed}] torch.compile(model.model) on; fused CE + liger/moe/flash kernels stay eager",
@@ -332,6 +341,7 @@ def main():
                    if (args.router_gate != "sigmoid" or router_norm != "sum") else "")
                 + ("" if args.norm_topk_prob else "_nontp")   # normalization is now the default; mark when OFF
                 + (f"_rs{args.routed_scaling_factor:g}" if args.routed_scaling_factor != 1.0 else "")
+                + ("_radamw" if args.router_optim == "adamw" else "")
                 + ("_rsL" if args.routed_scaling_learnable else "")
                 + ("_esL" if args.expert_scale_learnable else "")
                 + ("_cos" if args.scheduler == "cosine" else ""))
