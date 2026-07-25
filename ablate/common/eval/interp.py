@@ -92,7 +92,9 @@ class RouterTrace:
         idx, w = args[1], args[2]
         self.counts += torch.bincount(idx.detach().reshape(-1), minlength=self.E).to(self.counts.dtype)
         p = w.detach().float()
-        p = p / p.sum(-1, keepdim=True).clamp_min(1e-9)     # norm-invariant: comparable across router_norm
+        # L1 divisor (see MoEStats): sum(w) explodes for a SIGNED gate; sum|w| is identical for any
+        # non-negative gate and keeps this bounded. Norm-invariant either way.
+        p = p / p.abs().sum(-1, keepdim=True).clamp_min(1e-9)
         self.acc[0] += p.max(-1).values.sum()
         self.acc[1] += (-(p * p.clamp_min(1e-12).log()).sum(-1)).sum()
         self.acc[2] += p.shape[0]
