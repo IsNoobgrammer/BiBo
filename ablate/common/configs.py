@@ -62,7 +62,7 @@ def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_
                          use_ssmax=False, use_xsa=False, balance_exclude_specials=False,
                          pos_identity_expert=True, neg_identity_expert=True,
                          router_type="mlp", kernel_size=3, glu_token_budget=None,
-                         bias_update_mode="sign"):
+                         bias_update_mode="sign", top_k=None, moe_intermediate_size=None):
     from src.configuration_bibo import BiBoConfig
     # DeepSeek-style aux-loss-free balancing pairs with SIGMOID gating (bias added to sigmoid scores);
     # with no balancing we use softmax (Qwen-matched). So gate_type follows load_balance.
@@ -77,7 +77,11 @@ def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_
         vocab_size=SHARED["vocab_size"], hidden_size=SHARED["hidden_size"],
         intermediate_size=SHARED["intermediate_size"], num_hidden_layers=SHARED["num_hidden_layers"],
         num_attention_heads=SHARED["num_attention_heads"], num_key_value_heads=SHARED["num_key_value_heads"],
-        moe_intermediate_size=SHARED["moe_intermediate_size"], num_experts_per_tok=SHARED["num_experts_per_tok"],
+        # top_k / moe_intermediate_size default to SHARED. Raising top_k WITHOUT shrinking
+        # moe_intermediate_size multiplies active expert FLOPs by the same factor -- pass both to
+        # hold compute constant (the DeepSeek fine-grained-expert scaling).
+        moe_intermediate_size=(moe_intermediate_size or SHARED["moe_intermediate_size"]),
+        num_experts_per_tok=(top_k or SHARED["num_experts_per_tok"]),
         max_position_embeddings=SHARED["max_position_embeddings"], mlp_only_layers=SHARED["mlp_only_layers"],
         rms_norm_eps=SHARED["rms_norm_eps"], rope_theta=SHARED["rope_theta"],
         tie_word_embeddings=SHARED["tie_word_embeddings"], norm_topk_prob=SHARED["norm_topk_prob"],

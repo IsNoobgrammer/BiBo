@@ -229,6 +229,8 @@ def main():
     ap.add_argument("--use_ssmax", action="store_true")                           # ablation axis: SSMax scalable softmax (default OFF)
     ap.add_argument("--use_xsa", action="store_true")                             # ablation axis: XSA exclusive self-attention (default OFF)
     ap.add_argument("--balance_exclude_specials", action="store_true")            # ablation axis: bias balancer ignores the ±Identity experts (freezes their bias at 0; router learns special usage) — only matters with special_pairs>0
+    ap.add_argument("--top_k", type=int, default=0)                # 0 = SHARED (2). Raising it WITHOUT --moe_inter multiplies active expert FLOPs by the same factor. Tag _k<n>
+    ap.add_argument("--moe_inter", type=int, default=0)            # 0 = SHARED (768). Halve it when doubling top_k to hold compute constant. Tag _mi<n>
     ap.add_argument("--bias_update_mode", choices=["sign", "prop"], default="sign")  # LongCat uses NO sign(): "prop" applies u*(target-actual) directly -> proportional control, has a fixed point (no dither) and cannot drift common-mode. u is NOT comparable across modes. Tag _prop
     ap.add_argument("--glu_budget", type=float, default=-1.0)                     # LongCat K_e/K (arXiv:2509.01322): target share of routing slots for the GLU block, e.g. 0.75 -> GLU 3/4 / specials 1/4. <0 = off (DeepSeek mean-relative). Tag _gb<val>
     ap.add_argument("--bias_update_threshold", type=int, default=10240)           # tokens between bias updates (if bias)
@@ -323,7 +325,8 @@ def main():
                            neg_identity_expert=args.neg_identity_expert,
                            router_type=args.router_type, kernel_size=args.router_kernel,
                            glu_token_budget=(None if args.glu_budget < 0 else args.glu_budget),
-                           bias_update_mode=args.bias_update_mode)
+                           bias_update_mode=args.bias_update_mode,
+                           top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None))
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
     if args.situ_learnable:
         n_ap = patchmod.add_situ_params(model)
@@ -374,6 +377,8 @@ def main():
                 # once: se2-xsp (u=0.001) was clobbered by se2-xsp-u01 (u=0.01).
                 + (f"_u{args.bias_update_factor:g}" if args.bias_update_factor >= 0 else "")
                 + ("_prop" if args.bias_update_mode == "prop" else "")
+                + (f"_k{args.top_k}" if args.top_k else "")
+                + (f"_mi{args.moe_inter}" if args.moe_inter else "")
                 + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + (f"_rt-{args.router_gate}-{router_norm}"
