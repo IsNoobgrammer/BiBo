@@ -159,6 +159,8 @@ def patch_fused_moe():
     # -- grouped's tl.dot only wins for large experts -- AND per-expert is the only path that handles the
     # special experts correctly. (moe() auto-dispatch would wrongly pick grouped at >=4096 tok.)
     from kernels.sm120.moe import moe_per_expert as moe_fused
+    from kernels.sm120.moe_grouped import moe_grouped_cublas_polyglu, grouped_supported
+    from kernels.sm75.moe import _code_max
 
     _neg_identity_checked = []
 
@@ -211,6 +213,19 @@ def patch_fused_moe():
             self._act_codes = codes
         ap = (torch.stack([self.situ_alpha, self.situ_gamma], dim=1)
               if getattr(self, "situ_alpha", None) is not None else None)
+        # Prefer the sm120 cuBLAS GROUPED path. NOT moe(): its prefer_grouped() heuristic caps at
+        # GROUPED_TOKENS_PER_EXPERT_MAX=2048 tokens/expert, but our shape (H=512, I=768) runs ~2979
+        # and grouped still wins there -- measured fwd+bwd at N=32768: 4.90ms vs 3.96ms at 4
+        # specials (1.24x), widening to 1.58x at 12. The gap GROWS with special count because
+        # per-expert pays a launch per special while doing no GEMM (it gets 1.16x SLOWER from 0->12
+        # specials; grouped gets 0.82x faster). Grouped is also ~3x more accurate vs the eager
+        # reference (1.0e-3 vs 2.8e-3) -- one grouped GEMM instead of many small accumulations.
+        # Falls back to per-expert when grouped cannot run: fp32 (torch._grouped_mm is bf16/fp16
+        # only), act codes >4 (situ/normrelu2/normsitu), or learnable act_params.
+        if (ap is None and _code_max(codes) <= 4
+                and grouped_supported(hidden_states, self.gate_up_proj, self.down_proj)):
+            return moe_grouped_cublas_polyglu(hidden_states, top_k_indices, top_k_weights,
+                                              self.gate_up_proj, self.down_proj, codes)
         return moe_fused(hidden_states, top_k_indices, top_k_weights,
                          self.gate_up_proj, self.down_proj, codes, act_params=ap)
 
@@ -247,6 +262,14 @@ def patch_router_gate():
         router_logits = self.router_logits(hidden_states)
         router_logits = self._apply_router_activation(router_logits)
         scores = _gate_scores(router_logits, self.gate_type)          # <<< the ONLY change
+        # Mirror the native forward's boundary-gap probe. Without this the metric silently reads
+        # 0.0000 on every router_gate!=sigmoid arm (this patch REPLACES forward, so the native
+        # probe never runs and the buffer keeps its init) -- which is exactly what the situ arms
+        # reported before this was fixed.
+        if self._probe_gap and self.top_k < self.num_routed_experts:
+            with torch.no_grad():
+                _tk = scores.topk(self.top_k + 1, dim=-1).values
+                self.boundary_gap = (_tk[..., self.top_k - 1] - _tk[..., self.top_k]).mean()
         selection_scores = scores + self.bias                          # bias: SELECTION only
         _, top_k_indices = torch.topk(selection_scores, self.top_k, dim=-1, sorted=False)
         top_k_weights = scores.gather(-1, top_k_indices)               # UNBIASED weights
