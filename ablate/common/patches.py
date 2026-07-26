@@ -240,8 +240,11 @@ def patch_router_gate():
 
     def _fwd(self, hidden_states):
         batch_size, seq_len, _ = hidden_states.shape
-        flat_hidden = rearrange(hidden_states, 'b s h -> (b s) h')
-        router_logits = self.gate_proj(flat_hidden).float()
+        # router_logits() -- NOT self.gate_proj(). This body was written when the MLP router was the
+        # only one, and hardcoding gate_proj made every router_gate!=sigmoid arm crash on a conv
+        # router with AttributeError. router_logits() is the shared entry point and dispatches on
+        # router_type, so this patch now composes with mlp AND conv.
+        router_logits = self.router_logits(hidden_states)
         router_logits = self._apply_router_activation(router_logits)
         scores = _gate_scores(router_logits, self.gate_type)          # <<< the ONLY change
         selection_scores = scores + self.bias                          # bias: SELECTION only
