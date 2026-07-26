@@ -19,7 +19,7 @@ BiBo is a **Mixture-of-Experts (MoE) Transformer** for causal language modeling.
 1. **SSMax** — learnable per-head query scaling (`scale * log(n)`, where `n` is each query's **causal context length** `(kv_len − q_len) + t + 1`, not a global `kv_len`) that prevents attention fading at long sequences
 2. **Diverse experts** — PolyGLU layout: groups of 3 GLU experts with different activations (SiLU, ReLU², NormSiLU) + Identity/Zero special experts. **NormSiLU replaced Tanh (Jul 7 2026)**: `SiLU(gate/rms(gate))`, gain-free, eps 1e-6 — DECO's (arXiv:2605.10933) intra-expert normalization adapted to the GLU gate branch (inter-expert mean stage skipped: it couples all experts' grads and breaks per-expert dispatch). Tanh was a poor "norm expert": saturation ≠ normalization and down_proj rescales it away anyway.
 3. **Shared Conv1D expert** — causal convolution (gated, SwiGLU-style), always-active WHEN enabled. **OFF by default (since Jun 27 2026)** so BiBo stays param-matched to a no-shared baseline; opt in with `use_shared_expert=true`.
-4. **MiMo-V2.5 / DeepSeek-V3 router** — sigmoid scoring, auxiliary-loss-free bias (selection-only) updated by `b += u·sign(mean−load)`, `norm_topk_prob` (top-k sum-to-1), `routed_scaling_factor`. Verified bit-equivalent to MiMo's gate (`src/.autoresearch/bench_router_vs_mimo.py`). No Skywork logit-norm.
+4. **MiMo-V2.5 / DeepSeek-V3-style router** — configurable scoring (`gate_type`: `sigmoid` default / `situ` = SiTU `sigmoid(x)·tanh(x)` / `softmax`), auxiliary-loss-free bias (selection-only) updated by `b += u·sign(mean−load)`, `norm_topk_prob` (top-k sum-to-1 **via softmax**), `routed_scaling_factor`. No Skywork logit-norm. **NO LONGER MiMo-bit-equivalent as of Jul 26 2026** — `norm_topk_prob` switched from ÷sum to softmax; `src/.autoresearch/bench_router_vs_mimo.py` will now FAIL on the normalized arm by design (it still passes with `norm_topk_prob=False`).
 5. **Flash Attention (SDPA)** — uses `F.scaled_dot_product_attention` when `output_attentions=False`
 6. **Conv router option** — `router_type="conv"` gives router local context awareness
 7. **XSA (Exclusive Self Attention)** — parameter-free rejection of each token's attention output from its own value vector (`z = y − (y·v)v/‖v‖²`); applied after value-aggregation, before o_proj. See `docs/xsa.md`
@@ -135,7 +135,8 @@ BiBoForCausalLM
 | `bias_update_factor` | 0.01 | Load balancing step size |
 | `bias_update_threshold` | 100K | Tokens between bias updates |
 | `shared_expert_type` | "mlp" | Shared expert type: `"mlp"` (SwiGLU, like Qwen) or `"conv"` (CausalConv1D) |
-| `norm_topk_prob` | True | MiMo/DeepSeek-V3: renormalize the top-k routed weights to sum to 1 (÷ their sum). Default flipped True (Jun 28). |
+| `gate_type` | "sigmoid" | Router scoring fn. `"sigmoid"` (independent, DeepSeek-V3) / `"situ"` (SiTU `sigmoid(x)·tanh(x)`, same fn as PolyGLU act code 5 — independent + **signed**, requires `norm_topk_prob=True`) / `"softmax"` (competitive, legacy). Validated; unknown values now raise (used to fall through to softmax silently). |
+| `norm_topk_prob` | True | True → **SOFTMAX** over the gathered top-k scores so they sum to 1 (**changed from ÷sum, Jul 26 2026** — ÷sum is invalid for signed gates: the sum can cross 0 or go negative). False → raw gathered scores, unnormalized. ⚠️ With `sigmoid`+softmax the max/min weight ratio is bounded by **e ≈ 2.72** (scores span ≤1), so the router becomes near-purely a *selector* rather than a *weighter*. |
 | `routed_scaling_factor` | 1.0 | MiMo/DeepSeek-V3 final routed-weight scale, applied after `norm_topk_prob`. 1.0 = no-op (MiMo-V2.5). |
 | ~~`use_router_logit_norm` / `router_lambda`~~ | removed | **Skywork logit-norm REMOVED (Jun 28 2026)** — MiMo has none. Router is pure MiMo. |
 | ~~`moe_shared_scaling`~~ | removed | **DEPRECATED (Jun 28 2026)** — shared expert adds directly (DeepSeek-V3/Gemma), no learned/MC scalar. |
@@ -284,6 +285,38 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 ---
 
 ## Known Quirks / TODOs
+
+- **(July 26 2026) Router: `norm_topk_prob` is now SOFTMAX (not ÷sum), and `gate_type` gained
+  `"situ"`.** Two coupled changes in `ffn/router.py` + `configuration_bibo.py`:
+  1. **`norm_topk_prob=True` → `F.softmax(top_k_weights, dim=-1)`** over the gathered top-k scores,
+     replacing `w / (w.sum() + 1e-20)`. Reason: ÷sum is only valid for non-negative scores. With a
+     signed gate the top-k sum can cross zero (division explodes) or go negative (every weight flips
+     sign) — softmax has neither singularity, is defined on signed inputs, and always yields positive
+     weights summing to exactly 1. `norm_topk_prob=False` is unchanged (raw gathered scores). The
+     `top_k > 1` guard is unchanged, so top_k==1 still returns the raw score (pre-existing behavior).
+  2. **`gate_type="situ"`** = `sigmoid(x)·tanh(x)` (SiTU — the SAME function as PolyGLU act code 5
+     / `--situ`, so the expert-side and router-side ablations share one activation; Kimi K3 shipped it
+     as the EXPERT activation, this is the ROUTER gate, which K3 does NOT do).
+     Range ≈ (−0.2785, 1), min at x ≈ −0.7799, and **NON-MONOTONIC in the logit**: f(−5) ≈ −0.0067 >
+     f(−0.78) ≈ −0.2785, so a *strongly* rejected expert can outrank a *mildly* rejected one in the
+     top-k ordering — the router loses the ability to express "definitely not this expert" monotonically.
+     Config raises if `situ` is combined with `norm_topk_prob=False` at top_k>1.
+  ⚠️ **Breaks MiMo bit-equivalence** — `src/.autoresearch/bench_router_vs_mimo.py` now fails on the
+  normalized arm BY DESIGN (still passes with `norm_topk_prob=False`). Update or re-scope that bench.
+  ⚠️ **Routing is much flatter.** Softmax over sigmoid-squashed scores bounds the max/min weight ratio
+  at **e ≈ 2.72** (inputs span ≤ 1), vs unbounded for ÷sum (0.99 vs 0.01 → 99×). Measured at
+  hidden=32/top_k=2: weights land in [0.485, 0.515] (≈50/50) where ÷sum gave [0.494, 0.662]. This
+  pushes *further* in the direction of design insight #14 ("high top-1 confidence is BAD when
+  top_k > 1") but nearly to the limit — the router now expresses **selection**, barely **weighting**.
+  If sharpness is wanted back with signed-safety, the alternative is softmax over the top-k *logits*
+  (pre-gate) instead of the gathered scores — one line, NOT implemented, not benched.
+  ⚠️ Checkpoints are numerically affected (routing weights change) though shapes are unchanged.
+  ⚠️ **tkf kernels are now out of sync**: `norm_topk_prob` is FOLDED into the fused router epilogue on
+  both arches (see the Jul 7 entry) as ÷sum with Jacobian `c/T·(G_j − ⟨G,w⟩/T)`. That kernel path must
+  be updated to softmax (Jacobian becomes `diag(w) − w wᵀ`) or it will silently disagree with eager.
+  Verified (CPU, 8 experts): all three gates × norm on/off sum to 1.0 exactly when normalized, weights
+  strictly positive, both new config guards reject bad combos. `gate_proj.weight` is `(num_routed_experts,
+  hidden_size)` — experts already ARE the row dim, no change needed there.
 
 - **(July 7 2026) ManasOptimizer (tkf `kernels/sm75/manas.py`) — aurora-K1 Muon (NS-8) + rolling-probe
   gradient alignment (Nexus-adapted, arXiv:2604.09258).** Probe: `d ← ρ·d − (γ/‖g‖)·g` (short-memory

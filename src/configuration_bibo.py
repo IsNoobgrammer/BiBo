@@ -67,9 +67,14 @@ class BiBoConfig(PretrainedConfig):
         # ── Router ───────────────────────────────────────────────
         router_type="mlp",   # "mlp" or "conv"
         kernel_size=3,        # conv-router / conv-expert kernel width
-        gate_type="sigmoid",  # "sigmoid" (DeepSeek-V3, independent) or "softmax" (legacy, competitive)
-        router_activation="none",  # applied to raw logits before gating: "none", "relu" (DECO), "silu"
-        norm_topk_prob=True,        # MiMo-V2.5 / DeepSeek-V3: renormalize the top-k weights to sum to 1
+        gate_type="sigmoid",  # scoring fn: "sigmoid" (DeepSeek-V3, independent) | "situ" (SiTU,
+                              # sigmoid(x)*tanh(x) — independent + SIGNED, needs norm_topk_prob=True)
+                              # | "softmax" (legacy, competitive)
+        router_activation="none",  # applied to raw logits BEFORE gating: "none", "relu" (DECO), "silu"
+                                   # (a separate stage from gate_type — do not confuse the two)
+        norm_topk_prob=True,        # True -> SOFTMAX over the gathered top-k scores so they sum to 1
+                                    # (diverges from MiMo's ÷sum; required for signed gates). False ->
+                                    # raw gathered scores, no normalization.
         routed_scaling_factor=1.0,  # MiMo/DeepSeek-V3 final routed-weight scale; 1.0 = no-op (MiMo-V2.5)
         router_noise=0,             # DEPRECATED (injection commented out in router.py); kept for re-enable
         load_balance_strategy="bias",  # "none" or "bias" (heuristic aux-loss-free bias updates)
@@ -270,6 +275,18 @@ class BiBoConfig(PretrainedConfig):
         if self.router_activation not in ("none", "relu", "silu"):
             raise ValueError(
                 f"router_activation must be 'none', 'relu', or 'silu', got '{self.router_activation}'"
+            )
+        if self.gate_type not in ("sigmoid", "situ", "softmax"):
+            raise ValueError(
+                f"gate_type must be 'sigmoid', 'situ', or 'softmax', got '{self.gate_type}'"
+            )
+        # A signed gate with ÷sum-style normalization off means the combine weights can be negative
+        # AND unnormalized. Softmax normalization (norm_topk_prob=True) is what makes "situ" safe.
+        if self.gate_type == "situ" and not self.norm_topk_prob and self.num_experts_per_tok > 1:
+            raise ValueError(
+                "gate_type='situ' produces SIGNED scores; set norm_topk_prob=True so the top-k "
+                "weights are softmax-normalized (positive, sum to 1). Pass norm_topk_prob=True, "
+                "or use gate_type='sigmoid' if you need unnormalized weights."
             )
         if self.rope_scaling.get("type") not in ("none", "dynamic"):
             raise ValueError(

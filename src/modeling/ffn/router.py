@@ -19,13 +19,23 @@ class BiBoMoERouter(nn.Module):
     3. Bias updated via: b_i += u * sign(mean_load - expert_load), u=0.001
     4. No interference gradients — bias is outside the computation graph
     
-    Pipeline (matches MiMo-V2.5 `MiMoV2MoEGate` exactly; no Skywork logit-norm):
+    Pipeline (MiMo-V2.5 `MiMoV2MoEGate` structure, but see step 6 — the normalizer differs):
         1. raw_logits = W @ x  (MLP or Conv)
         2. raw_logits += noise  (DEPRECATED — commented out; we use router_noise=0)
-        3. scores = sigmoid(raw_logits)  — independent per-expert scores
+        3. scores = gate(raw_logits)  — sigmoid (default), situ, or softmax
         4. selection_scores = scores + bias  — for top-k selection ONLY
         5. top_k_indices = topk(selection_scores)
-        6. top_k_weights = scores[top_k_indices]  — UNBIASED; ÷sum if norm_topk_prob; × routed_scaling
+        6. top_k_weights = scores[top_k_indices]  — UNBIASED; SOFTMAX'd if norm_topk_prob;
+           × routed_scaling
+
+    ⚠️ Step 6 is a DELIBERATE DIVERGENCE from MiMo (2026-07-26). MiMo/DeepSeek-V3 normalize by
+    ÷sum. BiBo uses softmax over the gathered top-k scores instead, because ÷sum is only valid
+    for non-negative scores: with a signed gate (`gate_type="situ"`, range ~(-0.28, 1)) the sum can
+    cross zero (division explodes) or go negative (every weight flips sign). Softmax is defined
+    for signed inputs, always yields positive weights summing to 1, and has no such singularity.
+    Cost: softmax over sigmoid-squashed scores is FLATTER than ÷sum (inputs are confined to a
+    unit-width band, so the max weight ratio is bounded by e). `norm_topk_prob=False` keeps the
+    raw gathered scores and is unchanged.
     """
     def __init__(self, config: BiBoConfig):
         super().__init__()
@@ -98,13 +108,26 @@ class BiBoMoERouter(nn.Module):
         # Step 3: router activation (ReLU/SiLU/none)
         router_logits = self._apply_router_activation(router_logits)
 
-        # Step 4: gating — sigmoid (independent) or softmax (competitive)
+        # Step 4: gating — sigmoid (independent), situ (independent, signed), softmax (competitive)
         if self.gate_type == "sigmoid":
             # Sigmoid: each expert scored independently (DeepSeek-V3 preferred)
             scores = torch.sigmoid(router_logits)
-        else:
+        elif self.gate_type == "situ":
+            # SiTU (Sigmoid Tanh Unit) = sigmoid(x)*tanh(x) — same fn as PolyGLU act code 5
+            # (`--situ`); shipped as the EXPERT activation in Kimi K3, used here as the ROUTER gate.
+            # Range ~(-0.2785, 1); min at x ≈ -0.7799; NON-MONOTONIC in the logit (f(-5) ≈ -0.0067
+            # > f(-0.78) ≈ -0.2785), so a strongly-rejected expert can outrank a mildly-rejected
+            # one in the top-k ordering. Requires norm_topk_prob=True (softmax) — ÷sum is unsafe
+            # on signed scores.
+            scores = torch.sigmoid(router_logits) * torch.tanh(router_logits)
+        elif self.gate_type == "softmax":
             # Softmax: competitive normalization (legacy)
             scores = F.softmax(router_logits, dim=1)
+        else:
+            # Explicit: the old `else -> softmax` fallthrough silently accepted typos.
+            raise ValueError(
+                f"gate_type must be 'sigmoid', 'situ', or 'softmax', got '{self.gate_type}'"
+            )
 
         # Step 5: selection uses scores + bias. Bias is for load-balancing SELECTION ONLY
         # (MiMo/DeepSeek-V3) — never the combine weights (those come from raw `scores`, Step 7).
@@ -118,8 +141,10 @@ class BiBoMoERouter(nn.Module):
         # CRITICAL: use original scores, NOT selection_scores (which includes bias)
         top_k_weights = scores.gather(-1, top_k_indices)
         if self.top_k > 1 and self.norm_topk_prob:
-            # MiMo/DeepSeek-V3 use +1e-20 (sigmoid scores don't sum to 1, so renormalize the top-k)
-            norm_weights = top_k_weights / (top_k_weights.sum(-1, keepdim=True) + 1e-20)
+            # SOFTMAX over the gathered top-k scores (NOT MiMo's ÷sum) — see the class docstring.
+            # Safe for signed gates (gate_type="situ"): no zero-sum singularity, no sign flip, and
+            # the weights are always positive and sum to exactly 1.
+            norm_weights = F.softmax(top_k_weights, dim=-1)
         else:
             norm_weights = top_k_weights
         # MiMo/DeepSeek-V3: rescale the routed weights by a constant AFTER norm (1.0 = no-op)
