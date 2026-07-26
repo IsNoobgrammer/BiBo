@@ -299,7 +299,13 @@ def main():
     patchmod.ROUTER_SCALE = args.routed_scaling_factor
     _scale_on = (args.routed_scaling_factor != 1.0 or args.routed_scaling_learnable
                  or args.expert_scale_learnable)
-    if (args.router_gate != "sigmoid" or router_norm != "sum" or _scale_on) and "router_gate" not in patch_list:
+    # WHICH NORMS THE NATIVE ROUTER CAN DO: only softmax (norm_topk_prob=1) or none (=0). 'sum'
+    # (w/sum w) and 'l1' exist ONLY in the ablate patch. The old condition skipped the patch whenever
+    # router_norm=="sum", so `--norm_topk_prob 1 --router_norm sum` silently ran SOFTMAX -- and since
+    # 'auto' resolves to "sum" for a sigmoid gate, EVERY ntp=1 sigmoid run was labelled sum while
+    # actually running softmax. Patch whenever the requested norm is one the native path cannot do.
+    _norm_needs_patch = bool(args.norm_topk_prob) and router_norm not in ("softmax",)
+    if (args.router_gate != "sigmoid" or _norm_needs_patch or _scale_on) and "router_gate" not in patch_list:
         patch_list.append("router_gate")            # eager router swap (also carries the magnitude scales)
     # --act name[,name...] -> the act-code cycle for the fused moe patch
     act_names = [a.strip() for a in args.act.split(",") if a.strip()]
