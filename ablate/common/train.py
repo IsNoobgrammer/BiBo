@@ -200,7 +200,7 @@ def main():
     ap.add_argument("--use_xsa", action="store_true")                             # ablation axis: XSA exclusive self-attention (default OFF)
     ap.add_argument("--balance_exclude_specials", action="store_true")            # ablation axis: bias balancer ignores Identity/Zero experts (freezes their bias at 0; router learns special usage) — only matters with special_pairs>0
     ap.add_argument("--bias_update_threshold", type=int, default=10240)           # tokens between bias updates (if bias)
-    ap.add_argument("--bias_update_factor", type=float, default=-1.0)             # <0 = auto Hill (~0.175 for 9 experts)
+    ap.add_argument("--bias_update_factor", type=float, default=-1.0)             # <0 = config default (0.001); 0 = balancing off
     ap.add_argument("--compile", action="store_true")           # torch.compile the transformer body
     ap.add_argument("--peak_tflops", type=float, default=0.0)   # MFU denominator: 0=auto-measure achievable GEMM;
     #                                                             else theoretical, e.g. 480 (dense bf16) / 960 (sparse)

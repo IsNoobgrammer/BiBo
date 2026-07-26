@@ -137,7 +137,7 @@ BiBoForCausalLM
 | ~~`router_type`~~ | removed | **Conv router REMOVED (Jul 26 2026)** — MLP router only. `kernel_size` survives but now serves ONLY the conv shared expert (`shared_expert_type="conv"`). |
 | ~~`router_lambda`~~ / ~~`use_router_logit_norm`~~ / ~~`router_temperature`~~ | removed | Skywork logit-norm deleted Jun 28 2026 (`router_temperature` was never implemented) |
 | ~~`router_noise`~~ | removed | **DELETED Jul 26 2026** — never enabled; re-adding needs RNG preservation for grad checkpointing |
-| `bias_update_factor` | 0.01 | Load balancing step size |
+| `bias_update_factor` | 0.001 | Load-balancing step `u`. **FIXED, not a function of `n`** (the auto-Hill that grew 0.07→0.35 with expert count was removed Jul 26 2026 — it was backwards; the top-k boundary gap *shrinks* as experts are added). `sign()` never returns 0, so the bias dithers ±`u` forever and `u` is the steady-state routing-noise floor: it must stay well under the boundary gap. 0 disables balancing. |
 | `bias_update_threshold` | 100K | Tokens between bias updates |
 | `shared_expert_type` | "mlp" | Shared expert type: `"mlp"` (SwiGLU, like Qwen) or `"conv"` (CausalConv1D) |
 | `gate_type` | "sigmoid" | Router scoring fn. `"sigmoid"` (independent, DeepSeek-V3) / `"situ"` (SiTU `sigmoid(x)·tanh(x)`, same fn as PolyGLU act code 5 — independent + **signed**, requires `norm_topk_prob=True`) / `"softmax"` (competitive, legacy). Validated; unknown values now raise (used to fall through to softmax silently). |

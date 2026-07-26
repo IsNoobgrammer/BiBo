@@ -85,7 +85,7 @@ Key parameters (see [`docs/configuration_guide.md`](docs/configuration_guide.md)
 | `num_experts_per_tok` | `6` | Top-K routing |
 | `gate_type` | `"sigmoid"` | Router scoring fn: `"sigmoid"` / `"situ"` (signed, needs `norm_topk_prob=True`) / `"softmax"` |
 | `norm_topk_prob` | `True` | Softmax the gathered top-k weights so they sum to 1 |
-| `bias_update_factor` | auto | Load balancing step size (Hill function of n) |
+| `bias_update_factor` | `0.001` | Load-balancing step size (fixed, independent of expert count) |
 | `bias_update_threshold` | `8000` | Tokens between bias updates |
 | `mlp_only_layers` | `[0, N-1]` | Layers using dense MLP instead of MoE (first + last) |
 | `max_position_embeddings` | `32768` | Maximum context length |

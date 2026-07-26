@@ -145,9 +145,19 @@ batches_until_update = 8,000 / 4,096 ≈ 2 batches
 
 ### `bias_update_factor`
 
-**Default:** `None` → **auto-computed** as a Hill function of `num_routed_experts`:
-`round(0.35 * n**1.445 / (n**1.445 + 81), 4)`, bounded to [0, 0.35] and fit to f(8)=0.07,
-f(16)=0.1417, f(inf)=0.35. Pass an explicit float to override.
+**Default:** `0.001` — a FIXED small step, deliberately independent of `num_routed_experts`.
+
+> An auto-computed Hill function (0.07 at n=8 growing to 0.35) was removed Jul 26 2026: it was
+> backwards. With independent per-expert scoring (`sigmoid`/`situ`) the score distribution does not
+> move with `n`, only the order statistics get denser, so the bias distance needed to flip a top-k
+> selection *shrinks* as experts are added — measured mean gap at the k|k+1 boundary: **0.041 (n=8)
+> → 0.016 (n=32) → 0.0064 (n=128) → 0.0045 (n=512)** for sigmoid.
+>
+> **Why it must stay small:** `sign()` never returns 0, so the bias dithers ±`u` forever and never
+> settles. `u` *is* the balancer's steady-state routing-noise floor. If `u` exceeds the boundary gap
+> it reshuffles top-k selections on its own even at perfect balance. At n=128 that ratio is ~5× for
+> `u=0.03` but ~0.16× for `u=0.001`. 0.001 also matches DeepSeek-V3. Raise it for faster response at
+> the cost of routing jitter; `0` disables balancing entirely.
 
 **Location:** `src/configuration_bibo.py:56`
 
@@ -171,9 +181,9 @@ self.gate.bias.add_(self.bias_update_factor * deviation.sign())
 `bias_update_threshold`.
 
 **Tuning guidance:**
-- **1e-2 (default):** Moderate adjustment
-- **1e-3 to 5e-3:** Conservative, slow adaptation
-- **2e-2 to 5e-2:** Aggressive, fast adaptation
+- **1e-3 (default):** dither stays below the top-k boundary gap, so the bias settles
+- **1e-4 to 5e-4:** very conservative
+- **5e-3+:** faster response, but the dither starts competing with the boundary gap
 
 **Pros:**
 - Higher factor: Faster load balancing
@@ -194,15 +204,15 @@ These two parameters work together:
 ```python
 # Conservative (stable training)
 bias_update_threshold = 16_000
-bias_update_factor = 5e-3
+bias_update_factor = 5e-4
 
-# Balanced (default — factor auto-computed if left as None)
+# Balanced (defaults)
 bias_update_threshold = 8_000
-bias_update_factor = None   # auto
+bias_update_factor = 0.001  # default
 
 # Aggressive (fast load balancing)
 bias_update_threshold = 4_000
-bias_update_factor = 2e-2
+bias_update_factor = 5e-3
 ```
 
 **Key distinction:**
@@ -358,7 +368,7 @@ only take effect when this is `True`.
 | Parameter | Default | Purpose | Tuning Range |
 |-----------|---------|---------|--------------|
 | `bias_update_threshold` | 8000 | **Load balancing frequency** (tokens between updates) | 2k-50k |
-| `bias_update_factor` | None (auto) | **Load balancing step size** (auto: Hill fn of n) | 1e-3 to 5e-2 |
+| `bias_update_factor` | 0.001 | **Load balancing step size** (fixed, not a fn of n) | 1e-4 to 1e-2 |
 | `load_balance_strategy` | "bias" | How load is balanced | "none" / "bias" |
 | `router_activation` | "none" | Activation on the logits, before the gate | "none"/"relu"/"silu" |
 | `gate_type` | "sigmoid" | Gating mechanism | "sigmoid" / "situ" / "softmax" |
@@ -381,7 +391,7 @@ only take effect when this is `True`.
 ```python
 config = BiBoConfig(
     bias_update_threshold=16_000,  # Infrequent updates
-    bias_update_factor=5e-3,     # Small steps
+    bias_update_factor=5e-4,     # Small steps
 )
 ```
 
@@ -389,7 +399,7 @@ config = BiBoConfig(
 ```python
 config = BiBoConfig(
     bias_update_threshold=8_000,    # Regular updates (default)
-    bias_update_factor=None,     # Auto-computed (Hill fn of num_routed_experts)
+    bias_update_factor=0.001,    # default fixed step
 )
 ```
 
@@ -397,7 +407,7 @@ config = BiBoConfig(
 ```python
 config = BiBoConfig(
     bias_update_threshold=4_000,    # Frequent updates
-    bias_update_factor=2e-2,     # Large steps
+    bias_update_factor=5e-3,     # Large steps
 )
 ```
 
@@ -446,7 +456,7 @@ bias_magnitude = model.moe_layer.gate.bias.abs().mean()
 - **Solution:** 
   - Decrease `router_lambda` (0.5-0.8)
   - Decrease `bias_update_threshold` (~4000 — more frequent rebalancing; default 8000)
-  - Increase `bias_update_factor` (2e-2)
+  - Increase `bias_update_factor` (5e-3)
 
 **Issue: Poor expert specialization**
 - **Symptom:** All experts learn similar representations
@@ -459,7 +469,7 @@ bias_magnitude = model.moe_layer.gate.bias.abs().mean()
 - **Solution:**
   - Decrease `router_lambda` (0.8)
   - Increase `bias_update_threshold` (~16000 — gentler rebalancing; default 8000)
-  - Decrease `bias_update_factor` (5e-3)
+  - Decrease `bias_update_factor` (5e-4)
 
 **Issue: Shared expert dominates**
 - **Symptom:** Routed experts contribute little

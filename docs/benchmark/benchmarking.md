@@ -188,7 +188,7 @@ MY_CONFIG = BiBoConfig(
     shared_expert_type="mlp",        # "mlp" or "conv"
     # Router (MLP only — conv router removed Jul 26 2026)
     bias_update_threshold=100_000,
-    bias_update_factor=1e-2,
+    bias_update_factor=1e-3,
     # Other
     tie_word_embeddings=True,
 )
@@ -244,7 +244,7 @@ BIBO_50M_BASELINE = BiBoConfig(
     shared_expert_type="mlp",       # SwiGLU shared expert
     # Router (MLP only)
     bias_update_threshold=100_000,
-    bias_update_factor=1e-2,
+    bias_update_factor=1e-3,
     # Other
     tie_word_embeddings=True,
     rope_theta=10000.0,
@@ -384,7 +384,7 @@ BIBO_50M_BASELINE = BiBoConfig(
     shared_expert_type="conv",       # CausalConv1D shared expert
     # Router (MLP only — the conv router variant was removed Jul 26 2026)
     bias_update_threshold=100_000,
-    bias_update_factor=1e-2,
+    bias_update_factor=1e-3,
     # Other
     tie_word_embeddings=True,
     rope_theta=10000.0,

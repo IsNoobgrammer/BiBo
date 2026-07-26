@@ -68,7 +68,7 @@ def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_
     return BiBoConfig(
         load_balance_strategy=load_balance,         # "bias" (DeepSeek-style, sigmoid) | "none" (softmax, Qwen-matched)
         bias_update_threshold=bias_update_threshold,  # tokens between router-bias updates (only if load_balance="bias")
-        bias_update_factor=bias_update_factor,        # None = auto Hill (~0.08 for 9 experts)
+        bias_update_factor=bias_update_factor,        # None -> BiBoConfig default (0.001)
         balance_exclude_specials=balance_exclude_specials,  # ablation: freeze Identity/Zero bias (router learns their use)
         vocab_size=SHARED["vocab_size"], hidden_size=SHARED["hidden_size"],
         intermediate_size=SHARED["intermediate_size"], num_hidden_layers=SHARED["num_hidden_layers"],

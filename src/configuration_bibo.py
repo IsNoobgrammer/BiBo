@@ -72,7 +72,7 @@ class BiBoConfig(PretrainedConfig):
         norm_topk_prob=True,       # softmax the gathered top-k weights to sum to 1 (not MiMo's ÷sum)
         routed_scaling_factor=1.0,  # post-norm routed-weight scale; 1.0 = no-op
         load_balance_strategy="bias",  # "none" | "bias" (aux-loss-free bias updates)
-        bias_update_factor=None,    # Auto: Hill function of num_routed_experts
+        bias_update_factor=0.001,   # sign-update step; small on purpose, see __init__ note
         bias_update_threshold=8000,  # tokens between bias updates
         balance_exclude_specials=False,  # balance only the GLU block, freeze Identity/Zero biases at 0
         **kwargs,
@@ -164,13 +164,19 @@ class BiBoConfig(PretrainedConfig):
             else self.intermediate_size // self.num_experts_per_tok
         )
 
-        # Hill function A*n^α/(n^α+C) bounded to [0, 0.35], fit to f(8)=0.07, f(16)=0.1417,
-        # f(∞)=0.35 — small n wants a small step, large n needs strong balancing for EP.
-        if bias_update_factor is not None:
-            self.bias_update_factor = bias_update_factor
-        else:
-            n_pow = self.num_routed_experts ** 1.445
-            self.bias_update_factor = round(0.35 * n_pow / (n_pow + 81.0), 4)
+        # A FIXED small step, NOT a function of num_routed_experts (the old auto-Hill grew u from
+        # 0.07 at n=8 to 0.35 asymptotically, which is backwards). With independent per-expert
+        # scoring (sigmoid / situ) the score distribution does not move with n — only the order
+        # statistics get denser — so the bias distance needed to flip a top-k selection SHRINKS as
+        # experts are added: measured mean gap at the k|k+1 boundary is 0.041 (n=8) -> 0.0064
+        # (n=128) -> 0.0045 (n=512) for sigmoid. A small fixed step is therefore *more* than
+        # sufficient at scale, not less.
+        # Why this small: sign() never returns 0, so the bias dithers +-u forever and never settles;
+        # u IS the balancer's steady-state routing-noise floor. u must stay well under the boundary
+        # gap or it reshuffles selections on its own even at perfect balance (u=0.03 is ~5x the
+        # n=128 gap; u=0.001 is ~0.16x). 0.001 also matches DeepSeek-V3. Raise it for a faster
+        # response at the cost of more routing jitter; 0 disables balancing entirely.
+        self.bias_update_factor = 0.001 if bias_update_factor is None else bias_update_factor
 
         self.bias_update_threshold = bias_update_threshold if bias_update_threshold is not None else 8000
         self.balance_exclude_specials = balance_exclude_specials

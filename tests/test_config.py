@@ -23,19 +23,27 @@ def test_mlp_only_layers_dedupes_single_layer_model():
     assert c.mlp_only_layers == [0], "N==1 must give [0], not [0, 0]"
 
 
-def test_bias_update_factor_matches_documented_hill_fit():
-    """Auto factor is round(0.35 * n^1.445 / (n^1.445 + 81), 4), fit to f(8)=0.07, f(16)=0.1417."""
-    def hill(n):
-        return round(0.35 * n**1.445 / (n**1.445 + 81.0), 4)
-
-    assert abs(hill(8) - 0.07) < 5e-3
-    assert abs(hill(16) - 0.1417) < 5e-3
-    c = make_config()
-    assert c.bias_update_factor == hill(c.num_routed_experts)
+def test_bias_update_factor_is_a_fixed_small_step():
+    """It must NOT scale with num_routed_experts. sign() never returns 0, so the bias dithers +-u
+    forever and u is the balancer's steady-state routing-noise floor; it has to stay well under the
+    top-k boundary gap, which SHRINKS as experts are added (0.041 at n=8 -> 0.0064 at n=128)."""
+    assert make_config().bias_update_factor == 0.001
+    for mult in (1, 2, 10, 42):     # 5 .. 128 routed experts
+        c = make_config(polyglu_expert_multiplier=mult, special_expert_pairs=1,
+                        num_experts_per_tok=1)
+        assert c.bias_update_factor == 0.001, \
+            f"u must not depend on n (got {c.bias_update_factor} at n={c.num_routed_experts})"
 
 
 def test_explicit_bias_update_factor_wins():
-    assert make_config(bias_update_factor=1e-3).bias_update_factor == 1e-3
+    assert make_config(bias_update_factor=3e-2).bias_update_factor == 3e-2
+    assert make_config(bias_update_factor=None).bias_update_factor == 0.001, "None -> default"
+    assert make_config(bias_update_factor=0.0).bias_update_factor == 0.0, "0 disables balancing"
+
+
+def test_negative_bias_update_factor_is_rejected():
+    with pytest.raises(ValueError):
+        make_config(bias_update_factor=-1.0)
 
 
 @pytest.mark.parametrize("overrides,reason", [
