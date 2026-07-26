@@ -60,7 +60,8 @@ def make_qwen_config(attn_impl="sdpa", aux_coef=0.001, num_experts=None):
 def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_update_factor=None,
                          polyglu_mult=2, special_pairs=0,
                          use_ssmax=False, use_xsa=False, balance_exclude_specials=False,
-                         identity_expert=True, zero_expert=True):
+                         pos_identity_expert=True, neg_identity_expert=True,
+                         router_type="mlp", kernel_size=3, glu_token_budget=None):
     from src.configuration_bibo import BiBoConfig
     # DeepSeek-style aux-loss-free balancing pairs with SIGMOID gating (bias added to sigmoid scores);
     # with no balancing we use softmax (Qwen-matched). So gate_type follows load_balance.
@@ -69,7 +70,8 @@ def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_
         load_balance_strategy=load_balance,         # "bias" (DeepSeek-style, sigmoid) | "none" (softmax, Qwen-matched)
         bias_update_threshold=bias_update_threshold,  # tokens between router-bias updates (only if load_balance="bias")
         bias_update_factor=bias_update_factor,        # None -> BiBoConfig default (0.001)
-        balance_exclude_specials=balance_exclude_specials,  # ablation: freeze Identity/Zero bias (router learns their use)
+        balance_exclude_specials=balance_exclude_specials,  # ablation: freeze ±Identity bias (router learns their use)
+        glu_token_budget=glu_token_budget,  # LongCat K_e/K: absolute GLU-block share target (None = DeepSeek mean-relative)
         vocab_size=SHARED["vocab_size"], hidden_size=SHARED["hidden_size"],
         intermediate_size=SHARED["intermediate_size"], num_hidden_layers=SHARED["num_hidden_layers"],
         num_attention_heads=SHARED["num_attention_heads"], num_key_value_heads=SHARED["num_key_value_heads"],
@@ -80,14 +82,18 @@ def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_
         # --- the ablation delta: PolyGLU experts + partial RoPE ---
         polyglu_expert_multiplier=polyglu_mult,  # GLU experts = polyglu_mult*3 (silu/relu2/normsilu); == Qwen num_experts
         special_expert_pairs=special_pairs,      # per-type count of param-FREE special experts
-        identity_expert=identity_expert,         # ablation: include Identity special expert(s) (code 3)
-        zero_expert=zero_expert,                 # ablation: include Zero special expert(s)     (code 4)
+        pos_identity_expert=pos_identity_expert,  # ablation: include +Identity special expert(s) (code 3)
+        neg_identity_expert=neg_identity_expert,  # ablation: include -Identity special expert(s) (code 4)
         partial_rotary_factor=PARTIAL_ROPE,
         # --- everything else stripped to Qwen-equivalence ---
         use_xsa=use_xsa, use_ssmax=use_ssmax,    # ablation axes (default OFF): XSA + scalable-softmax
         add_full_attention_sink_bias=False, add_swa_attention_sink_bias=False,
         hybrid_layer_pattern=None,        # all-global attention (no SWA)
-        gate_type=gate, router_activation="none",   # MLP router only (conv router removed Jul 26 2026)
+        gate_type=gate, router_activation="none",
+        # ablation axis: "mlp" (Linear, default) | "conv" (causal Conv1d over kernel_size taps).
+        # The conv router weight is stored 2D (E, H*kernel_size) so Muon orthogonalizes per EXPERT,
+        # not per kernel tap -- see the big note atop ablate/common/optim.py before touching this.
+        router_type=router_type, kernel_size=kernel_size,
         routed_scaling_factor=1.0,
         use_shared_expert=False,
     )

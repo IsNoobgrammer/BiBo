@@ -1,4 +1,4 @@
-"""MoE: expert layout, PolyGLU activations, router gating, load balancing."""
+﻿"""MoE: expert layout, PolyGLU activations, router gating, load balancing."""
 import pytest
 import torch
 from conftest import DEVICE, make_config, make_model
@@ -16,8 +16,8 @@ def test_expert_layout_and_fused_weight_shapes(mult, pairs):
                     num_experts_per_tok=1)
     e = BiBoMoELayer(c).to(DEVICE).experts
     assert e.num_polyglu_experts == mult * 3
-    assert e.identity_start == mult * 3, "GLU block comes first"
-    assert e.zero_end == c.num_routed_experts, "Zero block closes the layout"
+    assert e.pos_start == mult * 3, "GLU block comes first"
+    assert e.neg_end == c.num_routed_experts, "-Identity block closes the layout"
     assert e.gate_up_proj.shape == (mult * 3, 2 * c.moe_intermediate_size, c.hidden_size)
     assert e.down_proj.shape == (mult * 3, c.hidden_size, c.moe_intermediate_size)
 
@@ -28,31 +28,116 @@ def test_polyglu_activation_cycle_is_e_mod_3():
     assert [_POLYGLU_ACTIVATIONS[e % 3] for e in range(n)] == ["silu", "relu2", "normsilu"] * 3
 
 
-def test_identity_and_zero_expert_semantics():
+def test_signed_identity_expert_semantics():
+    """+Identity emits +w*x, -Identity emits -w*x. No expert may emit 0 (that was the Zero expert,
+    removed Jul 26 2026 — its output carries no gradient signal to the router)."""
     c = make_config(polyglu_expert_multiplier=1, special_expert_pairs=1, num_experts_per_tok=1)
     e = BiBoMoELayer(c).to(DEVICE).experts
     x = torch.randn(4, c.hidden_size, device=DEVICE)
     w = torch.ones(4, 1, device=DEVICE)
     idx = lambda i: torch.full((4, 1), i, device=DEVICE, dtype=torch.long)
-    assert torch.allclose(e(x, idx(e.identity_start), w), x, atol=1e-6), "Identity is not passthrough"
-    assert e(x, idx(e.zero_start), w).abs().max() == 0, "Zero emitted nonzero output"
+    assert torch.allclose(e(x, idx(e.pos_start), w), x, atol=1e-6), "+Identity is not passthrough"
+    assert torch.allclose(e(x, idx(e.neg_start), w), -x, atol=1e-6), "-Identity is not negated passthrough"
 
 
-def test_identity_weight_is_applied():
+def test_signed_identity_weight_is_applied():
     c = make_config(polyglu_expert_multiplier=1, special_expert_pairs=1, num_experts_per_tok=1)
     e = BiBoMoELayer(c).to(DEVICE).experts
     x = torch.randn(4, c.hidden_size, device=DEVICE)
     half = torch.full((4, 1), 0.5, device=DEVICE)
-    out = e(x, torch.full((4, 1), e.identity_start, device=DEVICE, dtype=torch.long), half)
-    assert torch.allclose(out, x * 0.5, atol=1e-6)
+    for start, sign in ((e.pos_start, 1.0), (e.neg_start, -1.0)):
+        out = e(x, torch.full((4, 1), start, device=DEVICE, dtype=torch.long), half)
+        assert torch.allclose(out, sign * x * 0.5, atol=1e-6)
 
 
-@pytest.mark.parametrize("identity,zero", [(False, True), (True, False), (False, False)])
-def test_special_expert_toggles_make_zero_width_blocks(identity, zero):
-    c = make_config(identity_expert=identity, zero_expert=zero, special_expert_pairs=1)
+def test_equal_weight_signed_pair_cancels_to_zero():
+    """The ± pair spans the old Zero expert's behavior as the w+ == w- special case — but reachable
+    by routing, with live gradients on both branches."""
+    c = make_config(polyglu_expert_multiplier=1, special_expert_pairs=1, num_experts_per_tok=2)
     e = BiBoMoELayer(c).to(DEVICE).experts
-    assert (e.identity_end > e.identity_start) == identity
-    assert (e.zero_end > e.zero_start) == zero
+    x = torch.randn(4, c.hidden_size, device=DEVICE)
+    idx = torch.tensor([[e.pos_start, e.neg_start]] * 4, device=DEVICE)
+    out = e(x, idx, torch.full((4, 2), 0.5, device=DEVICE))
+    assert out.abs().max() < 1e-6, "equal-weight +x and -x must cancel"
+
+
+def test_both_signed_specials_carry_a_combine_weight_gradient():
+    """The reason Zero was removed: its output is 0, so d(loss)/d(its weight) = <grad_out, 0> is
+    identically 0 and the router can never learn that picking it was right. Both ±Identity branches
+    must carry real gradient."""
+    c = make_config(polyglu_expert_multiplier=1, special_expert_pairs=1, num_experts_per_tok=1)
+    e = BiBoMoELayer(c).to(DEVICE).experts
+    x = torch.randn(8, c.hidden_size, device=DEVICE)
+    for start in (e.pos_start, e.neg_start):
+        w = torch.full((8, 1), 0.5, device=DEVICE, requires_grad=True)
+        idx = torch.full((8, 1), start, device=DEVICE, dtype=torch.long)
+        # <out, random>, NOT out.sum(): a symmetric reduction can cancel to a vacuous zero gradient
+        (e(x, idx, w) * torch.randn(8, c.hidden_size, device=DEVICE)).sum().backward()
+        assert w.grad.abs().max() > 0, f"expert {start} has no gradient path to its router weight"
+
+
+@pytest.mark.parametrize("pos,neg", [(False, True), (True, False), (False, False)])
+def test_special_expert_toggles_make_zero_width_blocks(pos, neg):
+    c = make_config(pos_identity_expert=pos, neg_identity_expert=neg, special_expert_pairs=1)
+    e = BiBoMoELayer(c).to(DEVICE).experts
+    assert (e.pos_end > e.pos_start) == pos
+    assert (e.neg_end > e.neg_start) == neg
+
+
+# ── conv router ──────────────────────────────────────────────────────────────
+def test_conv_router_weight_is_2d_with_experts_as_rows():
+    """REGRESSION GUARD for the Muon orthogonalization axis. NS batches over the LEADING dim and
+    iterates on the smaller Gram, so an (E,H,K) nn.Conv1d weight gets its KERNEL TAPS decorrelated
+    and its EXPERTS left correlated (it cannot even de-collapse identical experts). Storing the
+    weight as 2D (E, H*K) makes the Gram (E,E) -> experts decorrelated, same as the MLP router.
+    If this test fails, routing quality silently regresses. See ablate/common/optim.py."""
+    K = 5
+    c = make_config(router_type="conv", kernel_size=K)
+    r = BiBoMoERouter(c).to(DEVICE)
+    assert r.gate_conv.ndim == 2, "conv router weight must be 2D or Muon whitens taps, not experts"
+    assert r.gate_conv.shape == (c.num_routed_experts, c.hidden_size * K)
+    assert not hasattr(r, "gate_proj"), "conv router must not also build the MLP projection"
+
+
+def test_conv_router_is_causal():
+    """Position t must depend only on t-K+1..t. Perturbing a LATER token cannot move earlier logits."""
+    c = make_config(router_type="conv", kernel_size=3)
+    r = BiBoMoERouter(c).to(DEVICE)
+    x = torch.randn(1, 12, c.hidden_size, device=DEVICE)
+    x2 = x.clone()
+    x2[0, 8] += 10.0
+    a, b = r.router_logits(x), r.router_logits(x2)
+    assert torch.allclose(a[:8], b[:8], atol=1e-5), "conv router leaked future information"
+    assert not torch.allclose(a[8], b[8], atol=1e-3), "token 8 should have changed"
+
+
+def test_conv_router_init_is_fan_in_aware():
+    """A conv logit sums H*K terms vs the MLP's H. Sharing initializer_range would start the conv
+    router sqrt(K)x sharper (measured 1.64x at K=3) -- an uncontrolled confound in any conv-vs-mlp
+    ablation. Dividing the std by sqrt(K) matches the two logit scales."""
+    K = 4
+    h = torch.randn(2, 64, 64, device=DEVICE)
+    lg_mlp = BiBoMoERouter(make_config(router_type="mlp")).to(DEVICE).router_logits(h)
+    lg_conv = BiBoMoERouter(make_config(router_type="conv", kernel_size=K)).to(DEVICE).router_logits(h)
+    ratio = (lg_conv.std() / lg_mlp.std()).item()
+    assert 0.75 < ratio < 1.35, f"conv/mlp logit-scale ratio {ratio:.3f} (fan-in init broken?)"
+
+
+@pytest.mark.parametrize("gate", GATES)
+def test_conv_router_routes_and_carries_gradient(gate):
+    c = make_config(router_type="conv", kernel_size=3, gate_type=gate)
+    r = BiBoMoERouter(c).to(DEVICE)
+    idx, w = r(torch.randn(2, 6, c.hidden_size, device=DEVICE))
+    assert idx.shape == (2, 6, c.num_experts_per_tok) and w.dtype == torch.float32
+    assert idx.min() >= 0 and idx.max() < c.num_routed_experts
+    # <w, random>, not w.sum(): normalized weights sum to a constant -> vacuous zero gradient
+    (w * torch.randn_like(w)).sum().backward()
+    assert r.gate_conv.grad is not None and r.gate_conv.grad.abs().max() > 0
+
+
+def test_router_type_is_validated():
+    with pytest.raises(ValueError):
+        make_config(router_type="attention")
 
 
 # ── router ───────────────────────────────────────────────────────────────────
@@ -137,8 +222,52 @@ def test_balance_exclude_specials_freezes_special_biases():
     layer = BiBoMoELayer(c).to(DEVICE)
     npg = layer.experts.num_polyglu_experts
     layer.update_bias(torch.arange(float(c.num_routed_experts), device=DEVICE) * 10)
-    assert (layer.gate.bias[npg:] == 0).all(), "Identity/Zero biases must stay at 0"
+    assert (layer.gate.bias[npg:] == 0).all(), "±Identity biases must stay at 0"
     assert (layer.gate.bias[:npg] != 0).any(), "the GLU block should still be balanced"
+
+
+def test_glu_token_budget_shifts_the_whole_glu_block_when_off_budget():
+    """LongCat's absolute target (K_e/K per block) vs DeepSeek's mean-relative one. When the GLU block
+    is collectively over budget EVERY GLU bias must drop -- a uniform shift that cannot reorder the
+    block but does push traffic across to the specials. The mean-relative rule cannot express this:
+    its deviations always sum to ~0 inside the block."""
+    c = make_config(load_balance_strategy="bias", bias_update_factor=0.1, glu_token_budget=0.75,
+                    polyglu_expert_multiplier=2, special_expert_pairs=1)
+    npg = BiBoMoELayer(c).experts.num_polyglu_experts
+    n_special = c.num_routed_experts - npg
+    for glu_share, want in ((0.95, -1.0), (0.40, 1.0)):     # over budget -> down, under -> up
+        layer = BiBoMoELayer(c).to(DEVICE)
+        tpe = torch.cat([torch.full((npg,), glu_share / npg, device=DEVICE),
+                         torch.full((n_special,), (1 - glu_share) / n_special, device=DEVICE)]) * 1000
+        layer.update_bias(tpe)
+        b = layer.gate.bias
+        assert torch.allclose(b[:npg], torch.full_like(b[:npg], want * 0.1)), \
+            f"GLU share {glu_share} vs budget 0.75: expected a uniform {want:+.0f} shift, got {b[:npg]}"
+        assert (b[npg:] == 0).all(), "specials are the residual sink -- Delta b must be 0 (LongCat)"
+
+
+def test_glu_token_budget_still_equalizes_within_the_glu_block():
+    """The budget sets the block's TOTAL share; experts inside it must still be balanced against
+    each other, or the knob would trade balance for budget."""
+    c = make_config(load_balance_strategy="bias", bias_update_factor=0.1, glu_token_budget=0.75,
+                    polyglu_expert_multiplier=2, special_expert_pairs=1)
+    layer = BiBoMoELayer(c).to(DEVICE)
+    npg = layer.experts.num_polyglu_experts
+    tpe = torch.full((c.num_routed_experts,), 10.0, device=DEVICE)
+    tpe[0] = 1000.0                                          # one hogging GLU expert
+    layer.update_bias(tpe)
+    b = layer.gate.bias
+    assert b[0] < 0 and (b[1:npg] > 0).all(), "the hog must be discouraged, its peers encouraged"
+
+
+def test_glu_token_budget_is_validated():
+    with pytest.raises(ValueError):
+        make_config(glu_token_budget=1.5)
+    with pytest.raises(ValueError):
+        make_config(glu_token_budget=0.0)
+    with pytest.raises(ValueError):                          # no specials -> nowhere for traffic to go
+        make_config(glu_token_budget=0.75, special_expert_pairs=0)
+    make_config(glu_token_budget=1.0, special_expert_pairs=0)   # 1.0 == "all GLU", always legal
 
 
 def test_bias_update_fires_on_the_expected_step_interval():

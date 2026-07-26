@@ -6,7 +6,7 @@
 
 1. **SSMax (Scalable-Softmax)** — Learnable per-head query scaling (`scale * log(kv_len)`) that prevents attention fading at long sequences. Based on [arXiv:2501.19399](https://arxiv.org/abs/2501.19399).
 
-2. **Diverse Expert Pool** — Not all experts are MLPs. The expert layout includes Identity, Zero, and ReLU² experts alongside standard SwiGLU MLPs, enabling the model to learn when tokens need no transformation, gated suppression, or simple non-linearity.
+2. **Diverse Expert Pool** — Not all experts are MLPs. The expert layout cycles SiLU, ReLU², and NormSiLU GLU experts and adds param-free **±Identity** experts (`+w·x` / `−w·x`), letting the model route a token through a signed pass-through instead of a transformation. (A Zero expert existed until Jul 26 2026; its output carries no gradient to the router, so it was replaced by the signed pair — which spans the same "skip" behavior as the `w₊ ≈ w₋` case.)
 
 3. **Shared Causal Conv1D Expert** — An always-active gated causal convolution that provides local temporal context to every token, independent of routing decisions. Novel — no prior MoE work uses convolution as a shared expert.
 
@@ -14,7 +14,7 @@
 
 5. **Threshold-Based Bias Heuristics** — Non-trainable router bias (`requires_grad=False`) updated via load-balancing heuristics. Avoids FSDP conflicts while maintaining expert utilization balance.
 
-6. **MLP Router** — a single linear projection `(num_routed_experts, hidden_size)` produces the router logits. (A causal-conv router variant existed until Jul 26 2026; it was removed after failing to beat the MLP router.)
+6. **Router** — `router_type="mlp"` (default) is a single linear projection `(num_routed_experts, hidden_size)`. `router_type="conv"` is a causal Conv1d over `kernel_size` taps, giving the router a local window. Its weight is stored **2D as `(num_routed_experts, hidden_size·kernel_size)`** so Muon's Newton-Schulz orthogonalizes **per expert**, not per kernel tap — see the axis rule atop [`ablate/common/optim.py`](ablate/common/optim.py).
 
 7. **Flash Attention (SDPA)** — Uses `F.scaled_dot_product_attention` by default, with manual fallback when `output_attentions=True`.
 
@@ -29,13 +29,13 @@ BiBoForCausalLM
 │   │   ├── RMSNorm → BiBoAttention (GQA + QK-Norm + SSMax + SDPA)
 │   │   └── RMSNorm → BiBoMoELayer (or dense BiBoMLP for first/last layers)
 │   │       ├── BiBoMoERouter (MLP projection, sigmoid/situ/softmax gate)
-│   │       ├── Routed: PolyGLU groups (SiLU + ReLU² + NormSiLU) + Identity + Zero
+│   │       ├── Routed: PolyGLU groups (SiLU + ReLU² + NormSiLU) + (+Identity) + (-Identity)
 │   │       └── Shared: 1 MLP-SwiGLU or CausalConv1D (off by default; added directly)
 │   └── Final RMSNorm
 └── LM Head
 ```
 
-**Expert layout**: `[0..n-4]` = SwiGLU MLPs, `[n-3]` = Identity, `[n-2]` = Zero, `[n-1]` = ReLU²
+**Expert layout**: `polyglu_expert_multiplier` groups of 3 GLU experts (SiLU / ReLU² / NormSiLU, cycled by `e % 3`), then `special_expert_pairs` × `+Identity`, then `special_expert_pairs` × `−Identity`
 
 **MoE layers**: First 2 and last decoder layers use dense MLP (configurable via `mlp_only_layers`). All remaining layers use MoE routing.
 
@@ -149,24 +149,19 @@ BiBo was benchmarked against Qwen3MoE on a sequence sorting task (2×T4 GPUs, Ka
 - **Shared expert is NOT routed** — always active CausalConv1D
 - **Router bias is non-trainable** — `requires_grad=False`, updated via heuristic `.add_()`
 - **Noise expert was removed** — no evidence it helps; Identity covers the "dump bucket" use case (see [`docs/deprecated.md`](docs/deprecated.md))
+- **Zero expert was removed (Jul 26 2026)** — `⟨grad_out, 0⟩ = 0`, so the router gets no gradient telling it Zero was the *right* pick; only negative pressure through softmax coupling. Replaced by the ±Identity pair. LongCat-Flash likewise uses identity, never zero, for its zero-computation experts.
 - **Logit norm prevents expert waste** — when `top_k > 1`, normalization ensures all selected experts contribute meaningfully
 
 ## Expert Types
 
 | Expert | Behavior | Purpose |
 |--------|----------|---------|
-| SwiGLU MLP | Standard gated FFN | General transformation |
-| Identity | `output = input` | Skip connection / no-op routing |
-| Zero | `output = 0` | Learned suppression |
-| ReLU² | `ReLU(Wx)²` | Sparse, high-activation features |
-| CausalConv1D (shared) | Gated temporal convolution | Local context (always active) |
-
-## Router Types
-
-| Type | Mechanism | Use Case |
-|------|-----------|----------|
-| MLP | `Linear(hidden → n_experts)` | Fast, global token-to-expert mapping |
-| Conv | `CausalConv1D(hidden → n_experts)` | Local temporal patterns in routing |
+| SiLU GLU | Standard gated FFN | General transformation |
+| ReLU² GLU | `ReLU(gate)² * up` | Sparse, high-activation features |
+| NormSiLU GLU | `SiLU(gate/rms(gate)) * up` | DECO-style intra-expert normalization |
+| +Identity | `output = w * input` | Signed pass-through (add) |
+| −Identity | `output = -w * input` | Signed pass-through (subtract); with `w₊ ≈ w₋` the pair cancels, spanning the removed Zero expert |
+| CausalConv1D (shared) | Gated temporal convolution | Local context (always active, off by default) |
 
 ## Documentation
 

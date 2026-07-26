@@ -17,7 +17,7 @@ BiBo is a **Mixture-of-Experts (MoE) Transformer** for causal language modeling.
 
 **Key differentiators from vanilla MoE (like Qwen3MoE):**
 1. **SSMax** — learnable per-head query scaling (`scale * log(n)`, where `n` is each query's **causal context length** `(kv_len − q_len) + t + 1`, not a global `kv_len`) that prevents attention fading at long sequences
-2. **Diverse experts** — PolyGLU layout: groups of 3 GLU experts with different activations (SiLU, ReLU², NormSiLU) + Identity/Zero special experts. **NormSiLU replaced Tanh (Jul 7 2026)**: `SiLU(gate/rms(gate))`, gain-free, eps 1e-6 — DECO's (arXiv:2605.10933) intra-expert normalization adapted to the GLU gate branch (inter-expert mean stage skipped: it couples all experts' grads and breaks per-expert dispatch). Tanh was a poor "norm expert": saturation ≠ normalization and down_proj rescales it away anyway.
+2. **Diverse experts** — PolyGLU layout: groups of 3 GLU experts with different activations (SiLU, ReLU², NormSiLU) + **±Identity** param-free special experts (the Zero expert was **removed Jul 26 2026**, see Known Quirks). **NormSiLU replaced Tanh (Jul 7 2026)**: `SiLU(gate/rms(gate))`, gain-free, eps 1e-6 — DECO's (arXiv:2605.10933) intra-expert normalization adapted to the GLU gate branch (inter-expert mean stage skipped: it couples all experts' grads and breaks per-expert dispatch). Tanh was a poor "norm expert": saturation ≠ normalization and down_proj rescales it away anyway.
 3. **Shared Conv1D expert** — causal convolution (gated, SwiGLU-style), always-active WHEN enabled. **OFF by default (since Jun 27 2026)** so BiBo stays param-matched to a no-shared baseline; opt in with `use_shared_expert=true`.
 4. **MiMo-V2.5 / DeepSeek-V3-style router** — configurable scoring (`gate_type`: `sigmoid` default / `situ` = SiTU `sigmoid(x)·tanh(x)` / `softmax`), auxiliary-loss-free bias (selection-only) updated by `b += u·sign(mean−load)`, `norm_topk_prob` (top-k sum-to-1 **via softmax**), `routed_scaling_factor`. No Skywork logit-norm. **NO LONGER MiMo-bit-equivalent as of Jul 26 2026** — `norm_topk_prob` switched from ÷sum to softmax; `src/.autoresearch/bench_router_vs_mimo.py` will now FAIL on the normalized arm by design (it still passes with `norm_topk_prob=False`).
 5. **Flash Attention (SDPA)** — uses `F.scaled_dot_product_attention` when `output_attentions=False`
@@ -44,7 +44,7 @@ src/
     │   └── utils.py               # repeat_kv, causal_band_mask, padding_bias, eager_attention_forward
     ├── ffn/
     │   ├── mlp.py                 # BiBoMLP (SwiGLU)
-    │   ├── experts.py             # Identity, ReLU², Zero, CausalConv1D
+    │   ├── experts.py             # PolyGLU expert + CausalConv1D (±Identity are inlined in moe.py)
     │   ├── router.py              # BiBoMoERouter (MLP or Conv, logit norm)
     │   └── moe.py                 # BiBoMoELayer (routing + dispatch + bias update)
     ├── layers.py                  # BiBoDecoderLayer
@@ -111,7 +111,7 @@ BiBoForCausalLM
 │   │   ├── RMSNorm → BiBoAttention (GQA + SSMax + SDPA)
 │   │   └── RMSNorm → BiBoMoELayer (or dense BiBoMLP for first/last layers)
 │   │       ├── BiBoMoERouter (conv or mlp, logit norm)
-│   │       ├── Routed: PolyGLU groups (SiLU + ReLU² + NormSiLU GLU) + Identity + Zero
+│   │       ├── Routed: PolyGLU groups (SiLU + ReLU² + NormSiLU GLU) + (+Identity) + (-Identity)
 │   │       └── Shared: 1 MLP-SwiGLU or CausalConv1D (off by default; added directly, no scalar)
 │   └── Final RMSNorm
 └── LM Head
@@ -121,7 +121,7 @@ BiBoForCausalLM
 
 **MoE**: First and last layers are dense MLP (layers 0 and N-1; `mlp_only_layers=[0, N-1]`). All remaining layers are MoE. Router = MiMo/DeepSeek-V3 sigmoid gate (no logit-norm). Bias heuristics for load balancing. Router bias is `requires_grad=False` (not optimizer-managed, updated heuristically).
 
-**Expert layout (PolyGLU)**: `polyglu_expert_multiplier` groups of 3 (SiLU-GLU, ReLU²-GLU, NormSiLU-GLU; NormSiLU replaced Tanh Jul 7 2026) + `special_expert_pairs` × (Identity, Zero). Config default: 2×3 + 1×2 = 8 routed. **Bench configs (Jun 27 2026): 3×3 + 1×2 = 9 GLU + 2 specials = 11 routed**, shared expert OFF — param-matched to Qwen's 9 experts on BOTH total (137.5M) and active (71.4M).
+**Expert layout (PolyGLU)**: `polyglu_expert_multiplier` groups of 3 (SiLU-GLU, ReLU²-GLU, NormSiLU-GLU; NormSiLU replaced Tanh Jul 7 2026) + `special_expert_pairs` × (**+Identity, −Identity**) — Zero removed Jul 26 2026. Config default: 2×3 + 1×2 = 8 routed. **Bench configs (Jun 27 2026): 3×3 + 1×2 = 9 GLU + 2 specials = 11 routed**, shared expert OFF — param-matched to Qwen's 9 experts on BOTH total (137.5M) and active (71.4M).
 
 ---
 
@@ -132,13 +132,14 @@ BiBoForCausalLM
 | `use_ssmax` | True | Enable SSMax query scaling |
 | `use_xsa` | True | Exclusive Self Attention: reject attn output from its own value vector |
 | `polyglu_expert_multiplier` | 2 | Groups of 3 GLU experts (SiLU, ReLU², NormSiLU) |
-| `special_expert_pairs` | 1 | Pairs of (Identity, Zero) special experts |
+| `special_expert_pairs` | 1 | Pairs of (**+Identity, −Identity**) param-free special experts. Per-type count — bump it to give signed pass-through more routing capacity. Toggle either sign off with `pos_identity_expert` / `neg_identity_expert`. |
 | `num_experts_per_tok` | 6 | Top-K routing |
 | ~~`router_type`~~ | removed | **Conv router REMOVED (Jul 26 2026)** — MLP router only. `kernel_size` survives but now serves ONLY the conv shared expert (`shared_expert_type="conv"`). |
 | ~~`router_lambda`~~ / ~~`use_router_logit_norm`~~ / ~~`router_temperature`~~ | removed | Skywork logit-norm deleted Jun 28 2026 (`router_temperature` was never implemented) |
 | ~~`router_noise`~~ | removed | **DELETED Jul 26 2026** — never enabled; re-adding needs RNG preservation for grad checkpointing |
 | `bias_update_factor` | 0.001 | Load-balancing step `u`. **FIXED, not a function of `n`** (the auto-Hill that grew 0.07→0.35 with expert count was removed Jul 26 2026 — it was backwards; the top-k boundary gap *shrinks* as experts are added). `sign()` never returns 0, so the bias dithers ±`u` forever and `u` is the steady-state routing-noise floor: it must stay well under the boundary gap. 0 disables balancing. |
 | `bias_update_threshold` | 100K | Tokens between bias updates |
+| `glu_token_budget` | None | LongCat-Flash `K_e/K` (arXiv:2509.01322). `None` = DeepSeek mean-relative balancing. A float in (0,1] targets that share of every token's routing slots at the GLU block, with the ±Identity specials absorbing the rest and getting `Δb = 0`. Supersedes `balance_exclude_specials`. Raises if `< 1.0` with no special experts. |
 | `shared_expert_type` | "mlp" | Shared expert type: `"mlp"` (SwiGLU, like Qwen) or `"conv"` (CausalConv1D) |
 | `gate_type` | "sigmoid" | Router scoring fn. `"sigmoid"` (independent, DeepSeek-V3) / `"situ"` (SiTU `sigmoid(x)·tanh(x)`, same fn as PolyGLU act code 5 — independent + **signed**, requires `norm_topk_prob=True`) / `"softmax"` (competitive, legacy). Validated; unknown values now raise (used to fall through to softmax silently). |
 | `norm_topk_prob` | True | True → **SOFTMAX** over the gathered top-k scores so they sum to 1 (**changed from ÷sum, Jul 26 2026** — ÷sum is invalid for signed gates: the sum can cross 0 or go negative). False → raw gathered scores, unnormalized. ⚠️ With `sigmoid`+softmax the max/min weight ratio is bounded by **e ≈ 2.72** (scores span ≤1), so the router becomes near-purely a *selector* rather than a *weighter*. |
@@ -289,6 +290,132 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 ---
 
 ## Known Quirks / TODOs
+
+- **(July 26 2026) LOAD BALANCING CAN NOW TARGET AN ABSOLUTE BUDGET — `glu_token_budget`
+  (LongCat-Flash `K_e/K`).** `None` (default) keeps the DeepSeek-V3 rule unchanged; set it to e.g.
+  `0.75` and the GLU block is driven toward 3/4 of every token's routing slots with the ±Identity
+  specials absorbing the remaining 1/4.
+  **Why the old rule could not express this.** DeepSeek's update is `b_i += u·sign(mean(load) − load_i)`
+  where the target is the block's **own observed mean**. That is scale-free: it equalizes experts
+  *within* the block and says **nothing** about how much traffic the block gets in total. Even with
+  `balance_exclude_specials=True` (which freezes special biases at 0), the GLU-vs-special split is left
+  entirely to the router, and the deviations always sum to ~0 inside the block so no uniform shift can
+  ever occur. LongCat's rule uses an **absolute** target measured against the global share
+  `T_i/(K·T_all)`:
+  `Δb_i = u·sign(r/n_glu − T_i/(K·T_all))` for the GLU block, `Δb_i = 0` for the specials
+  (arXiv:2509.01322 — zero-computation experts get no bias update; they are the residual sink).
+  When the GLU block is collectively over budget **every** GLU bias drops by the same `u` — a uniform
+  shift that cannot reorder the block but does push tokens across to the specials. Balance *within*
+  the block is unaffected (a hogging expert still gets a larger negative deviation than its peers).
+  ⚠️ `glu_token_budget < 1.0` with **no** special experts raises at config time — the balancer would
+  push the GLU block below budget with nowhere for the traffic to go.
+  ⚠️ `glu_token_budget` **supersedes** `balance_exclude_specials`: when it is set the specials are
+  always frozen, so the older flag is ignored.
+  Changed: `configuration_bibo.py` (knob + validation), `ffn/moe.py` (`update_bias`),
+  `ablate/common/{configs,models,train}.py` (`--glu_budget`, run tag `_gb<val>`), `tests/test_moe.py`
+  (3 tests: uniform block shift over/under budget, within-block equalization survives, validation).
+
+- **(July 26 2026) THE EXPERT-ACTIVATION AXIS IS CLOSED — six ablate switches collapsed to one
+  `--act`.** `--silu/--relu2/--normsilu/--situ/--normrelu2/--normsitu` are **gone**; the trainer takes
+  `--act name[,name,...]` (**default `silu`**) and maps it through `ACT_CODES`. All six activations
+  remain implemented and selectable in the kernel — a comma list revives a MIXED cycle (`--act
+  silu,normsitu` → codes `0,7,0,7,…`), which is how a future NormSiLU+NormSiTU mixture would be run.
+  Run tag letters are FROZEN (`s r n t Z X`) so `acts-s` / `acts-n` / `acts-X` stay comparable with the
+  pre-Jul-26 W&B history. Measured @e30, 500M tok: `acts-n` (NormSiLU) **0.7273**, `acts-s` (SiLU)
+  0.7444, `Z` (NormReLU²) 0.8345 — NormSiLU is the best measured single activation; the default is
+  nonetheless **SiLU** by explicit choice, so a NormSiLU arm must now be requested with `--act normsilu`.
+  Changed: `ablate/common/train.py` (`ACT_CODES`/`ACT_TAGS`, `--act`), `ablate/common/patches.py`.
+
+- **(July 26 2026) CONV ROUTER RE-ADDED — `router_type="conv"`, and its two original defects are
+  fixed.** It was removed earlier the same day; re-added as an ablation axis after finding that the
+  historical comparison was **never a clean test of the conv idea** — it was the idea plus two bugs.
+  **Defect 1 (the big one): Muon was orthogonalizing per KERNEL TAP, not per EXPERT.** An
+  `nn.Conv1d` weight is `(E,H,K)` = 3D. Muon's Newton-Schulz treats the LEADING dim as a BATCH and
+  iterates on the SMALLER Gram, so `(E,H,K)` gives Gram `(K,K)` → it decorrelates the **K taps** of
+  each expert and leaves the **experts correlated**. Expert de-collapse is the one thing Muon gives a
+  router: fed near-collapsed experts (`|cos| 0.9999`) the 2D path returns `0.0000`, the 3D path
+  returns `0.9999` — **it can never de-collapse experts**. Over 300 real steps the 3D layout drove
+  router expert-correlation up **13× faster** than the MLP router (Δxcos +0.0460 vs +0.0035).
+  **FIX — at the source, not in the optimizer:** `BiBoMoERouter` stores the conv weight as a **2D
+  `(num_routed_experts, hidden_size*kernel_size)` `nn.Parameter`** and `.view(E,H,K)` inside forward
+  for `F.conv1d`. Gram becomes `(E,E)` → per-expert, identical semantics to the MLP router,
+  **correct by construction**: no param-group flag, works with the fused `kernels.sm120.muon`
+  UNMODIFIED (we can't patch that repo from here), and it stays out of the `p.ndim==3` → `stacks`
+  bucket (so it can never become an unintended **xorth** target — another historical asymmetry, since
+  the 2D MLP router is pinned at `xorth_post=0.0`). ⚠️ **Do NOT "simplify" it back to `nn.Conv1d`.**
+  `ablate/common/optim.py` **raises** if a `.gate.*` param arrives with `ndim != 2`, and
+  `tests/test_moe.py::test_conv_router_weight_is_2d_with_experts_as_rows` guards the shape.
+  **Defect 2: fan-in-blind init.** Both routers used `normal_(std=initializer_range)`, but a conv
+  logit sums `H*K` terms vs the MLP's `H` → the conv router started **1.64× sharper** at K=3
+  (`√K=1.73` predicted). Now `std = initializer_range/√kernel_size`.
+  ⚠️ **The opposite rule holds for MoE expert stacks** (`experts.gate_up_proj`/`down_proj`, `(E,out,in)`):
+  each slice is a genuine weight matrix, so batched per-expert NS is correct and they MUST stay 3D.
+  Router == flatten the fan-in. Expert stack == keep batched.
+  **Closed by measurement, not opinion:** `normuon` (per-row post-NS normalize) is a **NO-OP for a
+  router** — NS returns `UVᵀ` and `(UVᵀ)(UVᵀ)ᵀ = I` when `E ≤ fan_in`, so expert rows already have
+  exactly unit norm (measured spread 1.0005; normuon-vs-polar rel diff 2.2e-4). It can only matter on
+  the batched 3D path or when `E > fan_in`. Don't switch the fused Muon's base mode for this.
+  **NOT settled — do not read the probe as a verdict:** across 9 arms × 2 seeds × 300 steps on a tiny
+  model, **loss spread was 0.029 (5.066–5.095) — inseparable**, and `conv+sigmoid` with the axis fix
+  was nominally *first*. Fixing the axis raised decisiveness (top-k gap 0.110→0.296) but *lowered*
+  load entropy (0.548→0.421) and cluster-NMI (0.158→0.059) at equal loss. The one large, consistent
+  effect found was unrelated to layout: **cutting the router LR 10–40× took dead experts from 4–5 of
+  8 down to 1** and doubled NMI — but with **no loss benefit**, and that probe ran with the load
+  balancer OFF by design, which exaggerates expert death. `conv+situ` was worst (NMI 0.003).
+  Changed: `configuration_bibo.py` (`router_type` back, validated; no longer popped as dead),
+  `ffn/router.py` (2D conv weight + fan-in init + new `router_logits()` method),
+  `ablate/common/optim.py` (**big axis-rule docstring + the ndim guard**),
+  `ablate/common/{configs,models,train}.py` (`--router_type`/`--router_kernel`, run tag `_rconv{K}`),
+  `tests/test_moe.py` (5 conv-router tests: 2D shape, causality, fan-in init, gating×3, validation).
+  Probe + permanent verifier: `src/.autoresearch/probe_router_muon.py` (`--selfcheck`).
+  Verified (RTX 3050): 112 pytest checks green; 5 real training steps with `router_type="conv"` —
+  param is `(8,768)` ndim 2, NS Gram `(8,8)`, and every step crushed expert `|cos|` 0.16–0.26 → ~1e-4
+  while preserving tap `|cos|` (0.42–0.58 → 0.34–0.41); the same gradient on the old 3D layout left
+  experts at 0.171 and whitened taps to 1.6e-4.
+  ⚠️ Historical `router_type="conv"` checkpoints remain unloadable (the weight is 2D now, not 3D).
+
+- **(July 26 2026) ZERO EXPERT REMOVED → replaced by a SIGNED ±Identity pair.** The two special
+  experts are now `+w·x` and `−w·x`, both param-free, both gated by the router score. `zero_expert` /
+  `identity_expert` are **deleted** from `BiBoConfig` and popped with a warning before
+  `super().__init__` (same reason as `router_type`: `PretrainedConfig` setattr()s unknown kwargs, so a
+  stale knob would be re-serialized into `config.json` as if the feature still existed). New knobs:
+  `pos_identity_expert` / `neg_identity_expert` (both True), derived `num_pos_identity_experts` /
+  `num_neg_identity_experts`; `special_expert_pairs` remains the **per-type** count.
+  **Why Zero had to go — a gradient argument, not a preference.** Zero's output is `0`, so its direct
+  weight gradient is identically zero: `∂L/∂w_zero = ⟨grad_out, 0⟩ = 0`. The router therefore can never
+  learn that picking Zero was *right*. Under `norm_topk_prob` softmax the weights are coupled, so the
+  score still receives `∂L/∂s_zero = Σ_{i≠zero} ⟨grad_out, E_i⟩·(−w_i·w_zero)` — which is **purely
+  negative pressure** ("picking Zero cost me the other experts"). Net effect: every bit of Zero usage
+  was forced by the load-balancing bias AGAINST the gradient. Corroborated externally — **LongCat-Flash
+  (arXiv:2509.01322) Eq. 1 uses IDENTITY, never zero**, for its "zero-computation" experts
+  (`E_i(x_t) = x_t` for `N < i ≤ N+Z`; "zero-computation" = zero FLOPs, not zero output), at N=512 FFN
+  / **Z=256 identity** / K=12 / K_e≈8, i.e. ~4 of 12 slots are identity pass-through. It also matches
+  the local ablation finding that Zero hurt more than Identity.
+  **Why SIGNED.** `norm_topk_prob` softmax forces all weights positive, so a single Identity can only
+  ever ADD `+w·x`; the ± pair restores a signed scalar gate on the pass-through, and it **spans the old
+  Zero expert as the `w₊ ≈ w₋` cancellation case** — same "skip this layer" behavior, but reached by
+  routing with live gradients on both branches instead of hard-coded with dead ones. No external
+  precedent for the signed variant (LongCat and MoE++ are both unsigned) — this is novel.
+  ⚠️ **Known weakness, measure it:** softmax over sigmoid-squashed scores bounds max/min weight ratio at
+  `e ≈ 2.72`, so at `top_k=2` the weights sit near 0.5/0.5 and `(w₊ − w₋) ≈ 0` whenever a token selects
+  BOTH signs — the signed gate has real magnitude only when ONE sign is picked alongside GLU experts.
+  Expect this to work better at higher `top_k` (LongCat runs 12).
+  ⚠️ Existing checkpoints with a Zero expert are numerically incompatible (that expert index now emits
+  `−w·x` instead of `0`); shapes are unchanged so the load will NOT warn. Retrain or remap.
+  ✅ **tkf kernels are IN SYNC (same day).** Act code 4 now emits `−w·x` on every path that
+  special-cases it: `kernels/sm75/moe.py` `_PerExpertMoE.forward`/`.backward` (signed weight into
+  `_combine_scatter`/`_combine_bwd`; `dw` picks the sign back up) and `moe_eager`, plus the Blackwell
+  `kernels/sm120/moe_grouped.py` sorted tail — where the old `nonzero()` select disappeared with it,
+  since every tail expert is now a contributor. `patch_fused_moe`'s `NotImplementedError` guard is
+  gone. Gate: **`parity_specials.py`** in triton-kernel-fused (fwd + all four grads vs an independent
+  PyTorch reference, fp32 and bf16, plus the ± cancellation property).
+  Changed: `configuration_bibo.py`, `ffn/moe.py` (`pos_start/pos_end/neg_start/neg_end`, dispatch),
+  `ffn/experts.py` (comment), `ablate/common/{configs,models,train}.py` (`--no_pos_identity` /
+  `--no_neg_identity`, run tags `_posonly`/`_negonly`), `tests/{test_moe,test_config,conftest}.py`.
+  Verified (RTX 3050): 106 pytest checks green; `+Identity`→`+w·x` and `−Identity`→`−w·x` to 1e-6;
+  equal-weight pair cancels to <1e-6; **both signs carry a nonzero combine-weight gradient**
+  (`|g|` = 12.7 / 9.2 where Zero's was exactly 0) and the router logit row for the `−Identity` expert
+  receives gradient (6.5e-3) through a bf16 full-model fwd+bwd.
 
 - **(July 26 2026) 🔴 TWO SEVERE `from_pretrained` BUGS FIXED — every checkpoint load was silently
   broken.** Found by a 49-check end-to-end suite; both were invisible (no missing keys, no warning).

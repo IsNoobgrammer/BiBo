@@ -58,15 +58,15 @@ class BiBoConfig(PretrainedConfig):
         moe_intermediate_size=None,  # Auto: intermediate_size // num_experts_per_tok
         num_experts_per_tok=6,
         polyglu_expert_multiplier=2,  # Groups of 3 (SiLU, ReLU², NormSiLU) GLU experts
-        special_expert_pairs=1,       # Count of special experts PER TYPE (see identity_expert/zero_expert)
-        identity_expert=True,         # include the Identity special expert(s) (code 3, param-free passthrough)
-        zero_expert=True,             # include the Zero special expert(s)     (code 4, param-free drop)
+        special_expert_pairs=1,       # Count of special experts PER TYPE (see pos/neg_identity_expert)
+        pos_identity_expert=True,     # include the +Identity special expert(s) (code 3, param-free  +w*x)
+        neg_identity_expert=True,     # include the -Identity special expert(s) (code 4, param-free  -w*x)
         # ── Shared expert ────────────────────────────────────────
         use_shared_expert=False,    # Off by default (param-match Qwen3MoE — no shared expert)
         shared_expert_type="mlp",   # "mlp" (SwiGLU, like Qwen) or "conv" (CausalConv1D)
         # ── Router ───────────────────────────────────────────────
-        kernel_size=3,        # conv SHARED-EXPERT kernel width (shared_expert_type="conv").
-                              # The conv ROUTER was removed Jul 26 2026 — MLP router only.
+        router_type="mlp",    # "mlp" (Linear, default) | "conv" (causal Conv1d over kernel_size taps)
+        kernel_size=3,        # kernel width for BOTH the conv router and the conv shared expert
         gate_type="sigmoid",       # "sigmoid" | "situ" (SIGNED, needs norm_topk_prob=True) | "softmax"
         router_activation="none",  # on the LOGITS, before gate_type: "none" | "relu" | "silu"
         norm_topk_prob=True,       # softmax the gathered top-k weights to sum to 1 (not MiMo's ÷sum)
@@ -74,13 +74,17 @@ class BiBoConfig(PretrainedConfig):
         load_balance_strategy="bias",  # "none" | "bias" (aux-loss-free bias updates)
         bias_update_factor=0.001,   # sign-update step; small on purpose, see __init__ note
         bias_update_threshold=8000,  # tokens between bias updates
-        balance_exclude_specials=False,  # balance only the GLU block, freeze Identity/Zero biases at 0
+        balance_exclude_specials=False,  # balance only the GLU block, freeze ±Identity biases at 0
+        glu_token_budget=None,      # LongCat K_e/K: fraction of the k slots/token targeted at the GLU
+                                    # block (e.g. 0.75 -> GLU 3/4, ±Identity 1/4). None = DeepSeek
+                                    # mean-relative balancing. See BiBoMoELayer.update_bias.
         **kwargs,
     ):
         # Pop removed knobs: PretrainedConfig setattr()s unknown kwargs, so a stale value would
         # reappear as an attribute AND be re-serialized into config.json as if it still existed.
-        for dead, why in (("router_type", "conv router removed Jul 26 2026; MLP router only"),
-                          ("router_noise", "noise injection removed Jul 26 2026; was never enabled")):
+        for dead, why in (("router_noise", "noise injection removed Jul 26 2026; was never enabled"),
+                          ("zero_expert", "Zero expert removed Jul 26 2026; use neg_identity_expert"),
+                          ("identity_expert", "renamed Jul 26 2026; use pos_identity_expert")):
             if kwargs.pop(dead, None) is not None:
                 logger.warning(f"`{dead}` was removed ({why}). Ignored, and not saved.")
 
@@ -129,21 +133,30 @@ class BiBoConfig(PretrainedConfig):
         self.num_experts_per_tok = num_experts_per_tok
         self.polyglu_expert_multiplier = polyglu_expert_multiplier
         self.special_expert_pairs = special_expert_pairs
-        self.identity_expert = identity_expert
-        self.zero_expert = zero_expert
-        # Identity/Zero enabled independently so each type can be ablated alone. special_expert_pairs is
-        # the per-type count; a disabled type contributes 0 experts. Layout stays GLU-first (kernel
-        # weight slot = expert index for GLU), then Identity block, then Zero block.
-        self.num_identity_experts = special_expert_pairs if identity_expert else 0
-        self.num_zero_experts = special_expert_pairs if zero_expert else 0
-        # experts = polyglu_multiplier * 3 (SiLU, ReLU², NormSiLU) + Identity block + Zero block
-        self.num_routed_experts = (polyglu_expert_multiplier * 3) + self.num_identity_experts + self.num_zero_experts
+        self.pos_identity_expert = pos_identity_expert
+        self.neg_identity_expert = neg_identity_expert
+        # The two specials are SIGNED param-free passthroughs: +w*x and -w*x. There is no Zero expert
+        # (removed Jul 26 2026) — a Zero expert's output is 0, so its direct weight gradient is
+        # identically 0 and the router can never learn that picking it was right; softmax coupling then
+        # leaves only negative pressure on its score, so all Zero usage is forced by the load balancer
+        # AGAINST the gradient. The ± pair still spans "skip this layer" (w+ ≈ w- cancels) but reaches
+        # it with live gradients on both branches. LongCat-Flash (arXiv:2509.01322) likewise uses
+        # identity, never zero, for its 256 zero-COMPUTATION experts.
+        # Each sign is toggleable so either can be ablated alone; special_expert_pairs is the per-type
+        # count and a disabled type is a zero-width block. Layout stays GLU-first (kernel weight slot ==
+        # expert index for GLU), then the +Identity block, then the -Identity block.
+        self.num_pos_identity_experts = special_expert_pairs if pos_identity_expert else 0
+        self.num_neg_identity_experts = special_expert_pairs if neg_identity_expert else 0
+        # experts = polyglu_multiplier * 3 (SiLU, ReLU², NormSiLU) + (+Identity) block + (-Identity) block
+        self.num_routed_experts = ((polyglu_expert_multiplier * 3)
+                                   + self.num_pos_identity_experts + self.num_neg_identity_experts)
 
         # ── Shared expert ────────────────────────────────────────
         self.use_shared_expert = use_shared_expert
         self.shared_expert_type = shared_expert_type
 
         # ── Router ───────────────────────────────────────────────
+        self.router_type = router_type
         self.kernel_size = kernel_size
         self.gate_type = gate_type
         self.router_activation = router_activation
@@ -180,6 +193,7 @@ class BiBoConfig(PretrainedConfig):
 
         self.bias_update_threshold = bias_update_threshold if bias_update_threshold is not None else 8000
         self.balance_exclude_specials = balance_exclude_specials
+        self.glu_token_budget = glu_token_budget
 
         # Dynamic NTK-aware: identity inside the trained window, smooth base growth beyond it.
         # type="none" for plain RoPE.
@@ -236,6 +250,18 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError("bias_update_factor must be non-negative")
         if self.bias_update_threshold <= 0:
             raise ValueError("bias_update_threshold must be positive")
+        if self.glu_token_budget is not None:
+            if not 0.0 < self.glu_token_budget <= 1.0:
+                raise ValueError(
+                    f"glu_token_budget must be in (0, 1], got {self.glu_token_budget}")
+            n_special = self.num_pos_identity_experts + self.num_neg_identity_experts
+            if self.glu_token_budget < 1.0 and n_special == 0:
+                raise ValueError(
+                    f"glu_token_budget={self.glu_token_budget} reserves {1 - self.glu_token_budget:.2f} "
+                    f"of every token's routing slots for special experts, but there are none. The "
+                    f"balancer would push the GLU block below budget with nowhere for the traffic to "
+                    f"go. Enable pos/neg_identity_expert with special_expert_pairs>0, or leave "
+                    f"glu_token_budget=None.")
         if self.add_full_attention_sink_bias and self.use_ssmax:
             raise ValueError(
                 "add_full_attention_sink_bias=True with use_ssmax=True (global sink + SSMax, 'G1') "
@@ -265,6 +291,10 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError(
                 f"load_balance_strategy must be 'none' or 'bias', got '{self.load_balance_strategy}'"
             )
+        if self.router_type not in ("mlp", "conv"):
+            raise ValueError(f"router_type must be 'mlp' or 'conv', got '{self.router_type}'")
+        if self.router_type == "conv" and self.kernel_size < 1:
+            raise ValueError(f"router_type='conv' needs kernel_size >= 1, got {self.kernel_size}")
         if self.router_activation not in ("none", "relu", "silu"):
             raise ValueError(
                 f"router_activation must be 'none', 'relu', or 'silu', got '{self.router_activation}'"

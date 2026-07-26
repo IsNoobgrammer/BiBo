@@ -26,6 +26,10 @@ from kernels.sm120.cross_entropy import fused_linear_cross_entropy   # sm120 (Bl
 
 DEV = "cuda"
 _DT = {"bf16": torch.bfloat16, "fp32": torch.float32}
+# --act name -> (kernel act code, run-tag letter). Tag letters are FROZEN so acts-s / acts-n / acts-X
+# runs stay comparable with the pre-Jul-26 W&B history.
+ACT_CODES = {"silu": 0, "relu2": 1, "normsilu": 2, "situ": 5, "normrelu2": 6, "normsitu": 7}
+ACT_TAGS = {0: "s", 1: "r", 2: "n", 5: "t", 6: "Z", 7: "X"}
 
 
 class _QwenAuxCollector:
@@ -175,18 +179,19 @@ def main():
     ap.add_argument("--load_balance", choices=["none", "bias"], default="bias")   # BiBo: bias=DeepSeek sigmoid+balance; none=softmax
     ap.add_argument("--aux_coef", type=float, default=0.001)                      # Qwen aux load-balancing loss coef (0=off; paper 0.001)
     ap.add_argument("--polyglu_mult", type=int, default=2)                        # BiBo GLU experts = polyglu_mult*3 (= Qwen num_experts); default 6 experts
-    # PolyGLU activation subset (codes: silu=0, relu2=1, normsilu=2). The ENABLED set cycles across the
-    # experts: only silu -> 000000; silu+relu2 -> 010101; all three -> 012012. Needs the 'moe' patch.
-    ap.add_argument("--silu", type=int, default=0)       # default menu is pure normsilu (acts-n); silu OFF
-    ap.add_argument("--relu2", type=int, default=0)      # LOST the acts ablation (dose-response harmful); off by default
-    ap.add_argument("--normsilu", type=int, default=1)   # DEFAULT EXPERT ACT: pure normsilu (acts-n, 0.7273 bpb @e30)
-    ap.add_argument("--situ", type=int, default=0)   # code 5: tanh(g)*sigmoid(g), parameter-free (default OFF)
+    # PolyGLU expert activation. THE ACTIVATION AXIS IS CLOSED (Jul 26 2026): the six on/off switches
+    # it was ablated with are gone and this is a single choice, DEFAULT silu. The other codes stay in
+    # the kernel and stay selectable -- pass a comma list to revive a MIXED cycle (e.g. --act silu,situ
+    # -> 0,5,0,5,...), which is how a future NormSiLU+NormSiTU mixture would be run.
+    #   silu 0 (default) | relu2 1 | normsilu 2 | situ 5 | normrelu2 6 | normsitu 7
+    # Measured @e30 500M tok: acts-n (normsilu) 0.7273, acts-s (silu) 0.7444, Z (normrelu2) 0.8345.
+    ap.add_argument("--act", default="silu")             # comma list allowed; cycles across the GLU experts
     ap.add_argument("--situ_learnable", type=int, default=0)   # per-expert gamma*tanh(alpha*g)*sigmoid(g); AdamW 1D params
-    ap.add_argument("--normrelu2", type=int, default=0)   # code 6 (tag Z): relu(g/rms(g))², RMS-normed ReLU² (default OFF)
-    ap.add_argument("--normsitu", type=int, default=0)   # code 7 (tag X): tanh(g/rms(g))*sig(g/rms(g)), RMS-normed SiTU (default OFF)
     ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free special experts, per-type count
-    ap.add_argument("--no_identity_expert", dest="identity_expert", action="store_false")  # drop Identity (code 3); test Zero alone
-    ap.add_argument("--no_zero_expert", dest="zero_expert", action="store_false")          # drop Zero (code 4); test Identity alone
+    ap.add_argument("--no_pos_identity", dest="pos_identity_expert", action="store_false")  # drop +Identity (code 3); test -Identity alone
+    ap.add_argument("--no_neg_identity", dest="neg_identity_expert", action="store_false")  # drop -Identity (code 4); test +Identity alone
+    ap.add_argument("--router_type", choices=["mlp", "conv"], default="mlp")  # conv = causal Conv1d router (run tag _rconv{K}); weight is 2D (E,H*K) so Muon whitens EXPERTS not taps -- see ablate/common/optim.py
+    ap.add_argument("--router_kernel", type=int, default=3)                   # conv router tap count (only used when --router_type conv)
     ap.add_argument("--router_gate", choices=["sigmoid", "situ"], default="sigmoid")  # router score fn; situ = tanh(g)*sig(g) (run tag _rt-situ)
     ap.add_argument("--router_norm", choices=["auto", "sum", "softmax", "l1"], default="auto")  # auto: sum for sigmoid, softmax for situ (the sum-to-1 pick per gate)
     ap.add_argument("--norm_topk_prob", type=int, default=1)  # 1 = normalize top-k weights to sum to 1 (BiBo model default). 0 = raw scores as weights (old ablate behavior)
@@ -198,7 +203,8 @@ def main():
     ap.add_argument("--expert_scale_learnable", type=_bool, default=False)       # learnable per-EXPERT vector, init 1.0; tag _esL
     ap.add_argument("--use_ssmax", action="store_true")                           # ablation axis: SSMax scalable softmax (default OFF)
     ap.add_argument("--use_xsa", action="store_true")                             # ablation axis: XSA exclusive self-attention (default OFF)
-    ap.add_argument("--balance_exclude_specials", action="store_true")            # ablation axis: bias balancer ignores Identity/Zero experts (freezes their bias at 0; router learns special usage) — only matters with special_pairs>0
+    ap.add_argument("--balance_exclude_specials", action="store_true")            # ablation axis: bias balancer ignores the ±Identity experts (freezes their bias at 0; router learns special usage) — only matters with special_pairs>0
+    ap.add_argument("--glu_budget", type=float, default=-1.0)                     # LongCat K_e/K (arXiv:2509.01322): target share of routing slots for the GLU block, e.g. 0.75 -> GLU 3/4 / specials 1/4. <0 = off (DeepSeek mean-relative). Tag _gb<val>
     ap.add_argument("--bias_update_threshold", type=int, default=10240)           # tokens between bias updates (if bias)
     ap.add_argument("--bias_update_factor", type=float, default=-1.0)             # <0 = config default (0.001); 0 = balancing off
     ap.add_argument("--compile", action="store_true")           # torch.compile the transformer body
@@ -267,12 +273,13 @@ def main():
                  or args.expert_scale_learnable)
     if (args.router_gate != "sigmoid" or router_norm != "sum" or _scale_on) and "router_gate" not in patch_list:
         patch_list.append("router_gate")            # eager router swap (also carries the magnitude scales)
-    # PolyGLU activation subset -> act-code cycle for the fused moe patch (codes: 0=silu,1=relu2,2=normsilu,5=situ,6=normrelu2)
-    act_cycle = [c for c, on in ((0, args.silu), (1, args.relu2), (2, args.normsilu), (5, args.situ),
-                                 (6, args.normrelu2), (7, args.normsitu)) if on]
-    assert act_cycle, "enable at least one of --silu/--relu2/--normsilu/--situ/--normrelu2/--normsitu"
+    # --act name[,name...] -> the act-code cycle for the fused moe patch
+    act_names = [a.strip() for a in args.act.split(",") if a.strip()]
+    unknown = [a for a in act_names if a not in ACT_CODES]
+    assert act_names and not unknown, f"--act: unknown {unknown}; pick from {sorted(ACT_CODES)}"
+    act_cycle = [ACT_CODES[a] for a in act_names]
     if args.situ_learnable:
-        assert args.situ, "--situ_learnable needs --situ 1"
+        assert 5 in act_cycle, "--situ_learnable needs situ in --act"
     if act_cycle != [0, 1, 2]:
         assert "moe" in patch_list, "custom act subset needs the 'moe' patch (eager experts keep the built-in triple)"
     patchmod.ACT_CYCLE = act_cycle
@@ -286,7 +293,10 @@ def main():
                            aux_coef=args.aux_coef, polyglu_mult=args.polyglu_mult, special_pairs=args.special_pairs,
                            use_ssmax=args.use_ssmax, use_xsa=args.use_xsa,
                            balance_exclude_specials=args.balance_exclude_specials,
-                           identity_expert=args.identity_expert, zero_expert=args.zero_expert)
+                           pos_identity_expert=args.pos_identity_expert,
+                           neg_identity_expert=args.neg_identity_expert,
+                           router_type=args.router_type, kernel_size=args.router_kernel,
+                           glu_token_budget=(None if args.glu_budget < 0 else args.glu_budget))
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
     if args.situ_learnable:
         n_ap = patchmod.add_situ_params(model)
@@ -319,16 +329,17 @@ def main():
     amp = contextlib.nullcontext() if args.precision == "fp32" else torch.autocast("cuda", dtype=dt)
     # acts-<subset> is the primary axis of this ablation; special_pairs / conv kernel etc. keep
     # their suffixes so variants don't collide on ckpt/log/run names (they otherwise share arm+seed)
-    acts_tag = "".join(n for n, on in (("s", args.silu), ("r", args.relu2), ("n", args.normsilu),
-                                       ("t", args.situ), ("Z", args.normrelu2), ("X", args.normsitu)) if on)
+    acts_tag = "".join(ACT_TAGS[c] for c in act_cycle)
     run_name = (f"{args.arm}_seed{args.seed}"
                 + (f"_acts-{acts_tag}" if args.arm == "bibo_min" else "")
                 + ("_situL" if args.situ_learnable else "")
                 + (f"_e{args.polyglu_mult * 3}" if args.polyglu_mult != 2 else "")
                 + (f"_se{args.special_pairs}" if args.special_pairs else "")
-                + (("_idonly" if not args.zero_expert else "") if args.special_pairs else "")
-                + (("_zeroonly" if not args.identity_expert else "") if args.special_pairs else "")
+                + (("_posonly" if not args.neg_identity_expert else "") if args.special_pairs else "")
+                + (("_negonly" if not args.pos_identity_expert else "") if args.special_pairs else "")
+                + (f"_rconv{args.router_kernel}" if args.router_type == "conv" else "")
                 + ("_xsp" if args.balance_exclude_specials else "")
+                + (f"_gb{args.glu_budget:g}" if args.glu_budget >= 0 else "")
                 + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + (f"_rt-{args.router_gate}-{router_norm}"
@@ -422,7 +433,11 @@ def main():
             if args.routed_scaling_learnable or args.expert_scale_learnable:
                 rt.update(patchmod.router_scale_stats(model))               # where the learned magnitude landed
             rt_s = (f" top1w={rt['train/router_top1_weight']:.3f} rent={rt['train/router_entropy']:.3f}"
-                    f" bal={rt['train/balance_entropy']:.3f}") if rt else ""
+                    f" bal={rt['train/balance_entropy']:.3f}"
+                    # spl = share of top-k slots on the ±Identity block (neg half in parens); with
+                    # --glu_budget r it should settle near 1-r. 0.000 means no special experts.
+                    + (f" spl={rt['train/special_load']:.3f}({rt['train/neg_identity_load']:.3f})"
+                       if rt.get("train/special_load", 0.0) > 0 else "")) if rt else ""
             print(f"  step {step}/{total_steps} loss={lv:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
                   f"xcorr={ecorr:.4f}{rt_s} elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"

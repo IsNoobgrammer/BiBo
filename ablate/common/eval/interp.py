@@ -82,8 +82,15 @@ class RouterTrace:
         # [split_top1, entropy, tokens, RAW_top1, RAW_sum, RAW_min]
         self.acc = torch.zeros(6, device=device, dtype=torch.float32)
         self._handles = []
+        # Expert-block boundaries, so the ±Identity specials get their own load channels. Read off the
+        # first expert module (every layer shares the config). n_glu == E for a Qwen arm / no specials,
+        # in which case the special channels are constant 0 and simply uninformative.
+        self.n_glu, self.pos_end = self.E, self.E
         for _, mod in model.named_modules():
             if mod.__class__.__name__ in _EXPERT_CLASSES:
+                if not self._handles:
+                    self.n_glu = int(getattr(mod, "num_polyglu_experts", self.E))
+                    self.pos_end = int(getattr(mod, "pos_end", self.E))
                 self._handles.append(mod.register_forward_pre_hook(self._hook))
 
     @torch.no_grad()
@@ -113,9 +120,13 @@ class RouterTrace:
         load = self.counts / self.counts.sum().clamp_min(1.0)
         bal = -(load * load.clamp_min(1e-12).log()).sum() / math.log(self.E)   # 0*log0 == 0, as intended
         n = self.acc[2].clamp_min(1.0)
+        # Fraction of top-k slots landing on the special block, and on the -Identity half of it. This
+        # is the channel the glu_token_budget knob controls (budget r => special_load -> 1-r) and the
+        # one that says whether the router WANTS signed pass-through or is only being pushed to it.
         packed = torch.stack([bal, self.acc[0] / n, self.acc[1] / n, load.max(), self.acc[2],
-                              self.acc[3] / n, self.acc[4] / n, self.acc[5] / n])
-        b, t1, ent, mx, ntok, rw1, rws, rwmin = packed.cpu().tolist()   # <-- THE ONLY SYNC
+                              self.acc[3] / n, self.acc[4] / n, self.acc[5] / n,
+                              load[self.n_glu:].sum(), load[self.pos_end:].sum()])
+        b, t1, ent, mx, ntok, rw1, rws, rwmin, spl, negl = packed.cpu().tolist()   # <-- THE ONLY SYNC
         self.counts.zero_(); self.acc.zero_()
         if ntok < 1:
             return {}                                     # nothing accumulated (e.g. logged before a step)
@@ -123,7 +134,9 @@ class RouterTrace:
                 "train/router_entropy": ent, "train/max_expert_load": mx,
                 "train/router_w_top1": rw1,      # RAW top-1 weight (gate-bounded)
                 "train/router_w_sum": rws,       # RAW sum over top-k = the branch magnitude channel
-                "train/router_w_min": rwmin}     # RAW min weight (negative => an expert is SUBTRACTED)
+                "train/router_w_min": rwmin,     # RAW min weight (negative => an expert is SUBTRACTED)
+                "train/special_load": spl,       # share of top-k slots on the ±Identity block
+                "train/neg_identity_load": negl}  # ... of which, on the -Identity half
 
     def close(self):
         for h in self._handles:

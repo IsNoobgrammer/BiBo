@@ -1,4 +1,6 @@
 """MoE router — MiMo-V2.5 / DeepSeek-V3 auxiliary-loss-free sigmoid gating (verbatim routing)."""
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,12 +31,43 @@ class BiBoMoERouter(nn.Module):
         self.gate_type = getattr(config, 'gate_type', 'sigmoid')
         self.routed_scaling_factor = getattr(config, 'routed_scaling_factor', 1.0)
 
+        self.router_type = getattr(config, 'router_type', 'mlp')
+        self.hidden_size = config.hidden_size
+        self.kernel_size = config.kernel_size
+
         # Heuristically updated by BiBoMoELayer, NOT optimizer-managed -> requires_grad=False.
         self.bias = nn.Parameter(torch.zeros(self.num_routed_experts), requires_grad=False)
 
-        # (num_routed_experts, hidden_size) — experts are the ROW dim.
-        self.gate_proj = nn.Linear(config.hidden_size, self.num_routed_experts, bias=False)
-        nn.init.normal_(self.gate_proj.weight, mean=0.0, std=config.initializer_range)
+        if self.router_type == "mlp":
+            # (num_routed_experts, hidden_size) — experts are the ROW dim.
+            self.gate_proj = nn.Linear(config.hidden_size, self.num_routed_experts, bias=False)
+            nn.init.normal_(self.gate_proj.weight, mean=0.0, std=config.initializer_range)
+        elif self.router_type == "conv":
+            # ┌─ WHY THIS IS STORED 2D (E, H*K) AND NOT AS AN nn.Conv1d ─────────────────────────┐
+            # A Conv1d weight is (E, H, K) — 3D. Muon's Newton-Schulz treats the LEADING dim as a
+            # BATCH and orthogonalizes each trailing 2D slice, iterating on the smaller Gram. With
+            # (E, H, K) the Gram is (K,K), so NS decorrelates the K TAPS of each expert and leaves
+            # the EXPERTS correlated — the exact opposite of what a router needs. Measured: fed
+            # experts collapsed onto one direction, the 3D path returns |cos| 0.9999 -> 0.9999, i.e.
+            # it CANNOT de-collapse experts, while the MLP router's 2D (E,H) path gives 0.9999 -> 0.0.
+            # Over 300 real steps the 3D layout drove expert correlation up 13x faster than the MLP
+            # router (dxcos +0.046 vs +0.0035).
+            # Storing the weight 2D as (E, H*K) makes the Gram (E,E), so NS decorrelates EXPERTS —
+            # identical semantics to the MLP router — and it does so BY CONSTRUCTION: no optimizer
+            # flag, no param-group surgery, and it stays correct under the fused Muon unchanged.
+            # It also keeps the weight out of any "3D => expert stack" bucket (e.g. xorth).
+            # DO NOT "simplify" this back to nn.Conv1d. See ablate/common/optim.py for the full rule.
+            # └──────────────────────────────────────────────────────────────────────────────────┘
+            self.gate_conv = nn.Parameter(
+                torch.empty(self.num_routed_experts, config.hidden_size * self.kernel_size)
+            )
+            # FAN-IN AWARE: a conv logit sums H*K terms vs the MLP's H, so sharing `initializer_range`
+            # would start the conv router sqrt(K)x sharper (measured 1.64x at K=3) — which silently
+            # confounded every historical conv-vs-mlp comparison. Divide by sqrt(K).
+            nn.init.normal_(self.gate_conv, mean=0.0,
+                            std=config.initializer_range / math.sqrt(self.kernel_size))
+        else:
+            raise ValueError(f"router_type must be 'mlp' or 'conv', got '{self.router_type}'")
 
     def _apply_router_activation(self, logits: torch.Tensor) -> torch.Tensor:
         if self.router_activation == "relu":
@@ -44,13 +77,20 @@ class BiBoMoERouter(nn.Module):
         else:  # "none"
             return logits
 
+    def router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """(b, s, h) -> ((b s), num_routed_experts) fp32 logits, before gate_type."""
+        if self.router_type == "mlp":
+            return self.gate_proj(rearrange(hidden_states, 'b s h -> (b s) h')).float()
+        # causal: left-pad K-1 so position t sees only t-K+1..t. view() is free (weight is contiguous).
+        x = F.pad(rearrange(hidden_states, 'b s h -> b h s'), (self.kernel_size - 1, 0))
+        w = self.gate_conv.view(self.num_routed_experts, self.hidden_size, self.kernel_size)
+        return rearrange(F.conv1d(x, w), 'b e s -> (b s) e').float()
+
     def forward(self, hidden_states: torch.Tensor):
         """(b, s, h) -> top_k_indices (b, s, k), norm_weights (b, s, k). Weights are UNBIASED."""
         batch_size, seq_len, hidden_dim = hidden_states.shape
 
-        flat_hidden = rearrange(hidden_states, 'b s h -> (b s) h')
-        router_logits = self.gate_proj(flat_hidden).float()
-        router_logits = self._apply_router_activation(router_logits)
+        router_logits = self._apply_router_activation(self.router_logits(hidden_states))
 
         if self.gate_type == "sigmoid":
             scores = torch.sigmoid(router_logits)

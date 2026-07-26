@@ -20,8 +20,8 @@ _NORMSILU_EPS = 1e-6  # MUST match _NS_EPS in the tkf kernel (kernels/sm75/moe.p
 
 class BiBoFusedExperts(nn.Module):
     """Fused PolyGLU experts, sorted dispatch: sort tokens by expert, process contiguous chunks,
-    index_add_ back. Expert layout is GLU block, then Identity block, then Zero block; a disabled
-    special type is simply a zero-width block. Identity/Zero cost no GEMM.
+    index_add_ back. Expert layout is GLU block, then +Identity block, then -Identity block; a disabled
+    special type is simply a zero-width block. The ±Identity specials cost no GEMM.
     """
     def __init__(self, config: BiBoConfig):
         super().__init__()
@@ -40,12 +40,12 @@ class BiBoFusedExperts(nn.Module):
         nn.init.normal_(self.gate_up_proj, mean=0.0, std=config.initializer_range)
         nn.init.normal_(self.down_proj, mean=0.0, std=config.initializer_range)
 
-        num_identity = getattr(config, "num_identity_experts", self.special_expert_pairs)
-        num_zero = getattr(config, "num_zero_experts", self.special_expert_pairs)
-        self.identity_start = self.num_polyglu_experts
-        self.identity_end = self.identity_start + num_identity
-        self.zero_start = self.identity_end
-        self.zero_end = self.zero_start + num_zero
+        num_pos = getattr(config, "num_pos_identity_experts", self.special_expert_pairs)
+        num_neg = getattr(config, "num_neg_identity_experts", self.special_expert_pairs)
+        self.pos_start = self.num_polyglu_experts
+        self.pos_end = self.pos_start + num_pos
+        self.neg_start = self.pos_end
+        self.neg_end = self.neg_start + num_neg
 
     @torch._dynamo.disable
     def forward(
@@ -113,17 +113,17 @@ class BiBoFusedExperts(nn.Module):
                 expert_output = F.linear(activated * up, self.down_proj[expert_idx])
                 output.index_add_(0, token_idx, expert_output * weights)
 
-            elif expert_idx < self.zero_start:
-                output.index_add_(0, token_idx, current_state * weights)   # Identity
+            elif expert_idx < self.neg_start:
+                output.index_add_(0, token_idx, current_state * weights)    # +Identity
 
             else:
-                pass                                                       # Zero
+                output.index_add_(0, token_idx, current_state * -weights)   # -Identity
 
         return output.to(hidden_states.dtype)
 
 
 class BiBoMoELayer(nn.Module):
-    """Routed = polyglu_expert_multiplier*3 GLU experts + special_expert_pairs*2 Identity/Zero."""
+    """Routed = polyglu_expert_multiplier*3 GLU experts + special_expert_pairs*2 ±Identity."""
     def __init__(self, config: BiBoConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -133,6 +133,7 @@ class BiBoMoELayer(nn.Module):
         self.bias_update_threshold = config.bias_update_threshold
         self.load_balance_strategy = getattr(config, 'load_balance_strategy', 'none')
         self.balance_exclude_specials = getattr(config, 'balance_exclude_specials', False)
+        self.glu_token_budget = getattr(config, 'glu_token_budget', None)
 
         self.register_buffer("accumulated_tpe", torch.zeros(config.num_routed_experts, dtype=torch.float))
         # Trigger on FORWARD STEPS, not device token counts: every rank then fires update_bias on the
@@ -152,20 +153,41 @@ class BiBoMoELayer(nn.Module):
 
     @torch.no_grad()
     def update_bias(self, tokens_per_expert: torch.Tensor):
-        """DeepSeek-V3 aux-loss-free update: b_i += u * sign(mean_load - load_i)."""
+        """Aux-loss-free bias update: b_i += u * sign(target_i - load_i). Two target rules:
+
+        DeepSeek-V3 (glu_token_budget=None, the default) — target is the OBSERVED MEAN of the
+        balanced block. This equalizes experts WITHIN the block but says nothing about how much
+        traffic the block gets in total, so with `balance_exclude_specials` the GLU-vs-special split
+        is left entirely to the router.
+
+        LongCat-Flash (glu_token_budget=r, arXiv:2509.01322 eq. for Delta b_i) — target is the
+        ABSOLUTE budget share r/n_glu, measured against T_i/(k*T_all), and the specials get
+        Delta b = 0 (they are the residual sink that absorbs whatever the GLU block sheds):
+
+            Delta b_i = u * sign( r/n_glu - T_i / (k*T_all) )   for the GLU block
+            Delta b_i = 0                                        for the +/-Identity specials
+
+        So when the GLU block is collectively over budget EVERY GLU bias drops by the same u --
+        a uniform shift that cannot change the ordering inside the block but does push tokens
+        across to the specials. That is the knob the mean-relative rule structurally lacks:
+        r is LongCat's K_e/K, the fraction of the k slots per token that should land on real FFNs.
+        """
         if not hasattr(self.gate, 'bias') or self.bias_update_factor <= 0:
             return
 
         tpe = tokens_per_expert.detach().float()
-        # balance_exclude_specials: balance only the leading GLU block and leave Identity/Zero biases
-        # at 0, so the router picks specials from raw scores instead of being pushed toward them.
-        n_balanced = self.experts.num_polyglu_experts if self.balance_exclude_specials else self.num_routed_experts
-        if n_balanced > 0:
-            balanced = tpe[:n_balanced]
-            deviation = torch.zeros_like(tpe)
-            deviation[:n_balanced] = balanced.mean() - balanced
+        deviation = torch.zeros_like(tpe)
+        n_glu = self.experts.num_polyglu_experts
+
+        if self.glu_token_budget is not None:
+            if n_glu > 0:
+                share = tpe / tpe.sum().clamp_min(1.0)      # T_i / (k * T_all), sums to 1 over experts
+                deviation[:n_glu] = self.glu_token_budget / n_glu - share[:n_glu]
         else:
-            deviation = torch.zeros_like(tpe)
+            n_balanced = n_glu if self.balance_exclude_specials else self.num_routed_experts
+            if n_balanced > 0:
+                balanced = tpe[:n_balanced]
+                deviation[:n_balanced] = balanced.mean() - balanced
 
         self.gate.bias.add_(self.bias_update_factor * deviation.sign())
 

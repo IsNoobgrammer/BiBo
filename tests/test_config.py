@@ -64,7 +64,8 @@ def test_validation_guards(overrides, reason):
         make_config(**overrides)
 
 
-@pytest.mark.parametrize("knob,value", [("router_type", "conv"), ("router_noise", 0.5)])
+@pytest.mark.parametrize("knob,value", [("router_noise", 0.5),
+                                        ("zero_expert", True), ("identity_expert", False)])
 def test_removed_knobs_are_dropped_not_stored(knob, value):
     """PretrainedConfig setattr()s unknown kwargs, so a stale knob would reappear as an attribute
     AND be re-serialized into config.json as if the feature still existed."""

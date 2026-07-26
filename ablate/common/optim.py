@@ -1,5 +1,56 @@
 """Optimizer builder: bf16-safe FusedMuon (NS8, aurora-K1) for 2D/3D matrices + AdamW for the rest.
-Identical for both arms. NEVER fp16 (see the fp16-divergence finding); ns_dtype defaults bf16."""
+Identical for both arms. NEVER fp16 (see the fp16-divergence finding); ns_dtype defaults bf16.
+
+═══════════════════════════════════════════════════════════════════════════════════════════════
+ MUON + THE ROUTER: ORTHOGONALIZE PER EXPERT, NEVER PER KERNEL TAP OR PER HIDDEN DIM
+═══════════════════════════════════════════════════════════════════════════════════════════════
+Muon's Newton-Schulz treats the LEADING dim of a param as a BATCH, orthogonalizes each trailing
+2D slice, and iterates on the SMALLER Gram. So the axis that gets decorrelated is decided purely
+by the parameter's STORED SHAPE — there is no flag for it:
+
+  param shape        NS batch   Gram     decorrelates          verdict for a ROUTER
+  ---------------    --------   ------   -------------------    --------------------------------
+  (E, H)             1          (E,E)    the E EXPERTS          CORRECT  <- MLP router
+  (E, H*K)           1          (E,E)    the E EXPERTS          CORRECT  <- conv router (we store this)
+  (E, H, K)          E          (K,K)    the K KERNEL TAPS      WRONG    <- an nn.Conv1d weight
+  (E, K, H) etc.     E          (K,K)    whichever trailing
+                                         dim is smaller         WRONG
+
+WHY (E,H,K) IS WRONG, measured, not argued:
+  * Expert de-collapse is the ONE thing Muon gives a router. Feed it experts collapsed onto a
+    single direction (|cos| = 0.9999): the 2D path returns 0.9999 -> 0.0000 (de-collapsed), the
+    3D path returns 0.9999 -> 0.9999. The 3D path CANNOT de-collapse experts, ever.
+    (Nuance: NS is a polynomial in X(X^T X), so it maps EXACTLY-zero singular values to zero and
+    cannot manufacture rank. At |cos| == 1.0000 exactly, neither path recovers -- but that is a
+    measure-zero case; any real collapse carries noise and the 2D path fixes it.)
+  * Over 300 real training steps the 3D layout drove router expert-correlation up 13x faster than
+    the MLP router (d xcos +0.0460 vs +0.0035); reshaping to 2D cut that ~3x (+0.0157).
+  * What it decorrelates INSTEAD is the temporal tap axis, which nobody asked for: tap |cos|
+    0.487 -> 0.0002 on a single update.
+  * Bonus hazard: a 3D param also falls into the `stacks` bucket below and becomes an xorth
+    (cross-expert whitening) target, which the 2D MLP router can never be -> asymmetric arms.
+
+HOW WE FIX IT: at the SOURCE, not here. `BiBoMoERouter` stores the conv router weight as a 2D
+(E, H*K) nn.Parameter and `.view(E, H, K)` inside forward for the F.conv1d call. Consequences:
+  - correct-by-construction: no param-group flag, nothing to remember, and it stays correct with
+    the fused Muon UNMODIFIED (we cannot patch kernels.sm120.muon from this repo);
+  - it lands in `mats` below (2D, never whitened) — exactly where the MLP router lands, so the
+    mlp-vs-conv ablation differs ONLY in architecture;
+  - `--router_optim adamw` catches it too (see `is_router`).
+If you ever reintroduce a routing param whose LEADING dim is the expert axis and whose trailing
+dims are a FAN-IN (taps x hidden, groups x hidden, ...), flatten the fan-in before it reaches Muon.
+
+⚠️ THE OPPOSITE RULE HOLDS FOR MoE EXPERT STACKS. `...experts.gate_up_proj` / `...down_proj` are
+(E, out, in) — each slice is a GENUINE weight matrix, so batched per-expert NS is exactly right
+and they MUST stay 3D. Never apply the flatten to them; it would orthogonalize across experts
+instead of within each expert's matrix. Router == flatten. Expert stack == keep batched.
+
+Related, checked and closed: `normuon` (per-row post-NS normalize) is a NO-OP for a router. NS
+returns U V^T and (U V^T)(U V^T)^T = U V^T V U^T = I when E <= fan_in, so every expert row already
+has exactly unit norm (measured spread max/min = 1.0005; normuon-vs-polar rel diff 2.2e-4). It
+only bites on the batched 3D path or when E > fan_in. Verifier: `src/.autoresearch/probe_router_muon.py --selfcheck`.
+═══════════════════════════════════════════════════════════════════════════════════════════════
+"""
 from . import _paths  # noqa: F401
 import torch
 
@@ -16,12 +67,24 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        # The MoE router projection is 2D (E,H) so the ndim rule ALREADY sends it to Muon -- that is the
-        # default and every result to date was produced that way. router_adamw=True is the ablation arm
-        # that moves it to AdamW instead. (The 3D conv-router weight is gone: conv router removed
-        # Jul 26 2026. The conv SHARED EXPERT lives at shared_experts_list.*.gate_conv, not .gate.*,
-        # so it was never matched here anyway.)
-        is_router = ".gate.gate_proj." in n
+        # Both routers are 2D so the ndim rule ALREADY sends them to Muon -> `mats` (never whitened);
+        # that is the default and every result to date was produced that way. router_adamw=True is the
+        # ablation arm that moves the router to AdamW instead.
+        #   .gate.gate_proj  -> MLP router,  (E, H)
+        #   .gate.gate_conv  -> conv router, (E, H*K) -- 2D ON PURPOSE, see the module docstring.
+        # The `.gate.` prefix is load-bearing: the conv SHARED EXPERT is at
+        # shared_experts_list.*.gate_conv (an actual nn.Conv1d, 3D) and must NOT match here.
+        is_router = ".gate.gate_proj." in n or ".gate.gate_conv" in n
+        # Guard the axis rule: a 3D routing param means someone reintroduced an nn.Conv1d router and
+        # NS would silently whiten kernel taps instead of experts.
+        if is_router and p.ndim != 2:
+            raise ValueError(
+                f"router param '{n}' has ndim={p.ndim}, expected 2. Muon orthogonalizes the "
+                f"trailing-2D slices batched over the leading dim, so a 3D router weight gets its "
+                f"KERNEL TAPS decorrelated instead of its EXPERTS (and joins the xorth stack "
+                f"bucket). Store it as (num_routed_experts, fan_in) and view() it in forward — see "
+                f"this module's docstring."
+            )
         if is_router:
             n_router += 1
         if router_adamw and is_router:

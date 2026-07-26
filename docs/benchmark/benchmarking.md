@@ -186,7 +186,7 @@ MY_CONFIG = BiBoConfig(
     moe_intermediate_size=256,
     use_shared_expert=True,
     shared_expert_type="mlp",        # "mlp" or "conv"
-    # Router (MLP only — conv router removed Jul 26 2026)
+    # Router (router_type="mlp" default; "conv" is a causal-Conv1d ablation axis)
     bias_update_threshold=100_000,
     bias_update_factor=1e-3,
     # Other
@@ -238,7 +238,7 @@ BIBO_50M_BASELINE = BiBoConfig(
     use_ssmax=True,
     # MoE — baseline (no PolyGLU)
     polyglu_expert_multiplier=1,    # 1 group = 3 SiLU experts
-    special_expert_pairs=0,         # No Identity/Zero
+    special_expert_pairs=0,         # No ±Identity specials
     num_experts_per_tok=2,          # Top-2 routing
     use_shared_expert=True,
     shared_expert_type="mlp",       # SwiGLU shared expert
@@ -382,7 +382,7 @@ BIBO_50M_BASELINE = BiBoConfig(
     moe_intermediate_size=256,
     use_shared_expert=True,
     shared_expert_type="conv",       # CausalConv1D shared expert
-    # Router (MLP only — the conv router variant was removed Jul 26 2026)
+    # Router (router_type="mlp" default; "conv" is a causal-Conv1d ablation axis)
     bias_update_threshold=100_000,
     bias_update_factor=1e-3,
     # Other
@@ -566,7 +566,7 @@ os.environ['WANDB_API_KEY'] = 'your_key_here'  # or WANDB_MODE=disabled
 | `num_attention_heads` | 5 | 4 | Query heads |
 | `num_key_value_heads` | 1 | 2 | KV heads (GQA) |
 | `polyglu_expert_multiplier` | 1 | 2 | Groups of 3 GLU experts |
-| `special_expert_pairs` | 0 | 1 | (Identity, Zero) pairs |
+| `special_expert_pairs` | 0 | 1 | (+Identity, −Identity) pairs |
 | `num_experts_per_tok` | 2 | 3 | Top-K routing |
 | `moe_intermediate_size` | 256 | 256 | Per-expert FFN size |
 | `shared_expert_type` | "mlp" | "conv" | Shared expert type |

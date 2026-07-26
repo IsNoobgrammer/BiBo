@@ -44,23 +44,38 @@ the combine weights — the bias affects selection only.
 
 ---
 
-### ~~`router_type`~~ — REMOVED (Jul 26 2026)
+### `router_type` — `"mlp"` (default) | `"conv"`
 
-The conv-router option and the `router_type` config key are **gone**. BiBo uses the MLP router
-exclusively: the conv router never outperformed it. Old configs passing `router_type=` log a warning
-and have it dropped — it is not stored on the config and not written back to `config.json`.
+`"mlp"` is one linear projection. `"conv"` is a causal Conv1d over `kernel_size` taps, so the router
+sees a local window (position `t` reads `t-K+1..t`, left-padded).
 
-The router is one linear projection, with **experts as the row dimension**:
+⚠️ **The conv router's weight is stored 2D as `(num_routed_experts, hidden_size·kernel_size)`** and
+`view()`-ed to `(E, H, K)` inside forward. This is not cosmetic. Muon's Newton-Schulz batches over a
+param's leading dim and iterates on the smaller Gram, so a 3D `(E,H,K)` weight gets its **kernel taps**
+decorrelated and its **experts left correlated** — it cannot de-collapse experts at all, which is the
+one thing Muon does for a router. The 2D layout makes the Gram `(E,E)` → per-expert, matching the MLP
+router, and keeps the weight out of any `ndim==3` expert-stack/xorth bucket. Full rule and measurements:
+the docstring atop `ablate/common/optim.py`, which also **raises** if a `.gate.*` param is not 2D.
+Its init is fan-in aware (`std = initializer_range/√kernel_size`) so both routers start at the same
+logit scale — without that the conv router starts `√K` sharper and confounds any comparison.
+
+Both routers put **experts on the row dimension**:
 
 ```python
 # src/modeling/ffn/router.py
+# router_type="mlp"
 self.gate_proj = nn.Linear(config.hidden_size, self.num_routed_experts, bias=False)
 # gate_proj.weight.shape == (num_routed_experts, hidden_size)
-# Forward: router_logits = self.gate_proj(flat_hidden).float()
+
+# router_type="conv" — 2D on purpose (see the warning above)
+self.gate_conv = nn.Parameter(torch.empty(self.num_routed_experts,
+                                          config.hidden_size * self.kernel_size))
+# forward: F.conv1d(left_pad(x, K-1), self.gate_conv.view(E, H, K))
 ```
 
-`kernel_size` still exists but now serves **only** the conv shared expert
-(`shared_expert_type="conv"`), which is unaffected by this removal.
+`kernel_size` serves **both** the conv router and the conv shared expert
+(`shared_expert_type="conv"`); they are independent modules and live at different parameter paths
+(`...mlp.gate.gate_conv` vs `...mlp.shared_experts_list.0.gate_conv`).
 
 ---
 
@@ -374,7 +389,7 @@ only take effect when this is `True`.
 | `gate_type` | "sigmoid" | Gating mechanism | "sigmoid" / "situ" / "softmax" |
 | `norm_topk_prob` | True | Softmax the gathered top-k weights to sum to 1 | bool |
 | `routed_scaling_factor` | 1.0 | Post-norm routed-weight scale | 1.0 = no-op |
-| `kernel_size` | 3 | Conv SHARED-EXPERT kernel size (conv router removed Jul 26 2026) | 3-7 (odd) |
+| `kernel_size` | 3 | Kernel width for the conv router (`router_type="conv"`) AND the conv shared expert | 3-7 (odd) |
 | `moe_shared_scaling` | 1.0 (auto) | Shared expert output scaling | 0.3-1.5 |
 | `use_shared_expert` | False | Enable the always-on shared expert (off = match Qwen3MoE) | bool |
 | `shared_expert_type` | "mlp" | Shared expert kind (only if `use_shared_expert`) | "mlp" / "conv" |
@@ -530,7 +545,7 @@ bias_magnitude = model.moe_layer.gate.bias.abs().mean()
 - Auto-computation of `moe_shared_scaling`
 - Skywork-MoE style logit normalization via `router_lambda`
 - Threshold-based bias updates
-- MLP router only (the Conv router variant was removed Jul 26 2026)
+- `router_type="mlp"` (default) or `"conv"` (causal Conv1d, weight stored 2D for the Muon per-expert axis)
 
 ---
 

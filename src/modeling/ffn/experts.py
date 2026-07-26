@@ -11,8 +11,8 @@ __all__ = [
     'BiBoCausalConv1D',
 ]
 
-# Identity ("pass x through") and Zero ("x*0") are NOT classes — BiBoFusedExperts handles them
-# inline as a weighted passthrough / a skip.
+# The ±Identity specials (+w*x / -w*x) are NOT classes — BiBoFusedExperts handles them inline as a
+# signed weighted passthrough. (The Zero expert was removed Jul 26 2026, see configuration_bibo.py.)
 
 
 class BiBoPolyGLUExpert(nn.Module):

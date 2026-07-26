@@ -93,8 +93,11 @@ fp16-divergence finding). Compare `bpb[hi]`/`bpb[en]` and `acc[hi]`/`acc[en]` be
 | `--final_mcq_n` / `--final_extrap` | 500 / 1024,2048,4096 | full final eval |
 | `--out` | ../runs | output dir |
 | `--wandb` / `--wandb_project` | off / polyglu-ablations | W&B logging |
-| `--silu` / `--relu2` / `--normsilu` | 1 / 1 / 1 | PolyGLU act subset (bibo_min): the ENABLED set cycles across the 6 experts (silu only -> 000000, silu+relu2 -> 010101, all -> 012012). Codes: silu=0, relu2=1, normsilu=2. Needs the `moe` patch. |
+| `--act` | silu | PolyGLU expert activation (bibo_min). One name, or a comma list to cycle a MIXED stack (`silu,normsitu` -> codes 0,7,0,7,...). Menu: `silu`(0) `relu2`(1) `normsilu`(2) `situ`(5) `normrelu2`(6) `normsitu`(7). Needs the `moe` patch. Replaced the six on/off switches Jul 26 2026. |
 | `--polyglu_mult` | 2 | GLU experts = mult*3 -> default 6 (LCM of 2,3: any act subset tiles evenly) |
+| `--special_pairs` | 0 | param-free special experts, PER TYPE: N gives N `+Identity` (`+w*x`) and N `-Identity` (`-w*x`). Drop one sign with `--no_pos_identity` / `--no_neg_identity`. |
+| `--glu_budget` | -1 (off) | LongCat `K_e/K` (arXiv:2509.01322): target share of routing slots for the GLU block, e.g. `0.75` -> GLU 3/4, specials 1/4, and the specials' bias is frozen. `<0` = DeepSeek mean-relative balancing. Watch `spl=` in the log / `train/special_load` in W&B. |
+| `--router_type` / `--router_kernel` | mlp / 3 | `conv` = causal Conv1d router over K taps (weight stored 2D so Muon whitens experts, not taps) |
 
 `python -m ablate.common.run_eval`
 | arg | default | meaning |

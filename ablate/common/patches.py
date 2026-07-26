@@ -19,7 +19,7 @@ except AttributeError:
     _nc = torch._dynamo.disable
 
 # PolyGLU act-cycle override (codes: 0=silu, 1=relu2, 2=normsilu, 5=situ, 6=normrelu2, 7=normsitu). None -> default (0,1,2) cycle.
-# train.py sets this from --silu/--relu2/--normsilu/--situ, e.g. [0] = all-SiLU experts, [0,1] = silu/relu2 alternating.
+# train.py sets this from --act, e.g. [0] = all-SiLU experts (the default), [0,5] = silu/situ alternating.
 ACT_CYCLE = None
 
 # Router GATE override (the fn turning router logits into per-expert scores). 'sigmoid' = shipped
@@ -119,7 +119,7 @@ def add_situ_params(model):
     n = 0
     for m in model.modules():
         if isinstance(m, BiBoFusedExperts):
-            E = m.zero_end   # rows must match the codes tensor length (polyglu + specials)
+            E = m.neg_end   # rows must match the codes tensor length (polyglu + specials)
             dev = m.gate_up_proj.device
             m.situ_alpha = nn.Parameter(torch.ones(E, device=dev))
             m.situ_gamma = nn.Parameter(torch.ones(E, device=dev))
@@ -157,17 +157,19 @@ def patch_liger_rope():
 def patch_fused_moe():
     # FORCE per-expert: measured 2.31x faster than grouped on Blackwell at our expert size (H=512, I=768)
     # -- grouped's tl.dot only wins for large experts -- AND per-expert is the only path that handles the
-    # Identity/Zero special experts correctly. (moe() auto-dispatch would wrongly pick grouped at >=4096 tok.)
+    # special experts correctly. (moe() auto-dispatch would wrongly pick grouped at >=4096 tok.)
     from kernels.sm120.moe import moe_per_expert as moe_fused
 
-    # BiBo: diverse PolyGLU activations (silu/relu2/normsilu cycled) + optional Identity/Zero specials
+    # BiBo: diverse PolyGLU activations (silu/relu2/normsilu cycled) + optional ±Identity specials
     def _bibo_moe(self, hidden_states, top_k_indices, top_k_weights):
         codes = getattr(self, "_act_codes", None)
         if codes is None or codes.device != hidden_states.device:
             cyc = ACT_CYCLE or (0, 1, 2)
+            # Kernel codes 3/4 = +Identity / -Identity (code 4 meant ZERO until Jul 26 2026; the
+            # kernel now emits -w*x for it -- gated by parity_specials.py in triton-kernel-fused).
             lst = ([cyc[e % len(cyc)] for e in range(self.num_polyglu_experts)]
-                   + [3] * (self.identity_end - self.identity_start)
-                   + [4] * (self.zero_end - self.zero_start))
+                   + [3] * (self.pos_end - self.pos_start)
+                   + [4] * (self.neg_end - self.neg_start))
             codes = torch.tensor(lst, dtype=torch.int32, device=hidden_states.device)
             self._act_codes = codes
         ap = (torch.stack([self.situ_alpha, self.situ_gamma], dim=1)
