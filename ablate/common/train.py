@@ -473,7 +473,11 @@ def main():
                         "train/tps": tps, "train/mfu": mfu, "train/mem_gb": mem, "train/elapsed_s": elapsed,
                         "train/expert_corr": ecorr, "train/router_corr": rcorr,
                         "tokens": toks, **rt}, step=step)
-        if do_eval and step % args.eval_every == 0:            # periodic eval -> W&B curves
+        # `step > 0`: step 0 evaluates a RANDOM-INIT model, so the numbers are noise (measured
+        # bpb hi=2.04 en=4.19 vs 0.74/1.64 at the end) while costing a full eval pass -- ~2.4 min
+        # of a 12.5 min 500-step arm, i.e. ~19%. The final eval still runs, and any --eval_every
+        # multiple after 0 still runs, so curves are unaffected.
+        if do_eval and step > 0 and step % args.eval_every == 0:   # periodic eval -> W&B curves
             with _eager(model):                                # eval on the un-compiled module (see _eager)
                 _, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.eval_mcq_n, bpb_n=args.eval_bpb_n,
                                    extrap_lengths=ev_extrap, do_samples=False,
@@ -481,7 +485,7 @@ def main():
             if wb:
                 wb.log(flat, step=step)
             print(f"  [eval @{step}] {summarize(flat)}", flush=True)
-        if do_eval and sample_every > 0 and step % sample_every == 0:   # samples on their own cadence (default = eval_every)
+        if do_eval and sample_every > 0 and step > 0 and step % sample_every == 0:   # samples on their own cadence (default = eval_every)
             with _eager(model):
                 for s in generate_samples(model, tok, device=DEV, dtype=dt):
                     print(f"    [sample {s['lang']}] {s['prompt']} -> {s['completion']}", flush=True)
