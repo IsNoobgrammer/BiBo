@@ -365,6 +365,12 @@ def main():
                 + (f"_rconv{args.router_kernel}" if args.router_type == "conv" else "")
                 + ("_xsp" if args.balance_exclude_specials else "")
                 + (f"_gb{args.glu_budget:g}" if args.glu_budget >= 0 else "")
+                # bias_update_factor MUST be in the tag: it is a first-class ablation axis (it sets
+                # the balancer's authority relative to the router boundary gap), and two arms that
+                # differ only in u would otherwise share a run name -- silently overwriting each
+                # other's ..._final.pt / _result.json and colliding in W&B. That already happened
+                # once: se2-xsp (u=0.001) was clobbered by se2-xsp-u01 (u=0.01).
+                + (f"_u{args.bias_update_factor:g}" if args.bias_update_factor >= 0 else "")
                 + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + (f"_rt-{args.router_gate}-{router_norm}"
