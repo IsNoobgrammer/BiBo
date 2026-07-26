@@ -61,7 +61,8 @@ def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_
                          polyglu_mult=2, special_pairs=0,
                          use_ssmax=False, use_xsa=False, balance_exclude_specials=False,
                          pos_identity_expert=True, neg_identity_expert=True,
-                         router_type="mlp", kernel_size=3, glu_token_budget=None):
+                         router_type="mlp", kernel_size=3, glu_token_budget=None,
+                         bias_update_mode="sign"):
     from src.configuration_bibo import BiBoConfig
     # DeepSeek-style aux-loss-free balancing pairs with SIGMOID gating (bias added to sigmoid scores);
     # with no balancing we use softmax (Qwen-matched). So gate_type follows load_balance.
@@ -72,6 +73,7 @@ def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_
         bias_update_factor=bias_update_factor,        # None -> BiBoConfig default (0.001)
         balance_exclude_specials=balance_exclude_specials,  # ablation: freeze ±Identity bias (router learns their use)
         glu_token_budget=glu_token_budget,  # LongCat K_e/K: absolute GLU-block share target (None = DeepSeek mean-relative)
+        bias_update_mode=bias_update_mode,  # "sign" (DeepSeek bang-bang) | "prop" (LongCat proportional)
         vocab_size=SHARED["vocab_size"], hidden_size=SHARED["hidden_size"],
         intermediate_size=SHARED["intermediate_size"], num_hidden_layers=SHARED["num_hidden_layers"],
         num_attention_heads=SHARED["num_attention_heads"], num_key_value_heads=SHARED["num_key_value_heads"],

@@ -74,6 +74,9 @@ class BiBoConfig(PretrainedConfig):
         load_balance_strategy="bias",  # "none" | "bias" (aux-loss-free bias updates)
         bias_update_factor=0.001,   # sign-update step; small on purpose, see __init__ note
         bias_update_threshold=8000,  # tokens between bias updates
+        bias_update_mode="sign",    # "sign" (DeepSeek-V3) | "prop" (LongCat: raw deviation, no
+                                    # sign() -- proportional control, has a fixed point and no
+                                    # common-mode drift). See BiBoMoELayer.update_bias.
         balance_exclude_specials=False,  # balance only the GLU block, freeze ±Identity biases at 0
         glu_token_budget=None,      # LongCat K_e/K: fraction of the k slots/token targeted at the GLU
                                     # block (e.g. 0.75 -> GLU 3/4, ±Identity 1/4). None = DeepSeek
@@ -194,6 +197,7 @@ class BiBoConfig(PretrainedConfig):
         self.bias_update_threshold = bias_update_threshold if bias_update_threshold is not None else 8000
         self.balance_exclude_specials = balance_exclude_specials
         self.glu_token_budget = glu_token_budget
+        self.bias_update_mode = bias_update_mode
 
         # Dynamic NTK-aware: identity inside the trained window, smooth base growth beyond it.
         # type="none" for plain RoPE.
@@ -250,6 +254,8 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError("bias_update_factor must be non-negative")
         if self.bias_update_threshold <= 0:
             raise ValueError("bias_update_threshold must be positive")
+        if self.bias_update_mode not in ("sign", "prop"):
+            raise ValueError(f"bias_update_mode must be 'sign' or 'prop', got '{self.bias_update_mode}'")
         if self.glu_token_budget is not None:
             if not 0.0 < self.glu_token_budget <= 1.0:
                 raise ValueError(

@@ -134,6 +134,7 @@ class BiBoMoELayer(nn.Module):
         self.load_balance_strategy = getattr(config, 'load_balance_strategy', 'none')
         self.balance_exclude_specials = getattr(config, 'balance_exclude_specials', False)
         self.glu_token_budget = getattr(config, 'glu_token_budget', None)
+        self.bias_update_mode = getattr(config, 'bias_update_mode', 'sign')
 
         self.register_buffer("accumulated_tpe", torch.zeros(config.num_routed_experts, dtype=torch.float))
         # Trigger on FORWARD STEPS, not device token counts: every rank then fires update_bias on the
@@ -171,6 +172,22 @@ class BiBoMoELayer(nn.Module):
         a uniform shift that cannot change the ordering inside the block but does push tokens
         across to the specials. That is the knob the mean-relative rule structurally lacks:
         r is LongCat's K_e/K, the fraction of the k slots per token that should land on real FFNs.
+
+        bias_update_mode: "sign" (DeepSeek-V3, default) | "prop" (LongCat, raw deviation).
+        LongCat's equation has NO sign() -- it applies mu * (target - actual) directly. That is
+        proportional control instead of bang-bang, and it fixes two defects we measured:
+          1. NO DITHER / IT HAS A FIXED POINT. sign() never returns 0, so the bias oscillates +-u
+             forever and u is a permanent routing-noise floor. Measured: u=0.01 hit its load target
+             (spl 0.160, balance 0.9973) yet lost 0.094 of loss to the noise -- 10x the 0.009
+             replicate floor. Proportional steps shrink as the deviation closes, so it settles.
+          2. NO COMMON-MODE DRIFT. Raw deviations sum to EXACTLY zero over the balanced block
+             (sum_i(mean - x_i) = 0), so the block's mean bias cannot move. sign()ed deviations do
+             NOT sum to zero -- a right-skewed load puts most experts below the mean, so most get
+             +1 and the whole block floats up. Measured with balance_exclude_specials at u=0.01:
+             GLU biases at +1.28 while the frozen specials sat at 0, i.e. ~84% of the accumulated
+             bias was common-mode. That silently turned u into a GLU-vs-special preference knob.
+        u is NOT comparable across modes: "sign" steps by u, "prop" steps by u * deviation, and
+        share deviations run ~1e-3..1e-1, so prop needs a u roughly 1-2 orders of magnitude larger.
         """
         if not hasattr(self.gate, 'bias') or self.bias_update_factor <= 0:
             return
@@ -178,18 +195,23 @@ class BiBoMoELayer(nn.Module):
         tpe = tokens_per_expert.detach().float()
         deviation = torch.zeros_like(tpe)
         n_glu = self.experts.num_polyglu_experts
+        # Deviations are always in SHARE units (T_i / (k*T_all)), never raw counts, so the update is
+        # invariant to batch size and to how many steps we accumulate over. In "sign" mode only the
+        # sign survives so this rescaling is a no-op; in "prop" mode it is what makes u portable.
+        share = tpe / tpe.sum().clamp_min(1.0)
 
         if self.glu_token_budget is not None:
             if n_glu > 0:
-                share = tpe / tpe.sum().clamp_min(1.0)      # T_i / (k * T_all), sums to 1 over experts
                 deviation[:n_glu] = self.glu_token_budget / n_glu - share[:n_glu]
         else:
             n_balanced = n_glu if self.balance_exclude_specials else self.num_routed_experts
             if n_balanced > 0:
-                balanced = tpe[:n_balanced]
-                deviation[:n_balanced] = balanced.mean() - balanced
+                deviation[:n_balanced] = share[:n_balanced].mean() - share[:n_balanced]
 
-        self.gate.bias.add_(self.bias_update_factor * deviation.sign())
+        if self.bias_update_mode == "prop":
+            self.gate.bias.add_(self.bias_update_factor * deviation)
+        else:
+            self.gate.bias.add_(self.bias_update_factor * deviation.sign())
 
     @torch._dynamo.disable
     def _balance_step(self, top_k_indices, num_tokens):

@@ -313,3 +313,61 @@ def test_shared_expert_is_off_by_default_and_adds_directly():
     layer = BiBoMoELayer(make_config(use_shared_expert=True)).to(DEVICE)
     assert len(layer.shared_experts_list) == 1
     assert not hasattr(layer, "moe_shared_scaling"), "the scaling scalar was removed"
+
+
+def test_prop_mode_deviations_sum_to_zero_so_no_common_mode_drift():
+    """The reason LongCat drops sign(). Raw deviations sum to EXACTLY 0 over the balanced block, so
+    the block's MEAN bias cannot move -- only the spread within it. sign()ed deviations do not: a
+    right-skewed load puts most experts below the mean, most get +1, and the whole block floats up.
+    Measured on a real run (xsp, u=0.01): GLU biases at +1.28 while frozen specials sat at 0."""
+    skewed = torch.tensor([500.0, 300.0] + [10.0] * 16 + [50.0] * 4, device=DEVICE)  # 22 experts
+    c = make_config(load_balance_strategy="bias", bias_update_factor=0.1,
+                    polyglu_expert_multiplier=6, special_expert_pairs=2, bias_update_mode="prop")
+    layer = BiBoMoELayer(c).to(DEVICE)
+    layer.update_bias(skewed)
+    assert abs(float(layer.gate.bias.mean())) < 1e-6, "prop mode must not shift the block mean"
+    assert float(layer.gate.bias.std()) > 0, "...but it must still spread the biases"
+
+    sign_layer = BiBoMoELayer(make_config(
+        load_balance_strategy="bias", bias_update_factor=0.1, polyglu_expert_multiplier=6,
+        special_expert_pairs=2, bias_update_mode="sign")).to(DEVICE)
+    sign_layer.update_bias(skewed)
+    assert float(sign_layer.gate.bias.mean()) > 0.05, \
+        "sign mode SHOULD drift the mean up on a right-skewed load (that is the defect)"
+
+
+def test_prop_mode_step_shrinks_as_load_approaches_balance():
+    """Proportional control has a fixed point; bang-bang does not. This is why u=0.01 in sign mode
+    held its load target yet lost 0.094 loss: the bias never stops dithering by +-u."""
+    c = make_config(load_balance_strategy="bias", bias_update_factor=1.0, bias_update_mode="prop")
+    E = c.num_routed_experts
+    steps = []
+    for skew in (10.0, 1.0, 0.0):                       # progressively closer to perfectly balanced
+        layer = BiBoMoELayer(c).to(DEVICE)
+        tpe = torch.full((E,), 100.0, device=DEVICE)
+        tpe[0] += skew * 10
+        layer.update_bias(tpe)
+        steps.append(float(layer.gate.bias.abs().max()))
+    assert steps[0] > steps[1] > steps[2], f"prop steps must shrink with the deviation, got {steps}"
+    assert steps[2] < 1e-6, "a perfectly balanced load must produce NO update in prop mode"
+
+    # torch.sign(0) IS 0, so an exactly-balanced load produces no sign-mode step either. That is not
+    # the real regime: a stochastic load is never exactly at its mean, and sign() maps ANY
+    # infinitesimal deviation to a FULL +-u step. That is the dither, and prop mode does not have it.
+    sc = make_config(load_balance_strategy="bias", bias_update_factor=0.1, bias_update_mode="sign")
+    tpe = torch.full((sc.num_routed_experts,), 100.0, device=DEVICE)
+    tpe[0] += 1e-3                                        # essentially, but not exactly, balanced
+    sign_layer = BiBoMoELayer(sc).to(DEVICE)
+    sign_layer.update_bias(tpe)
+    assert float(sign_layer.gate.bias.abs().max()) == pytest.approx(0.1), \
+        "sign mode takes a FULL u step on an infinitesimal deviation -- the dither floor"
+    prop_layer = BiBoMoELayer(make_config(load_balance_strategy="bias", bias_update_factor=0.1,
+                                          bias_update_mode="prop")).to(DEVICE)
+    prop_layer.update_bias(tpe)
+    assert float(prop_layer.gate.bias.abs().max()) < 1e-6, \
+        "prop mode's step must vanish with the deviation"
+
+
+def test_bias_update_mode_is_validated():
+    with pytest.raises(ValueError):
+        make_config(bias_update_mode="pid")
