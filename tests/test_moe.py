@@ -205,7 +205,8 @@ def test_router_projection_has_experts_as_the_row_dimension():
 
 # ── load balancing ───────────────────────────────────────────────────────────
 def test_bias_update_moves_toward_balance():
-    c = make_config(load_balance_strategy="bias", bias_update_factor=0.1)
+    c = make_config(load_balance_strategy="bias", bias_update_factor=0.005,
+                    bias_update_mode="sign")
     layer = BiBoMoELayer(c).to(DEVICE)
     tpe = torch.zeros(c.num_routed_experts, device=DEVICE)
     tpe[0] = 100.0
@@ -218,7 +219,7 @@ def test_bias_update_moves_toward_balance():
 
 def test_balance_exclude_specials_freezes_special_biases():
     c = make_config(load_balance_strategy="bias", balance_exclude_specials=True,
-                    bias_update_factor=0.1)
+                    bias_update_factor=0.005, bias_update_mode="sign")
     layer = BiBoMoELayer(c).to(DEVICE)
     npg = layer.experts.num_polyglu_experts
     layer.update_bias(torch.arange(float(c.num_routed_experts), device=DEVICE) * 10)
@@ -231,8 +232,8 @@ def test_glu_token_budget_shifts_the_whole_glu_block_when_off_budget():
     is collectively over budget EVERY GLU bias must drop -- a uniform shift that cannot reorder the
     block but does push traffic across to the specials. The mean-relative rule cannot express this:
     its deviations always sum to ~0 inside the block."""
-    c = make_config(load_balance_strategy="bias", bias_update_factor=0.1, glu_token_budget=0.75,
-                    polyglu_expert_multiplier=2, special_expert_pairs=1)
+    c = make_config(load_balance_strategy="bias", bias_update_factor=0.005, glu_token_budget=0.75,
+                    polyglu_expert_multiplier=2, special_expert_pairs=1, bias_update_mode="sign")
     npg = BiBoMoELayer(c).experts.num_polyglu_experts
     n_special = c.num_routed_experts - npg
     for glu_share, want in ((0.95, -1.0), (0.40, 1.0)):     # over budget -> down, under -> up
@@ -241,7 +242,7 @@ def test_glu_token_budget_shifts_the_whole_glu_block_when_off_budget():
                          torch.full((n_special,), (1 - glu_share) / n_special, device=DEVICE)]) * 1000
         layer.update_bias(tpe)
         b = layer.gate.bias
-        assert torch.allclose(b[:npg], torch.full_like(b[:npg], want * 0.1)), \
+        assert torch.allclose(b[:npg], torch.full_like(b[:npg], want * 0.005)), \
             f"GLU share {glu_share} vs budget 0.75: expected a uniform {want:+.0f} shift, got {b[:npg]}"
         assert (b[npg:] == 0).all(), "specials are the residual sink -- Delta b must be 0 (LongCat)"
 
@@ -249,8 +250,8 @@ def test_glu_token_budget_shifts_the_whole_glu_block_when_off_budget():
 def test_glu_token_budget_still_equalizes_within_the_glu_block():
     """The budget sets the block's TOTAL share; experts inside it must still be balanced against
     each other, or the knob would trade balance for budget."""
-    c = make_config(load_balance_strategy="bias", bias_update_factor=0.1, glu_token_budget=0.75,
-                    polyglu_expert_multiplier=2, special_expert_pairs=1)
+    c = make_config(load_balance_strategy="bias", bias_update_factor=0.005, glu_token_budget=0.75,
+                    polyglu_expert_multiplier=2, special_expert_pairs=1, bias_update_mode="sign")
     layer = BiBoMoELayer(c).to(DEVICE)
     npg = layer.experts.num_polyglu_experts
     tpe = torch.full((c.num_routed_experts,), 10.0, device=DEVICE)
@@ -321,7 +322,7 @@ def test_prop_mode_deviations_sum_to_zero_so_no_common_mode_drift():
     right-skewed load puts most experts below the mean, most get +1, and the whole block floats up.
     Measured on a real run (xsp, u=0.01): GLU biases at +1.28 while frozen specials sat at 0."""
     skewed = torch.tensor([500.0, 300.0] + [10.0] * 16 + [50.0] * 4, device=DEVICE)  # 22 experts
-    c = make_config(load_balance_strategy="bias", bias_update_factor=0.1,
+    c = make_config(load_balance_strategy="bias", bias_update_factor=0.4,
                     polyglu_expert_multiplier=6, special_expert_pairs=2, bias_update_mode="prop")
     layer = BiBoMoELayer(c).to(DEVICE)
     layer.update_bias(skewed)
@@ -329,10 +330,10 @@ def test_prop_mode_deviations_sum_to_zero_so_no_common_mode_drift():
     assert float(layer.gate.bias.std()) > 0, "...but it must still spread the biases"
 
     sign_layer = BiBoMoELayer(make_config(
-        load_balance_strategy="bias", bias_update_factor=0.1, polyglu_expert_multiplier=6,
+        load_balance_strategy="bias", bias_update_factor=0.005, polyglu_expert_multiplier=6,
         special_expert_pairs=2, bias_update_mode="sign")).to(DEVICE)
     sign_layer.update_bias(skewed)
-    assert float(sign_layer.gate.bias.mean()) > 0.05, \
+    assert float(sign_layer.gate.bias.mean()) > 0.002, \
         "sign mode SHOULD drift the mean up on a right-skewed load (that is the defect)"
 
 
@@ -354,14 +355,14 @@ def test_prop_mode_step_shrinks_as_load_approaches_balance():
     # torch.sign(0) IS 0, so an exactly-balanced load produces no sign-mode step either. That is not
     # the real regime: a stochastic load is never exactly at its mean, and sign() maps ANY
     # infinitesimal deviation to a FULL +-u step. That is the dither, and prop mode does not have it.
-    sc = make_config(load_balance_strategy="bias", bias_update_factor=0.1, bias_update_mode="sign")
+    sc = make_config(load_balance_strategy="bias", bias_update_factor=0.005, bias_update_mode="sign")
     tpe = torch.full((sc.num_routed_experts,), 100.0, device=DEVICE)
     tpe[0] += 1e-3                                        # essentially, but not exactly, balanced
     sign_layer = BiBoMoELayer(sc).to(DEVICE)
     sign_layer.update_bias(tpe)
-    assert float(sign_layer.gate.bias.abs().max()) == pytest.approx(0.1), \
+    assert float(sign_layer.gate.bias.abs().max()) == pytest.approx(0.005), \
         "sign mode takes a FULL u step on an infinitesimal deviation -- the dither floor"
-    prop_layer = BiBoMoELayer(make_config(load_balance_strategy="bias", bias_update_factor=0.1,
+    prop_layer = BiBoMoELayer(make_config(load_balance_strategy="bias", bias_update_factor=0.4,
                                           bias_update_mode="prop")).to(DEVICE)
     prop_layer.update_bias(tpe)
     assert float(prop_layer.gate.bias.abs().max()) < 1e-6, \
@@ -371,3 +372,20 @@ def test_prop_mode_step_shrinks_as_load_approaches_balance():
 def test_bias_update_mode_is_validated():
     with pytest.raises(ValueError):
         make_config(bias_update_mode="pid")
+
+
+def test_bias_update_factor_default_follows_the_mode():
+    """u is not comparable across modes -- prop steps by u*deviation, sign by u exactly -- so the
+    default has to track the mode or flipping the mode silently mis-scales the balancer."""
+    assert make_config(bias_update_factor=None).bias_update_mode == "prop", "prop is the default"
+    assert make_config(bias_update_factor=None).bias_update_factor == 0.4
+    assert make_config(bias_update_factor=None, bias_update_mode="sign").bias_update_factor == 0.001
+
+
+def test_prop_scale_u_is_rejected_under_sign_mode():
+    """The footgun the prop default creates: sign moves the bias by u EXACTLY every update against
+    scores in (0,1), so carrying u=0.4 over from prop would obliterate routing."""
+    with pytest.raises(ValueError, match="prop-scale step"):
+        make_config(bias_update_mode="sign", bias_update_factor=0.4)
+    make_config(bias_update_mode="sign", bias_update_factor=0.005)   # sane sign value, must pass
+    make_config(bias_update_mode="prop", bias_update_factor=0.4)     # same number, fine under prop

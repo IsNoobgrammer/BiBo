@@ -23,21 +23,24 @@ def test_mlp_only_layers_dedupes_single_layer_model():
     assert c.mlp_only_layers == [0], "N==1 must give [0], not [0, 0]"
 
 
-def test_bias_update_factor_is_a_fixed_small_step():
-    """It must NOT scale with num_routed_experts. sign() never returns 0, so the bias dithers +-u
-    forever and u is the balancer's steady-state routing-noise floor; it has to stay well under the
-    top-k boundary gap, which SHRINKS as experts are added (0.041 at n=8 -> 0.0064 at n=128)."""
-    assert make_config().bias_update_factor == 0.001
-    for mult in (1, 2, 10, 42):     # 5 .. 128 routed experts
-        c = make_config(polyglu_expert_multiplier=mult, special_expert_pairs=1,
-                        num_experts_per_tok=1)
-        assert c.bias_update_factor == 0.001, \
-            f"u must not depend on n (got {c.bias_update_factor} at n={c.num_routed_experts})"
+def test_bias_update_factor_is_a_fixed_step_not_a_function_of_n():
+    """u must NOT scale with num_routed_experts. Its correct scale is set by the MODE (prop: u is a
+    gain on the deviation; sign: u IS the per-update step and the steady-state routing-noise floor),
+    never by the expert count."""
+    assert make_config().bias_update_factor == 0.4, "prop is the default; its scale is ~0.4"
+    for mode, want in (("prop", 0.4), ("sign", 0.001)):
+        for mult in (1, 2, 10, 42):     # 5 .. 128 routed experts
+            c = make_config(polyglu_expert_multiplier=mult, special_expert_pairs=1,
+                            num_experts_per_tok=1, bias_update_mode=mode)
+            assert c.bias_update_factor == want, \
+                f"u must not depend on n (got {c.bias_update_factor} at n={c.num_routed_experts})"
 
 
 def test_explicit_bias_update_factor_wins():
     assert make_config(bias_update_factor=3e-2).bias_update_factor == 3e-2
-    assert make_config(bias_update_factor=None).bias_update_factor == 0.001, "None -> default"
+    assert make_config(bias_update_factor=None).bias_update_factor == 0.4, "None -> prop default"
+    assert make_config(bias_update_factor=None,
+                       bias_update_mode="sign").bias_update_factor == 0.001, "None -> sign default"
     assert make_config(bias_update_factor=0.0).bias_update_factor == 0.0, "0 disables balancing"
 
 

@@ -72,11 +72,23 @@ class BiBoConfig(PretrainedConfig):
         norm_topk_prob=True,       # softmax the gathered top-k weights to sum to 1 (not MiMo's ÷sum)
         routed_scaling_factor=1.0,  # post-norm routed-weight scale; 1.0 = no-op
         load_balance_strategy="bias",  # "none" | "bias" (aux-loss-free bias updates)
-        bias_update_factor=0.001,   # sign-update step; small on purpose, see __init__ note
+        bias_update_factor=None,    # None -> MODE-DEPENDENT default (prop 0.4, sign 0.001); u means
+                                    # different things in each mode, so it cannot be one literal
         bias_update_threshold=8000,  # tokens between bias updates
-        bias_update_mode="sign",    # "sign" (DeepSeek-V3) | "prop" (LongCat: raw deviation, no
-                                    # sign() -- proportional control, has a fixed point and no
-                                    # common-mode drift). See BiBoMoELayer.update_bias.
+        bias_update_mode="prop",    # DEFAULT since Jul 26 2026. "prop" (LongCat: raw deviation,
+                                    # no sign()) | "sign" (DeepSeek-V3 bang-bang).
+                                    # Measured, 18 GLU experts, 500 steps, replicate sigma 0.013:
+                                    #   sign over  5x of u (0.001->0.005): loss moved 0.0775 (6 sigma)
+                                    #   prop over 100x of u (0.02 ->2.0 ): loss moved 0.0271 (~noise)
+                                    # ~8x less sensitive PER DECADE, because proportional control
+                                    # has a fixed point: the steady state is set by the TARGET and u
+                                    # only sets convergence RATE. sign has none, so u sets the
+                                    # operating point and the dither amplitude too -- and its optimum
+                                    # MOVES with the expert layout, so it needs a per-config sweep.
+                                    # Cost of prop: it does not beat a hand-tuned sign (2.7186 vs
+                                    # 2.7030, 1.2 sigma). We trade <=1.2 sigma of peak for not tuning.
+                                    # NOTE u IS NOT COMPARABLE ACROSS MODES: sign steps by u, prop by
+                                    # u*deviation, and share deviations run ~1e-3..1e-1.
         balance_exclude_specials=False,  # balance only the GLU block, freeze ±Identity biases at 0
         glu_token_budget=None,      # LongCat K_e/K: fraction of the k slots/token targeted at the GLU
                                     # block (e.g. 0.75 -> GLU 3/4, ±Identity 1/4). None = DeepSeek
@@ -187,12 +199,15 @@ class BiBoConfig(PretrainedConfig):
         # experts are added: measured mean gap at the k|k+1 boundary is 0.041 (n=8) -> 0.0064
         # (n=128) -> 0.0045 (n=512) for sigmoid. A small fixed step is therefore *more* than
         # sufficient at scale, not less.
-        # Why this small: sign() never returns 0, so the bias dithers +-u forever and never settles;
-        # u IS the balancer's steady-state routing-noise floor. u must stay well under the boundary
-        # gap or it reshuffles selections on its own even at perfect balance (u=0.03 is ~5x the
-        # n=128 gap; u=0.001 is ~0.16x). 0.001 also matches DeepSeek-V3. Raise it for a faster
-        # response at the cost of more routing jitter; 0 disables balancing entirely.
-        self.bias_update_factor = 0.001 if bias_update_factor is None else bias_update_factor
+        # The default depends on the MODE, because u means different things in each:
+        #   prop (default): step = u * deviation, deviations ~1e-3..1e-1 -> u ~ 0.4.
+        #   sign:           step = u exactly                             -> u ~ 0.001..0.005.
+        # For sign, u is the balancer's steady-state routing-noise floor: any nonzero deviation
+        # gives a full +-u step, so it dithers forever and u must stay well under the selection
+        # boundary gap or it reshuffles routing even at perfect balance. prop has a fixed point and
+        # no such floor. 0 disables balancing entirely in both modes.
+        _u_default = 0.001 if bias_update_mode == "sign" else 0.4
+        self.bias_update_factor = _u_default if bias_update_factor is None else bias_update_factor
 
         self.bias_update_threshold = bias_update_threshold if bias_update_threshold is not None else 8000
         self.balance_exclude_specials = balance_exclude_specials
@@ -256,6 +271,15 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError("bias_update_threshold must be positive")
         if self.bias_update_mode not in ("sign", "prop"):
             raise ValueError(f"bias_update_mode must be 'sign' or 'prop', got '{self.bias_update_mode}'")
+        # u is NOT comparable across modes and the prop-scale default is catastrophic under sign:
+        # sign steps by u EXACTLY, so u=0.4 moves the bias 0.4 per update against sigmoid scores that
+        # live in (0,1) -- it would obliterate routing. Catch the mode flip that forgets to rescale u.
+        if self.bias_update_mode == "sign" and self.bias_update_factor > 0.05:
+            raise ValueError(
+                f"bias_update_mode='sign' with bias_update_factor={self.bias_update_factor} is a "
+                f"prop-scale step. sign moves the bias by u EXACTLY every update, against scores in "
+                f"(0,1); sane values are ~0.001-0.005. Either set bias_update_mode='prop' (the "
+                f"default, where u~0.4 is correct) or lower bias_update_factor.")
         if self.glu_token_budget is not None:
             if not 0.0 < self.glu_token_budget <= 1.0:
                 raise ValueError(

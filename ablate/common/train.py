@@ -232,7 +232,7 @@ def main():
     ap.add_argument("--bias_update_mode", choices=["sign", "prop"], default="sign")  # LongCat uses NO sign(): "prop" applies u*(target-actual) directly -> proportional control, has a fixed point (no dither) and cannot drift common-mode. u is NOT comparable across modes. Tag _prop
     ap.add_argument("--glu_budget", type=float, default=-1.0)                     # LongCat K_e/K (arXiv:2509.01322): target share of routing slots for the GLU block, e.g. 0.75 -> GLU 3/4 / specials 1/4. <0 = off (DeepSeek mean-relative). Tag _gb<val>
     ap.add_argument("--bias_update_threshold", type=int, default=10240)           # tokens between bias updates (if bias)
-    ap.add_argument("--bias_update_factor", type=float, default=-1.0)             # <0 = config default (0.001); 0 = balancing off
+    ap.add_argument("--bias_update_factor", type=float, default=-1.0)             # <0 = config default, which is MODE-DEPENDENT (prop 0.4, sign 0.001) because u means different things; 0 = balancing off
     ap.add_argument("--compile", action="store_true")           # torch.compile the transformer body
     ap.add_argument("--peak_tflops", type=float, default=0.0)   # MFU denominator: 0=auto-measure achievable GEMM;
     #                                                             else theoretical, e.g. 480 (dense bf16) / 960 (sparse)
