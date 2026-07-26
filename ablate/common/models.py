@@ -45,8 +45,18 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
 def count_params(model, top_k=None, num_experts=None):
     """Return (total, trainable, active). trainable excludes inert (requires_grad=False) params like
     BiBo's zero-init router bias; the ablation is matched on trainable/active params. active discounts
-    inactive experts (3D stacked expert tensors)."""
-    top_k = top_k or SHARED["num_experts_per_tok"]
+    inactive experts (3D stacked expert tensors).
+
+    top_k comes from the MODEL'S OWN CONFIG, not from SHARED. It used to fall back to
+    SHARED["num_experts_per_tok"], so every --top_k run reported the top_k=2 active count -- k=4 runs
+    printed active=71.96M when routing to 4 experts actually activates ~18.9M more (1.18M/expert x 2
+    extra x 8 MoE layers). Training was unaffected; only the number we quote for param-matching was.
+
+    NOTE it is an UPPER BOUND when param-free special experts are present: a token routed to a
+    +Identity expert activates one fewer GLU expert, so real active params are lower by roughly
+    (special_load * top_k) experts' worth. Conservative in the right direction for param-matching."""
+    cfg = getattr(model, "config", None)
+    top_k = top_k or getattr(cfg, "num_experts_per_tok", None) or SHARED["num_experts_per_tok"]
     num_experts = num_experts or SHARED["num_experts"]
     total = trainable = inactive = 0
     for n, p in model.named_parameters():
