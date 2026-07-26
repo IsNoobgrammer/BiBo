@@ -9,6 +9,7 @@ from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
 )
+from transformers import initialization as hf_init
 from transformers.modeling_utils import PreTrainedModel
 from transformers.generation.utils import GenerationMixin
 from transformers.cache_utils import Cache, DynamicCache
@@ -30,31 +31,41 @@ class BiBoPreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _no_split_modules = ["BiBoDecoderLayer"]
 
+    @torch.no_grad()
     def _init_weights(self, module):
+        """MUST write through `transformers.initialization` (`hf_init.*`), never `param.data.foo_()`.
+
+        Those helpers no-op on any tensor already flagged `_is_hf_initialized`, which is how
+        transformers >=5 protects checkpoint weights: `from_pretrained` loads, marks the loaded
+        params, then walks every module calling `_init_weights`. Raw in-place `.data` writes ignore
+        the flag and silently re-randomize everything that was just loaded (was doing exactly that
+        to all 24 nn.Linear + the Embedding — see the Jul 26 2026 AGENTS.md entry).
+        """
         std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
+        if isinstance(module, (nn.Linear, nn.Conv1d)):   # Conv1d = conv shared expert
+            hf_init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Conv1d):          # conv router / conv shared-expert kernels
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
+                hf_init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, BiBoRMSNorm):        # RMSNorm gain -> 1.0 (Qwen3 parity; needed on
-            module.weight.data.fill_(1.0)            # meta-init / from_pretrained-with-missing-keys)
+            hf_init.normal_(module.weight, mean=0.0, std=std)
+            # slicing drops the flag, so check it explicitly before zeroing the pad row
+            if module.padding_idx is not None and not getattr(module.weight, "_is_hf_initialized", False):
+                hf_init.zeros_(module.weight[module.padding_idx])
+        elif isinstance(module, BiBoRMSNorm):
+            hf_init.ones_(module.weight)                 # Qwen3 parity; needed on meta-init
+        elif isinstance(module, BiBoRotaryEmbedding):
+            # inv_freq/original_inv_freq are persistent=False, so they are NOT in the checkpoint and
+            # from_pretrained's lazy/meta path never runs __init__'s computation for them. Without
+            # this branch they come back as uninitialized memory — and since dynamic-NTK returns
+            # original_inv_freq in-window, a zeroed buffer means cos=1/sin=0, i.e. RoPE silently
+            # becomes the identity on every loaded checkpoint. (Stock Llama does the same thing.)
+            freqs = module._compute_inv_freq(module.base, module.inv_freq.device)
+            hf_init.copy_(module.inv_freq, freqs)
+            hf_init.copy_(module.original_inv_freq, freqs)
 
 
 class BiBoModel(BiBoPreTrainedModel):
-    """
-    BiBo transformer model.
-    
-    Args:
-        config: Model config
-    """
+    """BiBo transformer trunk."""
     def __init__(self, config: BiBoConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -65,14 +76,11 @@ class BiBoModel(BiBoPreTrainedModel):
             [BiBoDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # EXPERIMENTAL (exp_post_embed_norm): extra RMSNorm on the embeddings before block 0
-        # (BLOOM-style embedding norm — smooths the input to the residual stream). Created only
-        # when enabled so the param count is unchanged otherwise. The final pre-LM-head norm
-        # (self.norm) is always present regardless.
+        # EXPERIMENTAL: BLOOM-style embedding norm. Built only when enabled, so the param count is
+        # unchanged otherwise. self.norm (pre-LM-head) is always present either way.
         self.embed_norm = (BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
                            if getattr(config, "exp_post_embed_norm", False) else None)
-        # Dim-wise partial RoPE: cos/sin are sized rope_dim (the rotated slice of each head),
-        # NOT the full head_dim. Attention rotates q/k[..., :rope_dim] for every head.
+        # rope_dim, NOT head_dim — cos/sin cover only the rotated slice of each head.
         self.rotary_emb = BiBoRotaryEmbedding(
             config.rope_dim,
             max_position_embeddings=config.max_position_embeddings,
@@ -124,22 +132,20 @@ class BiBoModel(BiBoPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        # Cache handling (transformers 5.x: Cache objects only — no legacy tuple support).
-        # config-aware: SWA layers (config.layer_types) get window-evicting sliding layers, so
-        # windowed layers hold O(sliding_window) KV during decode instead of O(total_len).
+        # config-aware so SWA layers (config.layer_types) get window-evicting sliding layers and
+        # hold O(sliding_window) KV during decode instead of O(total_len).
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
-        # get_seq_length() is a host int (no GPU sync) — also feeds the rotary extent below.
+        # host int, no GPU sync — also feeds the rotary extent below
         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
         if cache_position is None:
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + seq_length, device=inputs_embeds.device
             )
 
-        # Padding: a 2D (B, K_total) mask (1=real, 0=pad) is threaded to every layer; attention
-        # folds it into its own causal/band mask. None (packed training / single sequence) keeps
-        # the SDPA is_causal fast path — no precomputed mask, the backend does the causal skip.
+        # A 2D (B, K_total) mask (1=real, 0=pad) is threaded to every layer, which folds it into its
+        # own causal/band mask. None keeps the SDPA is_causal fast path (backend does the skip).
         if attention_mask is not None:
             if attention_mask.dim() != 2:
                 raise ValueError(
@@ -158,15 +164,13 @@ class BiBoModel(BiBoPreTrainedModel):
                 position_ids = cache_position.unsqueeze(0)
 
         hidden_states = inputs_embeds
-        if self.embed_norm is not None:          # EXPERIMENTAL post-embedding norm (BLOOM-style)
+        if self.embed_norm is not None:
             hidden_states = self.embed_norm(hidden_states)
 
-        # Position embeddings (Qwen-style: use position_ids). seq_len as a host int keeps the
-        # dynamic-NTK path free of a per-step GPU sync / compile graph break.
+        # seq_len as a host int keeps the dynamic-NTK path free of a per-step GPU sync / graph break.
         position_embeddings = self.rotary_emb(
             hidden_states, position_ids, seq_len=past_seen_tokens + seq_length)
 
-        # Decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
@@ -219,12 +223,7 @@ class BiBoModel(BiBoPreTrainedModel):
         )
 
 class BiBoForCausalLM(BiBoPreTrainedModel, GenerationMixin):
-    """
-    BiBo causal LM with MoE support.
-    
-    Args:
-        config: Model config
-    """
+    """BiBo causal LM."""
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: BiBoConfig):

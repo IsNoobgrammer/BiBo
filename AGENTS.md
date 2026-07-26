@@ -56,7 +56,6 @@ baseline/                          # Reference implementations for comparison
 
 docs/                              # Technical documentation
 ├── ssmax.md                       # SSMax paper notes + implementation details
-├── moe_shared_scaling.md          # Monte Carlo scaling derivation
 ├── configuration_guide.md         # Full config parameter reference
 └── deprecated.md                  # Removed components (NoiseExpert) + reasoning
 
@@ -107,7 +106,7 @@ BiBoForCausalLM
 │   │   └── RMSNorm → BiBoMoELayer (or dense BiBoMLP for first/last layers)
 │   │       ├── BiBoMoERouter (conv or mlp, logit norm)
 │   │       ├── Routed: PolyGLU groups (SiLU + ReLU² + NormSiLU GLU) + Identity + Zero
-│   │       └── Shared: 1 MLP-SwiGLU or CausalConv1D (always active, scaled by moe_shared_scaling)
+│   │       └── Shared: 1 MLP-SwiGLU or CausalConv1D (off by default; added directly, no scalar)
 │   └── Final RMSNorm
 └── LM Head
 ```
@@ -130,8 +129,8 @@ BiBoForCausalLM
 | `special_expert_pairs` | 1 | Pairs of (Identity, Zero) special experts |
 | `num_experts_per_tok` | 6 | Top-K routing |
 | ~~`router_type`~~ | removed | **Conv router REMOVED (Jul 26 2026)** — MLP router only. `kernel_size` survives but now serves ONLY the conv shared expert (`shared_expert_type="conv"`). |
-| `router_lambda` | 1.0 | Logit norm scaling (higher = more decisive routing) |
-| `router_noise` | 0.5 | Exploration noise during training |
+| ~~`router_lambda`~~ / ~~`use_router_logit_norm`~~ / ~~`router_temperature`~~ | removed | Skywork logit-norm deleted Jun 28 2026 (`router_temperature` was never implemented) |
+| ~~`router_noise`~~ | removed | **DELETED Jul 26 2026** — never enabled; re-adding needs RNG preservation for grad checkpointing |
 | `bias_update_factor` | 0.01 | Load balancing step size |
 | `bias_update_threshold` | 100K | Tokens between bias updates |
 | `shared_expert_type` | "mlp" | Shared expert type: `"mlp"` (SwiGLU, like Qwen) or `"conv"` (CausalConv1D) |
@@ -203,7 +202,7 @@ BiBoForCausalLM
 
 1. **Hybrid SWA + global attention — IMPLEMENTED (Jul 1 2026)** via `hybrid_layer_pattern` (1=SWA, 0=global; None=all-global G2, the bench default). **BINDING VERDICT (2026-07-01), honored by the implementation: SWA layers use ONLY an (unscaled) per-head attention sink — no SSMax, no value-scaling; global layers pick one of {SSMax+sink, SSMax-only, sink-only}, value-scaling never used** (G1 = sink+SSMax is config-guarded until the C-scaled sink lands). Full rationale (why SSMax is redundant on windowed layers, the SSMax×sink coupling / Option A, the head_dim-based escape analysis, why we skip value-scale and a per-dim sink) + reference impl in `docs/attention_layers.md`. See also `docs/ssmax.md`.
 2. **SSMax init**: `1.0 / log(max_pos_emb / 2)` — ensures attention starts ~neutral, not 6× sharper than standard.
-3. **Shared expert is NOT routed** — when enabled it's always active. **OFF by default (Jun 27 2026)**; `use_shared_expert=False` is the `BiBoConfig` default and `moe.py`'s fallback. The `moe_shared_scaling` 10K-iter MC in config init is now guarded by `use_shared_expert` (no wasted sim when off).
+3. **Shared expert is NOT routed** — when enabled it's always active. **OFF by default (Jun 27 2026)**; `use_shared_expert=False` is the `BiBoConfig` default and `moe.py`'s fallback. When on, its output is **added directly** (DeepSeek-V3/Gemma) — the `moe_shared_scaling` scalar and its 10K-iter Monte-Carlo init were both removed Jun 28 2026.
 4. **`output_attentions=True`** works (falls back to manual attention).
 5. **Router bias is non-trainable** — `requires_grad=False`, updated via heuristic `.add_()`.
 6. **Noise expert was removed** — no evidence it helps. Identity covers the "dump bucket" use case. See `docs/deprecated.md`.
@@ -258,8 +257,7 @@ cfg = BiBoConfig(vocab_size=5000, hidden_size=512, num_hidden_layers=4,
                  num_attention_heads=8, num_key_value_heads=2,
                  polyglu_expert_multiplier=2, special_expert_pairs=1,
                  num_experts_per_tok=2,
-                 moe_intermediate_size=256, intermediate_size=1024,
-                 moe_shared_scaling=2.0)
+                 moe_intermediate_size=256, intermediate_size=1024)
 model = BiBoForCausalLM(cfg)
 x = torch.randint(0, 5000, (2, 128))
 out = model(x, labels=x)
@@ -285,6 +283,40 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 ---
 
 ## Known Quirks / TODOs
+
+- **(July 26 2026) 🔴 TWO SEVERE `from_pretrained` BUGS FIXED — every checkpoint load was silently
+  broken.** Found by a 49-check end-to-end suite; both were invisible (no missing keys, no warning).
+  1. **`_init_weights` re-randomized every loaded weight.** It wrote with `module.weight.data.normal_()`.
+     transformers ≥5 protects checkpoint weights by flagging loaded params `_is_hf_initialized` and
+     having `transformers.initialization.*` helpers **no-op on flagged tensors** — raw in-place `.data`
+     writes ignore that flag. `from_pretrained` loads → flags params → walks every module calling
+     `_init_weights` → our raw writes clobbered them. Measured: **25 of 54 tensors overwritten with
+     fresh random values** (all 24 `nn.Linear` + the `nn.Embedding`). What survived did so only by
+     luck — RMSNorm (re-init to 1.0 is idempotent), the 3D expert stacks (raw `nn.Parameter`, not
+     matched by module type), router bias (zeros). **Fix:** write through `hf_init.normal_/zeros_/ones_`
+     (`from transformers import initialization as hf_init`), mirroring stock Llama. Fresh init is
+     unchanged (the helpers fall through to torch when the flag is absent — verified bit-reproducible
+     under a fixed seed, `q_proj` std 0.0202 ≈ `initializer_range`).
+  2. **RoPE was silently disabled on every loaded checkpoint.** `inv_freq`/`original_inv_freq` are
+     `persistent=False`, so they are NOT in the checkpoint, and `from_pretrained`'s lazy/meta path
+     never re-runs `BiBoRotaryEmbedding.__init__`'s computation. `_init_weights` had no
+     `RotaryEmbedding` branch, so they came back as **uninitialized memory**: measured
+     `inv_freq=[256.17, 1.3e-42]`, `original_inv_freq=[0.0, 0.0]`. Because dynamic-NTK returns
+     `original_inv_freq` in-window, an all-zero buffer means `cos=1, sin=0` — i.e.
+     **`apply_rotary_pos_emb` degenerates to the identity and the model has NO positional encoding.**
+     **Fix:** a `BiBoRotaryEmbedding` branch that recomputes via `module._compute_inv_freq(module.base,
+     ...)` and `hf_init.copy_` into both buffers (stock Llama does the same via `ROPE_INIT_FUNCTIONS`;
+     we use our own since BiBo's `rope_dim`/partial-RoPE semantics differ).
+  ⚠️ **Any checkpoint evaluated or resumed before this fix produced garbage** — random attention/MLP/
+  embedding weights AND no RoPE. Re-run anything that loaded from disk. Bug 1 masked bug 2.
+  ⚠️ **NEVER use `param.data.foo_()` in `_init_weights`.** Use `hf_init.*` only.
+  📋 Remaining gap (not a live bug): explicit `nn.Parameter`s — expert `gate_up_proj`/`down_proj`,
+  `ssmax_scale`, `attention_sink_bias`, router `bias` — are still initialized only in their modules'
+  `__init__` and have no `_init_weights` branch. They are persistent params so they load fine from a
+  full checkpoint; they would be left uninitialized only on a true meta/`device_map` load or a
+  checkpoint with missing keys. HF's own docstring says these should be handled.
+  Verified after the fix: save/load `max|Δlogits| = 0.00e+00`, all 54 tensors bit-exact, all 4
+  buffers identical, `inv_freq[0] == 1.0`.
 
 - **(July 26 2026) CONV ROUTER REMOVED — the MLP router is the only router.** It never outperformed
   the MLP router in practice. `router_type` is **deleted from `BiBoConfig`** and actively **popped in
@@ -631,9 +663,10 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   deterministic forward (router noise commented out, dropout=0) makes recompute bit-exact. Tradeoff
   (`bench/ckpt_compare.py`): memory **0.65×→0.34×** (more saving at larger seq/batch), time **+23–38%**
   recompute tax at shapes that fit without ckpt (≥4096-tok "speedups" on the 3050 are 4 GB swap
-  artifacts; expect the ~1.2–1.4× tax everywhere on T4). Router noise injection in `router.py` is
-  **commented out (DEPRECATED, do not remove)** — we run `router_noise=0`; forward-time randomness
-  would break checkpointing without RNG preservation.
+  artifacts; expect the ~1.2–1.4× tax everywhere on T4). ~~Router noise injection in `router.py` is
+  commented out (DEPRECATED, do not remove)~~ — **SUPERSEDED Jul 26 2026: the commented-out block AND
+  the `router_noise` config knob are DELETED.** The reason it was never enabled still stands (forward-time
+  randomness breaks gradient checkpointing without RNG preservation), so re-adding it needs RNG handling.
 - **(June 24 2026) Conv router fused** (`conv_fused.py`, `patch_conv_router_with_triton`) — real
   Triton kernel now (was fake PyTorch): native-(B,S,H)-read forward + transpose-free Triton backward.
   Full router fwd+bwd ~2.5x vs eager at large batch; projection ~5x fwd. fp16 grad-correct.
