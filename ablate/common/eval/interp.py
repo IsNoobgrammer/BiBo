@@ -79,8 +79,8 @@ class RouterTrace:
     def __init__(self, model, num_experts, device):
         self.E = int(num_experts)
         self.counts = torch.zeros(self.E, device=device, dtype=torch.float32)
-        # [split_top1, entropy, tokens, RAW_top1, RAW_sum, RAW_min]
-        self.acc = torch.zeros(6, device=device, dtype=torch.float32)
+        # [split_top1, entropy, tokens, RAW_top1, RAW_sum, RAW_min, boundary_gap, n_router_fwd]
+        self.acc = torch.zeros(8, device=device, dtype=torch.float32)
         self._handles = []
         # Expert-block boundaries, so the ±Identity specials get their own load channels. Read off the
         # first expert module (every layer shares the config). n_glu == E for a Qwen arm / no specials,
@@ -92,6 +92,21 @@ class RouterTrace:
                     self.n_glu = int(getattr(mod, "num_polyglu_experts", self.E))
                     self.pos_end = int(getattr(mod, "pos_end", self.E))
                 self._handles.append(mod.register_forward_pre_hook(self._hook))
+        # Routers, for the selection-BOUNDARY gap (rank-k vs rank-k+1 raw score). The expert hook
+        # above never sees the full score vector -- it only gets (hidden, idx, weights) -- so this
+        # has to be read off the router itself. It is the gap the balancing bias competes against.
+        for _, mod in model.named_modules():
+            if mod.__class__.__name__ == "BiBoMoERouter":
+                mod._probe_gap = True
+                mod.boundary_gap = torch.zeros((), device=device)
+                self._handles.append(mod.register_forward_hook(self._router_hook))
+
+    @torch.no_grad()
+    def _router_hook(self, module, args, output):
+        if not module.training or module.boundary_gap is None:
+            return
+        self.acc[6] += module.boundary_gap
+        self.acc[7] += 1.0
 
     @torch.no_grad()
     def _hook(self, module, args):
@@ -125,8 +140,9 @@ class RouterTrace:
         # one that says whether the router WANTS signed pass-through or is only being pushed to it.
         packed = torch.stack([bal, self.acc[0] / n, self.acc[1] / n, load.max(), self.acc[2],
                               self.acc[3] / n, self.acc[4] / n, self.acc[5] / n,
-                              load[self.n_glu:].sum(), load[self.pos_end:].sum()])
-        b, t1, ent, mx, ntok, rw1, rws, rwmin, spl, negl = packed.cpu().tolist()   # <-- THE ONLY SYNC
+                              load[self.n_glu:].sum(), load[self.pos_end:].sum(),
+                              self.acc[6] / self.acc[7].clamp_min(1.0)])
+        b, t1, ent, mx, ntok, rw1, rws, rwmin, spl, negl, gap = packed.cpu().tolist()   # <-- THE ONLY SYNC
         self.counts.zero_(); self.acc.zero_()
         if ntok < 1:
             return {}                                     # nothing accumulated (e.g. logged before a step)
@@ -136,7 +152,11 @@ class RouterTrace:
                 "train/router_w_sum": rws,       # RAW sum over top-k = the branch magnitude channel
                 "train/router_w_min": rwmin,     # RAW min weight (negative => an expert is SUBTRACTED)
                 "train/special_load": spl,       # share of top-k slots on the ±Identity block
-                "train/neg_identity_load": negl}  # ... of which, on the -Identity half
+                "train/neg_identity_load": negl,  # ... of which, on the -Identity half
+                # mean rank-k minus rank-(k+1) RAW score gap = the selection boundary the bias must
+                # close. bias_update_factor u >> this gap => one step flips a large fraction of
+                # tokens => the balancer overshoots and dithers instead of converging.
+                "train/router_boundary_gap": gap}
 
     def close(self):
         for h in self._handles:

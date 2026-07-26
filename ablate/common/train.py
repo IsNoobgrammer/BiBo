@@ -460,6 +460,7 @@ def main():
                 rt.update(patchmod.router_scale_stats(model))               # where the learned magnitude landed
             rt_s = (f" top1w={rt['train/router_top1_weight']:.3f} rent={rt['train/router_entropy']:.3f}"
                     f" bal={rt['train/balance_entropy']:.3f}"
+                    f" gap={rt['train/router_boundary_gap']:.4f}"
                     # spl = share of top-k slots on the ±Identity block (neg half in parens); with
                     # --glu_budget r it should settle near 1-r. 0.000 means no special experts.
                     + (f" spl={rt['train/special_load']:.3f}({rt['train/neg_identity_load']:.3f})"

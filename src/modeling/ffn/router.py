@@ -38,6 +38,9 @@ class BiBoMoERouter(nn.Module):
         # Heuristically updated by BiBoMoELayer, NOT optimizer-managed -> requires_grad=False.
         self.bias = nn.Parameter(torch.zeros(self.num_routed_experts), requires_grad=False)
 
+        self._probe_gap = False          # see forward(); harness diagnostic, zero cost when off
+        self.boundary_gap = None
+
         if self.router_type == "mlp":
             # (num_routed_experts, hidden_size) — experts are the ROW dim.
             self.gate_proj = nn.Linear(config.hidden_size, self.num_routed_experts, bias=False)
@@ -105,6 +108,16 @@ class BiBoMoERouter(nn.Module):
             raise ValueError(
                 f"gate_type must be 'sigmoid', 'situ', or 'softmax', got '{self.gate_type}'"
             )
+
+        # Diagnostic, OFF unless a harness turns it on. Mean rank-k minus rank-(k+1) RAW score gap:
+        # the SELECTION-BOUNDARY gap. This is the quantity the load-balancing bias actually competes
+        # against -- b is added to `scores` and only reorders a token when it closes this gap -- so
+        # it, not the top-1/top-2 split, sets how many tokens one +-u step can flip (the balancer's
+        # control authority). Kept on-device, no sync; ablate's RouterTrace reads it post-forward.
+        if self._probe_gap and self.top_k < self.num_routed_experts:
+            with torch.no_grad():
+                _tk = scores.topk(self.top_k + 1, dim=-1).values
+                self.boundary_gap = (_tk[..., self.top_k - 1] - _tk[..., self.top_k]).mean()
 
         # Bias is SELECTION-ONLY. The combine weights below come from raw `scores`, never from
         # `selection_scores` — mixing them up silently breaks aux-loss-free balancing.
