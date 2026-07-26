@@ -92,6 +92,12 @@ legacy/                            # Old monolithic code (DO NOT USE for new wor
 .\.venv\Scripts\python -c "from src.modeling_bibo import BiBoForCausalLM; print('OK')"
 ```
 
+### Full test suite (do this before every push)
+```bash
+.\.venv\Scripts\python -m pytest              # 101 checks, ~5s, GPU if present else CPU
+.\.venv\Scripts\python -m pytest -m "not gpu"  # skip the CUDA-only bf16 autocast test
+```
+
 ---
 
 ## Architecture At A Glance
@@ -556,7 +562,15 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 - `moe_shared_scaling` is a **learnable nn.Parameter** (per MoE layer) as of this session — the config float is only its init. Rationale (from the shared-expert research): no production MoE hardcodes a fixed shared scalar — DeepSeek/Gemma just add (Gemma sizes 3×), Qwen2 used a learnable per-token gate (dropped in Qwen3), Qwen3/MiMo-V2 dropped the shared expert entirely. The old fixed 0.40 was ~7.5× below the measured init-balance (~3.0) AND the MC auto-formula diverges as experts scale; a learnable scalar (LayerScale-style) fixes both. Disable the shared expert with `use_shared_expert=False` / `--no-shared-expert`. ⚠️ The scalar lands in the AdamW group **with weight_decay** (norms/biases do too in this repo) — WD gently pulls it toward 0; acceptable but worth excluding if it underperforms.
 - `moe_shared_scaling=1.0` triggers a 10K-iteration Monte Carlo in config init (now used as the learnable param's INIT) — pass explicit value to skip
 - The `legacy/` folder has the old monolithic code — don't touch it, it's reference only
-- No tests currently exist — they were removed during cleanup. New tests needed.
+- **Tests: `tests/`, pytest, 101 checks, ~5s.** Run `.\.venv\Scripts\python -m pytest`. Configured in
+  `pyproject.toml` (`testpaths=["tests"]`). Uses CUDA when present, CPU otherwise (the one
+  `@pytest.mark.gpu` test — bf16 autocast — auto-skips on CPU); tiny models, ≤5 optimizer steps,
+  peak ~25 MiB VRAM. Files: `test_config.py` (derivation/validation/serialization),
+  `test_rope.py` (dim-wise partial + dynamic NTK), `test_attention.py` (SSMax/XSA/SWA band/sinks/
+  GQA/padding), `test_moe.py` (layout/PolyGLU cycle/router gates/load balancing),
+  `test_model.py` (KV cache/tying/generate/grad-ckpt + the `from_pretrained` **regression guards**),
+  `test_training.py` (grads/autocast/5-step loss). **Add a test with every architectural change** —
+  the suite is what caught the two silent `from_pretrained` bugs above.
 - Qwen baseline requires real `transformers` package (not stubs)
 - CausalConv1D needs halo exchange for sequence parallelism (future work)
 - MoE dispatch loop is fine for ≤16 experts on single GPU; needs grouped GEMM for 64+ experts with EP

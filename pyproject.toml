@@ -60,3 +60,6 @@ include = ["src*", "baseline*", "bench*"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --tb=short"
+markers = [
+    "gpu: requires CUDA (skipped automatically on CPU-only machines)",
+]
