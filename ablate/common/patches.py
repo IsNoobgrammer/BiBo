@@ -10,6 +10,7 @@ model's (hidden, lm_head.weight) directly, so CE is a swappable training-loop co
 model monkeypatch. Call apply(components) once before training.
 """
 from . import _paths  # noqa: F401
+import os
 import torch
 import torch.nn.functional as F
 
@@ -161,6 +162,13 @@ def patch_fused_moe():
     from kernels.sm120.moe import moe_per_expert as moe_fused
     from kernels.sm120.moe_grouped import moe_grouped_cublas_polyglu, grouped_supported
     from kernels.sm75.moe import _code_max
+    # BIBO_MOE_DISPATCH=per_expert|grouped|auto (default auto). A microbenchmark said grouped
+    # wins, but an isolated bench CANNOT see the cost that matters here: the grouped path does
+    # `int(offs[-1].item())`, a HOST SYNC, once per MoE layer per micro-batch. In a tight bench
+    # loop the CPU has nothing else to do so the sync is free; in real training it blocks the CPU
+    # from running ahead to queue the next layer. Keep this switch so the two can be A/B'd on the
+    # real step time instead of on a microbenchmark.
+    _DISPATCH = os.environ.get("BIBO_MOE_DISPATCH", "auto")
 
     _neg_identity_checked = []
 
@@ -222,7 +230,7 @@ def patch_fused_moe():
         # reference (1.0e-3 vs 2.8e-3) -- one grouped GEMM instead of many small accumulations.
         # Falls back to per-expert when grouped cannot run: fp32 (torch._grouped_mm is bf16/fp16
         # only), act codes >4 (situ/normrelu2/normsitu), or learnable act_params.
-        if (ap is None and _code_max(codes) <= 4
+        if (_DISPATCH != "per_expert" and ap is None and _code_max(codes) <= 4
                 and grouped_supported(hidden_states, self.gate_up_proj, self.down_proj)):
             return moe_grouped_cublas_polyglu(hidden_states, top_k_indices, top_k_weights,
                                               self.gate_up_proj, self.down_proj, codes)
