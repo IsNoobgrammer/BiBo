@@ -168,7 +168,15 @@ def patch_fused_moe():
     # loop the CPU has nothing else to do so the sync is free; in real training it blocks the CPU
     # from running ahead to queue the next layer. Keep this switch so the two can be A/B'd on the
     # real step time instead of on a microbenchmark.
-    _DISPATCH = os.environ.get("BIBO_MOE_DISPATCH", "auto")
+    # DEFAULT per_expert. Measured head-to-head at 30 GLU on real training steps: per-expert
+    # 205.1k vs grouped 205.6k tok/s (0 specials) and 204.9k vs 204.6k (10 specials) -- a WASH.
+    # The microbenchmark that predicted grouped 1.24-1.58x faster was measuring an isolated call
+    # in a tight loop, where the per-layer host sync is free because the CPU has nothing else
+    # queued. It does not survive contact with a real step. Grouped IS ~3x more accurate vs the
+    # eager reference (1.0e-3 vs 2.8e-3), so revisit if numerics ever matter more than matching
+    # history -- but every 18-GLU arm we compare against ran per-expert, and at equal speed
+    # comparability wins. Override with BIBO_MOE_DISPATCH=grouped|auto.
+    _DISPATCH = os.environ.get("BIBO_MOE_DISPATCH", "per_expert")
 
     _neg_identity_checked = []
 
