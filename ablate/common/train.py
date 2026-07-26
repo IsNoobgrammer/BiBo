@@ -101,6 +101,31 @@ def _expert_corr(model):
     return sum(vals) / len(vals) if vals else 0.0
 
 
+@torch.no_grad()
+def _router_corr(model):
+    """Mean off-diagonal |cosine| between the ROUTER's per-expert weight rows (0 = the experts are
+    scored along orthogonal directions, 1 = the router has collapsed onto one direction and can no
+    longer tell experts apart).
+
+    NOT the same thing as `_expert_corr`, which walks the 3D MoE expert STACKS. This walks the 2D
+    router projection -- `.gate.gate_proj.weight` (E,H) or `.gate.gate_conv` (E, H*K) -- and it is
+    the metric the conv-router axis fix is about: an nn.Conv1d (E,H,K) weight sends Muon's NS to a
+    (K,K) gram, which decorrelates kernel TAPS and lets THIS number climb. Storing the weight 2D
+    puts the gram back at (E,E). If conv is working as intended, rcorr must track the MLP router's,
+    not run away from it."""
+    vals = []
+    for n, p in model.named_parameters():
+        if ".gate.gate_proj.weight" in n or ".gate.gate_conv" in n:
+            x = p.detach().reshape(p.shape[0], -1).float()
+            e = x.shape[0]
+            if e < 2:
+                continue
+            x = x / x.norm(dim=1, keepdim=True).clamp_min(1e-12)
+            m = x @ x.t()
+            vals.append((m - torch.diag(torch.diagonal(m))).abs().sum().item() / (e * e - e))
+    return sum(vals) / len(vals) if vals else 0.0
+
+
 def _save_hf_ckpt(model, tokenizer, out_dir):
     """Write a reload-ready bf16 HF checkpoint (config.json + safetensors + tokenizer) to out_dir. Runs on
     the MAIN thread between steps (fast). Casts only the big matrices (ndim>=2: linears, embeddings, expert
@@ -429,6 +454,7 @@ def main():
             eta = (total_steps - step - 1) * elapsed / max(step + 1, 1)        # est. time remaining
             fin = math.isfinite(lv)
             ecorr = _expert_corr(model)                                    # cross-expert redundancy — logged every run
+            rcorr = _router_corr(model)                                    # ROUTER expert-direction collapse (the conv-axis metric)
             rt = rtrace.flush() if rtrace else {}                          # router mechanics over the interval
             if args.routed_scaling_learnable or args.expert_scale_learnable:
                 rt.update(patchmod.router_scale_stats(model))               # where the learned magnitude landed
@@ -440,12 +466,13 @@ def main():
                        if rt.get("train/special_load", 0.0) > 0 else "")) if rt else ""
             print(f"  step {step}/{total_steps} loss={lv:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
-                  f"xcorr={ecorr:.4f}{rt_s} elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"
+                  f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{rt_s} elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"
                   f"{'' if fin else '  <<NON-FINITE>>'}", flush=True)
             if wb:
                 wb.log({"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "train/ms_per_step": ms_per_step,
                         "train/tps": tps, "train/mfu": mfu, "train/mem_gb": mem, "train/elapsed_s": elapsed,
-                        "train/expert_corr": ecorr, "tokens": toks, **rt}, step=step)
+                        "train/expert_corr": ecorr, "train/router_corr": rcorr,
+                        "tokens": toks, **rt}, step=step)
         if do_eval and step % args.eval_every == 0:            # periodic eval -> W&B curves
             with _eager(model):                                # eval on the un-compiled module (see _eager)
                 _, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.eval_mcq_n, bpb_n=args.eval_bpb_n,

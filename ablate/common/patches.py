@@ -160,6 +160,38 @@ def patch_fused_moe():
     # special experts correctly. (moe() auto-dispatch would wrongly pick grouped at >=4096 tok.)
     from kernels.sm120.moe import moe_per_expert as moe_fused
 
+    _neg_identity_checked = []
+
+    def _assert_kernel_does_neg_identity(device, dtype):
+        """One-time probe: does THIS kernel build implement act code 4 as -Identity (-w*x), or is it
+        still the old ZERO expert (contribute nothing)?
+
+        triton-kernel-fused is a separate repo on a separate checkout. A box that cloned it before
+        Jul 26 2026 -- or cloned a branch without the change -- answers 'zero', and then every token
+        routed to a -Identity expert is silently DROPPED instead of subtracted. No exception, no
+        shape error, no warning: just a quietly wrong model and a wasted run. (This is not
+        hypothetical; a fresh box cloned the stale default branch and would have run two arms that
+        way.) Version strings can't catch it -- only asking the kernel does.
+
+        Cost: one 1-token MoE call, once per process, and only when a -Identity block exists."""
+        H, I = 8, 2
+        x = torch.ones(1, H, device=device, dtype=dtype)
+        gu = torch.zeros(1, 2 * I, H, device=device, dtype=dtype)   # 1 dummy GLU slot, never routed
+        dn = torch.zeros(1, H, I, device=device, dtype=dtype)
+        codes = torch.tensor([0, 4], dtype=torch.int32, device=device)
+        out = moe_fused(x, torch.tensor([[1]], device=device),      # route the single token to code 4
+                        torch.ones(1, 1, device=device, dtype=dtype), gu, dn, codes)
+        if torch.allclose(out.float(), -x.float(), atol=1e-3):
+            return
+        import kernels
+        raise RuntimeError(
+            f"kernel act code 4 is NOT -Identity: routing w=1 through it gave {out.flatten()[:4].tolist()} "
+            f"(expected all -1). This kernel still implements code 4 as the ZERO expert, so every "
+            f"-Identity token would be silently dropped instead of subtracted.\n"
+            f"  kernels package: {getattr(kernels, '__file__', '?')}\n"
+            f"  Fix: update the triton-kernel-fused checkout (needs commit 46727c8 or later, on "
+            f"master), or run with --no_neg_identity / --special_pairs 0.")
+
     # BiBo: diverse PolyGLU activations (silu/relu2/normsilu cycled) + optional ±Identity specials
     def _bibo_moe(self, hidden_states, top_k_indices, top_k_weights):
         codes = getattr(self, "_act_codes", None)
@@ -167,9 +199,14 @@ def patch_fused_moe():
             cyc = ACT_CYCLE or (0, 1, 2)
             # Kernel codes 3/4 = +Identity / -Identity (code 4 meant ZERO until Jul 26 2026; the
             # kernel now emits -w*x for it -- gated by parity_specials.py in triton-kernel-fused).
+            n_neg = self.neg_end - self.neg_start
+            if n_neg and not _neg_identity_checked:
+                _assert_kernel_does_neg_identity(hidden_states.device, hidden_states.dtype)
+                _neg_identity_checked.append(True)
+                print("[moe] kernel probe: act code 4 == -Identity (-w*x) OK", flush=True)
             lst = ([cyc[e % len(cyc)] for e in range(self.num_polyglu_experts)]
                    + [3] * (self.pos_end - self.pos_start)
-                   + [4] * (self.neg_end - self.neg_start))
+                   + [4] * n_neg)
             codes = torch.tensor(lst, dtype=torch.int32, device=hidden_states.device)
             self._act_codes = codes
         ap = (torch.stack([self.situ_alpha, self.situ_gamma], dim=1)
