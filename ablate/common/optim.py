@@ -18,9 +18,10 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
             continue
         # The MoE router projection is 2D (E,H) so the ndim rule ALREADY sends it to Muon -- that is the
         # default and every result to date was produced that way. router_adamw=True is the ablation arm
-        # that moves it to AdamW instead. (conv router weight is 3D, so by default it lands in `stacks`
-        # and would be an xorth target -- it is caught here too.)
-        is_router = ".gate.gate_proj." in n or ".gate.gate_conv." in n
+        # that moves it to AdamW instead. (The 3D conv-router weight is gone: conv router removed
+        # Jul 26 2026. The conv SHARED EXPERT lives at shared_experts_list.*.gate_conv, not .gate.*,
+        # so it was never matched here anyway.)
+        is_router = ".gate.gate_proj." in n
         if is_router:
             n_router += 1
         if router_adamw and is_router:

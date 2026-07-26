@@ -21,7 +21,7 @@ BiBo is a **Mixture-of-Experts (MoE) Transformer** for causal language modeling.
 3. **Shared Conv1D expert** — causal convolution (gated, SwiGLU-style), always-active WHEN enabled. **OFF by default (since Jun 27 2026)** so BiBo stays param-matched to a no-shared baseline; opt in with `use_shared_expert=true`.
 4. **MiMo-V2.5 / DeepSeek-V3-style router** — configurable scoring (`gate_type`: `sigmoid` default / `situ` = SiTU `sigmoid(x)·tanh(x)` / `softmax`), auxiliary-loss-free bias (selection-only) updated by `b += u·sign(mean−load)`, `norm_topk_prob` (top-k sum-to-1 **via softmax**), `routed_scaling_factor`. No Skywork logit-norm. **NO LONGER MiMo-bit-equivalent as of Jul 26 2026** — `norm_topk_prob` switched from ÷sum to softmax; `src/.autoresearch/bench_router_vs_mimo.py` will now FAIL on the normalized arm by design (it still passes with `norm_topk_prob=False`).
 5. **Flash Attention (SDPA)** — uses `F.scaled_dot_product_attention` when `output_attentions=False`
-6. **Conv router option** — `router_type="conv"` gives router local context awareness
+6. ~~**Conv router option**~~ — **REMOVED Jul 26 2026.** The MLP router is the only router. The conv router never outperformed it; `router_type` is gone from the config entirely (passing it logs a warning and is dropped — it is NOT stored or re-serialized into `config.json`).
 7. **XSA (Exclusive Self Attention)** — parameter-free rejection of each token's attention output from its own value vector (`z = y − (y·v)v/‖v‖²`); applied after value-aggregation, before o_proj. See `docs/xsa.md`
 
 ---
@@ -129,7 +129,7 @@ BiBoForCausalLM
 | `polyglu_expert_multiplier` | 2 | Groups of 3 GLU experts (SiLU, ReLU², NormSiLU) |
 | `special_expert_pairs` | 1 | Pairs of (Identity, Zero) special experts |
 | `num_experts_per_tok` | 6 | Top-K routing |
-| `router_type` | "mlp" | Router architecture ("mlp" or "conv") |
+| ~~`router_type`~~ | removed | **Conv router REMOVED (Jul 26 2026)** — MLP router only. `kernel_size` survives but now serves ONLY the conv shared expert (`shared_expert_type="conv"`). |
 | `router_lambda` | 1.0 | Logit norm scaling (higher = more decisive routing) |
 | `router_noise` | 0.5 | Exploration noise during training |
 | `bias_update_factor` | 0.01 | Load balancing step size |
@@ -285,6 +285,30 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
 ---
 
 ## Known Quirks / TODOs
+
+- **(July 26 2026) CONV ROUTER REMOVED — the MLP router is the only router.** It never outperformed
+  the MLP router in practice. `router_type` is **deleted from `BiBoConfig`** and actively **popped in
+  `__init__` before `super().__init__`** with a `logger.warning` — necessary because
+  `PretrainedConfig` setattr()s unknown kwargs, so a stale `router_type` would otherwise reappear as
+  an attribute and get serialized straight back into `config.json`, looking like the feature still
+  exists (verified: absent from `to_dict()`). Removed: the `router_type` branch / `gate_conv` / `causal_padding`
+  in `ffn/router.py`; `router_type` in `configuration_bibo.py`; `router_type`+`kernel_size` plumbing in
+  `ablate/common/{configs,models,train}.py`; `patch_conv_router()` and the `"router"` patch-registry
+  entry in `ablate/common/patches.py` (plus the conv branch inside `patch_router_gate`); the
+  `.gate.gate_conv.` clause in `ablate/common/optim.py`'s router detector.
+  **KEPT ON PURPOSE:** (a) `config.kernel_size` — it now serves ONLY the conv SHARED EXPERT
+  (`shared_expert_type="conv"`), which is untouched; (b) `BiBoCausalConv1D` in `ffn/experts.py` — that
+  is the shared expert, not the router; (c) the PolyGLU activation set — unchanged, ablate it via the
+  act codes as before. Note the conv shared expert lives at `shared_experts_list.*.gate_conv`, NOT
+  `.gate.gate_conv`, so the optim.py change cannot affect it.
+  ⚠️ Existing checkpoints trained with `router_type="conv"` are unloadable (the `gate_conv` weight has
+  no home). MLP-router checkpoints are unaffected.
+  ⚠️ Docs updated for current state; the DATED historical entries below that mention the conv router or
+  its (already-deleted) Triton kernel are left intact as history. `docs/benchmark/benchmarking.md` and
+  `docs/configuration_guide.md` remain stale on OTHER removed knobs (`router_lambda`,
+  `num_shared_experts`, `moe_shared_scaling`, Skywork logit-norm) — out of scope here, flagged inline.
+  Verified: CPU build + fwd/bwd for all 3 gate types, `router_type=` now silently ignored, no
+  `gate_conv` parameter on the router, conv shared expert still constructs and runs.
 
 - **(July 26 2026) Router: `norm_topk_prob` is now SOFTMAX (not ÷sum), and `gate_type` gained
   `"situ"`.** Two coupled changes in `ffn/router.py` + `configuration_bibo.py`:

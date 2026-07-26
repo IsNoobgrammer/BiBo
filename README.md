@@ -14,7 +14,7 @@
 
 5. **Threshold-Based Bias Heuristics** — Non-trainable router bias (`requires_grad=False`) updated via load-balancing heuristics. Avoids FSDP conflicts while maintaining expert utilization balance.
 
-6. **Conv Router Option** — `router_type="conv"` gives the router local context awareness via causal 1D convolution over hidden states before expert selection.
+6. **MLP Router** — a single linear projection `(num_routed_experts, hidden_size)` produces the router logits. (A causal-conv router variant existed until Jul 26 2026; it was removed after failing to beat the MLP router.)
 
 7. **Flash Attention (SDPA)** — Uses `F.scaled_dot_product_attention` by default, with manual fallback when `output_attentions=True`.
 
@@ -84,7 +84,7 @@ Key parameters (see [`docs/configuration_guide.md`](docs/configuration_guide.md)
 | `use_ssmax` | `True` | Enable SSMax query scaling |
 | `num_routed_experts` | `16` | Total routed experts (must be ≥ 4) |
 | `num_experts_per_tok` | `6` | Top-K routing |
-| `router_type` | `"mlp"` | Router architecture (`"mlp"` or `"conv"`) |
+| `gate_type` | `"sigmoid"` | Router scoring fn: `"sigmoid"` / `"situ"` (signed, needs `norm_topk_prob=True`) / `"softmax"` |
 | `router_lambda` | `1.0` | Logit norm scaling (higher = more decisive) |
 | `router_noise` | `0.5` | Exploration noise during training |
 | `bias_update_factor` | auto | Load balancing step size (Hill function of n) |

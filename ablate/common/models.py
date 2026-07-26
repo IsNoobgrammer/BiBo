@@ -7,7 +7,7 @@ from . import patches
 
 def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
               load_balance="bias", bias_update_threshold=10240, bias_update_factor=None, aux_coef=0.001,
-              polyglu_mult=2, special_pairs=0, router_type="mlp", kernel_size=3,
+              polyglu_mult=2, special_pairs=0,
               use_ssmax=False, use_xsa=False, balance_exclude_specials=False,
               identity_expert=True, zero_expert=True):
     """arm in {'qwen','bibo_min'} -> (model, config). Params in `dtype` (fp32 master; bf16 via autocast).
@@ -24,7 +24,6 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
         from src.modeling.models import BiBoForCausalLM
         cfg = make_bibo_min_config(load_balance, bias_update_threshold, bias_update_factor,
                                    polyglu_mult=polyglu_mult, special_pairs=special_pairs,
-                                   router_type=router_type, kernel_size=kernel_size,
                                    use_ssmax=use_ssmax, use_xsa=use_xsa,
                                    balance_exclude_specials=balance_exclude_specials,
                                    identity_expert=identity_expert, zero_expert=zero_expert)

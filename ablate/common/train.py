@@ -196,8 +196,6 @@ def main():
     ap.add_argument("--routed_scaling_factor", type=float, default=1.0)          # fixed global scale (1.0 = no-op); tag _rs<val>
     ap.add_argument("--routed_scaling_learnable", type=_bool, default=False)     # learnable per-LAYER scalar, init 1.0; tag _rsL
     ap.add_argument("--expert_scale_learnable", type=_bool, default=False)       # learnable per-EXPERT vector, init 1.0; tag _esL
-    ap.add_argument("--router_type", choices=["mlp", "conv"], default="mlp")       # BiBo router; conv -> sm120 fused-Triton conv kernel
-    ap.add_argument("--kernel_size", type=int, default=3)                         # conv-router kernel width (only used when router_type=conv)
     ap.add_argument("--use_ssmax", action="store_true")                           # ablation axis: SSMax scalable softmax (default OFF)
     ap.add_argument("--use_xsa", action="store_true")                             # ablation axis: XSA exclusive self-attention (default OFF)
     ap.add_argument("--balance_exclude_specials", action="store_true")            # ablation axis: bias balancer ignores Identity/Zero experts (freezes their bias at 0; router learns special usage) — only matters with special_pairs>0
@@ -248,8 +246,6 @@ def main():
     dt = _DT[args.precision]
     patch_list = [p.strip() for p in args.patches.split(",") if p.strip()]
     use_fused_ce = "ce" in patch_list
-    if args.router_type == "conv" and "router" not in patch_list:     # conv router -> use the fused sm120 kernel
-        patch_list.append("router")
     patchmod.ROUTER_GATE = args.router_gate                            # router score fn (sigmoid | situ)
     # 'auto' picks the norm that actually sums to 1 for the chosen gate: sigmoid is non-negative so
     # the shipped w/sum(w) is proper; situ is SIGNED, where only softmax is all-positive + sum-to-1.
@@ -288,7 +284,6 @@ def main():
                            load_balance=args.load_balance, bias_update_threshold=args.bias_update_threshold,
                            bias_update_factor=(None if args.bias_update_factor < 0 else args.bias_update_factor),
                            aux_coef=args.aux_coef, polyglu_mult=args.polyglu_mult, special_pairs=args.special_pairs,
-                           router_type=args.router_type, kernel_size=args.kernel_size,
                            use_ssmax=args.use_ssmax, use_xsa=args.use_xsa,
                            balance_exclude_specials=args.balance_exclude_specials,
                            identity_expert=args.identity_expert, zero_expert=args.zero_expert)
@@ -336,7 +331,6 @@ def main():
                 + ("_xsp" if args.balance_exclude_specials else "")
                 + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
-                + (f"_conv{args.kernel_size}" if args.router_type == "conv" else "")
                 + (f"_rt-{args.router_gate}-{router_norm}"
                    if (args.router_gate != "sigmoid" or router_norm != "sum") else "")
                 + ("" if args.norm_topk_prob else "_nontp")   # normalization is now the default; mark when OFF

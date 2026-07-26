@@ -65,8 +65,8 @@ class BiBoConfig(PretrainedConfig):
         use_shared_expert=False,    # Off by default (param-match Qwen3MoE — no shared expert)
         shared_expert_type="mlp",   # "mlp" (SwiGLU, like Qwen) or "conv" (CausalConv1D)
         # ── Router ───────────────────────────────────────────────
-        router_type="mlp",   # "mlp" or "conv"
-        kernel_size=3,        # conv-router / conv-expert kernel width
+        kernel_size=3,        # conv SHARED-EXPERT kernel width (shared_expert_type="conv").
+                              # The conv ROUTER was removed Jul 26 2026 — MLP router only.
         gate_type="sigmoid",  # scoring fn: "sigmoid" (DeepSeek-V3, independent) | "situ" (SiTU,
                               # sigmoid(x)*tanh(x) — independent + SIGNED, needs norm_topk_prob=True)
                               # | "softmax" (legacy, competitive)
@@ -85,6 +85,18 @@ class BiBoConfig(PretrainedConfig):
                                          # at 0) so the router learns special usage instead of being forced
         **kwargs,
     ):
+        # ── Removed knobs: drop before super().__init__ ───────────
+        # PretrainedConfig setattr()s any unknown kwarg, so a stale `router_type` from an old
+        # config/checkpoint would silently reappear as an attribute AND get serialized back into
+        # config.json — looking like the conv router still exists. Pop it instead.
+        # (Conv router removed Jul 26 2026; MLP router only. `kernel_size` is NOT removed — it
+        # still configures the conv SHARED EXPERT.)
+        if kwargs.pop("router_type", None) is not None:
+            logger.warning(
+                "`router_type` was removed (conv router deleted Jul 26 2026); BiBo uses the MLP "
+                "router only. The value is ignored and will not be saved."
+            )
+
         # ── Core dimensions ──────────────────────────────────────
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -145,7 +157,6 @@ class BiBoConfig(PretrainedConfig):
         self.shared_expert_type = shared_expert_type
 
         # ── Router ───────────────────────────────────────────────
-        self.router_type = router_type
         self.kernel_size = kernel_size
         self.gate_type = gate_type
         self.router_activation = router_activation

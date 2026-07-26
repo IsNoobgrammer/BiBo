@@ -236,46 +236,23 @@ randomness breaks gradient checkpointing's recompute without RNG preservation, a
 
 ---
 
-### `router_type`
+### ~~`router_type`~~ — REMOVED (Jul 26 2026)
 
-**Default:** `"mlp"`
+The conv-router option and the `router_type` config key are **gone**. BiBo uses the MLP router
+exclusively: the conv router never outperformed it. Old configs passing `router_type=` log a warning
+and have it dropped — it is not stored on the config and not written back to `config.json`.
 
-**Options:** `"mlp"` or `"conv"`
+The router is one linear projection, with **experts as the row dimension**:
 
-**Location:** `src/configuration_bibo.py:68`
-
-**What it does:**
-Determines the architecture of the router network.
-
-**Implementation:**
-
-**MLP Router:**
 ```python
-# src/modeling/ffn/router.py:20-21
+# src/modeling/ffn/router.py
 self.gate_proj = nn.Linear(config.hidden_size, self.num_routed_experts, bias=False)
-# Forward: router_logits = self.gate_proj(flat_hidden)
+# gate_proj.weight.shape == (num_routed_experts, hidden_size)
+# Forward: router_logits = self.gate_proj(flat_hidden).float()
 ```
 
-**Conv Router:**
-```python
-# src/modeling/ffn/router.py:23-24
-self.gate_conv = nn.Conv1d(config.hidden_size, self.num_routed_experts, 
-                           self.kernel_size, padding=0, bias=False)
-# Forward: Uses causal convolution with padding
-```
-
-**Comparison:**
-
-| Feature | MLP Router | Conv Router |
-|---------|-----------|-------------|
-| Context | Token-level (no context) | Local context (kernel_size tokens) |
-| Parameters | hidden_size × num_experts | hidden_size × num_experts × kernel_size |
-| Speed | Faster | Slightly slower |
-| Routing | Independent per token | Context-aware |
-
-**Tuning guidance:**
-- **MLP:** Default choice, simpler, faster
-- **Conv:** Use if you want routing to consider local context (e.g., kernel_size=3 looks at previous 2 tokens)
+`kernel_size` still exists but now serves **only** the conv shared expert
+(`shared_expert_type="conv"`), which is unaffected by this removal.
 
 ---
 
@@ -749,8 +726,8 @@ only take effect when this is `True`.
 | `gate_type` | "sigmoid" | Gating mechanism | "sigmoid" / "softmax" |
 | `router_temperature` | 1.3 | Legacy parameter (not actively used) | 0.8-2.0 |
 | `router_noise` | 0 | Exploration noise (DEPRECATED, code commented out) | 0 |
-| `router_type` | "mlp" | Router architecture | "mlp" or "conv" |
-| `kernel_size` | 3 | Conv router kernel size (sees prev kernel_size-1 tokens) | 3-7 (odd) |
+| ~~`router_type`~~ | removed | Conv router removed Jul 26 2026 — MLP router only | — |
+| `kernel_size` | 3 | Conv SHARED-EXPERT kernel size (conv router removed Jul 26 2026) | 3-7 (odd) |
 | `moe_shared_scaling` | 1.0 (auto) | Shared expert output scaling | 0.3-1.5 |
 | `use_shared_expert` | False | Enable the always-on shared expert (off = match Qwen3MoE) | bool |
 | `shared_expert_type` | "mlp" | Shared expert kind (only if `use_shared_expert`) | "mlp" / "conv" |
@@ -855,7 +832,6 @@ ratio = shared_norm / routed_norm
 - **Solution:**
   - Increase `router_lambda` (1.5-2.0)
   - Decrease `moe_shared_scaling` (0.3-0.5)
-  - Use conv router for context-aware routing
 
 **Issue: Training instability**
 - **Symptom:** Loss spikes, gradient explosions
@@ -923,7 +899,7 @@ ratio = shared_norm / routed_norm
 - Auto-computation of `moe_shared_scaling`
 - Skywork-MoE style logit normalization via `router_lambda`
 - Threshold-based bias updates
-- Support for both MLP and Conv routers
+- MLP router only (the Conv router variant was removed Jul 26 2026)
 
 ---
 
@@ -946,9 +922,14 @@ When adding new configuration parameters:
 
 **Never apply L2 weight decay to parameters that directly encode routing preferences, scales, or temperatures.**
 
-### Why `gate_proj` / `gate_conv` Are Safe Under L2
+### Why `gate_proj` Is Safe Under L2
 
-The router projection weights (`gate_proj.weight`, `gate_conv.weight`) are standard projection matrices. They map hidden states into logit space. Weight decay shrinks their magnitude, but the Skywork-MoE normalization step:
+> ⚠️ **This subsection is stale beyond the conv-router removal.** It reasons from the Skywork-MoE
+> logit-normalization and `router_lambda`, both of which were **removed Jun 28 2026** (the router is
+> pure MiMo now). The L2 conclusion still holds — `gate_proj` is an ordinary projection — but the
+> justification below no longer describes the code.
+
+The router projection weight (`gate_proj.weight`) is a standard projection matrix. It maps hidden states into logit space. Weight decay shrinks its magnitude, but the (now-removed) Skywork-MoE normalization step:
 
 ```python
 z̃ = λ · (z - μ) / σ
@@ -989,8 +970,7 @@ for name, param in model.named_parameters():
 
 | Parameter | Status |
 |-----------|--------|
-| `gate_proj.weight` | L2 OK — projection, magnitude decoupled by Skywork norm |
-| `gate_conv.weight` | L2 OK — same logic |
+| `gate_proj.weight` | L2 OK — ordinary projection |
 | `router.bias` | N/A — `requires_grad=False`, optimizer ignores it |
 | `router_lambda` | Currently a config constant, not a parameter |
 | `router_temperature` | Currently unused (legacy config field) |

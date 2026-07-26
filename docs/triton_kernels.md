@@ -28,7 +28,6 @@ from src.kernels import (
     patch_moe_auto,                # MoE experts (per-expert / grouped auto-dispatch)
     patch_dense_mlp_with_triton,   # dense MLP (Liger SwiGLU)
     patch_xsa_with_triton,         # XSA rejection
-    patch_conv_router_with_triton, # conv router (only if router_type="conv")
 )
 
 model = BiBoForCausalLM(config).cuda()
@@ -37,7 +36,6 @@ patch_moe_auto(model)
 patch_dense_mlp_with_triton(model)
 patch_xsa_with_triton()
 model.config.use_fused_linear_ce = True   # fused-linear cross-entropy
-# patch_conv_router_with_triton(model)     # only when config.router_type == "conv"
 ```
 
 The bench suite does this in one call: `apply_triton_kernels(model, config, use_fused_ce=True)`
@@ -82,13 +80,9 @@ The bench suite does this in one call: `apply_triton_kernels(model, config, use_
 - **Results (fp16):** **1.19× fwd / 1.23× fwd+bwd**.
 - **Apply:** `patch_dense_mlp_with_triton(model)` (Qwen: `patch_qwen_dense_mlp_with_triton`).
 
-### 5. Conv router — custom (`patch_conv_router_with_triton`)
-- **What:** the causal-conv1d router (only when `config.router_type == "conv"`).
-- **How it saves:** reads hidden states natively in `(B, S, H)` and does a **transpose-free**
-  backward — kills the permute round-trips the eager conv router pays.
-- **Results (fp16):** full router **~2.5× fwd+bwd** at large batch; projection ~5× fwd.
-- **Apply:** `patch_conv_router_with_triton(model)`.
-- **⚠ Not this:** the conv **shared-expert** kernel (`patch_conv_expert_with_triton`) exists but is
+### 5. ~~Conv router~~ — REMOVED (Jul 26 2026)
+The conv router and its kernel are gone; BiBo uses the MLP router only.
+- **⚠ Also not this:** the conv **shared-expert** kernel (`patch_conv_expert_with_triton`) exists but is
   **intentionally not used** — 0.41× (slower than PyTorch ops; launch overhead dominates the cheap
   elementwise op).
 

@@ -72,7 +72,7 @@ knowledge_base:
   
   baselines: "baseline/qwen3: dense transformer. baseline/qwen3moe: sparse MoE. Read-only references."
   
-  features: "CRITICAL: Every feature needs config toggle. use_ssmax, attention_type, router_type, num_routed_experts, num_shared_experts, moe_shared_scaling."
+  features: "CRITICAL: Every feature needs config toggle. use_ssmax, use_xsa, gate_type, norm_topk_prob, num_routed_experts, load_balance_strategy."
   
   compilation: "Must be torch.compile() + torch-xla compatible. Avoid Python control flow in forward(). Use static shapes. Prefer torch ops over numpy."
   

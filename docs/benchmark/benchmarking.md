@@ -187,8 +187,7 @@ MY_CONFIG = BiBoConfig(
     moe_intermediate_size=256,
     use_shared_expert=True,
     shared_expert_type="mlp",        # "mlp" or "conv"
-    # Router
-    router_type="mlp",               # "mlp" or "conv"
+    # Router (MLP only — conv router removed Jul 26 2026)
     router_lambda=1.5,               # Sharper routing
     router_noise=0.5,
     bias_update_threshold=100_000,
@@ -204,7 +203,7 @@ if __name__ == "__main__":
     print(f"Config OK — {total:.2f}M params")
     print(f"  Experts: {MY_CONFIG.num_routed_experts} routed + {MY_CONFIG.num_shared_experts} shared")
     print(f"  Top-K: {MY_CONFIG.num_experts_per_tok}")
-    print(f"  Router: {MY_CONFIG.router_type}, lambda={MY_CONFIG.router_lambda}")
+    print(f"  Router: mlp, lambda={MY_CONFIG.router_lambda}")
 ```
 
 Then run it:
@@ -248,8 +247,7 @@ BIBO_50M_BASELINE = BiBoConfig(
     num_experts_per_tok=2,          # Top-2 routing
     use_shared_expert=True,
     shared_expert_type="mlp",       # SwiGLU shared expert
-    # Router
-    router_type="mlp",
+    # Router (MLP only)
     router_lambda=1.0,
     router_noise=0.0,               # Disabled for bench
     bias_update_threshold=100_000,
@@ -345,7 +343,6 @@ config = BiBoConfig(
     num_experts_per_tok=2,
     use_shared_expert=True,
     shared_expert_type="mlp",
-    router_type="mlp",
     tie_word_embeddings=True,
 )
 model = BiBoForCausalLM(config)
@@ -393,8 +390,7 @@ BIBO_50M_BASELINE = BiBoConfig(
     moe_intermediate_size=256,
     use_shared_expert=True,
     shared_expert_type="conv",       # CausalConv1D shared expert
-    # Router
-    router_type="conv",              # Conv router (context-aware)
+    # Router (MLP only — the conv router variant was removed Jul 26 2026)
     router_lambda=1.5,               # Sharper routing
     router_noise=0.5,                # Exploration noise
     bias_update_threshold=100_000,
@@ -432,7 +428,7 @@ if __name__ == "__main__":
     print(f"  Layers: {BIBO_50M_BASELINE.num_hidden_layers}")
     print(f"  Experts: {BIBO_50M_BASELINE.num_routed_experts} routed + {BIBO_50M_BASELINE.num_shared_experts} shared")
     print(f"  Top-K: {BIBO_50M_BASELINE.num_experts_per_tok}")
-    print(f"  Router: {BIBO_50M_BASELINE.router_type}, lambda={BIBO_50M_BASELINE.router_lambda}")
+    print(f"  Router: mlp, lambda={BIBO_50M_BASELINE.router_lambda}")
     print(f"  Shared expert: {BIBO_50M_BASELINE.shared_expert_type}")
 ```
 
@@ -586,7 +582,6 @@ os.environ['WANDB_API_KEY'] = 'your_key_here'  # or WANDB_MODE=disabled
 | `num_experts_per_tok` | 2 | 3 | Top-K routing |
 | `moe_intermediate_size` | 256 | 256 | Per-expert FFN size |
 | `shared_expert_type` | "mlp" | "conv" | Shared expert type |
-| `router_type` | "mlp" | "conv" | Router architecture |
 | `router_lambda` | 1.0 | 1.5 | Logit normalization scaling |
 | `router_noise` | 0.0 | 0.5 | Training exploration noise |
 

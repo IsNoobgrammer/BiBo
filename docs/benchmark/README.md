@@ -21,7 +21,6 @@ This folder contains all benchmarking-related documentation for BiBo.
 | RoPE | Liger | fused | eliminates intermediate |
 | MoE experts | Custom Triton (`patch_moe_auto`) | 1.42× fwd / 1.40× fwd+bwd | grouped path ~2–2.5× fwd at 4k–8k tok |
 | Dense MLP | Liger SwiGLU | 1.19× fwd / 1.23× fwd+bwd | — |
-| Conv **router** | Custom Triton (`patch_conv_router_with_triton`) | ~2.5× fwd+bwd (large batch) | conv **expert** kernel NOT used (0.41× slower) |
 | Fused-linear CE | Custom Triton (default) | 2.1× fwd; enabling at 16k tok | mem flat ~0.5 GB |
 | XSA | Custom Triton (`patch_xsa_with_triton`) | 2.2–2.6× fwd / 2.5–3.2× fwd+bwd | mem 0.68–0.76×; in-kernel GQA broadcast |
 
@@ -42,7 +41,6 @@ validate on T4.
 from src.kernels import (
     patch_bibo_with_liger,           # RMSNorm + RoPE (Liger; alias: patch_bibo_with_triton)
     patch_moe_auto,                  # MoE experts (per-expert / grouped auto-dispatch)
-    patch_conv_router_with_triton,   # Conv router (only if router_type="conv")
     patch_xsa_with_triton,           # XSA rejection
 )
 
@@ -50,7 +48,6 @@ model = BiBoForCausalLM(config).cuda()
 patch_bibo_with_liger(model)
 patch_moe_auto(model)
 patch_xsa_with_triton()
-# patch_conv_router_with_triton(model)   # only when router_type="conv"
 # NOTE: the conv shared-expert kernel is intentionally NOT applied (slower than PyTorch ops).
 ```
 

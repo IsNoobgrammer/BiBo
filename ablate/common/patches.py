@@ -201,13 +201,8 @@ def patch_router_gate():
 
     def _fwd(self, hidden_states):
         batch_size, seq_len, _ = hidden_states.shape
-        if self.router_type == "mlp":
-            flat_hidden = rearrange(hidden_states, 'b s h -> (b s) h')
-            router_logits = self.gate_proj(flat_hidden).float()
-        else:
-            x_perm = rearrange(hidden_states, 'b s h -> b h s')
-            x_padded = F.pad(x_perm, (self.causal_padding, 0))
-            router_logits = rearrange(self.gate_conv(x_padded), 'b e s -> (b s) e').float()
+        flat_hidden = rearrange(hidden_states, 'b s h -> (b s) h')
+        router_logits = self.gate_proj(flat_hidden).float()
         router_logits = self._apply_router_activation(router_logits)
         scores = _gate_scores(router_logits, self.gate_type)          # <<< the ONLY change
         selection_scores = scores + self.bias                          # bias: SELECTION only
@@ -234,34 +229,8 @@ def patch_router_gate():
     R.forward = _nc(_fwd)
 
 
-# ───────────────────────── fused conv router (BiBo only) ─────────────────────────
-def patch_conv_router():
-    """Route BiBo's CONV router through the sm120 fused-Triton conv kernel (no cuDNN).
-    Only fires for router_type='conv' + gate_type='sigmoid' + router_activation='none' (the kernel's
-    hardcoded pipeline: causal conv -> sigmoid -> +bias select -> top-k -> unbiased gather -> norm/scale).
-    Any other config (mlp router, softmax gate, relu/silu activation) falls through to the eager forward,
-    so this is safe to apply unconditionally (no-op for the qwen arm / mlp router)."""
-    from kernels.sm120.router import fused_router
-    import src.modeling.ffn.router as rmod
-    R = rmod.BiBoMoERouter
-    _orig = getattr(R, "_orig_forward", None) or R.forward
-    R._orig_forward = _orig
-
-    def _fwd(self, hidden_states):
-        # ROUTER_GATE guard: the kernel hardcodes sigmoid, so a non-sigmoid gate MUST fall through
-        # to the eager forward (else it would silently compute the wrong gate).
-        if (self.router_type == "conv" and self.gate_type == "sigmoid"
-                and self.router_activation == "none" and ROUTER_GATE == "sigmoid"):
-            # cast fp32 master conv weight to the (bf16 under autocast) input dtype so the kernel's
-            # tl.dot sees matching operands; the .to() is differentiable -> grad flows back to fp32 weight
-            w_conv = self.gate_conv.weight.to(hidden_states.dtype)
-            idx, w = fused_router(hidden_states, w_conv, self.bias,
-                                  self.top_k, self.num_routed_experts,
-                                  norm_topk_prob=self.norm_topk_prob,
-                                  routed_scaling_factor=self.routed_scaling_factor)
-            return idx.long(), w.float()
-        return _orig(self, hidden_states)
-    R.forward = _nc(_fwd)
+# NOTE: patch_conv_router() lived here and routed the CONV router through the sm120 fused-Triton
+# conv kernel. Removed Jul 26 2026 along with the conv router itself — MLP router only.
 
 
 # ───────────────────────── FlashAttention (both arms) ─────────────────────────
@@ -312,14 +281,14 @@ def patch_bibo_flash():
 
 
 _APPLY = {"liger_norm": patch_liger_norm, "liger_rope": patch_liger_rope, "moe": patch_fused_moe,
-          "router": patch_conv_router, "router_gate": patch_router_gate}
+          "router_gate": patch_router_gate}
 
 
 def apply(components):
     """components: iterable subset of {'liger_norm','liger_rope','moe'}. Returns the list applied."""
     done = []
-    # router_gate first (stable sort keeps the rest in order): patch_conv_router wraps whatever
-    # forward is current, so the gate swap must already be installed for conv's fallback to use it.
+    # router_gate first (stable sort keeps the rest in order) — kept for ordering stability now that
+    # the conv-router patch that depended on it is gone.
     for c in sorted(components, key=lambda c: c != "router_gate"):
         if c == "ce":
             continue  # CE lives in the training loop

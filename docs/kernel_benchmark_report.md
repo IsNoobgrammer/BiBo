@@ -149,7 +149,6 @@ timing-noise floor and is omitted. Benches: `src/kernels/.autoresearch/bench_xsa
 |--------|-----------------|-------|
 | MoE experts (per-expert, `patch_moe_auto`) | 1.42× fwd / 1.40× fwd+bwd | sync-removal fix; grouped path ~2–2.5× fwd at 4k–8k |
 | Dense MLP (Liger SwiGLU) | 1.19× fwd / 1.23× fwd+bwd | it *is* Liger |
-| Conv **router** (`patch_conv_router_with_triton`) | ~2.5× fwd+bwd (large batch) | conv **expert** kernel intentionally NOT used (0.41× slower) |
 | Fused-linear CE | 2.1× fwd; fwd+bwd 1.05–1.26× ≤2048, 5.7× @4096, enabling @16384 | mem flat ~0.5 GB; only path that runs the 16k step |
 | RMSNorm (Liger) | dim320: 7.8–8.5× fwd / 2.7× fwd+bwd · QK dim64: 2.3× fwd / 1.0–1.13× fwd+bwd | QK-norm break-even on bwd; not worth a custom kernel |
 | **XSA (fused, ours)** | 2.2–2.6× fwd / 2.5–3.2× fwd+bwd; mem 0.68–0.76× | see table above |

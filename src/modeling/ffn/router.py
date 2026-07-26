@@ -20,7 +20,7 @@ class BiBoMoERouter(nn.Module):
     4. No interference gradients — bias is outside the computation graph
     
     Pipeline (MiMo-V2.5 `MiMoV2MoEGate` structure, but see step 6 — the normalizer differs):
-        1. raw_logits = W @ x  (MLP or Conv)
+        1. raw_logits = W @ x  (MLP projection)
         2. raw_logits += noise  (DEPRECATED — commented out; we use router_noise=0)
         3. scores = gate(raw_logits)  — sigmoid (default), situ, or softmax
         4. selection_scores = scores + bias  — for top-k selection ONLY
@@ -42,9 +42,6 @@ class BiBoMoERouter(nn.Module):
         self.num_routed_experts = config.num_routed_experts
         self.top_k = config.num_experts_per_tok
         self.router_noise = config.router_noise
-        self.router_type = config.router_type
-        self.kernel_size = config.kernel_size
-        self.causal_padding = self.kernel_size - 1
 
         # Configurable options — getattr fallbacks MATCH the BiBoConfig defaults so a partial/stale
         # config can't silently flip behavior (norm_topk_prob especially: config default is True).
@@ -57,15 +54,11 @@ class BiBoMoERouter(nn.Module):
         # DeepSeek-V3: bias only affects selection, not output weights
         self.bias = nn.Parameter(torch.zeros(self.num_routed_experts), requires_grad=False)
 
-        # Router projection — normal init (matches Qwen3MoE)
-        if self.router_type == "mlp":
-            self.gate_proj = nn.Linear(config.hidden_size, self.num_routed_experts, bias=False)
-            nn.init.normal_(self.gate_proj.weight, mean=0.0, std=config.initializer_range)
-        elif self.router_type == "conv":
-            self.gate_conv = nn.Conv1d(config.hidden_size, self.num_routed_experts, self.kernel_size, padding=0, bias=False)
-            nn.init.normal_(self.gate_conv.weight, mean=0.0, std=config.initializer_range)
-        else:
-            raise ValueError(f"Unknown router type: {self.router_type}. Expected 'mlp' or 'conv'.")
+        # Router projection — normal init (matches Qwen3MoE). Shape is (num_routed_experts,
+        # hidden_size), i.e. experts are the ROW dim. MLP only — the conv router was removed
+        # (Jul 26 2026): it never outperformed the MLP router.
+        self.gate_proj = nn.Linear(config.hidden_size, self.num_routed_experts, bias=False)
+        nn.init.normal_(self.gate_proj.weight, mean=0.0, std=config.initializer_range)
 
     def _apply_router_activation(self, logits: torch.Tensor) -> torch.Tensor:
         """Apply optional activation to router logits before gating."""
@@ -87,14 +80,8 @@ class BiBoMoERouter(nn.Module):
         batch_size, seq_len, hidden_dim = hidden_states.shape
 
         # Step 1: raw logits
-        if self.router_type == "mlp":
-            flat_hidden = rearrange(hidden_states, 'b s h -> (b s) h')
-            router_logits = self.gate_proj(flat_hidden).float()
-        else:  
-            x_perm = rearrange(hidden_states, 'b s h -> b h s')
-            x_padded = F.pad(x_perm, (self.causal_padding, 0))
-            conv_out = self.gate_conv(x_padded)
-            router_logits = rearrange(conv_out, 'b e s -> (b s) e').float()
+        flat_hidden = rearrange(hidden_states, 'b s h -> (b s) h')
+        router_logits = self.gate_proj(flat_hidden).float()
 
         # Step 2: exploration noise (training only) — DEPRECATED, DO NOT REMOVE.
         # We do not use router noise (router_noise=0). Commented out because forward-time
