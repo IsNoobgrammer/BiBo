@@ -1,5 +1,14 @@
 # BiBo Triton Kernels
 
+> ## ⚠️ HISTORICAL — none of this code is in this repo
+>
+> **All custom kernels were removed on Jun 30 2026** and now live in a separate kernels repo. The
+> `src/kernels/` tree, every `patch_*_with_triton` helper, and the config knobs referenced below
+> (`use_fused_ce`, `use_fused_linear_ce`) **no longer exist**. BiBo runs pure PyTorch eager +
+> `torch.compile`.
+>
+> Kept as a design record of what was built and measured. Do not use the APIs below as-is.
+
 Custom + Liger GPU kernels for BiBo, applied by **monkey-patching** (never by editing modeling
 code). Every kernel is wrapped in a `torch.autograd.Function`, is **grad-exact vs PyTorch eager**
 (atol 1e-3 fp16), and is benchmarked in **fp16** with `triton.testing.do_bench`.

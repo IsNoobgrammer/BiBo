@@ -11,26 +11,15 @@ __all__ = [
     'BiBoCausalConv1D',
 ]
 
-# Note: the Identity ("pass x through") and Zero ("x*0") experts are NOT separate classes — the
-# fused MoE path (BiBoFusedExperts in moe.py) handles them inline (weighted passthrough / skip).
+# Identity ("pass x through") and Zero ("x*0") are NOT classes — BiBoFusedExperts handles them
+# inline as a weighted passthrough / a skip.
 
 
 class BiBoPolyGLUExpert(nn.Module):
-    """
-    GLU expert with configurable activation function.
-    
-    PolyGLU idea: diverse activations across experts in the same MoE layer.
-    Each expert uses a different activation in the GLU gate:
-      - "silu"     → SiLU (SwiGLU, standard)
-      - "relu2"    → ReLU² (ReGLU², sparse + sharp)
-      - "normsilu" → SiLU(RMS-normed gate) (DECO-style norm expert, scale-invariant gate)
+    """down_proj(act(gate_proj(x)) * up_proj(x)) — a BiBoMLP with an explicit activation choice.
 
-    Architecture: down_proj( act(gate_proj(x)) * up_proj(x) )
-    Same structure as BiBoMLP but with explicit activation choice.
-
-    Args:
-        config: Model config
-        activation: One of "silu", "relu2", "normsilu"
+    PolyGLU's premise is diverse activations across experts in one MoE layer. Reference
+    implementation only: the shipped path is BiBoFusedExperts, which inlines the same math.
     """
     VALID_ACTIVATIONS = ("silu", "relu2", "normsilu")
 
@@ -50,9 +39,9 @@ class BiBoPolyGLUExpert(nn.Module):
             return F.silu(x)
         elif self.activation_name == "relu2":
             r = F.relu(x)
-            return (r.float() * r.float()).to(x.dtype)   # fp32 square: avoid fp16 overflow (>256 -> inf)
+            return (r.float() * r.float()).to(x.dtype)   # fp32 square: fp16 overflows above 256
         elif self.activation_name == "normsilu":
-            # SiLU(RMS-normed gate), gain-free — eps matches _NORMSILU_EPS in moe.py / tkf kernel
+            # eps MUST match _NORMSILU_EPS in moe.py and _NS_EPS in the tkf kernel
             g = x.float()
             g = g * torch.rsqrt(g.square().mean(-1, keepdim=True) + 1e-6)
             return F.silu(g).to(x.dtype)
@@ -62,14 +51,10 @@ class BiBoPolyGLUExpert(nn.Module):
 
 
 class BiBoCausalConv1D(nn.Module):
-    """
-    1D causal conv expert (shared, always-active).
-    
-    Applies causal (left-padded) 1D conv → gated activation → linear proj.
-    Captures local sequential deps while preserving causality.
-    
-    Args:
-        config: Model config
+    """Shared, always-active expert: left-padded causal 1D conv -> gated act -> linear proj.
+
+    This is the conv SHARED EXPERT (shared_expert_type="conv"), not the conv router — that was
+    removed Jul 26 2026.
     """
     def __init__(self, config: BiBoConfig):
         super().__init__()
@@ -86,9 +71,7 @@ class BiBoCausalConv1D(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, hidden_dim = x.shape
         x_perm = rearrange(x, 'b s h -> b h s')
-        
-        # Causal pad left (k-1)
-        x_padded = F.pad(x_perm, (self.causal_padding_gate, 0))
+        x_padded = F.pad(x_perm, (self.causal_padding_gate, 0))   # left-pad k-1 => causal
         gate_conv_out = self.gate_conv(x_padded)
         gate_output = rearrange(gate_conv_out, 'b i s -> b s i')
         output = self.down_proj(self.act_fn(gate_output) * self.up_proj(x))

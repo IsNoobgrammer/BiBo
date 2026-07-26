@@ -128,7 +128,7 @@ review_guidelines:
   config_validation:
     - "Every new parameter MUST have validation in BiBoConfig.__init__()"
     - "Check for sensible default values (document reasoning)"
-    - "Verify parameter interactions are validated (e.g., num_experts_per_tok <= num_experts)"
+    - "Verify parameter interactions are validated (e.g., num_experts_per_tok <= num_routed_experts)"
     - "Ensure config changes are documented in docs/configuration_guide.md"
   
   numerical_stability:

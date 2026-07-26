@@ -36,8 +36,7 @@ cfg = BiBoConfig(vocab_size=5000, hidden_size=512, num_hidden_layers=4,
                  num_attention_heads=8, num_key_value_heads=2,
                  polyglu_expert_multiplier=2, special_expert_pairs=1,
                  num_experts_per_tok=2,
-                 moe_intermediate_size=256, intermediate_size=1024,
-                 moe_shared_scaling=2.0)
+                 moe_intermediate_size=256, intermediate_size=1024)
 model = BiBoForCausalLM(cfg)
 x = torch.randint(0, 5000, (2, 128))
 out = model(x, labels=x)
@@ -188,8 +187,6 @@ MY_CONFIG = BiBoConfig(
     use_shared_expert=True,
     shared_expert_type="mlp",        # "mlp" or "conv"
     # Router (MLP only — conv router removed Jul 26 2026)
-    router_lambda=1.5,               # Sharper routing
-    router_noise=0.5,
     bias_update_threshold=100_000,
     bias_update_factor=1e-2,
     # Other
@@ -201,9 +198,7 @@ if __name__ == "__main__":
     model = BiBoForCausalLM(MY_CONFIG)
     total = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Config OK — {total:.2f}M params")
-    print(f"  Experts: {MY_CONFIG.num_routed_experts} routed + {MY_CONFIG.num_shared_experts} shared")
     print(f"  Top-K: {MY_CONFIG.num_experts_per_tok}")
-    print(f"  Router: mlp, lambda={MY_CONFIG.router_lambda}")
 ```
 
 Then run it:
@@ -248,8 +243,6 @@ BIBO_50M_BASELINE = BiBoConfig(
     use_shared_expert=True,
     shared_expert_type="mlp",       # SwiGLU shared expert
     # Router (MLP only)
-    router_lambda=1.0,
-    router_noise=0.0,               # Disabled for bench
     bias_update_threshold=100_000,
     bias_update_factor=1e-2,
     # Other
@@ -297,7 +290,6 @@ if __name__ == "__main__":
     print(f"  LM head params: {stats['lm_head']:,}")
     print(f"  Hidden: {BIBO_50M_BASELINE.hidden_size}")
     print(f"  Layers: {BIBO_50M_BASELINE.num_hidden_layers}")
-    print(f"  Experts: {BIBO_50M_BASELINE.num_routed_experts} routed + {BIBO_50M_BASELINE.num_shared_experts} shared")
     print(f"  Top-K: {BIBO_50M_BASELINE.num_experts_per_tok}")
 ```
 
@@ -391,8 +383,6 @@ BIBO_50M_BASELINE = BiBoConfig(
     use_shared_expert=True,
     shared_expert_type="conv",       # CausalConv1D shared expert
     # Router (MLP only — the conv router variant was removed Jul 26 2026)
-    router_lambda=1.5,               # Sharper routing
-    router_noise=0.5,                # Exploration noise
     bias_update_threshold=100_000,
     bias_update_factor=1e-2,
     # Other
@@ -426,9 +416,7 @@ if __name__ == "__main__":
     print(f"  Total params: {stats['total']:,} ({stats['total_m']:.2f}M)")
     print(f"  Hidden: {BIBO_50M_BASELINE.hidden_size}")
     print(f"  Layers: {BIBO_50M_BASELINE.num_hidden_layers}")
-    print(f"  Experts: {BIBO_50M_BASELINE.num_routed_experts} routed + {BIBO_50M_BASELINE.num_shared_experts} shared")
     print(f"  Top-K: {BIBO_50M_BASELINE.num_experts_per_tok}")
-    print(f"  Router: mlp, lambda={BIBO_50M_BASELINE.router_lambda}")
     print(f"  Shared expert: {BIBO_50M_BASELINE.shared_expert_type}")
 ```
 
@@ -582,8 +570,8 @@ os.environ['WANDB_API_KEY'] = 'your_key_here'  # or WANDB_MODE=disabled
 | `num_experts_per_tok` | 2 | 3 | Top-K routing |
 | `moe_intermediate_size` | 256 | 256 | Per-expert FFN size |
 | `shared_expert_type` | "mlp" | "conv" | Shared expert type |
-| `router_lambda` | 1.0 | 1.5 | Logit normalization scaling |
-| `router_noise` | 0.0 | 0.5 | Training exploration noise |
+| `gate_type` | "sigmoid" | "situ" | Router scoring fn |
+| `norm_topk_prob` | True | True | Softmax top-k weights to sum to 1 |
 
 **Expert count formula:**
 ```

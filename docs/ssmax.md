@@ -141,7 +141,7 @@ fading.** We don't do it — we get `s` right at train time instead. (YaRN's *at
    1M**. If `s` learned a hair hot it degrades *before* 1M — that's the signal, and the fix is
    training-length (curriculum longer), not `n`-interpolation.
 2. **SSMax is only the attention-sharpness axis.** Real 1M serving also needs *positional* extrapolation.
-   BiBo is well-set: **NoPE heads (`rope_nope_ratio=0.5`) are position-agnostic → extrapolate for free**,
+   BiBo is well-set: **NoPE dims (`partial_rotary_factor=0.334`) are position-agnostic → extrapolate for free**,
    and the RoPE heads use dynamic-NTK. The positional side complements the SSMax buffer; SSMax alone with
    pure RoPE (no NTK/NoPE) would cap sooner.
 

@@ -1,5 +1,9 @@
 # BiBo Benchmark Documentation
 
+> ⚠️ The kernel table and `apply_triton_kernels` snippet below are **historical** — all custom
+> kernels moved to a separate repo on Jun 30 2026, and `use_fused_ce` / `use_fused_linear_ce`
+> no longer exist as config knobs.
+
 This folder contains all benchmarking-related documentation for BiBo.
 
 ## Contents

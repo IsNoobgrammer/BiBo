@@ -10,7 +10,7 @@
 
 3. **Shared Causal Conv1D Expert** — An always-active gated causal convolution that provides local temporal context to every token, independent of routing decisions. Novel — no prior MoE work uses convolution as a shared expert.
 
-4. **Router Logit Normalization** — `router_lambda` scales normalized logits, preventing top-1 confidence collapse when `top_k > 1`. This ensures all selected experts contribute meaningfully (not just the top-1 dominating).
+4. **Top-k Weight Normalization** — `norm_topk_prob` softmaxes the gathered top-k scores so they sum to 1, keeping every selected expert's contribution meaningful instead of letting top-1 dominate. (A Skywork-style logit-normalization mechanism, `router_lambda`, existed until Jun 28 2026; the router is pure MiMo now.)
 
 5. **Threshold-Based Bias Heuristics** — Non-trainable router bias (`requires_grad=False`) updated via load-balancing heuristics. Avoids FSDP conflicts while maintaining expert utilization balance.
 
@@ -28,9 +28,9 @@ BiBoForCausalLM
 │   ├── BiBoDecoderLayer × N
 │   │   ├── RMSNorm → BiBoAttention (GQA + QK-Norm + SSMax + SDPA)
 │   │   └── RMSNorm → BiBoMoELayer (or dense BiBoMLP for first/last layers)
-│   │       ├── BiBoMoERouter (MLP or Conv, logit normalization)
-│   │       ├── Routed: (n-3) SwiGLU MLPs + 1 Identity + 1 Zero + 1 ReLU²
-│   │       └── Shared: 1 CausalConv1D (always active, scaled by moe_shared_scaling)
+│   │       ├── BiBoMoERouter (MLP projection, sigmoid/situ/softmax gate)
+│   │       ├── Routed: PolyGLU groups (SiLU + ReLU² + NormSiLU) + Identity + Zero
+│   │       └── Shared: 1 MLP-SwiGLU or CausalConv1D (off by default; added directly)
 │   └── Final RMSNorm
 └── LM Head
 ```
@@ -66,7 +66,6 @@ config = BiBoConfig(
     num_experts_per_tok=2,
     moe_intermediate_size=256,
     intermediate_size=1024,
-    moe_shared_scaling=2.0,
 )
 
 model = BiBoForCausalLM(config)
@@ -85,12 +84,10 @@ Key parameters (see [`docs/configuration_guide.md`](docs/configuration_guide.md)
 | `num_routed_experts` | `16` | Total routed experts (must be ≥ 4) |
 | `num_experts_per_tok` | `6` | Top-K routing |
 | `gate_type` | `"sigmoid"` | Router scoring fn: `"sigmoid"` / `"situ"` (signed, needs `norm_topk_prob=True`) / `"softmax"` |
-| `router_lambda` | `1.0` | Logit norm scaling (higher = more decisive) |
-| `router_noise` | `0.5` | Exploration noise during training |
+| `norm_topk_prob` | `True` | Softmax the gathered top-k weights so they sum to 1 |
 | `bias_update_factor` | auto | Load balancing step size (Hill function of n) |
 | `bias_update_threshold` | `8000` | Tokens between bias updates |
-| `moe_shared_scaling` | auto | Shared expert output scaling (Monte Carlo estimated) |
-| `mlp_only_layers` | `[0, 1, N-1]` | Layers using dense MLP instead of MoE (first 2 + last) |
+| `mlp_only_layers` | `[0, N-1]` | Layers using dense MLP instead of MoE (first + last) |
 | `max_position_embeddings` | `32768` | Maximum context length |
 | `rope_theta` | auto | RoPE base frequency (scales with context length) |
 
@@ -121,7 +118,6 @@ baseline/                          # Reference implementations
 
 docs/                              # Technical documentation
 ├── ssmax.md                       # SSMax theory + implementation
-├── moe_shared_scaling.md          # Monte Carlo scaling derivation
 ├── configuration_guide.md         # Full config parameter reference
 └── deprecated.md                  # Removed components + reasoning
 
@@ -175,7 +171,6 @@ BiBo was benchmarked against Qwen3MoE on a sequence sorting task (2×T4 GPUs, Ka
 ## Documentation
 
 - [`docs/ssmax.md`](docs/ssmax.md) — SSMax theory, initialization, and integration
-- [`docs/moe_shared_scaling.md`](docs/moe_shared_scaling.md) — Monte Carlo derivation for shared expert scaling
 - [`docs/configuration_guide.md`](docs/configuration_guide.md) — Full parameter reference and tuning guidance
 - [`docs/deprecated.md`](docs/deprecated.md) — Removed components and reasoning
 

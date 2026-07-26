@@ -67,35 +67,22 @@ class BiBoConfig(PretrainedConfig):
         # ── Router ───────────────────────────────────────────────
         kernel_size=3,        # conv SHARED-EXPERT kernel width (shared_expert_type="conv").
                               # The conv ROUTER was removed Jul 26 2026 — MLP router only.
-        gate_type="sigmoid",  # scoring fn: "sigmoid" (DeepSeek-V3, independent) | "situ" (SiTU,
-                              # sigmoid(x)*tanh(x) — independent + SIGNED, needs norm_topk_prob=True)
-                              # | "softmax" (legacy, competitive)
-        router_activation="none",  # applied to raw logits BEFORE gating: "none", "relu" (DECO), "silu"
-                                   # (a separate stage from gate_type — do not confuse the two)
-        norm_topk_prob=True,        # True -> SOFTMAX over the gathered top-k scores so they sum to 1
-                                    # (diverges from MiMo's ÷sum; required for signed gates). False ->
-                                    # raw gathered scores, no normalization.
-        routed_scaling_factor=1.0,  # MiMo/DeepSeek-V3 final routed-weight scale; 1.0 = no-op (MiMo-V2.5)
-        router_noise=0,             # DEPRECATED (injection commented out in router.py); kept for re-enable
-        load_balance_strategy="bias",  # "none" or "bias" (heuristic aux-loss-free bias updates)
+        gate_type="sigmoid",       # "sigmoid" | "situ" (SIGNED, needs norm_topk_prob=True) | "softmax"
+        router_activation="none",  # on the LOGITS, before gate_type: "none" | "relu" | "silu"
+        norm_topk_prob=True,       # softmax the gathered top-k weights to sum to 1 (not MiMo's ÷sum)
+        routed_scaling_factor=1.0,  # post-norm routed-weight scale; 1.0 = no-op
+        load_balance_strategy="bias",  # "none" | "bias" (aux-loss-free bias updates)
         bias_update_factor=None,    # Auto: Hill function of num_routed_experts
         bias_update_threshold=8000,  # tokens between bias updates
-        balance_exclude_specials=False,  # if True, the bias balancer ignores Identity/Zero experts
-                                         # (balances GLU experts among themselves, freezes special biases
-                                         # at 0) so the router learns special usage instead of being forced
+        balance_exclude_specials=False,  # balance only the GLU block, freeze Identity/Zero biases at 0
         **kwargs,
     ):
-        # ── Removed knobs: drop before super().__init__ ───────────
-        # PretrainedConfig setattr()s any unknown kwarg, so a stale `router_type` from an old
-        # config/checkpoint would silently reappear as an attribute AND get serialized back into
-        # config.json — looking like the conv router still exists. Pop it instead.
-        # (Conv router removed Jul 26 2026; MLP router only. `kernel_size` is NOT removed — it
-        # still configures the conv SHARED EXPERT.)
-        if kwargs.pop("router_type", None) is not None:
-            logger.warning(
-                "`router_type` was removed (conv router deleted Jul 26 2026); BiBo uses the MLP "
-                "router only. The value is ignored and will not be saved."
-            )
+        # Pop removed knobs: PretrainedConfig setattr()s unknown kwargs, so a stale value would
+        # reappear as an attribute AND be re-serialized into config.json as if it still existed.
+        for dead, why in (("router_type", "conv router removed Jul 26 2026; MLP router only"),
+                          ("router_noise", "noise injection removed Jul 26 2026; was never enabled")):
+            if kwargs.pop(dead, None) is not None:
+                logger.warning(f"`{dead}` was removed ({why}). Ignored, and not saved.")
 
         # ── Core dimensions ──────────────────────────────────────
         self.vocab_size = vocab_size
@@ -162,44 +149,37 @@ class BiBoConfig(PretrainedConfig):
         self.router_activation = router_activation
         self.norm_topk_prob = norm_topk_prob
         self.routed_scaling_factor = routed_scaling_factor
-        self.router_noise = router_noise
         self.load_balance_strategy = load_balance_strategy
 
-        # ============================================================
-        # Auto-derived hyperparameters (when left as None)
-        # ============================================================
+        # ── Auto-derived when left as None ────────────────────────
 
-        # rope_theta: default 1e7 (matched to dim-wise partial RoPE — fewer rotated dims want
-        # longer wavelengths; MiMo-V2.5 pairs partial_rotary_factor=0.334 with theta=1e7).
+        # 1e7 matches dim-wise partial RoPE: fewer rotated dims want longer wavelengths (MiMo-V2.5
+        # pairs partial_rotary_factor=0.334 with theta=1e7).
         self.rope_theta = rope_theta if rope_theta is not None else 1e7
 
-        # moe_intermediate_size: compute parity with dense FFN.
-        #   dense active/token = 2*hidden*intermediate ; MoE = 2*hidden*moe_intermediate*top_k
-        #   parity → moe_intermediate = intermediate // top_k
+        # Compute parity with the dense FFN: dense active/token = 2*hidden*intermediate,
+        # MoE = 2*hidden*moe_intermediate*top_k, so moe_intermediate = intermediate // top_k.
         self.moe_intermediate_size = (
             moe_intermediate_size if moe_intermediate_size is not None
             else self.intermediate_size // self.num_experts_per_tok
         )
 
-        # bias_update_factor: scales with num_experts (small n → small step; large n → strong
-        # balancing for EP). Bounded [0, 0.35] via a Hill function A*n^α/(n^α+C), fit to
-        # f(8)=0.07, f(16)=0.1417, f(∞)=0.35.
+        # Hill function A*n^α/(n^α+C) bounded to [0, 0.35], fit to f(8)=0.07, f(16)=0.1417,
+        # f(∞)=0.35 — small n wants a small step, large n needs strong balancing for EP.
         if bias_update_factor is not None:
             self.bias_update_factor = bias_update_factor
         else:
             n_pow = self.num_routed_experts ** 1.445
             self.bias_update_factor = round(0.35 * n_pow / (n_pow + 81.0), 4)
 
-        # bias_update_threshold: tokens to accumulate before applying a bias update
         self.bias_update_threshold = bias_update_threshold if bias_update_threshold is not None else 8000
         self.balance_exclude_specials = balance_exclude_specials
 
-        # rope_scaling: dynamic NTK-aware by default — identity within the trained window,
-        # smooth base growth beyond it. type="none" for plain RoPE; factor=1.0 = pure dynamic.
+        # Dynamic NTK-aware: identity inside the trained window, smooth base growth beyond it.
+        # type="none" for plain RoPE.
         if self.rope_scaling is None:
             self.rope_scaling = {"type": "dynamic", "factor": 1.0}
 
-        # mlp_only_layers: first + last layers are dense MLP, rest are MoE
         self.mlp_only_layers = (
             mlp_only_layers if mlp_only_layers is not None
             else sorted({0, num_hidden_layers - 1})   # dedupe: N==1 -> [0], not [0,0]
@@ -213,15 +193,13 @@ class BiBoConfig(PretrainedConfig):
             **kwargs,
         )
 
-        # Derived dims — computed AFTER super().__init__(**kwargs) so a stale serialized head_dim/
-        # rope_dim (which arrive via **kwargs on reload) cannot win over the current derivation.
+        # AFTER super().__init__(**kwargs): a stale serialized head_dim/rope_dim arrives via kwargs
+        # on reload and must NOT win over the current derivation.
         self.head_dim = self.hidden_size // self.num_attention_heads
         _rope_dim = round(self.partial_rotary_factor * self.head_dim)
-        self.rope_dim = _rope_dim - (_rope_dim % 2)   # force even (rotate_half needs an even dim)
+        self.rope_dim = _rope_dim - (_rope_dim % 2)   # rotate_half needs an even dim
 
-        # ============================================================
-        # Validations
-        # ============================================================
+        # ── Validations ───────────────────────────────────────────
         if self.layer_norm_type != "rms":
             raise ValueError(f"Only 'rms' layer_norm_type is supported. Got: {self.layer_norm_type}")
         if self.hidden_size % self.num_attention_heads != 0:
@@ -258,8 +236,6 @@ class BiBoConfig(PretrainedConfig):
                 "needs the sink scaled by the SSMax factor C=s·log(n) (docs/attention_layers.md §4); "
                 "that coupling is not implemented yet. Disable one, or wire the C-scaled sink first."
             )
-        if self.router_noise < 0.0:
-            raise ValueError("router_noise must be non-negative")
         if self.shared_expert_type not in ("mlp", "conv"):
             raise ValueError(f"shared_expert_type must be 'mlp' or 'conv', got '{self.shared_expert_type}'")
         if self.polyglu_expert_multiplier < 1:

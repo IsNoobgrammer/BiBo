@@ -8,43 +8,26 @@ Complete reference for all BiBo model configuration parameters with implementati
 
 1. [Router Configuration](#router-configuration)
 2. [MoE Architecture](#moe-architecture)
-3. [Shared Expert Scaling](#shared-expert-scaling)
-4. [RoPE Scaling](#rope-scaling)
-5. [Attention Configuration](#attention-configuration)
-6. [Additional Router / MoE Parameters](#additional-router--moe-parameters)
-7. [Quick Reference Table](#quick-reference-table)
+3. [RoPE Scaling](#rope-scaling)
+4. [Attention Configuration](#attention-configuration)
+5. [Additional Router / MoE Parameters](#additional-router--moe-parameters)
+6. [Quick Reference Table](#quick-reference-table)
 
 ---
 
 ## Router Configuration
 
-### Two Independent Mechanisms
+### Load Balancing via Bias Updates
 
-The BiBo router uses **two independent mechanisms** that serve different purposes:
+BiBo balances expert load with aux-loss-free **bias updates** (DeepSeek-V3 / MiMo-V2.5). The bias
+shifts *which* experts get selected without touching the combine weights.
 
-#### 1. **Router Logit Normalization** (`router_lambda`) — Controls Confidence
+> Historical note: BiBo also had a Skywork-style **logit-normalization** mechanism (`router_lambda`,
+> `use_router_logit_norm`) that controlled routing *confidence* independently of load balancing.
+> Both were **removed Jun 28 2026** — the router is pure MiMo now, whose only normalization is
+> `norm_topk_prob`. Bias updates are the sole balancing mechanism.
 
-**Purpose:** Increase confidence in expert selection (low entropy in router logits)
-
-**What it does:** Makes the router more or less decisive when picking experts
-
-**Mechanism:** Normalizes and scales logits before softmax
-```python
-z̃ = λ · (z - μ) / σ
-g = softmax(z̃)
-```
-
-**Controls:**
-- ✓ Entropy of routing distribution (confidence)
-- ✓ Sharpness of expert selection (decisiveness)
-- ✗ Does NOT control which experts get selected
-- ✗ Does NOT control load balancing
-
-**Key insight:** Higher λ → lower entropy → more confident decisions
-
----
-
-#### 2. **Bias Update Mechanism** (`bias_update_*`) — Controls Load Balancing
+#### **Bias Update Mechanism** (`bias_update_*`)
 
 **Purpose:** Ensure experts are selected evenly over the long run
 
@@ -56,183 +39,8 @@ deviation = mean_tokens_per_expert - tokens_per_expert
 bias += factor × sign(deviation)
 ```
 
-**Controls:**
-- ✓ Load distribution across experts (fairness)
-- ✓ Prevents expert collapse (some experts never used)
-- ✗ Does NOT control routing confidence/entropy
-- ✗ Does NOT control sharpness of decisions
-
-**Key insight:** Bias updates ensure all experts get used, regardless of routing confidence
-
----
-
-### How They Work Together
-
-| Mechanism | What it controls | Analogy |
-|-----------|------------------|---------|
-| `router_lambda` | **HOW CONFIDENT** the router is | "How decisively should I pick?" |
-| `bias_update_*` | **WHICH EXPERTS** get selected over time | "Am I picking all experts fairly?" |
-
-**Example scenario:**
-- `router_lambda = 2.0` → Router is very confident (low entropy), picks experts decisively
-- `bias_update_factor = 1e-2` → If some experts are under-used, bias increases to make them more likely
-- **Result:** Confident routing + fair load distribution
-
-**They are independent:**
-- You can have high confidence (low entropy) AND balanced load
-- You can have low confidence (high entropy) AND imbalanced load
-- They solve different problems
-
----
-
-### `router_temperature`
-
-**Default:** `1.3`
-
-**Location:** `src/configuration_bibo.py:68`
-
-**What it does:**
-Temperature parameter for router logits. Controls the "sharpness" or "smoothness" of the expert selection distribution.
-
-**Implementation:**
-The temperature is NOT explicitly used in the current implementation. Instead, router logits are normalized using the `router_lambda` parameter (see below). The temperature parameter is kept for backward compatibility but the actual sharpening/desharpening is now handled implicitly through logit normalization.
-
-**Code Reference:**
-```python
-# src/modeling/ffn/router.py:45-50
-# z = lambda * (z - mean) / std (Skywork-MoE normalization)
-mean = router_logits.mean(dim=1, keepdim=True)
-std = router_logits.std(dim=1, keepdim=True) + 1e-6
-router_logits_norm = (router_logits - mean) / std
-router_logits_scaled = self.router_lambda * router_logits_norm
-```
-
-**How it works:**
-- **Higher values** → sharper distribution → more confident expert selection → fewer experts get significant weight
-- **Lower values** → smoother distribution → more uniform expert selection → load balancing but less specialization
-
-**Tuning guidance:**
-- **Default (1.3):** Good starting point for most cases
-- **Increase (1.5-2.0):** If you want stronger expert specialization and have good load balancing
-- **Decrease (0.8-1.2):** If experts are too specialized and you're seeing load imbalance
-
-**Pros:**
-- Higher temp: Better expert specialization, potentially better performance
-- Lower temp: Better load balancing, more stable training
-
-**Cons:**
-- Higher temp: Risk of expert collapse (some experts never used)
-- Lower temp: Experts may not specialize enough, reduced model capacity
-
-**Research Reference:**
-This parameter is conceptually related to temperature in softmax, but the actual implementation follows the Skywork-MoE gating logit normalization approach (see `router_lambda`).
-
----
-
-### `router_lambda`
-
-**Default:** `1.0`
-
-**Location:** `src/configuration_bibo.py:69`
-
-**What it does:**
-Scaling factor for normalized router logits before softmax. Controls **confidence/decisiveness** in expert selection by creating **low-entropy routing distributions**.
-
-**Purpose:** Increase confidence in expert selection (low entropy in router logits)
-
-**Implementation:**
-```python
-# src/modeling/ffn/router.py:45-50
-mean = router_logits.mean(dim=1, keepdim=True)
-std = router_logits.std(dim=1, keepdim=True) + 1e-6
-router_logits_norm = (router_logits - mean) / std
-router_logits_scaled = self.router_lambda * router_logits_norm
-routing_weights = F.softmax(router_logits_scaled, dim=1)
-```
-
-**How it works:**
-1. Router logits are first normalized to zero mean and unit std
-2. Then scaled by `router_lambda`
-3. Finally passed through softmax
-
-This ensures consistent behavior regardless of the magnitude of raw logits.
-
-**Mathematical formulation (Skywork-MoE, Equation 6):**
-```
-z̃ = λ · (z - μ) / σ
-g = softmax(z̃)
-```
-
-Where:
-- `z` = raw router logits
-- `μ` = mean of logits
-- `σ` = standard deviation of logits
-- `λ` = router_lambda (scaling factor)
-- `z̃` = normalized and scaled logits
-- `g` = final routing weights
-
-**What this controls:**
-- **Entropy of routing distribution** (confidence in expert selection)
-- **Sharpness of expert selection** (how decisively the router picks experts)
-- **Separation between expert logits** (forces model to create clear preferences)
-
-**Does NOT control:**
-- Load balancing across experts (that's `bias_update_*` parameters)
-- Which experts get selected (that's learned through training)
-
-**Tuning guidance:**
-- **λ = 1.0:** Standard normalization, balanced routing
-- **λ = 1.5-2.0:** Sharper routing, stronger expert specialization, **lower entropy**
-- **λ = 0.5-0.8:** Softer routing, **higher entropy**, more exploration
-
-**Pros:**
-- Higher λ: **Lower entropy** → clearer expert differentiation, more confident decisions, better specialization
-- Lower λ: **Higher entropy** → more uniform expert usage, stable training, more exploration
-
-**Cons:**
-- Higher λ: Risk of token dropping, load imbalance (some experts never selected)
-- Lower λ: Experts may not learn distinct specializations, mushy routing decisions
-
-**Research Reference:**
-[Skywork-MoE: A Deep Dive into Training Techniques for Mixture-of-Experts Language Models](https://arxiv.org/abs/2406.06563)
-
-Section 4.1 "Gating Logit Normalization" - This technique prevents high-entropy gate distributions and improves expert diversification.
-
-**Key findings from Skywork-MoE:**
-- Without normalization: gate outputs become nearly uniform (**high entropy** = no confidence)
-- With λ=1: Significant improvement in loss and token drop rate (**lower entropy** = more confidence)
-- With λ=2: Even sharper distributions (**very low entropy** = very confident), but λ=1 is sufficient for most cases
-
-**Entropy interpretation:**
-- **High entropy** (λ < 1.0): Router is uncertain, spreads probability across many experts
-- **Low entropy** (λ > 1.0): Router is confident, concentrates probability on few experts
-- **Goal:** Low entropy = confident, decisive expert selection
-
----
-
-### `router_noise`
-
-**Default:** `0` (disabled)
-
-**Location:** `src/configuration_bibo.py:55`
-
-**What it does:**
-Would add Gaussian noise to router logits during training for exploration. **Currently run at 0 and the
-noise-injection code in `router.py` is commented out (DEPRECATED, do not remove)** — forward-time
-randomness breaks gradient checkpointing's recompute without RNG preservation, and we train with
-`router_noise=0`. Kept for compat / future re-enable.
-
-**Implementation (DEPRECATED, commented out in `router.py`):**
-```python
-# if self.training and self.router_noise > 0:
-#     noise_stddev = math.sqrt(self.router_noise)
-#     noise = torch.randn_like(router_logits) * noise_stddev
-#     router_logits = router_logits + noise.detach()
-```
-
-**Tuning guidance:**
-- **0 (default):** No noise, deterministic routing (required for gradient checkpointing exactness).
-- Re-enabling requires uncommenting the block and preserving RNG state across checkpoint recompute.
+**Controls:** load distribution across experts, and prevents expert collapse. It does **not** touch
+the combine weights — the bias affects selection only.
 
 ---
 
@@ -269,22 +77,22 @@ Number of tokens (batch_size × seq_len) to process before updating router bias 
 
 **Purpose:** Ensure experts are selected evenly over the long run (load balancing)
 
-**Implementation:**
+**Implementation** (`src/modeling/ffn/moe.py::_balance_step`):
 ```python
-# src/modeling/ffn/moe.py:18-20
-self.register_buffer("tokens_processed", torch.tensor(0, dtype=torch.long))
 self.register_buffer("accumulated_tpe", torch.zeros(config.num_routed_experts, dtype=torch.float))
+self._fwd_step = 0        # host-side int: no CUDA buffer, no per-step .item() sync
+self._update_every = None # derived once from bias_update_threshold / tokens_per_forward
 
-# During forward pass (moe.py:60-68)
-batch_tokens = bsz * seq_len
-self.tokens_processed += batch_tokens
 self.accumulated_tpe += current_tpe.float()
-
-if self.tokens_processed >= self.bias_update_threshold:
+self._fwd_step += 1
+if self._fwd_step % self._update_every == 0:
+    dist.all_reduce(self.accumulated_tpe, op=dist.ReduceOp.SUM)   # if distributed
     tokens_per_expert = self.accumulated_tpe.clone()
-    self.tokens_processed.zero_()
     self.accumulated_tpe.zero_()
 ```
+The trigger counts **forward steps**, not device tokens, so every DDP rank fires the update on the
+same step and the `all_reduce` can never desync. (A `tokens_processed` buffer did this until
+Jul 1 2026; it forced a per-step host sync.)
 
 **How it works:**
 1. Accumulate token counts per expert across batches
@@ -306,23 +114,8 @@ def update_bias(self, tokens_per_expert: torch.Tensor):
     self.gate.bias.add_(self.bias_update_factor * deviation.sign())
 ```
 
-**What this controls:**
-- **Load balancing** (ensuring all experts get used evenly)
-- **Expert utilization distribution** (prevents expert collapse)
-- **Long-term fairness** in expert selection
-
-**Does NOT control:**
-- Confidence/entropy of routing decisions (that's `router_lambda`)
-- Sharpness of expert selection (that's `router_lambda`)
-- Which expert is best for a given token (that's learned through training)
-
-**Key distinction from `router_lambda`:**
-- `router_lambda`: Controls **HOW CONFIDENT** the router is (entropy of logits)
-- `bias_update_*`: Controls **WHICH EXPERTS** get selected over time (load distribution)
-
-**Analogy:**
-- `router_lambda` = "How decisively should I pick?" (confidence)
-- `bias_update_*` = "Am I picking all experts fairly?" (fairness)
+**What this controls:** load balancing / expert utilization / long-term selection fairness. It does
+**not** decide which expert is best for a given token — that is learned.
 
 **Tuning guidance:**
 - **8000 (default):** Update every ~8k tokens
@@ -352,8 +145,9 @@ batches_until_update = 8,000 / 4,096 ≈ 2 batches
 
 ### `bias_update_factor`
 
-**Default:** `None` → **auto-computed** as a Hill function of `num_routed_experts`
-(`(1 - exp(-n/48)) * 0.5`); pass an explicit float (e.g. `1e-2`) to override.
+**Default:** `None` → **auto-computed** as a Hill function of `num_routed_experts`:
+`round(0.35 * n**1.445 / (n**1.445 + 81), 4)`, bounded to [0, 0.35] and fit to f(8)=0.07,
+f(16)=0.1417, f(inf)=0.35. Pass an explicit float to override.
 
 **Location:** `src/configuration_bibo.py:56`
 
@@ -373,13 +167,8 @@ self.gate.bias.add_(self.bias_update_factor * deviation.sign())
 - Updates bias by: `bias += factor × sign(deviation)`
 - Only the sign matters (not magnitude), so this is a fixed-step update
 
-**What this controls:**
-- **Speed of load balancing** (how fast under-utilized experts get boosted)
-- **Magnitude of bias adjustments** (step size per update)
-
-**Does NOT control:**
-- Confidence/entropy of routing decisions (that's `router_lambda`)
-- Frequency of updates (that's `bias_update_threshold`)
+**What this controls:** speed of load balancing and the step size per update. Update *frequency* is
+`bias_update_threshold`.
 
 **Tuning guidance:**
 - **1e-2 (default):** Moderate adjustment
@@ -420,135 +209,6 @@ bias_update_factor = 2e-2
 - This parameter affects **load distribution** (which experts get used)
 - It does NOT affect **routing confidence** (how decisively experts are selected)
 - For routing confidence, use `router_lambda`
-
----
-
-## Shared Expert Scaling
-
-### `moe_shared_scaling`
-
-**Default:** `1.0` (auto-computed if left as 1.0)
-
-**Location:** `src/configuration_bibo.py:70`
-
-**What it does:**
-Scaling factor for shared expert output in MoE block. Balances the contribution of shared vs. routed experts.
-
-**Implementation:**
-```python
-# src/modeling/ffn/moe.py:115-116
-final_output = final_routed + (getattr(self, 'moe_shared_scaling', 1.0) * shared_combined)
-```
-
-**Auto-computation (if moe_shared_scaling == 1.0):**
-```python
-# src/configuration_bibo.py:130-152
-if moe_shared_scaling == 1.0:
-    try:
-        import numpy as np
-        def softmax(x):                  # numerically stable (matches the code)
-            e = np.exp(x - x.max())
-            return e / e.sum()
-        
-        n = self.num_routed_experts  # e.g., 16
-        k = self.num_experts_per_tok  # e.g., 6
-        s = self.num_shared_experts   # e.g., 1
-        
-        factors = []
-        for _ in range(10000):
-            logits = np.random.randn(n - s)
-            p = np.sort(softmax(logits))[::-1][:k - s]
-            factors.append(s**0.5 / (np.sum(p**2)**0.5))
-        
-        approx_lambda = float(np.mean(factors))
-        self.moe_shared_scaling = round(approx_lambda, 2)
-```
-
-**Mathematical intuition:**
-
-The formula computes:
-```
-λ = √s / ||p||₂
-```
-
-Where:
-- `s` = number of shared experts
-- `p` = top-k routing probabilities (sorted, excluding shared experts)
-- `||p||₂` = L2 norm of routing probabilities
-
-**Why this formula?**
-
-The goal is to balance the magnitude of contributions:
-- **Routed experts:** Output is weighted by routing probabilities `p`, so effective magnitude ~ `||p||₂`
-- **Shared experts:** Always active with weight 1, so effective magnitude ~ `√s`
-- **Scaling factor:** `λ = √s / ||p||₂` makes both contributions comparable
-
-**Example calculation:**
-```python
-# Configuration
-num_routed_experts = 16
-num_experts_per_tok = 6
-num_shared_experts = 1
-
-# Simulation (10,000 random routing scenarios)
-# Typical result: λ ≈ 0.35 - 0.45
-
-# With s=1: λ ≈ 0.40
-# With s=2: λ ≈ 0.57 (√2 ≈ 1.41 times larger)
-# With s=4: λ ≈ 0.80 (√4 = 2 times larger)
-```
-
-**Tuning guidance:**
-
-**Auto mode (recommended):**
-```python
-moe_shared_scaling = 1.0  # Triggers auto-computation
-```
-
-**Manual tuning:**
-- **< 0.5:** Reduce shared expert influence (more specialization)
-- **0.5-1.0:** Balanced contribution
-- **> 1.0:** Increase shared expert influence (more shared knowledge)
-
-**When to tune manually:**
-- If shared expert is learning too slowly → increase scaling
-- If routed experts are underutilized → decrease scaling
-- If you want to emphasize common knowledge → increase scaling
-- If you want to emphasize specialization → decrease scaling
-
-**Pros:**
-- Higher scaling: Stronger common knowledge, more stable
-- Lower scaling: More expert specialization, higher capacity
-
-**Cons:**
-- Higher scaling: Routed experts may be underutilized
-- Lower scaling: May lose common knowledge benefits
-
-**Research References:**
-
-1. **DeepSeek-V2/V3:**
-   - [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437)
-   - Uses shared experts to capture common knowledge across all tokens
-   - Shared experts are always active, routed experts provide specialization
-
-2. **Muon Optimizer Context:**
-   - [Muon: An optimizer for hidden layers](https://kellerjordan.github.io/posts/muon/)
-   - While Muon is an optimizer, the shared expert scaling concept appears in discussions of MoE training efficiency
-   - Proper scaling of shared vs. routed experts is crucial for stable training
-
-**Architecture insight:**
-
-```
-Input
-  ↓
-  ├─→ Shared Expert (always active) ──→ × moe_shared_scaling ──┐
-  │                                                              │
-  └─→ Router → Top-K Routed Experts → Weighted Sum ────────────┤
-                                                                 ↓
-                                                            Final Output
-```
-
-The shared expert acts as a "baseline" that all tokens pass through, while routed experts provide token-specific specialization.
 
 ---
 
@@ -661,21 +321,11 @@ prevent attention fading at long context. Details: **[docs/ssmax.md](ssmax.md)**
 How load balancing is enforced across experts:
 - `"none"` — no balancing.
 - `"bias"` — heuristic router-bias updates (see `bias_update_*`). The BiBo default.
-- `"aux_loss"` — Switch-Transformer / Qwen-style auxiliary load-balancing loss (uses `aux_loss_coef`).
+- `"none"` — no balancing.
 
-### `aux_loss_coef`
-
-**Default:** `0.01` · **Location:** `src/configuration_bibo.py:63`
-
-Coefficient on the auxiliary load-balancing loss. **Only used when `load_balance_strategy="aux_loss"`.**
-`1e-2` is the ablated consensus (Switch-T, ST-MoE, OLMoE).
-
-### `use_router_logit_norm`
-
-**Default:** `False` · **Location:** `src/configuration_bibo.py:60`
-
-z-score normalize router logits before softmax (Skywork-MoE style). Note `router_lambda` scaling is
-applied on top of this normalization in the router.
+Only those two are valid; the config rejects anything else. (An `"aux_loss"` strategy with an
+`aux_loss_coef` was documented here but never existed in BiBo — the Qwen baseline has its own
+`router_aux_loss_coef`.)
 
 ### `router_activation`
 
@@ -703,30 +353,17 @@ only take effect when this is `True`.
 
 ## Quick Reference Table
 
-### Router Mechanisms Summary
-
-| Mechanism | Parameters | Purpose | What it Controls |
-|-----------|-----------|---------|------------------|
-| **Logit Normalization** | `router_lambda` | Confidence in expert selection | Entropy of routing distribution (decisiveness) |
-| **Bias Updates** | `bias_update_threshold`, `bias_update_factor` | Load balancing | Which experts get selected over time (fairness) |
-
-**Key insight:** These are independent mechanisms that solve different problems.
-
 ### All Parameters
 
 | Parameter | Default | Purpose | Tuning Range |
 |-----------|---------|---------|--------------|
-| `router_lambda` | 1.0 | **Routing confidence (entropy control)** | 0.5-2.0 |
 | `bias_update_threshold` | 8000 | **Load balancing frequency** (tokens between updates) | 2k-50k |
 | `bias_update_factor` | None (auto) | **Load balancing step size** (auto: Hill fn of n) | 1e-3 to 5e-2 |
-| `load_balance_strategy` | "bias" | How load is balanced | "none" / "bias" / "aux_loss" |
-| `aux_loss_coef` | 0.01 | Aux load-balance loss coef (only if strategy="aux_loss") | 1e-3 to 1e-2 |
-| `use_router_logit_norm` | False | z-score normalize logits before softmax (Skywork) | bool |
-| `router_activation` | "none" | Activation on raw logits before softmax | "none"/"relu"/"silu" |
-| `gate_type` | "sigmoid" | Gating mechanism | "sigmoid" / "softmax" |
-| `router_temperature` | 1.3 | Legacy parameter (not actively used) | 0.8-2.0 |
-| `router_noise` | 0 | Exploration noise (DEPRECATED, code commented out) | 0 |
-| ~~`router_type`~~ | removed | Conv router removed Jul 26 2026 — MLP router only | — |
+| `load_balance_strategy` | "bias" | How load is balanced | "none" / "bias" |
+| `router_activation` | "none" | Activation on the logits, before the gate | "none"/"relu"/"silu" |
+| `gate_type` | "sigmoid" | Gating mechanism | "sigmoid" / "situ" / "softmax" |
+| `norm_topk_prob` | True | Softmax the gathered top-k weights to sum to 1 | bool |
+| `routed_scaling_factor` | 1.0 | Post-norm routed-weight scale | 1.0 = no-op |
 | `kernel_size` | 3 | Conv SHARED-EXPERT kernel size (conv router removed Jul 26 2026) | 3-7 (odd) |
 | `moe_shared_scaling` | 1.0 (auto) | Shared expert output scaling | 0.3-1.5 |
 | `use_shared_expert` | False | Enable the always-on shared expert (off = match Qwen3MoE) | bool |
@@ -743,34 +380,26 @@ only take effect when this is `True`.
 ### Conservative (Stable Training)
 ```python
 config = BiBoConfig(
-    router_lambda=0.8,           # Softer routing
     bias_update_threshold=16_000,  # Infrequent updates
     bias_update_factor=5e-3,     # Small steps
-    moe_shared_scaling=1.0,      # Auto (or 0.6 for more shared influence)
 )
 ```
 
 ### Balanced (Default)
 ```python
 config = BiBoConfig(
-    router_lambda=1.0,           # Standard normalization
     bias_update_threshold=8_000,    # Regular updates (default)
     bias_update_factor=None,     # Auto-computed (Hill fn of num_routed_experts)
-    moe_shared_scaling=1.0,      # Auto-computed
 )
 ```
 
 ### Aggressive (Fast Specialization)
 ```python
 config = BiBoConfig(
-    router_lambda=1.5,           # Sharper routing
     bias_update_threshold=4_000,    # Frequent updates
     bias_update_factor=2e-2,     # Large steps
-    moe_shared_scaling=1.0,      # Auto (or 0.3 for more specialization)
 )
 ```
-
-> `router_noise` is omitted from these presets — it is DEPRECATED and run at 0 (see its section).
 
 ### Long Context (Extended Sequences)
 ```python
@@ -809,14 +438,6 @@ bias_magnitude = model.moe_layer.gate.bias.abs().mean()
 # Should stabilize after initial training
 ```
 
-**4. Shared vs. Routed Contribution:**
-```python
-# Compare magnitudes
-shared_norm = shared_output.norm()
-routed_norm = routed_output.norm()
-ratio = shared_norm / routed_norm
-# Should be close to 1.0 with auto-scaling
-```
 
 ### Common Issues and Solutions
 
@@ -947,8 +568,8 @@ If any of these are added as learnable parameters in the future:
 
 | Parameter | Why L2 Kills It |
 |-----------|-----------------|
-| Learnable `router_lambda` | L2 → λ→0 → post-normalization logits collapse → uniform routing |
-| Learnable `router_temperature` | L2 → τ→0 → softmax degenerates |
+| Learnable `routed_scaling_factor` | L2 → scale→0 → the routed branch is silenced |
+| Per-expert scale vector (`expert_scale`) | L2 → →0 → per-expert preference erased |
 | Per-expert preference bias (α) | L2 → α→0 → routing preferences erased → uniform selection |
 | Any scalar gate on routing logits | Same class — directly controls routing sharpness |
 
@@ -960,7 +581,7 @@ for name, param in model.named_parameters():
         continue
     if param.ndim == 1:  # biases, LayerNorm/RMSNorm weights
         no_decay_params.append(param)
-    elif any(k in name for k in ('router_lambda', 'router_temperature', 'routing_alpha')):
+    elif any(k in name for k in ('router_scale', 'expert_scale', 'routing_alpha')):
         no_decay_params.append(param)  # routing scale/preference — never decay
     else:
         decay_params.append(param)  # standard weight matrices — decay is fine
@@ -972,8 +593,6 @@ for name, param in model.named_parameters():
 |-----------|--------|
 | `gate_proj.weight` | L2 OK — ordinary projection |
 | `router.bias` | N/A — `requires_grad=False`, optimizer ignores it |
-| `router_lambda` | Currently a config constant, not a parameter |
-| `router_temperature` | Currently unused (legacy config field) |
 
 ---
 

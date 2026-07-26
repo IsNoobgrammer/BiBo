@@ -19,13 +19,7 @@ __all__ = ['BiBoAttention']
 
 
 class BiBoAttention(nn.Module):
-    """
-    GQA attention with optional SSMax scaling.
-    
-    Args:
-        config: Model config
-        layer_idx: Layer index
-    """
+    """GQA attention with optional SSMax scaling, XSA, and per-layer SWA/global dispatch."""
     def __init__(self, config: BiBoConfig, layer_idx: int, **kwargs):
         super().__init__()
         self.config = config
@@ -37,25 +31,21 @@ class BiBoAttention(nn.Module):
         self.layer_idx = layer_idx
         self.use_xsa = config.use_xsa
         self.attention_dropout = config.attention_dropout
-        self.scaling = self.head_dim ** -0.5     # 1/sqrt(head_dim); used by both SDPA and eager paths
-        # Dim-wise partial RoPE: first rope_dim of EVERY head rotates, the rest is NoPE.
-        self.rope_dim = config.rope_dim
+        self.scaling = self.head_dim ** -0.5
+        self.rope_dim = config.rope_dim   # dim-wise partial RoPE: first rope_dim rotates, rest NoPE
 
-        # Hybrid SWA vs global (docs/attention_layers.md §2). hybrid_layer_pattern[idx]==1 => sliding.
         pattern = getattr(config, "hybrid_layer_pattern", None)
         self.is_swa = bool(pattern[layer_idx]) if pattern is not None else False
         self.sliding_window = config.sliding_window if self.is_swa else None
-        # SSMax forced OFF on SWA (n capped by window => redundant constant temperature).
-        self.use_ssmax = config.use_ssmax and not self.is_swa
-        # Attention sink: SWA gets it by the norm; global only if configured (G1/G3). Single
-        # learnable scalar per head, appended as a value-less softmax column (GPT-OSS / MiMo style).
+        self.use_ssmax = config.use_ssmax and not self.is_swa   # window caps n => SSMax redundant
+        # One learnable scalar per head, appended as a value-less softmax column (GPT-OSS / MiMo).
+        # SWA gets it by default; global only under G1/G3. See docs/attention_layers.md.
         use_sink = ((self.is_swa and config.add_swa_attention_sink_bias)
                     or (not self.is_swa and config.add_full_attention_sink_bias))
         self.attention_sink_bias = nn.Parameter(torch.zeros(self.num_heads)) if use_sink else None
 
         if self.use_ssmax:
-            # SSMax init: scale * log(typical_kv_len) ≈ 1.0 at step 0
-            # Prevents attention collapse early
+            # init so scale*log(typical_kv_len) ≈ 1.0 at step 0 — starts neutral instead of ~6x sharp
             typical_log = math.log(max(config.max_position_embeddings / 2, 2.0))
             init_val = 1.0 / typical_log
             self.ssmax_scale = nn.Parameter(
@@ -90,8 +80,7 @@ class BiBoAttention(nn.Module):
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        # Dim-wise partial RoPE: rotate the first rope_dim of EVERY head, pass the rest through (NoPE).
-        # cos/sin are sized rope_dim (built at model level).
+        # cos/sin are sized rope_dim (built at model level); the tail passes through as NoPE.
         cos, sin = position_embeddings
         rd = self.rope_dim
         if rd < self.head_dim:
@@ -103,28 +92,24 @@ class BiBoAttention(nn.Module):
         else:
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # KV cache
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        # SSMax query scaling. With a padding mask, n must count REAL keys only (grid positions
-        # over-count by the pad width): mask.cumsum at each query's grid position == real causal
-        # context length. SSMax runs only on global layers, whose KV is never window-cropped, so
-        # the mask always covers the full kv_len.
+        # SSMax's n must count REAL keys only — grid positions over-count by the pad width, and
+        # mask.cumsum at a query's grid position is exactly its real causal context length.
         kv_len = key_states.shape[-2]
         if self.use_ssmax:
             context_lens = (attention_mask.cumsum(-1)[:, -query_states.shape[-2]:]
                             if attention_mask is not None else None)
             query_states = apply_ssmax_query_scaling(query_states, kv_len, self.ssmax_scale, context_lens)
 
-        # Dispatch to the per-layer attention flavor. All masking (band/causal/padding) and sink
-        # handling lives inside the flavor modules; attention_mask here is the raw 2D (B, K_total)
-        # padding mask (1=real, 0=pad) or None. value_states stays GROUPED (un-repeated) so XSA's
-        # enable_gqa broadcast below is consistent across all paths.
+        # All masking (band/causal/padding) and sink handling lives inside the flavor modules;
+        # `attention_mask` here is the raw 2D (B, K_total) padding mask (1=real, 0=pad) or None.
+        # value_states stays GROUPED so XSA's enable_gqa broadcast is consistent on every path.
         if self.is_swa:
-            # Eager only, by design — the fast path for SWA is a dedicated sink-aware banded
-            # kernel (not SDPA); this eager core is its exact numerics target.
+            # Eager only by design: SWA's fast path is a dedicated sink-aware banded kernel, not
+            # SDPA, and this eager core is that kernel's exact numerics target.
             attn_output, probs = swa_attention(
                 query_states, key_states, value_states, self.attention_sink_bias,
                 sliding_window=self.sliding_window,
@@ -144,11 +129,9 @@ class BiBoAttention(nn.Module):
         if self.use_xsa:
             attn_output = apply_xsa(attn_output, value_states, enable_gqa=True)
 
-        # Reshape output
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(*input_shape, -1)
         attn_output = self.o_proj(attn_output)
 
-        # No cache in the return: past_key_value is a shared object mutated in place by
-        # .update() — threading it back through every layer return is HF-legacy ritual.
+        # No cache returned: past_key_value is mutated in place by .update().
         return attn_output, attn_weights

@@ -1,5 +1,11 @@
 # BiBo Kernel Optimization — Benchmark Report
 
+> ## ⚠️ HISTORICAL — the kernels benchmarked here are not in this repo
+>
+> **All custom kernels were removed on Jun 30 2026** (moved to a separate kernels repo), along with
+> the `use_fused_ce` / `use_fused_linear_ce` config knobs. Numbers below are a measurement record,
+> not a description of current behaviour.
+
 > Generated: June 2026 | Device: RTX 3050 Laptop (4GB, sm_86) | PyTorch 2.6.0+cu124 | Triton 3.7.0
 
 ## ⚠️ CORRECTION (June 24, 2026) — read this before trusting numbers below
