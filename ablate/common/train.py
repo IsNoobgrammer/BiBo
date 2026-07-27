@@ -457,6 +457,12 @@ def main():
           f"flops/token ~{flops_per_token/1e9:.2f} GFLOP", flush=True)
     model.train()
     t0 = time.time(); _last_t = t0; _last_tok = 0; _last_step = 0
+    # Running loss over the last LOSS_WINDOW steps. The per-step `loss` is ONE global batch and
+    # swings ~0.3 between adjacent steps, so reading a single step (least of all the last one) is
+    # mostly reading batch noise -- every arm comparison should use the window, not the point.
+    from collections import deque
+    LOSS_WINDOW = 20
+    _loss_hist = deque(maxlen=LOSS_WINDOW)
     for step in range(total_steps):
         for o in opts:
             o.zero_grad(set_to_none=True)
@@ -468,6 +474,7 @@ def main():
                            getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok) / args.grad_accum
             loss.backward()
             loss_val += loss.item()
+        _loss_hist.append(loss_val)
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) if args.grad_clip > 0 else \
             torch.sqrt(sum(p.grad.float().pow(2).sum() for p in model.parameters() if p.grad is not None))
         for o in opts:
@@ -476,6 +483,7 @@ def main():
             s.step()
         if step % args.log_every == 0 or step == total_steps - 1:
             lv, gn = loss_val, float(gnorm)
+            lv_run = sum(_loss_hist) / len(_loss_hist)         # mean over the last LOSS_WINDOW steps
             lr = opts[0].param_groups[0]["lr"]
             toks = (step + 1) * tok_per_step
             _now = time.time(); _dt = _now - _last_t
@@ -501,7 +509,7 @@ def main():
                     # --glu_budget r it should settle near 1-r. 0.000 means no special experts.
                     + (f" spl={rt['train/special_load']:.3f}({rt['train/neg_identity_load']:.3f})"
                        if rt.get("train/special_load", 0.0) > 0 else "")) if rt else ""
-            print(f"  step {step}/{total_steps} loss={lv:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
+            print(f"  step {step}/{total_steps} loss={lv:.4f} run{len(_loss_hist)}={lv_run:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
                   f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{rt_s} elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"
                   f"{'' if fin else '  <<NON-FINITE>>'}", flush=True)
@@ -556,7 +564,7 @@ def main():
             print(f"  [final eval] FAILED: {type(e).__name__}: {str(e)[:200]} (checkpoints already pushed)",
                   flush=True)
     res = {"arm": args.arm, "seed": args.seed, "steps": total_steps, "tokens": total_steps * tok_per_step,
-           "final_loss": loss_val, "params_total": total, "params_active": active,
+           "final_loss": loss_val, "final_loss_running": sum(_loss_hist) / len(_loss_hist), "params_total": total, "params_active": active,
            "ckpt": ckpt, "wall_s": time.time() - t0, "eval": final_eval, "config": vars(args)}
     with open(os.path.join(out_dir, f"{run_name}_result.json"), "w") as f:
         json.dump(res, f, indent=2)
@@ -569,7 +577,9 @@ def main():
                 pass
     if wb:
         wb.finish()
-    print(f"[{run_name}] DONE final_loss={loss_val:.4f} ckpt={ckpt}", flush=True)
+    final_loss_run = sum(_loss_hist) / len(_loss_hist)
+    print(f"[{run_name}] DONE final_loss={loss_val:.4f} final_loss_run{len(_loss_hist)}={final_loss_run:.4f} "
+          f"ckpt={ckpt}", flush=True)
 
 
 if __name__ == "__main__":
