@@ -15,6 +15,7 @@ import argparse
 import contextlib
 import torch
 from .models import build_arm, count_params
+from src.configuration_bibo import GATE_TYPES, SIGNED_GATES
 from . import patches as patchmod
 from .optim import build_optimizers
 from .schedule import make_scheduler
@@ -217,7 +218,7 @@ def main():
     ap.add_argument("--no_neg_identity", dest="neg_identity_expert", action="store_false")  # drop -Identity (code 4); test +Identity alone
     ap.add_argument("--router_type", choices=["mlp", "conv"], default="mlp")  # conv = causal Conv1d router (run tag _rconv{K}); weight is 2D (E,H*K) so Muon whitens EXPERTS not taps -- see ablate/common/optim.py
     ap.add_argument("--router_kernel", type=int, default=3)                   # conv router tap count (only used when --router_type conv)
-    ap.add_argument("--router_gate", choices=["sigmoid", "situ"], default="sigmoid")  # router score fn; situ = tanh(g)*sig(g) (run tag _rt-situ)
+    ap.add_argument("--router_gate", choices=list(GATE_TYPES), default="sigmoid")  # router score fn (run tag _rt-<gate>-<norm>); shapes documented at GATE_TYPES in src/configuration_bibo.py
     ap.add_argument("--router_norm", choices=["auto", "sum", "softmax", "l1"], default="auto")  # auto: sum for sigmoid, softmax for situ (the sum-to-1 pick per gate)
     ap.add_argument("--norm_topk_prob", type=int, default=1)  # 1 = normalize top-k weights to sum to 1 (BiBo model default). 0 = raw scores as weights (old ablate behavior)
     ap.add_argument("--router_log", type=int, default=1)
@@ -281,21 +282,24 @@ def main():
     dt = _DT[args.precision]
     patch_list = [p.strip() for p in args.patches.split(",") if p.strip()]
     use_fused_ce = "ce" in patch_list
-    patchmod.ROUTER_GATE = args.router_gate                            # router score fn (sigmoid | situ)
-    # 'auto' picks the norm that actually sums to 1 for the chosen gate: sigmoid is non-negative so
-    # the shipped w/sum(w) is proper; situ is SIGNED, where only softmax is all-positive + sum-to-1.
+    patchmod.ROUTER_GATE = args.router_gate                            # router score fn, see GATE_TYPES
+    # 'auto' picks the norm that actually sums to 1 for the chosen gate: the non-negative gates work
+    # with the shipped w/sum(w); SIGNED gates need softmax, the only all-positive sum-to-1 option.
     router_norm = args.router_norm
     if router_norm == "auto":
-        router_norm = "softmax" if args.router_gate == "situ" else "sum"
+        router_norm = "softmax" if args.router_gate in SIGNED_GATES else "sum"
     patchmod.ROUTER_NORM = router_norm
     from . import configs as _cfgmod
     _cfgmod.SHARED["norm_topk_prob"] = bool(args.norm_topk_prob)
     if not args.norm_topk_prob:
         print("[router] warning: norm_topk_prob=0 -> NO top-k normalization; raw gate scores are the "
               f"combine weights (they will NOT sum to 1) and --router_norm {router_norm} is INERT.", flush=True)
-    elif args.router_gate == "situ" and router_norm == "sum":
-        print("[router] warning: signed gate 'situ' with norm 'sum' -- weights escape [0,1], can flip sign "
-              "and explode on near-cancel; 'softmax' is the all-positive sum-to-1 choice", flush=True)
+    elif args.router_gate in SIGNED_GATES and router_norm == "sum":
+        print(f"[router] warning: signed gate '{args.router_gate}' with norm 'sum' -- weights escape [0,1], can "
+              "flip sign and explode on near-cancel; 'softmax' is the all-positive sum-to-1 choice", flush=True)
+    elif args.router_gate == "sqsp" and router_norm == "sum":
+        print("[router] note: 'sqsp' is UNBOUNDED above, so under div-sum a single expert can take an "
+              "arbitrarily large share -- watch max expert load on this arm", flush=True)
     print(f"[router] gate={args.router_gate} norm={router_norm} norm_topk_prob={bool(args.norm_topk_prob)}", flush=True)
     patchmod.ROUTER_SCALE = args.routed_scaling_factor
     _scale_on = (args.routed_scaling_factor != 1.0 or args.routed_scaling_learnable

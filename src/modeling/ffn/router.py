@@ -5,9 +5,36 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from src.configuration_bibo import BiBoConfig
+from src.configuration_bibo import BiBoConfig, GATE_TYPES
 
-__all__ = ['BiBoMoERouter']
+__all__ = ['BiBoMoERouter', 'gate_scores']
+
+
+def gate_scores(logits: torch.Tensor, gate_type: str) -> torch.Tensor:
+    """Router logits -> per-expert scores. See GATE_TYPES in configuration_bibo.py for the shapes.
+
+    SINGLE DEFINITION ON PURPOSE. ablate/common/patches.py imports this instead of keeping its own
+    copy: the two implementations had already drifted once (the patched forward silently dropped the
+    boundary-gap probe, so every non-sigmoid arm logged gap=0.0000 until it was caught).
+    """
+    if gate_type == "sigmoid":
+        return torch.sigmoid(logits)
+    if gate_type == "situ":
+        # SiTU = sigmoid(x)*tanh(x). Range ~(-0.2785, 1), min at x ≈ -0.78, and NON-MONOTONIC in the
+        # logit: f(-5) ≈ -0.0067 > f(-0.78) ≈ -0.2785, so a strongly-rejected expert can outrank a
+        # mildly-rejected one in the top-k ordering.
+        return torch.sigmoid(logits) * torch.tanh(logits)
+    if gate_type == "softmax":
+        return F.softmax(logits, dim=1)
+    if gate_type == "tsig":
+        return torch.tanh(torch.sigmoid(logits))
+    if gate_type == "sigtanh":
+        return torch.sigmoid(torch.tanh(logits))
+    if gate_type == "sqsp":
+        # d/dx sqrt(softplus) = sigmoid(x) / (2*sqrt(softplus(x))). The sqrt looks like it should blow
+        # up as x -> -inf, but softplus ~ e^x there so the ratio ~ e^(x/2)/2 -> 0. Safe in fp32.
+        return torch.sqrt(F.softplus(logits))
+    raise ValueError(f"gate_type must be one of {GATE_TYPES}, got '{gate_type}'")
 
 
 class BiBoMoERouter(nn.Module):
@@ -101,19 +128,7 @@ class BiBoMoERouter(nn.Module):
         if self.router_temperature != 1.0:
             router_logits = router_logits / self.router_temperature
 
-        if self.gate_type == "sigmoid":
-            scores = torch.sigmoid(router_logits)
-        elif self.gate_type == "situ":
-            # SiTU = sigmoid(x)*tanh(x). Range ~(-0.2785, 1), min at x ≈ -0.78, and NON-MONOTONIC
-            # in the logit: f(-5) ≈ -0.0067 > f(-0.78) ≈ -0.2785, so a strongly-rejected expert can
-            # outrank a mildly-rejected one in the top-k ordering.
-            scores = torch.sigmoid(router_logits) * torch.tanh(router_logits)
-        elif self.gate_type == "softmax":
-            scores = F.softmax(router_logits, dim=1)
-        else:
-            raise ValueError(
-                f"gate_type must be 'sigmoid', 'situ', or 'softmax', got '{self.gate_type}'"
-            )
+        scores = gate_scores(router_logits, self.gate_type)
 
         # Diagnostic, OFF unless a harness turns it on. Mean rank-k minus rank-(k+1) RAW score gap:
         # the SELECTION-BOUNDARY gap. This is the quantity the load-balancing bias actually competes

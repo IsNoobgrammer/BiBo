@@ -5,6 +5,23 @@ logger = logging.get_logger(__name__)
 
 BIBO_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
+# Router gate activations. Defined HERE (a leaf module) so config validation, the router, the
+# ablate patch and the CLI all read one list instead of four drifting copies.
+#   sigmoid   baseline, span ~[0.007,0.993] over logits +-5, floor 0.007
+#   situ      sigmoid(x)*tanh(x). SIGNED and NON-MONOTONIC -> needs norm_topk_prob=True (div-sum breaks)
+#   softmax   normalizes across experts before top-k
+#   tsig      tanh(sigmoid(x)) in (0,0.762). tanh is CONCAVE on [0,1] so it compresses the TOP of the
+#             sigmoid harder than the bottom: ASYMMETRIC (0 sits 60.6% up the span), shrinking
+#             differences among HIGH-scoring experts. Less gradient-uniform than sigmoid (0.256 vs
+#             0.420 over +-2) -- it is NOT a temperature, despite looking like one when plotted.
+#   sigtanh   sigmoid(tanh(x)) in (0.269,0.731). tanh saturates first => soft clamp. Highest FLOOR of
+#             any bounded gate (min/max 0.368) but nearly flat past |x|~2.5, so confident experts stop
+#             differing by WEIGHT (selection is unaffected -- still monotone).
+#   sqsp      sqrt(softplus(x)). UNBOUNDED above (2.24 at x=5) and EXPANDS the top rather than
+#             compressing it. Under div-sum a runaway expert has no ceiling: watch max expert load.
+GATE_TYPES = ("sigmoid", "situ", "softmax", "tsig", "sigtanh", "sqsp")
+SIGNED_GATES = ("situ",)          # gates whose scores can go negative -> div-sum normalization is invalid
+
 
 class BiBoConfig(PretrainedConfig):
     r"""
@@ -67,7 +84,7 @@ class BiBoConfig(PretrainedConfig):
         # ── Router ───────────────────────────────────────────────
         router_type="mlp",    # "mlp" (Linear, default) | "conv" (causal Conv1d over kernel_size taps)
         kernel_size=3,        # kernel width for BOTH the conv router and the conv shared expert
-        gate_type="sigmoid",       # "sigmoid" | "situ" (SIGNED, needs norm_topk_prob=True) | "softmax"
+        gate_type="sigmoid",       # one of GATE_TYPES (top of this file); "situ" is SIGNED -> needs norm_topk_prob=True
         router_temperature=1.0,    # logits are divided by this BEFORE the gate. T>1 flattens the
                                    # score distribution (derivative scales exactly 1/T), T<1 sharpens.
                                    # NOT redundant with the router weight scale under Muon: Muon pins
@@ -338,13 +355,11 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError(
                 f"router_activation must be 'none', 'relu', or 'silu', got '{self.router_activation}'"
             )
-        if self.gate_type not in ("sigmoid", "situ", "softmax"):
-            raise ValueError(
-                f"gate_type must be 'sigmoid', 'situ', or 'softmax', got '{self.gate_type}'"
-            )
+        if self.gate_type not in GATE_TYPES:
+            raise ValueError(f"gate_type must be one of {GATE_TYPES}, got '{self.gate_type}'")
         # A signed gate with ÷sum-style normalization off means the combine weights can be negative
         # AND unnormalized. Softmax normalization (norm_topk_prob=True) is what makes "situ" safe.
-        if self.gate_type == "situ" and not self.norm_topk_prob and self.num_experts_per_tok > 1:
+        if self.gate_type in SIGNED_GATES and not self.norm_topk_prob and self.num_experts_per_tok > 1:
             raise ValueError(
                 "gate_type='situ' produces SIGNED scores; set norm_topk_prob=True so the top-k "
                 "weights are softmax-normalized (positive, sum to 1). Pass norm_topk_prob=True, "

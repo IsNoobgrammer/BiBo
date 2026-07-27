@@ -82,12 +82,13 @@ def router_scale_stats(model):
 
 
 def _gate_scores(router_logits, gate_type):
-    """Router logits -> per-expert scores. Mirrors router.py Step 4 + the 'situ' ablation arm."""
-    if ROUTER_GATE == "situ":
-        return torch.tanh(router_logits) * torch.sigmoid(router_logits)
-    if gate_type == "sigmoid":
-        return torch.sigmoid(router_logits)
-    return torch.softmax(router_logits, dim=1)
+    """Router logits -> per-expert scores, DELEGATED to the model's own gate_scores().
+
+    This used to re-implement the gate here, which meant every new gate had to be added twice and
+    the ablation could silently measure something the model would never do. ROUTER_GATE (set from
+    --router_gate) is the ablation override; it wins over the config's gate_type."""
+    from src.modeling.ffn.router import gate_scores
+    return gate_scores(router_logits, ROUTER_GATE or gate_type)
 
 
 def _norm_topk(top_k_weights):
