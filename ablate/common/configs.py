@@ -62,7 +62,8 @@ def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_
                          use_ssmax=False, use_xsa=False, balance_exclude_specials=False,
                          pos_identity_expert=True, neg_identity_expert=True,
                          router_type="mlp", kernel_size=3, glu_token_budget=None,
-                         bias_update_mode="sign", top_k=None, moe_intermediate_size=None):
+                         bias_update_mode="sign", top_k=None, moe_intermediate_size=None,
+                         router_temperature=1.0):
     from src.configuration_bibo import BiBoConfig
     # DeepSeek-style aux-loss-free balancing pairs with SIGMOID gating (bias added to sigmoid scores);
     # with no balancing we use softmax (Qwen-matched). So gate_type follows load_balance.
@@ -95,7 +96,7 @@ def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_
         use_xsa=use_xsa, use_ssmax=use_ssmax,    # ablation axes (default OFF): XSA + scalable-softmax
         add_full_attention_sink_bias=False, add_swa_attention_sink_bias=False,
         hybrid_layer_pattern=None,        # all-global attention (no SWA)
-        gate_type=gate, router_activation="none",
+        gate_type=gate, router_activation="none", router_temperature=router_temperature,
         # ablation axis: "mlp" (Linear, default) | "conv" (causal Conv1d over kernel_size taps).
         # The conv router weight is stored 2D (E, H*kernel_size) so Muon orthogonalizes per EXPERT,
         # not per kernel tap -- see the big note atop ablate/common/optim.py before touching this.

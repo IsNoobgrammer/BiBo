@@ -135,7 +135,8 @@ BiBoForCausalLM
 | `special_expert_pairs` | 1 | Pairs of (**+Identity, −Identity**) param-free special experts. Per-type count — bump it to give signed pass-through more routing capacity. Toggle either sign off with `pos_identity_expert` / `neg_identity_expert`. |
 | `num_experts_per_tok` | 6 | Top-K routing |
 | ~~`router_type`~~ | removed | **Conv router REMOVED (Jul 26 2026)** — MLP router only. `kernel_size` survives but now serves ONLY the conv shared expert (`shared_expert_type="conv"`). |
-| ~~`router_lambda`~~ / ~~`use_router_logit_norm`~~ / ~~`router_temperature`~~ | removed | Skywork logit-norm deleted Jun 28 2026 (`router_temperature` was never implemented) |
+| ~~`router_lambda`~~ / ~~`use_router_logit_norm`~~ | removed | Skywork logit-norm deleted Jun 28 2026 |
+| `router_temperature` | 1.0 | Logits are divided by `T` **before** the gate, so `sigma(x/T)` flattens the score spread by exactly `1/T` (`T>1` flatter, `T<1` sharper). Applied to logits, not scores, so the selection bias is untouched — but flatter scores shrink the top-k boundary gap, which *raises* `bias_update_factor`'s control authority. Not redundant with the router weight's scale: Muon pins its spectral norm, so the model cannot rescale logits to absorb `T`. (Was listed here as "never implemented" until Jul 27 2026.) |
 | ~~`router_noise`~~ | removed | **DELETED Jul 26 2026** — never enabled; re-adding needs RNG preservation for grad checkpointing |
 | `bias_update_factor` | 0.001 | Load-balancing step `u`. **FIXED, not a function of `n`** (the auto-Hill that grew 0.07→0.35 with expert count was removed Jul 26 2026 — it was backwards; the top-k boundary gap *shrinks* as experts are added). `sign()` never returns 0, so the bias dithers ±`u` forever and `u` is the steady-state routing-noise floor: it must stay well under the boundary gap. 0 disables balancing. |
 | `bias_update_threshold` | 100K | Tokens between bias updates |

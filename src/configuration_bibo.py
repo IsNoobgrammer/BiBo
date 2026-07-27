@@ -68,6 +68,12 @@ class BiBoConfig(PretrainedConfig):
         router_type="mlp",    # "mlp" (Linear, default) | "conv" (causal Conv1d over kernel_size taps)
         kernel_size=3,        # kernel width for BOTH the conv router and the conv shared expert
         gate_type="sigmoid",       # "sigmoid" | "situ" (SIGNED, needs norm_topk_prob=True) | "softmax"
+        router_temperature=1.0,    # logits are divided by this BEFORE the gate. T>1 flattens the
+                                   # score distribution (derivative scales exactly 1/T), T<1 sharpens.
+                                   # NOT redundant with the router weight scale under Muon: Muon pins
+                                   # the weight's spectral norm, so the model cannot rescale its own
+                                   # logits to absorb T. (Listed as "removed, never implemented" in
+                                   # AGENTS.md until Jul 27 2026 -- this is the real implementation.)
         router_activation="none",  # on the LOGITS, before gate_type: "none" | "relu" | "silu"
         norm_topk_prob=True,       # softmax the gathered top-k weights to sum to 1 (not MiMo's ÷sum)
         routed_scaling_factor=1.0,  # post-norm routed-weight scale; 1.0 = no-op
@@ -174,6 +180,7 @@ class BiBoConfig(PretrainedConfig):
         self.router_type = router_type
         self.kernel_size = kernel_size
         self.gate_type = gate_type
+        self.router_temperature = router_temperature
         self.router_activation = router_activation
         self.norm_topk_prob = norm_topk_prob
         self.routed_scaling_factor = routed_scaling_factor
@@ -325,6 +332,8 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError(f"router_type must be 'mlp' or 'conv', got '{self.router_type}'")
         if self.router_type == "conv" and self.kernel_size < 1:
             raise ValueError(f"router_type='conv' needs kernel_size >= 1, got {self.kernel_size}")
+        if self.router_temperature <= 0:
+            raise ValueError(f"router_temperature must be > 0, got {self.router_temperature}")
         if self.router_activation not in ("none", "relu", "silu"):
             raise ValueError(
                 f"router_activation must be 'none', 'relu', or 'silu', got '{self.router_activation}'"

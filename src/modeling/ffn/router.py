@@ -29,6 +29,7 @@ class BiBoMoERouter(nn.Module):
         self.router_activation = getattr(config, 'router_activation', 'none')
         self.norm_topk_prob = getattr(config, 'norm_topk_prob', True)
         self.gate_type = getattr(config, 'gate_type', 'sigmoid')
+        self.router_temperature = float(getattr(config, 'router_temperature', 1.0))
         self.routed_scaling_factor = getattr(config, 'routed_scaling_factor', 1.0)
 
         self.router_type = getattr(config, 'router_type', 'mlp')
@@ -94,6 +95,11 @@ class BiBoMoERouter(nn.Module):
         batch_size, seq_len, hidden_dim = hidden_states.shape
 
         router_logits = self._apply_router_activation(self.router_logits(hidden_states))
+        # Temperature BEFORE the gate: sigma(x/T) has derivative sigma'(x/T)/T, so T>1 flattens the
+        # score spread by exactly 1/T. Applied to logits, not scores, so the selection bias (added
+        # to SCORES) is untouched.
+        if self.router_temperature != 1.0:
+            router_logits = router_logits / self.router_temperature
 
         if self.gate_type == "sigmoid":
             scores = torch.sigmoid(router_logits)

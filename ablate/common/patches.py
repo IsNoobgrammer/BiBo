@@ -277,6 +277,8 @@ def patch_router_gate():
         # router_type, so this patch now composes with mlp AND conv.
         router_logits = self.router_logits(hidden_states)
         router_logits = self._apply_router_activation(router_logits)
+        if getattr(self, 'router_temperature', 1.0) != 1.0:           # mirror the native forward
+            router_logits = router_logits / self.router_temperature
         scores = _gate_scores(router_logits, self.gate_type)          # <<< the ONLY change
         # Mirror the native forward's boundary-gap probe. Without this the metric silently reads
         # 0.0000 on every router_gate!=sigmoid arm (this patch REPLACES forward, so the native

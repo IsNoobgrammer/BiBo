@@ -229,6 +229,7 @@ def main():
     ap.add_argument("--use_ssmax", action="store_true")                           # ablation axis: SSMax scalable softmax (default OFF)
     ap.add_argument("--use_xsa", action="store_true")                             # ablation axis: XSA exclusive self-attention (default OFF)
     ap.add_argument("--balance_exclude_specials", action="store_true")            # ablation axis: bias balancer ignores the ±Identity experts (freezes their bias at 0; router learns special usage) — only matters with special_pairs>0
+    ap.add_argument("--router_temp", type=float, default=1.0)      # logits /= T before the gate. T>1 FLATTENS scores (derivative scales 1/T). Not absorbable by the weight: Muon pins its spectral norm. Tag _T<v>
     ap.add_argument("--top_k", type=int, default=0)                # 0 = SHARED (2). Raising it WITHOUT --moe_inter multiplies active expert FLOPs by the same factor. Tag _k<n>
     ap.add_argument("--moe_inter", type=int, default=0)            # 0 = SHARED (768). Halve it when doubling top_k to hold compute constant. Tag _mi<n>
     ap.add_argument("--bias_update_mode", choices=["sign", "prop"], default="sign")  # LongCat uses NO sign(): "prop" applies u*(target-actual) directly -> proportional control, has a fixed point (no dither) and cannot drift common-mode. u is NOT comparable across modes. Tag _prop
@@ -332,7 +333,8 @@ def main():
                            router_type=args.router_type, kernel_size=args.router_kernel,
                            glu_token_budget=(None if args.glu_budget < 0 else args.glu_budget),
                            bias_update_mode=args.bias_update_mode,
-                           top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None))
+                           top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
+                           router_temperature=args.router_temp)
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
     if args.situ_learnable:
         n_ap = patchmod.add_situ_params(model)
@@ -384,11 +386,17 @@ def main():
                 + (f"_u{args.bias_update_factor:g}" if args.bias_update_factor >= 0 else "")
                 + ("_prop" if args.bias_update_mode == "prop" else "")
                 + (f"_k{args.top_k}" if args.top_k else "")
+                + (f"_T{args.router_temp:g}" if args.router_temp != 1.0 else "")
                 + (f"_mi{args.moe_inter}" if args.moe_inter else "")
                 + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
+                # Tag the norm whenever it is ACTIVE (ntp=1). The old rule stayed silent for
+                # sigmoid+sum, so a real sum-normalized run was named identically to an
+                # unnormalized one bar the _nontp marker -- indistinguishable at a glance, and
+                # we just lost time to exactly that class of mislabelling.
                 + (f"_rt-{args.router_gate}-{router_norm}"
-                   if (args.router_gate != "sigmoid" or router_norm != "sum") else "")
+                   if (args.router_gate != "sigmoid" or router_norm != "sum"
+                       or bool(args.norm_topk_prob)) else "")
                 + ("" if args.norm_topk_prob else "_nontp")   # normalization is now the default; mark when OFF
                 + (f"_rs{args.routed_scaling_factor:g}" if args.routed_scaling_factor != 1.0 else "")
                 + ("_radamw" if args.router_optim == "adamw" else "")
