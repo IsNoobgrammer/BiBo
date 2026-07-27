@@ -15,7 +15,7 @@ import argparse
 import contextlib
 import torch
 from .models import build_arm, count_params
-from src.configuration_bibo import GATE_TYPES, SIGNED_GATES
+from src.configuration_bibo import GATE_TYPES, SIGNED_GATES, ROUTER_INPUT_NORMS
 from . import patches as patchmod
 from .optim import build_optimizers
 from .schedule import make_scheduler
@@ -230,6 +230,7 @@ def main():
     ap.add_argument("--use_ssmax", action="store_true")                           # ablation axis: SSMax scalable softmax (default OFF)
     ap.add_argument("--use_xsa", action="store_true")                             # ablation axis: XSA exclusive self-attention (default OFF)
     ap.add_argument("--balance_exclude_specials", action="store_true")            # ablation axis: bias balancer ignores the ±Identity experts (freezes their bias at 0; router learns special usage) — only matters with special_pairs>0
+    ap.add_argument("--router_input_norm", choices=list(ROUTER_INPUT_NORMS), default="none")  # per-token norm on the ROUTER INPUT ONLY (expert input untouched). Tag _rin-<v>
     ap.add_argument("--router_temp", type=float, default=1.0)      # logits /= T before the gate. T>1 FLATTENS scores (derivative scales 1/T). Not absorbable by the weight: Muon pins its spectral norm. Tag _T<v>
     ap.add_argument("--top_k", type=int, default=0)                # 0 = SHARED (2). Raising it WITHOUT --moe_inter multiplies active expert FLOPs by the same factor. Tag _k<n>
     ap.add_argument("--moe_inter", type=int, default=0)            # 0 = SHARED (768). Halve it when doubling top_k to hold compute constant. Tag _mi<n>
@@ -338,7 +339,8 @@ def main():
                            glu_token_budget=(None if args.glu_budget < 0 else args.glu_budget),
                            bias_update_mode=args.bias_update_mode,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
-                           router_temperature=args.router_temp)
+                           router_temperature=args.router_temp,
+                           router_input_norm=args.router_input_norm)
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
     if args.situ_learnable:
         n_ap = patchmod.add_situ_params(model)
@@ -391,6 +393,7 @@ def main():
                 + ("_prop" if args.bias_update_mode == "prop" else "")
                 + (f"_k{args.top_k}" if args.top_k else "")
                 + (f"_T{args.router_temp:g}" if args.router_temp != 1.0 else "")
+                + (f"_rin-{args.router_input_norm}" if args.router_input_norm != "none" else "")
                 + (f"_mi{args.moe_inter}" if args.moe_inter else "")
                 + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
@@ -493,6 +496,7 @@ def main():
             rt_s = (f" top1w={rt['train/router_top1_weight']:.3f} rent={rt['train/router_entropy']:.3f}"
                     f" bal={rt['train/balance_entropy']:.3f}"
                     f" gap={rt['train/router_boundary_gap']:.4f}"
+                    f" icv={rt['train/router_input_cv']:.4f}"
                     # spl = share of top-k slots on the ±Identity block (neg half in parens); with
                     # --glu_budget r it should settle near 1-r. 0.000 means no special experts.
                     + (f" spl={rt['train/special_load']:.3f}({rt['train/neg_identity_load']:.3f})"

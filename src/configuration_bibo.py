@@ -20,6 +20,7 @@ BIBO_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 #   sqsp      sqrt(softplus(x)). UNBOUNDED above (2.24 at x=5) and EXPANDS the top rather than
 #             compressing it. Under div-sum a runaway expert has no ceiling: watch max expert load.
 GATE_TYPES = ("sigmoid", "situ", "softmax", "tsig", "sigtanh", "sqsp")
+ROUTER_INPUT_NORMS = ("none", "rms", "unit")
 SIGNED_GATES = ("situ",)          # gates whose scores can go negative -> div-sum normalization is invalid
 
 
@@ -85,6 +86,13 @@ class BiBoConfig(PretrainedConfig):
         router_type="mlp",    # "mlp" (Linear, default) | "conv" (causal Conv1d over kernel_size taps)
         kernel_size=3,        # kernel width for BOTH the conv router and the conv shared expert
         gate_type="sigmoid",       # one of GATE_TYPES (top of this file); "situ" is SIGNED -> needs norm_topk_prob=True
+        router_input_norm="none",  # per-token norm on the ROUTER INPUT ONLY: "none" | "rms" (own
+                                   # learnable gain) | "unit" (x/rms(x), no gain -> logits depend on
+                                   # DIRECTION only). The block is pre-norm so the router and the
+                                   # experts share post_attention_layernorm(h); that tensor is RMS-
+                                   # normed but then scaled by a learned gain, so ||h_t|| still
+                                   # varies per token and the gate temperature is effectively
+                                   # per-token. Normalizing here leaves the EXPERT input untouched.
         router_temperature=1.0,    # logits are divided by this BEFORE the gate. T>1 flattens the
                                    # score distribution (derivative scales exactly 1/T), T<1 sharpens.
                                    # NOT redundant with the router weight scale under Muon: Muon pins
@@ -197,6 +205,7 @@ class BiBoConfig(PretrainedConfig):
         self.router_type = router_type
         self.kernel_size = kernel_size
         self.gate_type = gate_type
+        self.router_input_norm = router_input_norm
         self.router_temperature = router_temperature
         self.router_activation = router_activation
         self.norm_topk_prob = norm_topk_prob
@@ -349,6 +358,8 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError(f"router_type must be 'mlp' or 'conv', got '{self.router_type}'")
         if self.router_type == "conv" and self.kernel_size < 1:
             raise ValueError(f"router_type='conv' needs kernel_size >= 1, got {self.kernel_size}")
+        if self.router_input_norm not in ROUTER_INPUT_NORMS:
+            raise ValueError(f"router_input_norm must be one of {ROUTER_INPUT_NORMS}, got '{self.router_input_norm}'")
         if self.router_temperature <= 0:
             raise ValueError(f"router_temperature must be > 0, got {self.router_temperature}")
         if self.router_activation not in ("none", "relu", "silu"):

@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from src.configuration_bibo import BiBoConfig, GATE_TYPES
+from src.modeling.norm import BiBoRMSNorm
 
 __all__ = ['BiBoMoERouter', 'gate_scores']
 
@@ -63,6 +64,12 @@ class BiBoMoERouter(nn.Module):
         self.hidden_size = config.hidden_size
         self.kernel_size = config.kernel_size
 
+        # Per-token normalization of the ROUTER'S INPUT ONLY (see _router_input).
+        self.router_input_norm = getattr(config, 'router_input_norm', 'none')
+        self.input_norm = (BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                           if self.router_input_norm == 'rms' else None)
+        self.input_cv = None             # probe: CV of ||h_t|| across tokens, filled when _probe_gap
+
         # Heuristically updated by BiBoMoELayer, NOT optimizer-managed -> requires_grad=False.
         self.bias = nn.Parameter(torch.zeros(self.num_routed_experts), requires_grad=False)
 
@@ -108,8 +115,38 @@ class BiBoMoERouter(nn.Module):
         else:  # "none"
             return logits
 
+    def _router_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Per-token normalization applied to the ROUTER'S INPUT ONLY.
+
+        The block is pre-norm, so BiBoMoELayer receives post_attention_layernorm(h) and hands the
+        SAME tensor to the router and to the experts. That tensor is RMS-normalized but then scaled
+        by a LEARNED PER-CHANNEL GAIN, so ||h_t|| varies token to token again -- and router logits
+        scale with it, which makes the effective gate temperature per-token and uncontrolled.
+        Normalizing here (and only here) leaves the expert input byte-identical, so any measured
+        delta is attributable to routing rather than to expert conditioning.
+
+          none  ship-current: whatever post_attention_layernorm produced
+          rms   own BiBoRMSNorm, i.e. re-normalize with a SEPARATE learnable gain
+          unit  x / rms(x) with NO gain -> logits depend on DIRECTION only. (Same thing as
+                x/||x||_2 * sqrt(H); the sqrt(H) is what makes the two spellings identical.)
+        """
+        if self._probe_gap:                      # harness diagnostic; zero cost when off
+            with torch.no_grad():
+                r = hidden_states.detach().float().pow(2).mean(-1).sqrt().reshape(-1)
+                self.input_cv = r.std() / r.mean().clamp_min(1e-9)
+        if self.router_input_norm == "none":
+            return hidden_states
+        if self.router_input_norm == "unit":
+            v = hidden_states.float().pow(2).mean(-1, keepdim=True)
+            return (hidden_states.float() * torch.rsqrt(v + 1e-6)).to(hidden_states.dtype)
+        return self.input_norm(hidden_states)
+
     def router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """(b, s, h) -> ((b s), num_routed_experts) fp32 logits, before gate_type."""
+        """(b, s, h) -> ((b s), num_routed_experts) fp32 logits, before gate_type.
+
+        Both the native forward AND ablate's patched forward call this, so putting the input
+        normalization here means neither path can miss it."""
+        hidden_states = self._router_input(hidden_states)
         if self.router_type == "mlp":
             return self.gate_proj(rearrange(hidden_states, 'b s h -> (b s) h')).float()
         # causal: left-pad K-1 so position t sees only t-K+1..t. view() is free (weight is contiguous).
