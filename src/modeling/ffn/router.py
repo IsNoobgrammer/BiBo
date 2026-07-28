@@ -68,7 +68,6 @@ class BiBoMoERouter(nn.Module):
         self.router_input_norm = getattr(config, 'router_input_norm', 'none')
         self.input_norm = (BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
                            if self.router_input_norm == 'rms' else None)
-        self.input_cv = None             # probe: CV of ||h_t|| across tokens, filled when _probe_gap
 
         # Heuristically updated by BiBoMoELayer, NOT optimizer-managed -> requires_grad=False.
         self.bias = nn.Parameter(torch.zeros(self.num_routed_experts), requires_grad=False)
@@ -130,10 +129,9 @@ class BiBoMoERouter(nn.Module):
           unit  x / rms(x) with NO gain -> logits depend on DIRECTION only. (Same thing as
                 x/||x||_2 * sqrt(H); the sqrt(H) is what makes the two spellings identical.)
         """
-        if self._probe_gap:                      # harness diagnostic; zero cost when off
-            with torch.no_grad():
-                r = hidden_states.detach().float().pow(2).mean(-1).sqrt().reshape(-1)
-                self.input_cv = r.std() / r.mean().clamp_min(1e-9)
+        # (The input_cv probe that used to sit here -- CV of ||h_t|| across tokens -- is gone. It
+        # measured 0.0004, i.e. per-token magnitude is constant to 0.04%, which closed the
+        # router_input_norm axis; the reduction is not worth paying for on every probe step.)
         if self.router_input_norm == "none":
             return hidden_states
         if self.router_input_norm == "unit":

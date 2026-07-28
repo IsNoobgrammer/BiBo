@@ -197,8 +197,11 @@ def main():
     ap.add_argument("--arm", choices=["qwen", "bibo_min"], required=True)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tokens", type=int, default=1_000_000_000)
-    ap.add_argument("--batch", type=int, default=40)             # per micro-step
-    ap.add_argument("--grad_accum", type=int, default=1)          # global batch = batch * grad_accum
+    # 64x2 measured Jul 28 2026 at 64 experts/k=8: 156.3k tps vs 147.3k for 32x4, a free 6.1% at the
+    # SAME 128 seq/step (same update count, same math up to accumulation rounding, so results stay
+    # comparable). bs=64 costs 73.7 G of 96; bs=96 would not fit. ga is memory-free.
+    ap.add_argument("--batch", type=int, default=64)             # per micro-step
+    ap.add_argument("--grad_accum", type=int, default=2)          # global batch = batch * grad_accum
     ap.add_argument("--seq_len", type=int, default=1024)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")  # NEVER fp16
     ap.add_argument("--attn", choices=["sdpa", "flash_attention_4"], default="sdpa")
@@ -259,14 +262,16 @@ def main():
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--data", choices=["real", "synthetic"], default="real")
     ap.add_argument("--dataset", default=TRAIN_DATASET)          # QTK-81K packed instruct corpus (HF id)
-    ap.add_argument("--max_steps", type=int, default=0)      # >0 overrides token budget (smoke)
+    ap.add_argument("--max_steps", type=int, default=1200)   # >0 overrides token budget; 0 = use --tokens
     ap.add_argument("--log_every", type=int, default=20)
     ap.add_argument("--ckpt_every", type=int, default=2000)
     ap.add_argument("--hf_repo", default="")     # if set, push model+tokenizer to this HF repo every --ckpt_every steps (async, non-blocking)
     ap.add_argument("--hf_token", default="")    # HF WRITE token; falls back to $HF_TOKEN / $HUGGING_FACE_HUB_TOKEN
     ap.add_argument("--hf_private", action="store_true")  # create the repo private
     # in-training eval -> W&B curves (this is the point; not a post-hoc-only eval)
-    ap.add_argument("--eval_every", type=int, default=500)       # 0 disables; try 200/500/1000
+    # 0 = FINAL EVAL ONLY (the default). Periodic evals cost ~2.4 min each and only exist to draw
+    # W&B curves; the number every comparison actually uses is the final one. >0 re-enables them.
+    ap.add_argument("--eval_every", type=int, default=0)         # 0 = final only; try 200/500/1000
     ap.add_argument("--sample_every", type=int, default=0)       # 0 = same as eval_every; steps between 2en+2hi samples
     ap.add_argument("--eval_mcq_n", type=int, default=200)       # cheap periodic MCQ sample
     ap.add_argument("--eval_bpb_n", type=int, default=200)       # cheap periodic bpb sample/source
@@ -427,9 +432,12 @@ def main():
                                 "params_total": total, "params_active": active})
 
     # in-training eval (needs the real corpus/tokenizer + benchmark datasets)
-    do_eval = args.eval_every > 0 and args.data == "real"
+    # do_eval gates the FINAL eval (the number every comparison uses); --eval_every only adds
+    # periodic ones on top. They were one flag, so --eval_every 0 silently suppressed the final
+    # eval as well -- which is why "final only" was previously spelled --eval_every 100000.
+    do_eval = args.data == "real"
     tok = Tok() if do_eval else None
-    if args.eval_every > 0 and not do_eval:
+    if not do_eval:
         print("[eval] disabled: --data synthetic (benchmark eval needs the real corpus + downloads)", flush=True)
     ev_extrap = tuple(int(x) for x in args.eval_extrap.split(",") if x.strip()) or None
     sample_every = args.sample_every if args.sample_every > 0 else args.eval_every   # default: sample when we eval
@@ -450,7 +458,9 @@ def main():
 
     print(f"[{run_name}] params total={total/1e6:.2f}M active={active/1e6:.2f}M | steps={total_steps} "
           f"tok/step={tok_per_step} patches={patch_list} {args.precision} attn={args.attn} "
-          f"muon_mats={n_mat} eval_every={args.eval_every if do_eval else 'off'}", flush=True)
+          f"muon_mats={n_mat} eval="
+          f"{'off' if not do_eval else (f'every {args.eval_every}' if args.eval_every > 0 else 'final only')}",
+          flush=True)
 
     gen = token_batches(args.batch, args.seq_len, DEV, dataset=args.dataset,
                         synthetic=(args.data == "synthetic"), vocab=cfg.vocab_size, seed=args.seed)
@@ -510,7 +520,6 @@ def main():
             rt_s = (f" top1w={rt['train/router_top1_weight']:.3f} rent={rt['train/router_entropy']:.3f}"
                     f" bal={rt['train/balance_entropy']:.3f}"
                     f" gap={rt['train/router_boundary_gap']:.4f}"
-                    f" icv={rt['train/router_input_cv']:.4f}"
                     # spl = share of top-k slots on the ±Identity block (neg half in parens); with
                     # --glu_budget r it should settle near 1-r. 0.000 means no special experts.
                     + (f" spl={rt['train/special_load']:.3f}({rt['train/neg_identity_load']:.3f})"
@@ -528,7 +537,7 @@ def main():
         # bpb hi=2.04 en=4.19 vs 0.74/1.64 at the end) while costing a full eval pass -- ~2.4 min
         # of a 12.5 min 500-step arm, i.e. ~19%. The final eval still runs, and any --eval_every
         # multiple after 0 still runs, so curves are unaffected.
-        if do_eval and step > 0 and step % args.eval_every == 0:   # periodic eval -> W&B curves
+        if do_eval and args.eval_every > 0 and step > 0 and step % args.eval_every == 0:   # periodic eval -> W&B curves
             with _eager(model):                                # eval on the un-compiled module (see _eager)
                 _, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.eval_mcq_n, bpb_n=args.eval_bpb_n,
                                    extrap_lengths=ev_extrap, do_samples=False,
