@@ -2,6 +2,7 @@
 from . import _paths  # noqa: F401
 import torch
 from .configs import ARMS, SHARED, make_qwen_config, make_bibo_min_config
+from src.configuration_bibo import POLYGLU_GROUP
 from . import patches
 
 
@@ -18,7 +19,7 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
     PARAM MATCH: BiBo GLU experts = polyglu_mult*3; Qwen num_experts is set to the SAME so they're matched, and
     BiBo's special_pairs ±Identity experts (param-free) are the extra we test."""
     eff = patches.resolve_attn(attn_impl)
-    n_glu = polyglu_mult * 3
+    n_glu = polyglu_mult * POLYGLU_GROUP
     if arm == "qwen":
         from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
         cfg = make_qwen_config(eff, aux_coef=aux_coef, num_experts=n_glu)

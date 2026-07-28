@@ -6,7 +6,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from src.configuration_bibo import BiBoConfig
+from src.configuration_bibo import BiBoConfig, POLYGLU_GROUP
 from .experts import BiBoCausalConv1D
 from .mlp import BiBoMLP
 from .router import BiBoMoERouter
@@ -25,7 +25,7 @@ class BiBoFusedExperts(nn.Module):
     """
     def __init__(self, config: BiBoConfig):
         super().__init__()
-        self.num_polyglu_experts = config.polyglu_expert_multiplier * 3
+        self.num_polyglu_experts = config.polyglu_expert_multiplier * POLYGLU_GROUP
         self.special_expert_pairs = config.special_expert_pairs
         self.num_routed_experts = config.num_routed_experts
         self.hidden_size = config.hidden_size
@@ -123,7 +123,7 @@ class BiBoFusedExperts(nn.Module):
 
 
 class BiBoMoELayer(nn.Module):
-    """Routed = polyglu_expert_multiplier*3 GLU experts + special_expert_pairs*2 ±Identity."""
+    """Routed = polyglu_expert_multiplier*POLYGLU_GROUP GLU experts + special_expert_pairs*2 ±Identity."""
     def __init__(self, config: BiBoConfig):
         super().__init__()
         self.hidden_size = config.hidden_size

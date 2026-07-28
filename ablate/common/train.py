@@ -15,7 +15,7 @@ import argparse
 import contextlib
 import torch
 from .models import build_arm, count_params
-from src.configuration_bibo import GATE_TYPES, SIGNED_GATES, ROUTER_INPUT_NORMS
+from src.configuration_bibo import GATE_TYPES, SIGNED_GATES, ROUTER_INPUT_NORMS, POLYGLU_GROUP
 from . import patches as patchmod
 from .optim import build_optimizers
 from .schedule import make_scheduler
@@ -324,8 +324,11 @@ def main():
     if act_cycle != [0, 1, 2]:
         assert "moe" in patch_list, "custom act subset needs the 'moe' patch (eager experts keep the built-in triple)"
     patchmod.ACT_CYCLE = act_cycle
-    if (args.polyglu_mult * 3) % len(act_cycle):
-        print(f"[acts] warning: cycle {act_cycle} does not tile {args.polyglu_mult * 3} experts evenly "
+    n_glu_experts = args.polyglu_mult * POLYGLU_GROUP
+    print(f"[experts] polyglu_mult {args.polyglu_mult} x POLYGLU_GROUP {POLYGLU_GROUP} = {n_glu_experts} "
+          f"GLU experts (+ {2 * args.special_pairs if not args.no_neg_identity else args.special_pairs} special)", flush=True)
+    if n_glu_experts % len(act_cycle):
+        print(f"[acts] warning: cycle {act_cycle} does not tile {n_glu_experts} experts evenly "
               f"(counts will differ by one)", flush=True)
 
     model, cfg = build_arm(args.arm, device=DEV, dtype=torch.float32, attn_impl=args.attn,  # fp32 master weights
@@ -379,7 +382,7 @@ def main():
     run_name = (f"{args.arm}_seed{args.seed}"
                 + (f"_acts-{acts_tag}" if args.arm == "bibo_min" else "")
                 + ("_situL" if args.situ_learnable else "")
-                + (f"_e{args.polyglu_mult * 3}" if args.polyglu_mult != 2 else "")
+                + (f"_e{args.polyglu_mult * POLYGLU_GROUP}" if args.polyglu_mult != 2 else "")
                 + (f"_se{args.special_pairs}" if args.special_pairs else "")
                 + (("_posonly" if not args.neg_identity_expert else "") if args.special_pairs else "")
                 + (("_negonly" if not args.pos_identity_expert else "") if args.special_pairs else "")

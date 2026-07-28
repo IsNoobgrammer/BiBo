@@ -21,6 +21,12 @@ BIBO_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 #             compressing it. Under div-sum a runaway expert has no ceiling: watch max expert load.
 GATE_TYPES = ("sigmoid", "situ", "softmax", "tsig", "sigtanh", "sqsp")
 ROUTER_INPUT_NORMS = ("none", "rms", "unit")
+# GLU experts = polyglu_expert_multiplier * POLYGLU_GROUP. Was 3 when the act menu was the fixed
+# triple (SiLU, ReLU2, NormSiLU). The act axis has since settled on the NORMED pair
+# (normsilu, normsitu) -- relu2/NormRelu measured far worse -- so the natural group is 2, and 2
+# also makes even expert counts like 64 reachable (3 never could: 63 or 66 only).
+# NOTE this CHANGES what a given multiplier means: mult 10 was 30 GLU experts, it is now 20.
+POLYGLU_GROUP = 2
 SIGNED_GATES = ("situ",)          # gates whose scores can go negative -> div-sum normalization is invalid
 
 
@@ -75,7 +81,7 @@ class BiBoConfig(PretrainedConfig):
         mlp_only_layers=None,  # Auto: [0, num_hidden_layers - 1] (first + last dense)
         moe_intermediate_size=None,  # Auto: intermediate_size // num_experts_per_tok
         num_experts_per_tok=6,
-        polyglu_expert_multiplier=2,  # Groups of 3 (SiLU, ReLU², NormSiLU) GLU experts
+        polyglu_expert_multiplier=2,  # GLU experts = this * POLYGLU_GROUP (2, see top of file)
         special_expert_pairs=1,       # Count of special experts PER TYPE (see pos/neg_identity_expert)
         pos_identity_expert=True,     # include the +Identity special expert(s) (code 3, param-free  +w*x)
         neg_identity_expert=True,     # include the -Identity special expert(s) (code 4, param-free  -w*x)
@@ -199,8 +205,8 @@ class BiBoConfig(PretrainedConfig):
         # expert index for GLU), then the +Identity block, then the -Identity block.
         self.num_pos_identity_experts = special_expert_pairs if pos_identity_expert else 0
         self.num_neg_identity_experts = special_expert_pairs if neg_identity_expert else 0
-        # experts = polyglu_multiplier * 3 (SiLU, ReLU², NormSiLU) + (+Identity) block + (-Identity) block
-        self.num_routed_experts = ((polyglu_expert_multiplier * 3)
+        # experts = polyglu_multiplier * POLYGLU_GROUP + (+Identity) block + (-Identity) block
+        self.num_routed_experts = ((polyglu_expert_multiplier * POLYGLU_GROUP)
                                    + self.num_pos_identity_experts + self.num_neg_identity_experts)
 
         # ── Shared expert ────────────────────────────────────────
@@ -342,7 +348,7 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError(f"shared_expert_type must be 'mlp' or 'conv', got '{self.shared_expert_type}'")
         if self.polyglu_expert_multiplier < 1:
             raise ValueError(
-                "polyglu_expert_multiplier must be >= 1 (need at least one group of SiLU/ReLU²/NormSiLU GLU experts)"
+                f"polyglu_expert_multiplier must be >= 1 (one group = {POLYGLU_GROUP} GLU experts)"
             )
         if self.special_expert_pairs < 0:
             raise ValueError("special_expert_pairs must be >= 0")
