@@ -149,7 +149,10 @@ class BiBoMoELayer(nn.Module):
             if config.shared_expert_type == "conv":
                 self.shared_experts_list.append(BiBoCausalConv1D(config))
             else:
-                self.shared_experts_list.append(BiBoMLP(config, is_expert=True))
+                _n_sh = int(getattr(config, 'num_shared_experts', 1))
+                self.shared_experts_list.append(BiBoMLP(
+                    config, is_expert=True,
+                    intermediate_size=config.moe_intermediate_size * _n_sh))
         self.gate = BiBoMoERouter(config)
 
     @torch.no_grad()

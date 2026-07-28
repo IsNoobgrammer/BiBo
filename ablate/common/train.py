@@ -230,6 +230,7 @@ def main():
     ap.add_argument("--use_ssmax", action="store_true")                           # ablation axis: SSMax scalable softmax (default OFF)
     ap.add_argument("--use_xsa", action="store_true")                             # ablation axis: XSA exclusive self-attention (default OFF)
     ap.add_argument("--balance_exclude_specials", action="store_true")            # ablation axis: bias balancer ignores the ±Identity experts (freezes their bias at 0; router learns special usage) — only matters with special_pairs>0
+    ap.add_argument("--n_shared", type=int, default=0)   # shared experts as a WIDTH multiple of moe_intermediate_size (Kimi K3 form). 0 = no shared expert. Added UNSCALED to the routed sum. Tag _sh<N>
     ap.add_argument("--router_input_norm", choices=list(ROUTER_INPUT_NORMS), default="none")  # per-token norm on the ROUTER INPUT ONLY (expert input untouched). Tag _rin-<v>
     ap.add_argument("--router_temp", type=float, default=1.0)      # logits /= T before the gate. T>1 FLATTENS scores (derivative scales 1/T). Not absorbable by the weight: Muon pins its spectral norm. Tag _T<v>
     ap.add_argument("--top_k", type=int, default=0)                # 0 = SHARED (2). Raising it WITHOUT --moe_inter multiplies active expert FLOPs by the same factor. Tag _k<n>
@@ -340,7 +341,8 @@ def main():
                            bias_update_mode=args.bias_update_mode,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
                            router_temperature=args.router_temp,
-                           router_input_norm=args.router_input_norm)
+                           router_input_norm=args.router_input_norm,
+                           num_shared_experts=args.n_shared)
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
     if args.situ_learnable:
         n_ap = patchmod.add_situ_params(model)
@@ -394,6 +396,7 @@ def main():
                 + (f"_k{args.top_k}" if args.top_k else "")
                 + (f"_T{args.router_temp:g}" if args.router_temp != 1.0 else "")
                 + (f"_rin-{args.router_input_norm}" if args.router_input_norm != "none" else "")
+                + (f"_sh{args.n_shared}" if args.n_shared else "")
                 + (f"_mi{args.moe_inter}" if args.moe_inter else "")
                 + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")

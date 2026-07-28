@@ -82,6 +82,12 @@ class BiBoConfig(PretrainedConfig):
         # ── Shared expert ────────────────────────────────────────
         use_shared_expert=False,    # Off by default (param-match Qwen3MoE — no shared expert)
         shared_expert_type="mlp",   # "mlp" (SwiGLU, like Qwen) or "conv" (CausalConv1D)
+        num_shared_experts=1,       # WIDTH multiple for the shared expert: its intermediate size is
+                                    # moe_intermediate_size * this. N parallel width-I GLUs summed ==
+                                    # one width-N*I GLU, so this is exactly "N shared experts" at one
+                                    # GEMM (Kimi K3 does the same). Only read when use_shared_expert.
+                                    # Shared output is added UNSCALED (Kimi: y = y + shared(x); DeepSeek-V3
+                                    # and Gemma likewise) -- routed_scaling_factor never touches it.
         # ── Router ───────────────────────────────────────────────
         router_type="mlp",    # "mlp" (Linear, default) | "conv" (causal Conv1d over kernel_size taps)
         kernel_size=3,        # kernel width for BOTH the conv router and the conv shared expert
@@ -200,6 +206,7 @@ class BiBoConfig(PretrainedConfig):
         # ── Shared expert ────────────────────────────────────────
         self.use_shared_expert = use_shared_expert
         self.shared_expert_type = shared_expert_type
+        self.num_shared_experts = num_shared_experts
 
         # ── Router ───────────────────────────────────────────────
         self.router_type = router_type
@@ -358,6 +365,8 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError(f"router_type must be 'mlp' or 'conv', got '{self.router_type}'")
         if self.router_type == "conv" and self.kernel_size < 1:
             raise ValueError(f"router_type='conv' needs kernel_size >= 1, got {self.kernel_size}")
+        if self.use_shared_expert and self.num_shared_experts < 1:
+            raise ValueError(f"num_shared_experts must be >= 1 when use_shared_expert, got {self.num_shared_experts}")
         if self.router_input_norm not in ROUTER_INPUT_NORMS:
             raise ValueError(f"router_input_norm must be one of {ROUTER_INPUT_NORMS}, got '{self.router_input_norm}'")
         if self.router_temperature <= 0:
