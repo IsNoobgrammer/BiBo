@@ -326,7 +326,7 @@ def main():
     patchmod.ACT_CYCLE = act_cycle
     n_glu_experts = args.polyglu_mult * POLYGLU_GROUP
     print(f"[experts] polyglu_mult {args.polyglu_mult} x POLYGLU_GROUP {POLYGLU_GROUP} = {n_glu_experts} "
-          f"GLU experts (+ {2 * args.special_pairs if not args.no_neg_identity else args.special_pairs} special)", flush=True)
+          f"GLU experts, special_pairs={args.special_pairs}", flush=True)
     if n_glu_experts % len(act_cycle):
         print(f"[acts] warning: cycle {act_cycle} does not tile {n_glu_experts} experts evenly "
               f"(counts will differ by one)", flush=True)
