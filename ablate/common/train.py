@@ -215,6 +215,12 @@ def main():
     #   silu 0 (default) | relu2 1 | normsilu 2 | situ 5 | normrelu2 6 | normsitu 7
     # Measured @e30 500M tok: acts-n (normsilu) 0.7273, acts-s (silu) 0.7444, Z (normrelu2) 0.8345.
     ap.add_argument("--act", default="silu")             # comma list allowed; cycles across the GLU experts
+    # Per-expert INPUT SCALE alpha for ANY activation: act(alpha_e * x), x = gate (silu/relu2) or
+    # gate/rms(gate) (the normed codes; alpha sits AFTER the rms or it is exactly inert). Reuses the
+    # situ (alpha,gamma) params -- gamma gets ZERO gradient for non-SiTU codes and stays 1.0, since a
+    # per-expert OUTPUT gain is redundant with the router weight (g_e*w*f == (g_e*w)*f). 1D (E,) ->
+    # AdamW by the ndim rule. Tag _aS.
+    ap.add_argument("--act_scale_learnable", type=_bool, default=False)
     ap.add_argument("--situ_learnable", type=int, default=0)   # per-expert gamma*tanh(alpha*g)*sigmoid(g); AdamW 1D params
     ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free special experts, per-type count
     ap.add_argument("--no_pos_identity", dest="pos_identity_expert", action="store_false")  # drop +Identity (code 3); test -Identity alone
@@ -358,7 +364,7 @@ def main():
                            moe_out_norm=args.moe_out_norm,
                            num_shared_experts=args.n_shared)
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
-    if args.situ_learnable:
+    if args.situ_learnable or args.act_scale_learnable:
         n_ap = patchmod.add_situ_params(model)
         print(f"[acts] learnable SiTU: (alpha,gamma) registered on {n_ap} MoE layers", flush=True)
     if args.routed_scaling_learnable or args.expert_scale_learnable:
@@ -393,6 +399,7 @@ def main():
     run_name = (f"{args.arm}_seed{args.seed}"
                 + (f"_acts-{acts_tag}" if args.arm == "bibo_min" else "")
                 + ("_situL" if args.situ_learnable else "")
+                + ("_aS" if args.act_scale_learnable else "")
                 + (f"_e{args.polyglu_mult * POLYGLU_GROUP}" if args.polyglu_mult != 2 else "")
                 + (f"_se{args.special_pairs}" if args.special_pairs else "")
                 + (("_posonly" if not args.neg_identity_expert else "") if args.special_pairs else "")
