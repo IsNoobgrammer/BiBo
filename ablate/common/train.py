@@ -221,6 +221,10 @@ def main():
     # per-expert OUTPUT gain is redundant with the router weight (g_e*w*f == (g_e*w)*f). 1D (E,) ->
     # AdamW by the ndim rule. Tag _aS.
     ap.add_argument("--act_scale_learnable", type=_bool, default=False)
+    # alpha must travel from 1 to ~5 to matter; AdamW moves a param ~lr/step, cosine-averaged ~0.5*lr,
+    # so reachable travel over N steps is ~0.5*lr*N. At adam_lr 5e-4 / 2000 steps that is 0.5 -- alpha
+    # cannot get there and the arm reads as a null for the wrong reason. 1e-2 gives travel ~10.
+    ap.add_argument("--act_scale_lr", type=float, default=0.0)  # 0 = share --adam_lr
     ap.add_argument("--situ_learnable", type=int, default=0)   # per-expert gamma*tanh(alpha*g)*sigmoid(g); AdamW 1D params
     ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free special experts, per-type count
     ap.add_argument("--no_pos_identity", dest="pos_identity_expert", action="store_false")  # drop +Identity (code 3); test -Identity alone
@@ -386,7 +390,8 @@ def main():
                                           scale_mode=args.muon_scale_mode, xorth_post=args.xorth_post,
                                           xorth_gate_ref=args.xorth_gate_ref, xorth_ema=args.xorth_ema,
                                           xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where,
-                                          router_adamw=(args.router_optim == "adamw"))
+                                          router_adamw=(args.router_optim == "adamw"),
+                                          act_scale_lr=args.act_scale_lr)
     if args.compile:                                            # compile the transformer body only; the
         model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
         print(f"[{args.arm}_seed{args.seed}] torch.compile(model.model) on; fused CE + liger/moe/flash kernels stay eager",
@@ -402,7 +407,8 @@ def main():
     run_name = (f"{args.arm}_seed{args.seed}"
                 + (f"_acts-{acts_tag}" if args.arm == "bibo_min" else "")
                 + ("_situL" if args.situ_learnable else "")
-                + ("_aS" if args.act_scale_learnable else "")
+                + (("_aS" + (f"{args.act_scale_lr:g}" if args.act_scale_lr else ""))
+                   if args.act_scale_learnable else "")
                 + (f"_e{args.polyglu_mult * POLYGLU_GROUP}" if args.polyglu_mult != 2 else "")
                 + (f"_se{args.special_pairs}" if args.special_pairs else "")
                 + (("_posonly" if not args.neg_identity_expert else "") if args.special_pairs else "")

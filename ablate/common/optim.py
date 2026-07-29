@@ -60,7 +60,8 @@ NS8 = (_KJ,) * 6 + (_PIN,) * 2
 
 def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, ns_dtype=torch.bfloat16,
                      scale_mode="aurora", xorth_post=0.0, xorth_gate_ref=0.3, xorth_ema=0.95,
-                     xorth_warmup_steps=0, xorth_where="post", router_adamw=False):
+                     xorth_warmup_steps=0, xorth_where="post", router_adamw=False,
+                     act_scale_lr=None):
     from kernels.sm120.muon import FusedMuon   # Blackwell: gram-NS (self-gates to symmul/cuBLAS on small mats) + 8M knee
     stacks, mats, other = [], [], []
     n_router = 0
@@ -88,9 +89,9 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
         if is_router:
             n_router += 1
         if router_adamw and is_router:
-            other.append(p)                 # -> AdamW (ablation: router off Muon)
+            other.append((n, p))            # -> AdamW (ablation: router off Muon)
         elif "embed" in n or p.ndim not in (2, 3):
-            other.append(p)                 # -> AdamW (1D norms/biases, embeddings)
+            other.append((n, p))            # -> AdamW (1D norms/biases, embeddings)
         elif p.ndim == 3:
             stacks.append(p)                # 3D MoE expert stacks -> the xorth (cross-expert whitening) target
         else:
@@ -113,5 +114,18 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
     muon = FusedMuon(groups, lr=muon_lr, momentum=momentum, weight_decay=wd,
                      coeffs=NS8, ns_dtype=ns_dtype, aurora_k=1, gram_restarts=[4, 5], scale_mode=scale_mode,
                      **_xo)
-    adamw = torch.optim.AdamW(other, lr=adam_lr, weight_decay=wd)
+    # act_scale_lr: the per-expert activation scales (situ_alpha/gamma) need to travel FAR -- alpha
+    # must reach ~5 to lift a Muon-pinned gate from RMS 0.18 into SiLU's nonlinear region, and AdamW
+    # at adam_lr=5e-4 can only move it ~0.5 over 2000 steps. Own group, own lr, and wd=0 -- decay on
+    # a gain would just re-impose the lr/wd scale equilibrium this axis exists to escape.
+    _is_as = lambda n: "situ_alpha" in n or "situ_gamma" in n
+    a_scale = [p for n, p in other if _is_as(n)]
+    rest = [p for n, p in other if not _is_as(n)]
+    if a_scale and act_scale_lr:
+        print(f"[optim] act scales: {len(a_scale)} params -> AdamW lr={act_scale_lr:g} wd=0", flush=True)
+        adamw = torch.optim.AdamW([{"params": rest},
+                                   {"params": a_scale, "lr": act_scale_lr, "weight_decay": 0.0}],
+                                  lr=adam_lr, weight_decay=wd)
+    else:
+        adamw = torch.optim.AdamW([p for _, p in other], lr=adam_lr, weight_decay=wd)
     return [muon, adamw], len(stacks) + len(mats), len(other)
