@@ -282,7 +282,10 @@ def main():
     # in-training eval -> W&B curves (this is the point; not a post-hoc-only eval)
     # 0 = FINAL EVAL ONLY (the default). Periodic evals cost ~2.4 min each and only exist to draw
     # W&B curves; the number every comparison actually uses is the final one. >0 re-enables them.
-    ap.add_argument("--eval_every", type=int, default=0)         # 0 = final only; try 200/500/1000
+    #  -1 = NO EVAL AT ALL (use for short diagnostic/throughput runs -- a full eval is ~2.5 min
+    #       and dwarfs a 100-step run; it is also where runs have hung in teardown)
+    #   0 = FINAL EVAL ONLY (default)   >0 = periodic evals on top
+    ap.add_argument("--eval_every", type=int, default=0)
     ap.add_argument("--sample_every", type=int, default=0)       # 0 = same as eval_every; steps between 2en+2hi samples
     ap.add_argument("--eval_mcq_n", type=int, default=200)       # cheap periodic MCQ sample
     ap.add_argument("--eval_bpb_n", type=int, default=200)       # cheap periodic bpb sample/source
@@ -449,9 +452,11 @@ def main():
     # do_eval gates the FINAL eval (the number every comparison uses); --eval_every only adds
     # periodic ones on top. They were one flag, so --eval_every 0 silently suppressed the final
     # eval as well -- which is why "final only" was previously spelled --eval_every 100000.
-    do_eval = args.data == "real"
+    do_eval = args.data == "real" and args.eval_every >= 0
     tok = Tok() if do_eval else None
-    if not do_eval:
+    if args.eval_every < 0:
+        print("[eval] disabled entirely (--eval_every -1)", flush=True)
+    elif not do_eval:
         print("[eval] disabled: --data synthetic (benchmark eval needs the real corpus + downloads)", flush=True)
     ev_extrap = tuple(int(x) for x in args.eval_extrap.split(",") if x.strip()) or None
     sample_every = args.sample_every if args.sample_every > 0 else args.eval_every   # default: sample when we eval
