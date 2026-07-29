@@ -549,9 +549,23 @@ def main():
                     # --glu_budget r it should settle near 1-r. 0.000 means no special experts.
                     + (f" spl={rt['train/special_load']:.3f}({rt['train/neg_identity_load']:.3f})"
                        if rt.get("train/special_load", 0.0) > 0 else "")) if rt else ""
+            # aS = where the per-expert input scale landed. The arm is only informative if alpha
+            # actually TRAVELS -- it must reach ~5 to pull a Muon-pinned gate (RMS ~0.18) into
+            # SiLU's nonlinear band, so an alpha stuck near 1.0 means the lr is too low, NOT that
+            # scale does not matter. Must come after rt_s: rt is {} when --router_log is off and
+            # rt_s keys off `if rt`. min/mean/max over every expert in the model.
+            aS_s = ""
+            if args.act_scale_learnable or args.situ_learnable:
+                _a = torch.cat([m.situ_alpha.detach().float().flatten()
+                                for m in model.modules() if hasattr(m, "situ_alpha")])
+                rt.update({"train/act_alpha_mean": _a.mean().item(),
+                           "train/act_alpha_min": _a.min().item(),
+                           "train/act_alpha_max": _a.max().item()})
+                aS_s = (f" aS={rt['train/act_alpha_mean']:.3f}"
+                        f"[{rt['train/act_alpha_min']:.2f},{rt['train/act_alpha_max']:.2f}]")
             print(f"  step {step}/{total_steps} loss={lv:.4f} run{len(_loss_hist)}={lv_run:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
-                  f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{rt_s} elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"
+                  f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{rt_s}{aS_s} elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"
                   f"{'' if fin else '  <<NON-FINITE>>'}", flush=True)
             if wb:
                 wb.log({"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "train/ms_per_step": ms_per_step,
