@@ -63,7 +63,8 @@ def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_
                          pos_identity_expert=True, neg_identity_expert=True,
                          router_type="mlp", kernel_size=3, glu_token_budget=None,
                          bias_update_mode="sign", top_k=None, moe_intermediate_size=None,
-                         router_temperature=1.0, router_input_norm="none", num_shared_experts=0):
+                         router_temperature=1.0, router_input_norm="none", num_shared_experts=0,
+                         moe_out_norm="none"):
     from src.configuration_bibo import BiBoConfig
     # DeepSeek-style aux-loss-free balancing pairs with SIGMOID gating (bias added to sigmoid scores);
     # with no balancing we use softmax (Qwen-matched). So gate_type follows load_balance.
@@ -98,6 +99,7 @@ def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_
         hybrid_layer_pattern=None,        # all-global attention (no SWA)
         gate_type=gate, router_activation="none", router_temperature=router_temperature,
         router_input_norm=router_input_norm,
+        moe_out_norm=moe_out_norm,
         use_shared_expert=bool(num_shared_experts),
         num_shared_experts=max(int(num_shared_experts), 1),
         # ablation axis: "mlp" (Linear, default) | "conv" (causal Conv1d over kernel_size taps).

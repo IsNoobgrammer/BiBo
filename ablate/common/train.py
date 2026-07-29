@@ -15,7 +15,7 @@ import argparse
 import contextlib
 import torch
 from .models import build_arm, count_params
-from src.configuration_bibo import GATE_TYPES, SIGNED_GATES, ROUTER_INPUT_NORMS, POLYGLU_GROUP
+from src.configuration_bibo import GATE_TYPES, SIGNED_GATES, ROUTER_INPUT_NORMS, MOE_OUT_NORMS, POLYGLU_GROUP
 from . import patches as patchmod
 from .optim import build_optimizers
 from .schedule import make_scheduler
@@ -234,6 +234,11 @@ def main():
     ap.add_argument("--use_xsa", action="store_true")                             # ablation axis: XSA exclusive self-attention (default OFF)
     ap.add_argument("--balance_exclude_specials", action="store_true")            # ablation axis: bias balancer ignores the ±Identity experts (freezes their bias at 0; router learns special usage) — only matters with special_pairs>0
     ap.add_argument("--n_shared", type=int, default=0)   # shared experts as a WIDTH multiple of moe_intermediate_size (Kimi K3 form). 0 = no shared expert. Added UNSCALED to the routed sum. Tag _sh<N>
+    # Per-token norm on the MoE BLOCK OUTPUT (combined expert sum) just before the residual add.
+    # "rms" keeps a learnable per-channel gain; "unit" is gain-free so ONLY the mixture direction
+    # survives. Pairs with --norm_topk_prob 0: let the router weights run unbounded, then pin the
+    # branch magnitude here instead. Tag _mon-<v>
+    ap.add_argument("--moe_out_norm", choices=list(MOE_OUT_NORMS), default="none")
     ap.add_argument("--router_input_norm", choices=list(ROUTER_INPUT_NORMS), default="none")  # per-token norm on the ROUTER INPUT ONLY (expert input untouched). Tag _rin-<v>
     ap.add_argument("--router_temp", type=float, default=1.0)      # logits /= T before the gate. T>1 FLATTENS scores (derivative scales 1/T). Not absorbable by the weight: Muon pins its spectral norm. Tag _T<v>
     ap.add_argument("--top_k", type=int, default=0)                # 0 = SHARED (2). Raising it WITHOUT --moe_inter multiplies active expert FLOPs by the same factor. Tag _k<n>
@@ -350,6 +355,7 @@ def main():
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
                            router_temperature=args.router_temp,
                            router_input_norm=args.router_input_norm,
+                           moe_out_norm=args.moe_out_norm,
                            num_shared_experts=args.n_shared)
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
     if args.situ_learnable:
@@ -404,6 +410,7 @@ def main():
                 + (f"_k{args.top_k}" if args.top_k else "")
                 + (f"_T{args.router_temp:g}" if args.router_temp != 1.0 else "")
                 + (f"_rin-{args.router_input_norm}" if args.router_input_norm != "none" else "")
+                + (f"_mon-{args.moe_out_norm}" if args.moe_out_norm != "none" else "")
                 + (f"_sh{args.n_shared}" if args.n_shared else "")
                 + (f"_mi{args.moe_inter}" if args.moe_inter else "")
                 + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")

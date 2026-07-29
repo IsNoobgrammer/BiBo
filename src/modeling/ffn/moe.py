@@ -10,6 +10,7 @@ from src.configuration_bibo import BiBoConfig, POLYGLU_GROUP
 from .experts import BiBoCausalConv1D
 from .mlp import BiBoMLP
 from .router import BiBoMoERouter
+from ..norm import BiBoRMSNorm
 
 __all__ = ['BiBoMoELayer']
 
@@ -155,6 +156,14 @@ class BiBoMoELayer(nn.Module):
                     intermediate_size=config.moe_intermediate_size * _n_sh))
         self.gate = BiBoMoERouter(config)
 
+        # Per-token norm on the BLOCK OUTPUT, applied to the combined expert sum just before the
+        # residual add. Top-k weight normalization bounds the WEIGHTS but not the experts' own
+        # output magnitudes, so the branch magnitude still varies per token; this pins it directly.
+        # "unit" is gain-free -> only the DIRECTION of the mixture reaches the residual stream.
+        self.moe_out_norm = getattr(config, 'moe_out_norm', 'none')
+        self.out_norm = (BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                         if self.moe_out_norm == 'rms' else None)
+
     @torch.no_grad()
     def update_bias(self, tokens_per_expert: torch.Tensor):
         """Aux-loss-free bias update: b_i += u * sign(target_i - load_i). Two target rules:
@@ -264,6 +273,12 @@ class BiBoMoELayer(nn.Module):
             final_output = final_routed + shared_combined   # direct add (DeepSeek-V3/Gemma)
         else:
             final_output = final_routed
+
+        if self.moe_out_norm == 'rms':
+            final_output = self.out_norm(final_output)
+        elif self.moe_out_norm == 'unit':                      # gain-free: direction only
+            _v = final_output.float().pow(2).mean(-1, keepdim=True)
+            final_output = (final_output.float() * torch.rsqrt(_v + _NORMSILU_EPS)).to(hidden_states.dtype)
 
         if tokens_per_expert is not None:
             self.update_bias(tokens_per_expert)

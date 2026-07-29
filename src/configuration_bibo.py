@@ -21,6 +21,12 @@ BIBO_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 #             compressing it. Under div-sum a runaway expert has no ceiling: watch max expert load.
 GATE_TYPES = ("sigmoid", "situ", "softmax", "tsig", "sigtanh", "sqsp")
 ROUTER_INPUT_NORMS = ("none", "rms", "unit")
+# Per-token norm on the MoE BLOCK OUTPUT, applied to the combined expert sum O just before it
+# reaches the residual stream. "rms" = O/rms(O) with a learnable per-channel gain; "unit" = the
+# same but GAIN-FREE, so only the DIRECTION of the expert mixture survives and its magnitude is
+# pinned exactly. This is the scale-control knob that top-k weight normalization only approximates:
+# sum-to-1 bounds the WEIGHTS but the experts' own output magnitudes still ride through.
+MOE_OUT_NORMS = ("none", "rms", "unit")
 # GLU experts = polyglu_expert_multiplier * POLYGLU_GROUP. Was 3 when the act menu was the fixed
 # triple (SiLU, ReLU2, NormSiLU). The act axis has since settled on the NORMED pair
 # (normsilu, normsitu) -- relu2/NormRelu measured far worse -- so the natural group is 2, and 2
@@ -98,6 +104,7 @@ class BiBoConfig(PretrainedConfig):
         router_type="mlp",    # "mlp" (Linear, default) | "conv" (causal Conv1d over kernel_size taps)
         kernel_size=3,        # kernel width for BOTH the conv router and the conv shared expert
         gate_type="sigmoid",       # one of GATE_TYPES (top of this file); "situ" is SIGNED -> needs norm_topk_prob=True
+        moe_out_norm="none",       # per-token norm on the MoE BLOCK OUTPUT (see MOE_OUT_NORMS)
         router_input_norm="none",  # per-token norm on the ROUTER INPUT ONLY: "none" | "rms" (own
                                    # learnable gain) | "unit" (x/rms(x), no gain -> logits depend on
                                    # DIRECTION only). The block is pre-norm so the router and the
@@ -219,6 +226,7 @@ class BiBoConfig(PretrainedConfig):
         self.kernel_size = kernel_size
         self.gate_type = gate_type
         self.router_input_norm = router_input_norm
+        self.moe_out_norm = moe_out_norm
         self.router_temperature = router_temperature
         self.router_activation = router_activation
         self.norm_topk_prob = norm_topk_prob
@@ -375,6 +383,8 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError(f"num_shared_experts must be >= 1 when use_shared_expert, got {self.num_shared_experts}")
         if self.router_input_norm not in ROUTER_INPUT_NORMS:
             raise ValueError(f"router_input_norm must be one of {ROUTER_INPUT_NORMS}, got '{self.router_input_norm}'")
+        if self.moe_out_norm not in MOE_OUT_NORMS:
+            raise ValueError(f"moe_out_norm must be one of {MOE_OUT_NORMS}, got '{self.moe_out_norm}'")
         if self.router_temperature <= 0:
             raise ValueError(f"router_temperature must be > 0, got {self.router_temperature}")
         if self.router_activation not in ("none", "relu", "silu"):
