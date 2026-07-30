@@ -314,6 +314,20 @@ def main():
     # >0 = the legacy low-rank sketch at that rank. The 137M rank ladder was monotone in rank, so
     # full rank is the limit of the trend at ~zero compute -- and it has never run on a box.
     ap.add_argument("--probe_rank", type=int, default=0)
+    # GAMMA TRACKS LR. The probe holds a STANDING displacement of size ~gamma/(1-rho_step); with a
+    # fixed gamma that displacement does not shrink as the cosine anneals lr -> 0, so the endgame is
+    # optimized at a point the run never lands on. Measured on the MNIST demo: at constant LR the
+    # tuned recipe kept its early lead but REGRESSED test acc ~0.02-0.03 at saturation, and setting
+    # probe_gamma = law(lr_t) each step recovered the ceiling while keeping the full early lead
+    # (the 2D toy showed the same endgame bias first). Our cosine anneals to final_frac 0.0 and bpb
+    # is read at the very end, so this is the failure mode this A/B is most exposed to.
+    # Safe because gamma is applied at PROBE time and nothing is baked into the buffers -- changing
+    # it rescales the dose retroactively (see manas.py _coef_of / _d_of). Set once per STEP, never
+    # between micros: apply_probe and _restore_theta must see the same gamma or theta won't restore.
+    # WARMUP IS HELD AT THE PEAK DOSE, not ramped: probe warmup was separately measured HARMFUL at
+    # BiBo (w100 flipped manas to +0.01-0.02 WORSE than muon -- the win is front-loaded in early
+    # descent), so letting gamma follow lr UP from ~0 would rebuild a known-bad arm.
+    ap.add_argument("--probe_gamma_schedule", choices=["none", "lr"], default="none")  # tag _gs
     # LatentMoE: shared W_down before dispatch / W_up after combine; experts run at width d.
     # I' / E / k already have flags (--moe_inter / --polyglu_mult / --top_k), so the matched-budget
     # family is k*I' = const with E = 8k -- see the round config. 0 = off. Run tag _lat<d>.
@@ -471,9 +485,10 @@ def main():
     # eval_every steps). GPU-resident accumulators -> one device->host transfer per log_every.
     # Manas dose law (measured, .autoresearch/manas/): per-vote gamma scales with the vote count and
     # with per-vote gradient noise, and tracks sqrt(LR). k = votes/step = grad_accum, m = micro batch.
+    _gamma_law = lambda lr: 0.08 * (lr / 3e-4) ** 0.5 * args.grad_accum / args.batch ** 0.5
     probe_gamma = args.probe_gamma
     if args.optim == "manas" and probe_gamma == 0.0:
-        probe_gamma = 0.08 * (args.muon_lr / 3e-4) ** 0.5 * args.grad_accum / args.batch ** 0.5
+        probe_gamma = _gamma_law(args.muon_lr)
         print(f"[optim] manas auto-gamma = 0.08*sqrt({args.muon_lr:g}/3e-4)*{args.grad_accum}"
               f"/sqrt({args.batch}) = {probe_gamma:g}", flush=True)
     if args.optim == "manas" and args.grad_accum < 2:
@@ -522,6 +537,7 @@ def main():
                    else (f"_wd{args.wd:g}" if args.wd != 0.1 else ""))
                 + ("_cwd" if args.cautious_decay else "")
                 + (f"_manas-g{probe_gamma:g}" + (f"-r{args.probe_rank}" if args.probe_rank else "")
+                   + ("-gs" if args.probe_gamma_schedule == "lr" else "")
                    if args.optim == "manas" else "")
                 + (f"_lat{args.moe_latent_dim}" + ("" if args.latent_norm else "-nonorm")
                    if args.moe_latent_dim else "")
@@ -625,9 +641,17 @@ def main():
     _mns = opts[0] if hasattr(opts[0], "probe") else None
     _probe = _mns.probe if _mns is not None else contextlib.nullcontext
     _vote = _mns.vote if _mns is not None else (lambda: None)
+    # gamma-tracks-lr: hold the peak dose through warmup, then follow the anneal (see the flag).
+    _gs_warm = max(int(total_steps * args.warmup_frac), 1)
+    _gs_on = _mns is not None and args.probe_gamma_schedule == "lr"
+    if _gs_on:
+        print(f"[optim] manas gamma tracks lr: {probe_gamma:g} held through warmup "
+              f"({_gs_warm} steps), then law(lr_t) -> ~0 at the end of the cosine", flush=True)
     for step in range(total_steps):
         for o in opts:
             o.zero_grad(set_to_none=True)
+        if _gs_on and step >= _gs_warm:                      # once per STEP, never between micros
+            _mns.probe_gamma = _gamma_law(opts[0].param_groups[0]["lr"])
         loss_val = 0.0
         for _ in range(args.grad_accum):                     # gradient accumulation -> global batch
             ids = next(gen)
