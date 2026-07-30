@@ -230,6 +230,11 @@ def main():
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
     # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
     ap.add_argument("--act_scale_init", type=float, default=1.0)
+    # gamma init, code 9 only (gamma is inert elsewhere). Needed because gamma*SiLU(alpha*g) is
+    # DEGENERATE once |alpha*g| is large -- it collapses to gamma*alpha*g, so only the product
+    # matters and AdamW moves both params together. Starting alpha near 1/rms(gate) and gamma near
+    # rms(gate)^p puts the gate in its curved region from step 0, where the two grads differ.
+    ap.add_argument("--act_gamma_init", type=float, default=1.0)
     # PER-LAYER activation: MoE layers >= --act_tail_from use --act_tail, earlier layers use --act.
     # Motivated by measurement: CV(rms(gate)) across tokens is 28% at MoE layer 0 but only ~4% from
     # layer 2 on, so NormSiLU's per-token norm earns its keep early and is nearly a constant divide
@@ -404,7 +409,8 @@ def main():
                            num_shared_experts=args.n_shared)
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
     if args.situ_learnable or args.act_scale_learnable:
-        n_ap = patchmod.add_situ_params(model, init=args.act_scale_init)
+        n_ap = patchmod.add_situ_params(model, init=args.act_scale_init,
+                                        gamma_init=args.act_gamma_init)
         print(f"[acts] learnable act scales: (alpha,gamma) on {n_ap} MoE layers, alpha init "
               f"{args.act_scale_init:g}"
               + (f" -> p=sigmoid={torch.sigmoid(torch.tensor(args.act_scale_init)):.3f}"

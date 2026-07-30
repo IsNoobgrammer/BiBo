@@ -111,7 +111,7 @@ def _norm_topk(top_k_weights):
     return top_k_weights / (top_k_weights.sum(-1, keepdim=True) + 1e-20)
 
 
-def add_situ_params(model, init=1.0):
+def add_situ_params(model, init=1.0, gamma_init=1.0):
     """Learnable SiTU: register per-expert (alpha, gamma) so code-5 experts compute
     gamma*tanh(alpha*g)*sigmoid(g) instead of the parameter-free tanh(g)*sigmoid(g).
     Two 1D (E,) params (not one (E,2)) so build_optimizers' ndim>=2 rule sends them to AdamW,
@@ -127,7 +127,7 @@ def add_situ_params(model, init=1.0):
             # 0.0 for radial (code 8), where this param is the exponent LOGIT and p=sigmoid(0)=0.5
             # is the intended start. gamma stays 1.0 -- it gets zero gradient for every non-SiTU code.
             m.situ_alpha = nn.Parameter(torch.full((E,), float(init), device=dev))
-            m.situ_gamma = nn.Parameter(torch.ones(E, device=dev))
+            m.situ_gamma = nn.Parameter(torch.full((E,), float(gamma_init), device=dev))
             n += 1
     return n
 
