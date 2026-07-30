@@ -111,7 +111,7 @@ def _norm_topk(top_k_weights):
     return top_k_weights / (top_k_weights.sum(-1, keepdim=True) + 1e-20)
 
 
-def add_situ_params(model):
+def add_situ_params(model, init=1.0):
     """Learnable SiTU: register per-expert (alpha, gamma) so code-5 experts compute
     gamma*tanh(alpha*g)*sigmoid(g) instead of the parameter-free tanh(g)*sigmoid(g).
     Two 1D (E,) params (not one (E,2)) so build_optimizers' ndim>=2 rule sends them to AdamW,
@@ -123,7 +123,10 @@ def add_situ_params(model):
         if isinstance(m, BiBoFusedExperts):
             E = m.neg_end   # rows must match the codes tensor length (polyglu + specials)
             dev = m.gate_up_proj.device
-            m.situ_alpha = nn.Parameter(torch.ones(E, device=dev))
+            # init: 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so 1 == feature off);
+            # 0.0 for radial (code 8), where this param is the exponent LOGIT and p=sigmoid(0)=0.5
+            # is the intended start. gamma stays 1.0 -- it gets zero gradient for every non-SiTU code.
+            m.situ_alpha = nn.Parameter(torch.full((E,), float(init), device=dev))
             m.situ_gamma = nn.Parameter(torch.ones(E, device=dev))
             n += 1
     return n
@@ -215,7 +218,9 @@ def patch_fused_moe():
     def _bibo_moe(self, hidden_states, top_k_indices, top_k_weights):
         codes = getattr(self, "_act_codes", None)
         if codes is None or codes.device != hidden_states.device:
-            cyc = ACT_CYCLE or (0, 1, 2)
+            # _act_cycle is the optional PER-LAYER override stamped on this module by train.py
+            # (--act_tail / --act_tail_from); falls back to the global cycle.
+            cyc = getattr(self, "_act_cycle", None) or ACT_CYCLE or (0, 1, 2)
             # Kernel codes 3/4 = +Identity / -Identity (code 4 meant ZERO until Jul 26 2026; the
             # kernel now emits -w*x for it -- gated by parity_specials.py in triton-kernel-fused).
             n_neg = self.neg_end - self.neg_start

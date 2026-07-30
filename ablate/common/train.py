@@ -29,8 +29,9 @@ DEV = "cuda"
 _DT = {"bf16": torch.bfloat16, "fp32": torch.float32}
 # --act name -> (kernel act code, run-tag letter). Tag letters are FROZEN so acts-s / acts-n / acts-X
 # runs stay comparable with the pre-Jul-26 W&B history.
-ACT_CODES = {"silu": 0, "relu2": 1, "normsilu": 2, "situ": 5, "normrelu2": 6, "normsitu": 7}
-ACT_TAGS = {0: "s", 1: "r", 2: "n", 5: "t", 6: "Z", 7: "X"}
+ACT_CODES = {"silu": 0, "relu2": 1, "normsilu": 2, "situ": 5, "normrelu2": 6, "normsitu": 7,
+             "radial": 8}
+ACT_TAGS = {0: "s", 1: "r", 2: "n", 5: "t", 6: "Z", 7: "X", 8: "R"}
 
 
 class _QwenAuxCollector:
@@ -225,6 +226,16 @@ def main():
     # so reachable travel over N steps is ~0.5*lr*N. At adam_lr 5e-4 / 2000 steps that is 0.5 -- alpha
     # cannot get there and the arm reads as a null for the wrong reason. 1e-2 gives travel ~10.
     ap.add_argument("--act_scale_lr", type=float, default=0.0)  # 0 = share --adam_lr
+    # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
+    # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
+    # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
+    ap.add_argument("--act_scale_init", type=float, default=1.0)
+    # PER-LAYER activation: MoE layers >= --act_tail_from use --act_tail, earlier layers use --act.
+    # Motivated by measurement: CV(rms(gate)) across tokens is 28% at MoE layer 0 but only ~4% from
+    # layer 2 on, so NormSiLU's per-token norm earns its keep early and is nearly a constant divide
+    # later -- where a per-expert scalar reproduces it and skips the RMS pre-pass.
+    ap.add_argument("--act_tail", default="")            # comma list, same names as --act; "" = off
+    ap.add_argument("--act_tail_from", type=int, default=-1)   # first MoE layer index using --act_tail
     ap.add_argument("--situ_learnable", type=int, default=0)   # per-expert gamma*tanh(alpha*g)*sigmoid(g); AdamW 1D params
     ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free special experts, per-type count
     ap.add_argument("--no_pos_identity", dest="pos_identity_expert", action="store_false")  # drop +Identity (code 3); test -Identity alone
@@ -347,8 +358,20 @@ def main():
     unknown = [a for a in act_names if a not in ACT_CODES]
     assert act_names and not unknown, f"--act: unknown {unknown}; pick from {sorted(ACT_CODES)}"
     act_cycle = [ACT_CODES[a] for a in act_names]
+    tail_names = [a.strip() for a in args.act_tail.split(",") if a.strip()]
+    unknown_t = [a for a in tail_names if a not in ACT_CODES]
+    assert not unknown_t, f"--act_tail: unknown {unknown_t}; pick from {sorted(ACT_CODES)}"
+    tail_cycle = [ACT_CODES[a] for a in tail_names]
+    assert bool(tail_cycle) == (args.act_tail_from >= 0), \
+        "--act_tail and --act_tail_from must be given together (or neither)"
     if args.situ_learnable:
         assert 5 in act_cycle, "--situ_learnable needs situ in --act"
+    # code 8 (radial) carries its exponent in the act-scale param, so the kernel raises without it.
+    # Fail here with the actionable message instead of deep in the first forward.
+    if 8 in act_cycle or 8 in tail_cycle:
+        assert args.act_scale_learnable, (
+            "act 'radial' (code 8) stores its exponent logit theta in the act-scale param -- pass "
+            "--act_scale_learnable 1 (and --act_scale_init 0 so p=sigmoid(0)=0.5)")
     if act_cycle != [0, 1, 2]:
         assert "moe" in patch_list, "custom act subset needs the 'moe' patch (eager experts keep the built-in triple)"
     patchmod.ACT_CYCLE = act_cycle
@@ -377,8 +400,24 @@ def main():
                            num_shared_experts=args.n_shared)
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
     if args.situ_learnable or args.act_scale_learnable:
-        n_ap = patchmod.add_situ_params(model)
-        print(f"[acts] learnable SiTU: (alpha,gamma) registered on {n_ap} MoE layers", flush=True)
+        n_ap = patchmod.add_situ_params(model, init=args.act_scale_init)
+        print(f"[acts] learnable act scales: (alpha,gamma) on {n_ap} MoE layers, alpha init "
+              f"{args.act_scale_init:g}"
+              + (f" -> p=sigmoid={torch.sigmoid(torch.tensor(args.act_scale_init)):.3f}"
+                 if 8 in act_cycle or 8 in tail_cycle else ""), flush=True)
+    # PER-LAYER act override: stamp _act_cycle on the MoE modules at/after --act_tail_from. Indices
+    # are MoE-MODULE order, not model-layer order -- model layer 0 is a DENSE FFN, so MoE index 0 is
+    # model layer 1. The printout below names both so the mapping is never in doubt.
+    if tail_cycle and args.act_tail_from >= 0:
+        from src.modeling.ffn.moe import BiBoFusedExperts
+        _mods = [(n, m) for n, m in model.named_modules() if isinstance(m, BiBoFusedExperts)]
+        for i, (n, m) in enumerate(_mods):
+            m._act_cycle = list(tail_cycle) if i >= args.act_tail_from else list(act_cycle)
+        print(f"[acts] per-layer: {len(_mods)} MoE modules; "
+              f"idx<{args.act_tail_from} -> {act_cycle}, idx>={args.act_tail_from} -> {tail_cycle}",
+              flush=True)
+        for i, (n, m) in enumerate(_mods):
+            print(f"    MoE idx {i}  ({n})  codes={m._act_cycle}", flush=True)
     if args.routed_scaling_learnable or args.expert_scale_learnable:
         n_rs = patchmod.add_router_scales(model, bool(args.routed_scaling_learnable),
                                           bool(args.expert_scale_learnable))
@@ -414,7 +453,9 @@ def main():
     amp = contextlib.nullcontext() if args.precision == "fp32" else torch.autocast("cuda", dtype=dt)
     # acts-<subset> is the primary axis of this ablation; special_pairs / conv kernel etc. keep
     # their suffixes so variants don't collide on ckpt/log/run names (they otherwise share arm+seed)
-    acts_tag = "".join(ACT_TAGS[c] for c in act_cycle)
+    acts_tag = ("".join(ACT_TAGS[c] for c in act_cycle)
+                + (f"-t{args.act_tail_from}" + "".join(ACT_TAGS[c] for c in tail_cycle)
+                   if tail_cycle else ""))
     run_name = (f"{args.arm}_seed{args.seed}"
                 + (f"_acts-{acts_tag}" if args.arm == "bibo_min" else "")
                 + ("_situL" if args.situ_learnable else "")
