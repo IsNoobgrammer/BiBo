@@ -21,7 +21,9 @@
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 
-OUT=/tmp/sweeps/manas_ladder
+# Logs go where the notebook TRAINING MONITOR globs (/home/marimo/work/*.log, arm name =
+# basename[6:-4], so the "sweep_" prefix is load-bearing).
+OUT=/home/marimo/work
 mkdir -p "$OUT"
 
 BASE=(--arm bibo_min --seed 42069
@@ -48,7 +50,7 @@ ARMS=(
 
 for a in "${ARMS[@]}"; do
   set -- $a; name=$1; optim=$2; gamma=$3
-  log="$OUT/$name.log"
+  log="$OUT/sweep_$name.log"
   if grep -q "^\[done\]" "$log" 2>/dev/null; then echo "skip $name (done)"; continue; fi
   echo "=== $name  optim=$optim gamma=$gamma  $(date -u +%H:%M:%S) ==="
   extra=(--optim "$optim")
@@ -65,6 +67,6 @@ done
 echo; echo "=== LADDER TAIL (last logged window per arm) ==="
 for a in "${ARMS[@]}"; do
   set -- $a; name=$1
-  printf "%-12s %s\n" "$name" "$(grep -oE "loss [0-9.]+ \(run [0-9.]+\)" "$OUT/$name.log" 2>/dev/null | tail -1)"
+  printf "%-12s %s\n" "$name" "$(grep -oE "loss [0-9.]+ \(run [0-9.]+\)" "$OUT/sweep_$name.log" 2>/dev/null | tail -1)"
 done
 echo "Read the run-mean (the 20-step window), not the point loss. Compare WITHIN this sweep only."

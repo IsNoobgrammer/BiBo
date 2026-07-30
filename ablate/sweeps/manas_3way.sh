@@ -23,7 +23,10 @@
 set -u
 cd "$(dirname "$0")/../.." || exit 1
 
-OUT=/tmp/sweeps/manas_3way
+# Logs live where the notebook TRAINING MONITOR looks: it globs /home/marimo/work/*.log and
+# derives the arm name as basename[6:-4], i.e. it requires a 6-char "sweep_" prefix. Writing
+# anywhere else (e.g. /tmp/sweeps/) makes the whole sweep invisible in the notebook.
+OUT=/home/marimo/work
 mkdir -p "$OUT"
 
 BASE=(--arm bibo_min --seed 42069
@@ -42,7 +45,7 @@ BASE=(--arm bibo_min --seed 42069
 
 run () {           # name, extra args...
   local name=$1; shift
-  local log="$OUT/$name.log"
+  local log="$OUT/sweep_$name.log"
   if grep -q "^\[done\]" "$log" 2>/dev/null; then echo "skip $name (done)"; return; fi
   echo "=== $name  $*  $(date -u +%H:%M:%S) ==="
   python -m ablate.common.train "${BASE[@]}" "$@" >"$log" 2>&1
@@ -58,6 +61,6 @@ run mn_gs     --optim manas --probe_gamma_schedule lr
 echo; echo "=== 3-WAY (last 20-step window; compare WITHIN this sweep only) ==="
 for n in mu_anchor mn_fixed mn_gs; do
   printf "%-10s %s  %s\n" "$n" \
-    "$(grep -oE 'run[0-9]+=[0-9.]+' "$OUT/$n.log" 2>/dev/null | tail -1)" \
-    "$(grep -oE 'tps=[0-9.]+k' "$OUT/$n.log" 2>/dev/null | tail -1)"
+    "$(grep -oE 'run[0-9]+=[0-9.]+' "$OUT/sweep_$n.log" 2>/dev/null | tail -1)" \
+    "$(grep -oE 'tps=[0-9.]+k' "$OUT/sweep_$n.log" 2>/dev/null | tail -1)"
 done
