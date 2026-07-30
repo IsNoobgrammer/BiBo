@@ -18,7 +18,7 @@ from .models import build_arm, count_params
 from src.configuration_bibo import GATE_TYPES, SIGNED_GATES, ROUTER_INPUT_NORMS, MOE_OUT_NORMS, POLYGLU_GROUP
 from . import patches as patchmod
 from .optim import build_optimizers
-from .schedule import make_scheduler
+from .schedule import make_scheduler, make_wd_schedule
 from .data import token_batches, TRAIN_DATASET
 from .evaluate import evaluate, Tok, summarize
 from .eval.interp import RouterTrace
@@ -271,6 +271,11 @@ def main():
     ap.add_argument("--muon_lr", type=float, default=3e-4)
     ap.add_argument("--adam_lr", type=float, default=3e-4)
     ap.add_argument("--wd", type=float, default=0.1)
+    # REVERSE-COSINE wd ramp: --wd is the START, --wd_end the finish, rising while the LR decays.
+    # wd 0.01 leads on train loss through ~step 1500 then loses ~0.021 in the anneal (BOTH silu and
+    # normsilu, 0.0207 / 0.0215) because the relative step sqrt(2*lr*wd) collapses as lr -> 0.
+    ap.add_argument("--wd_schedule", choices=["none", "rcos"], default="none")
+    ap.add_argument("--wd_end", type=float, default=0.1)   # only used when --wd_schedule rcos
     ap.add_argument("--scheduler", choices=["wsd", "cosine"], default="wsd")  # LR schedule shape
     ap.add_argument("--warmup_frac", type=float, default=0.05)   # both schedulers
     ap.add_argument("--decay_frac", type=float, default=0.20)    # WSD only: fraction of steps in the final decay
@@ -400,6 +405,12 @@ def main():
     tok_per_step = args.batch * args.seq_len * args.grad_accum   # global batch
     total_steps = args.max_steps or (args.tokens // tok_per_step)
     scheds = make_scheduler(args.scheduler, opts, total_steps, args.warmup_frac, args.decay_frac)
+    wd_sched = (make_wd_schedule(opts, total_steps, args.wd, args.wd_end)
+                if args.wd_schedule == "rcos" else None)
+    cur_wd = args.wd
+    if wd_sched is not None:
+        print(f"[optim] wd schedule rcos: {args.wd:g} -> {args.wd_end:g} (reverse cosine, rises as lr decays)",
+              flush=True)
     amp = contextlib.nullcontext() if args.precision == "fp32" else torch.autocast("cuda", dtype=dt)
     # acts-<subset> is the primary axis of this ablation; special_pairs / conv kernel etc. keep
     # their suffixes so variants don't collide on ckpt/log/run names (they otherwise share arm+seed)
@@ -411,7 +422,8 @@ def main():
                    if args.act_scale_learnable else "")
                 # wd is an ablation axis now (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
-                + (f"_wd{args.wd:g}" if args.wd != 0.1 else "")
+                + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
+                   else (f"_wd{args.wd:g}" if args.wd != 0.1 else ""))
                 + (f"_e{args.polyglu_mult * POLYGLU_GROUP}" if args.polyglu_mult != 2 else "")
                 + (f"_se{args.special_pairs}" if args.special_pairs else "")
                 + (("_posonly" if not args.neg_identity_expert else "") if args.special_pairs else "")
@@ -521,6 +533,8 @@ def main():
         _loss_hist.append(loss_val)
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) if args.grad_clip > 0 else \
             torch.sqrt(sum(p.grad.float().pow(2).sum() for p in model.parameters() if p.grad is not None))
+        if wd_sched is not None:
+            cur_wd = wd_sched(step)      # BEFORE o.step() so this step decays at the scheduled wd
         for o in opts:
             o.step()
         for s in scheds:
@@ -568,7 +582,9 @@ def main():
                         f"[{rt['train/act_alpha_min']:.2f},{rt['train/act_alpha_max']:.2f}]")
             print(f"  step {step}/{total_steps} loss={lv:.4f} run{len(_loss_hist)}={lv_run:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
-                  f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{rt_s}{aS_s} elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"
+                  f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{rt_s}{aS_s}"
+                  f"{f' wd={cur_wd:.4f}' if wd_sched is not None else ''}"
+                  f" elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"
                   f"{'' if fin else '  <<NON-FINITE>>'}", flush=True)
             if wb:
                 wb.log({"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "train/ms_per_step": ms_per_step,
