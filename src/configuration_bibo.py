@@ -105,6 +105,8 @@ class BiBoConfig(PretrainedConfig):
         kernel_size=3,        # kernel width for BOTH the conv router and the conv shared expert
         gate_type="sigmoid",       # one of GATE_TYPES (top of this file); "situ" is SIGNED -> needs norm_topk_prob=True
         moe_out_norm="none",       # per-token norm on the MoE BLOCK OUTPUT (see MOE_OUT_NORMS)
+        moe_latent_dim=0,          # LatentMoE: expert in/out width d (0 = off, experts run at hidden_size)
+        latent_moe_use_norm=True,  # RMSNorm on the latent before the up-projection (K3 ships this on)
         router_input_norm="none",  # per-token norm on the ROUTER INPUT ONLY: "none" | "rms" (own
                                    # learnable gain) | "unit" (x/rms(x), no gain -> logits depend on
                                    # DIRECTION only). The block is pre-norm so the router and the
@@ -227,6 +229,8 @@ class BiBoConfig(PretrainedConfig):
         self.gate_type = gate_type
         self.router_input_norm = router_input_norm
         self.moe_out_norm = moe_out_norm
+        self.moe_latent_dim = int(moe_latent_dim or 0)
+        self.latent_moe_use_norm = bool(latent_moe_use_norm)
         self.router_temperature = router_temperature
         self.router_activation = router_activation
         self.norm_topk_prob = norm_topk_prob

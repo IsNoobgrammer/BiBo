@@ -29,7 +29,10 @@ class BiBoFusedExperts(nn.Module):
         self.num_polyglu_experts = config.polyglu_expert_multiplier * POLYGLU_GROUP
         self.special_expert_pairs = config.special_expert_pairs
         self.num_routed_experts = config.num_routed_experts
-        self.hidden_size = config.hidden_size
+        # LatentMoE: when moe_latent_dim is set the experts live in the LATENT space, so their
+        # in/out width is d, not hidden_size. Everything downstream keys off self.hidden_size --
+        # including the fused Triton kernel, which just sees a smaller H -- so no kernel change.
+        self.hidden_size = getattr(config, "moe_latent_dim", 0) or config.hidden_size
         self.intermediate_size = config.moe_intermediate_size
 
         self.gate_up_proj = nn.Parameter(
@@ -128,6 +131,23 @@ class BiBoMoELayer(nn.Module):
     def __init__(self, config: BiBoConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
+        # LatentMoE (arXiv 2601.18089; Kimi K3 ships it as routed_expert_hidden_size 3584 of 7168,
+        # i.e. ratio 1/2, with latent_moe_use_norm=true). Shared W_down BEFORE dispatch and W_up
+        # AFTER combine wrap the routed path, so the experts run at width d instead of hidden_size.
+        # The ROUTER still reads the FULL hidden state -- the paper is explicit about that, and our
+        # router has been the most sensitive part of this model.
+        self.moe_latent_dim = getattr(config, 'moe_latent_dim', 0) or 0
+        if self.moe_latent_dim:
+            d = self.moe_latent_dim
+            self.latent_down = nn.Linear(config.hidden_size, d, bias=False)
+            self.latent_up = nn.Linear(d, config.hidden_size, bias=False)
+            nn.init.normal_(self.latent_down.weight, mean=0.0, std=config.initializer_range)
+            nn.init.normal_(self.latent_up.weight, mean=0.0, std=config.initializer_range)
+            # RMSNorm on the LATENT before the up-projection. Distinct from moe_out_norm, which
+            # normalizes the full-width output and cost 0.010 bpb -- but that was measured with no
+            # bottleneck, and K3 runs this one at 2.8T, so it is a flag defaulting to the K3 setting.
+            self.latent_norm = (BiBoRMSNorm(d, eps=config.rms_norm_eps)
+                                if getattr(config, 'latent_moe_use_norm', True) else None)
         self.num_routed_experts = config.num_routed_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.bias_update_factor = config.bias_update_factor
@@ -265,7 +285,17 @@ class BiBoMoELayer(nn.Module):
         flat_indices = rearrange(top_k_indices, 'b s k -> (b s) k')
         flat_weights = rearrange(top_k_weights, 'b s k -> (b s) k')
 
+        # LatentMoE: compress AFTER the router (which read the full hidden state above), so only
+        # the expert path pays the bottleneck.
+        if self.moe_latent_dim:
+            flat_hidden = self.latent_down(flat_hidden)
+
         final_routed = self.experts(flat_hidden, flat_indices, flat_weights)
+
+        if self.moe_latent_dim:
+            if self.latent_norm is not None:
+                final_routed = self.latent_norm(final_routed)
+            final_routed = self.latent_up(final_routed)      # back to hidden_size before the add
         final_routed = rearrange(final_routed, '(b s) h -> b s h', b=bsz)
 
         if self.use_shared_expert:

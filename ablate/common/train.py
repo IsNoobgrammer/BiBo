@@ -295,6 +295,11 @@ def main():
     # 0.67674, rad-n 0.67669) was trained NON-cautious, so any cautious run must be A/B'd against
     # them rather than against another cautious run. Runs are tagged _cwd when this is on.
     ap.add_argument("--cautious_decay", type=_bool, default=True)
+    # LatentMoE: shared W_down before dispatch / W_up after combine; experts run at width d.
+    # I' / E / k already have flags (--moe_inter / --polyglu_mult / --top_k), so the matched-budget
+    # family is k*I' = const with E = 8k -- see the round config. 0 = off. Run tag _lat<d>.
+    ap.add_argument("--moe_latent_dim", type=int, default=0)
+    ap.add_argument("--latent_norm", type=_bool, default=True)   # RMSNorm on the latent pre-up-proj
     ap.add_argument("--wd_schedule", choices=["none", "rcos"], default="none")
     ap.add_argument("--wd_end", type=float, default=0.1)   # only used when --wd_schedule rcos
     ap.add_argument("--scheduler", choices=["wsd", "cosine"], default="wsd")  # LR schedule shape
@@ -411,6 +416,8 @@ def main():
                            router_temperature=args.router_temp,
                            router_input_norm=args.router_input_norm,
                            moe_out_norm=args.moe_out_norm,
+                           moe_latent_dim=args.moe_latent_dim,
+                           latent_moe_use_norm=args.latent_norm,
                            num_shared_experts=args.n_shared)
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
     if args.situ_learnable or args.act_scale_learnable:
@@ -482,6 +489,8 @@ def main():
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
                    else (f"_wd{args.wd:g}" if args.wd != 0.1 else ""))
                 + ("_cwd" if args.cautious_decay else "")
+                + (f"_lat{args.moe_latent_dim}" + ("" if args.latent_norm else "-nonorm")
+                   if args.moe_latent_dim else "")
                 + (f"_e{args.polyglu_mult * POLYGLU_GROUP}" if args.polyglu_mult != 2 else "")
                 + (f"_se{args.special_pairs}" if args.special_pairs else "")
                 + (("_posonly" if not args.neg_identity_expert else "") if args.special_pairs else "")
