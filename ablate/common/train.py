@@ -290,6 +290,11 @@ def main():
     # REVERSE-COSINE wd ramp: --wd is the START, --wd_end the finish, rising while the LR decays.
     # wd 0.01 leads on train loss through ~step 1500 then loses ~0.021 in the anneal (BOTH silu and
     # normsilu, 0.0207 / 0.0215) because the relative step sqrt(2*lr*wd) collapses as lr -> 0.
+    # Muon-only cautious decay: skip the decay on coordinates the update is already shrinking.
+    # WARNING on comparability: every baseline on the board (normsilu 0.67726, silu 0.68171, aS-s
+    # 0.67674, rad-n 0.67669) was trained NON-cautious, so any cautious run must be A/B'd against
+    # them rather than against another cautious run. Runs are tagged _cwd when this is on.
+    ap.add_argument("--cautious_decay", type=_bool, default=True)
     ap.add_argument("--wd_schedule", choices=["none", "rcos"], default="none")
     ap.add_argument("--wd_end", type=float, default=0.1)   # only used when --wd_schedule rcos
     ap.add_argument("--scheduler", choices=["wsd", "cosine"], default="wsd")  # LR schedule shape
@@ -445,7 +450,8 @@ def main():
                                           xorth_gate_ref=args.xorth_gate_ref, xorth_ema=args.xorth_ema,
                                           xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where,
                                           router_adamw=(args.router_optim == "adamw"),
-                                          act_scale_lr=args.act_scale_lr)
+                                          act_scale_lr=args.act_scale_lr,
+                                          cautious_decay=args.cautious_decay)
     if args.compile:                                            # compile the transformer body only; the
         model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
         print(f"[{args.arm}_seed{args.seed}] torch.compile(model.model) on; fused CE + liger/moe/flash kernels stay eager",
@@ -475,6 +481,7 @@ def main():
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
                    else (f"_wd{args.wd:g}" if args.wd != 0.1 else ""))
+                + ("_cwd" if args.cautious_decay else "")
                 + (f"_e{args.polyglu_mult * POLYGLU_GROUP}" if args.polyglu_mult != 2 else "")
                 + (f"_se{args.special_pairs}" if args.special_pairs else "")
                 + (("_posonly" if not args.neg_identity_expert else "") if args.special_pairs else "")
