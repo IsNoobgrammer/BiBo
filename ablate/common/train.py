@@ -30,8 +30,8 @@ _DT = {"bf16": torch.bfloat16, "fp32": torch.float32}
 # --act name -> (kernel act code, run-tag letter). Tag letters are FROZEN so acts-s / acts-n / acts-X
 # runs stay comparable with the pre-Jul-26 W&B history.
 ACT_CODES = {"silu": 0, "relu2": 1, "normsilu": 2, "situ": 5, "normrelu2": 6, "normsitu": 7,
-             "radial": 8}
-ACT_TAGS = {0: "s", 1: "r", 2: "n", 5: "t", 6: "Z", 7: "X", 8: "R"}
+             "radial": 8, "siluag": 9}
+ACT_TAGS = {0: "s", 1: "r", 2: "n", 5: "t", 6: "Z", 7: "X", 8: "R", 9: "G"}
 
 
 class _QwenAuxCollector:
@@ -372,6 +372,10 @@ def main():
         assert args.act_scale_learnable, (
             "act 'radial' (code 8) stores its exponent logit theta in the act-scale param -- pass "
             "--act_scale_learnable 1 (and --act_scale_init 0 so p=sigmoid(0)=0.5)")
+    if 9 in act_cycle or 9 in tail_cycle:
+        assert args.act_scale_learnable, (
+            "act 'siluag' (code 9) = gamma*SiLU(alpha*g) needs BOTH per-expert params -- pass "
+            "--act_scale_learnable 1 (keep --act_scale_init 1 so it starts as plain silu)")
     if act_cycle != [0, 1, 2]:
         assert "moe" in patch_list, "custom act subset needs the 'moe' patch (eager experts keep the built-in triple)"
     patchmod.ACT_CYCLE = act_cycle
@@ -621,6 +625,17 @@ def main():
                            "train/act_alpha_max": _a.max().item()})
                 aS_s = (f" aS={rt['train/act_alpha_mean']:.3f}"
                         f"[{rt['train/act_alpha_min']:.2f},{rt['train/act_alpha_max']:.2f}]")
+                # gamma matters only where it is LIVE: code 5 (situ) and code 9 (decoupled silu).
+                # For code 9 the whole hypothesis is that alpha FALLS (gate temperature) while gamma
+                # RISES (magnitude) -- which is unreadable unless both are logged.
+                if 9 in act_cycle or 9 in tail_cycle or args.situ_learnable:
+                    _gm = torch.cat([m.situ_gamma.detach().float().flatten()
+                                     for m in model.modules() if hasattr(m, "situ_gamma")])
+                    rt.update({"train/act_gamma_mean": _gm.mean().item(),
+                               "train/act_gamma_min": _gm.min().item(),
+                               "train/act_gamma_max": _gm.max().item()})
+                    aS_s += (f" gG={rt['train/act_gamma_mean']:.3f}"
+                             f"[{rt['train/act_gamma_min']:.2f},{rt['train/act_gamma_max']:.2f}]")
             print(f"  step {step}/{total_steps} loss={lv:.4f} run{len(_loss_hist)}={lv_run:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
                   f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{rt_s}{aS_s}"
