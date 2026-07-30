@@ -409,6 +409,9 @@ def main():
                 + ("_situL" if args.situ_learnable else "")
                 + (("_aS" + (f"{args.act_scale_lr:g}" if args.act_scale_lr else ""))
                    if args.act_scale_learnable else "")
+                # wd is an ablation axis now (scale-equilibrium test) -- untagged runs would collide
+                # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
+                + (f"_wd{args.wd:g}" if args.wd != 0.1 else "")
                 + (f"_e{args.polyglu_mult * POLYGLU_GROUP}" if args.polyglu_mult != 2 else "")
                 + (f"_se{args.special_pairs}" if args.special_pairs else "")
                 + (("_posonly" if not args.neg_identity_expert else "") if args.special_pairs else "")
