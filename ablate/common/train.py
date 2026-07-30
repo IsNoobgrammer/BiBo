@@ -328,6 +328,11 @@ def main():
     # BiBo (w100 flipped manas to +0.01-0.02 WORSE than muon -- the win is front-loaded in early
     # descent), so letting gamma follow lr UP from ~0 would rebuild a known-bad arm.
     ap.add_argument("--probe_gamma_schedule", choices=["none", "lr"], default="none")  # tag _gs
+    # Log the loss at RESTORED theta every log_every steps (one extra no-grad forward, ~0.3%).
+    # Under muon it equals the training loss and is a free consistency check; under manas the
+    # difference IS the cosmetic part of the train-loss edge. Deconfound, not an ablation axis --
+    # untagged, so it never splits a run name away from its baseline.
+    ap.add_argument("--clean_loss", type=_bool, default=False)
     # LatentMoE: shared W_down before dispatch / W_up after combine; experts run at width d.
     # I' / E / k already have flags (--moe_inter / --polyglu_mult / --top_k), so the matched-budget
     # family is k*I' = const with E = 8k -- see the round config. 0 = off. Run tag _lat<d>.
@@ -644,6 +649,7 @@ def main():
     # gamma-tracks-lr: hold the peak dose through warmup, then follow the anneal (see the flag).
     _gs_warm = max(int(total_steps * args.warmup_frac), 1)
     _gs_on = _mns is not None and args.probe_gamma_schedule == "lr"
+    _clean_on, loss_clean = bool(args.clean_loss), None
     if _gs_on:
         print(f"[optim] manas gamma tracks lr: {probe_gamma:g} held through warmup "
               f"({_gs_warm} steps), then law(lr_t) -> ~0 at the end of the cosine", flush=True)
@@ -668,6 +674,23 @@ def main():
         _loss_hist.append(loss_val)
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) if args.grad_clip > 0 else \
             torch.sqrt(sum(p.grad.float().pow(2).sum() for p in model.parameters() if p.grad is not None))
+        # CLEAN-THETA LOSS. Manas logs its training loss at theta + gamma*D, and D is a DESCENT
+        # direction, so its train curve is read from downhill of the weights the run actually keeps.
+        # The loss landscape is identical between the arms -- what differs is WHERE it is sampled --
+        # but the bias scales with the standing probe gamma/(1-rho_step), so it flatters whichever
+        # arm probes harder. That is precisely the fixed-vs-gs axis (gamma 0.231 vs 0.098 by the end
+        # of a cosine), which is why train loss cannot rank those two. One extra no-grad forward on
+        # the last micro-batch at RESTORED theta makes the gap measurable instead of assumed.
+        # eval() so RouterTrace skips it (it ignores non-training forwards by design) -- the config
+        # has no dropout, so eval mode does not change the computation. ~0.3% overhead at log_every 25.
+        if _clean_on and (step % args.log_every == 0 or step == total_steps - 1):
+            if _mns is not None:
+                _mns._restore_theta()    # step() does this anyway; doing it early is idempotent
+            model.eval()
+            with torch.no_grad(), amp:
+                loss_clean = float(_ce(model, ids, use_fused_ce, None, 0.0,
+                                       getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok))
+            model.train()
         if wd_sched is not None:
             cur_wd = wd_sched(step)      # BEFORE o.step() so this step decays at the scheduled wd
         for o in opts:
@@ -730,12 +753,19 @@ def main():
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
                   f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{rt_s}{aS_s}"
                   f"{f' wd={cur_wd:.4f}' if wd_sched is not None else ''}"
-                  f" elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"
+                  # clean = loss at RESTORED theta; probe = how much of `loss` is the probe sitting
+                  # downhill. Under muon probe is ~0 by construction (nothing to restore).
+                  + (f" clean={loss_clean:.4f} probe={loss_clean - lv:+.4f}"
+                     if loss_clean is not None else "")
+                  + f" elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"
                   f"{'' if fin else '  <<NON-FINITE>>'}", flush=True)
             if wb:
                 wb.log({"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "train/ms_per_step": ms_per_step,
                         "train/tps": tps, "train/mfu": mfu, "train/mem_gb": mem, "train/elapsed_s": elapsed,
                         "train/expert_corr": ecorr, "train/router_corr": rcorr,
+                        **({"train/loss_clean": loss_clean, "train/probe_gap": loss_clean - lv}
+                           if loss_clean is not None else {}),
+                        **({"train/probe_gamma": _mns.probe_gamma} if _mns is not None else {}),
                         "tokens": toks, **rt}, step=step)
         # `step > 0`: step 0 evaluates a RANDOM-INIT model, so the numbers are noise (measured
         # bpb hi=2.04 en=4.19 vs 0.74/1.64 at the end) while costing a full eval pass -- ~2.4 min
