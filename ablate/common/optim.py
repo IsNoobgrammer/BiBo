@@ -61,7 +61,8 @@ NS8 = (_KJ,) * 6 + (_PIN,) * 2
 def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, ns_dtype=torch.bfloat16,
                      scale_mode="aurora", xorth_post=0.0, xorth_gate_ref=0.3, xorth_ema=0.95,
                      xorth_warmup_steps=0, xorth_where="post", router_adamw=False,
-                     act_scale_lr=None, cautious_decay=True):
+                     act_scale_lr=None, cautious_decay=True,
+                     optim="muon", probe_gamma=0.0, probe_rho_step=0.96, probe_rank=0):
     from kernels.sm120.muon import FusedMuon   # Blackwell: gram-NS (self-gates to symmul/cuBLAS on small mats) + 8M knee
     stacks, mats, other = [], [], []
     n_router = 0
@@ -116,9 +117,30 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
     # applies it to both. Passed explicitly so the run record always states which mode was used:
     # every baseline on the board predates this and is NON-cautious.
     print(f"[optim] cautious weight decay: {bool(cautious_decay)} (Muon only; AdamW standard)", flush=True)
-    muon = FusedMuon(groups, lr=muon_lr, momentum=momentum, weight_decay=wd,
-                     coeffs=NS8, ns_dtype=ns_dtype, aurora_k=1, gram_restarts=[4, 5], scale_mode=scale_mode,
-                     cautious_decay=bool(cautious_decay), **_xo)
+    _mk = dict(lr=muon_lr, momentum=momentum, weight_decay=wd, coeffs=NS8, ns_dtype=ns_dtype,
+               aurora_k=1, gram_restarts=[4, 5], scale_mode=scale_mode,
+               cautious_decay=bool(cautious_decay), **_xo)
+    # optim=manas: the SAME sm120 gram-NS Muon step (kernels.sm120.manas subclasses it cooperatively --
+    # never import kernels.sm75.manas here, that would swap the NS backend along with the optimizer and
+    # confound the A/B) plus the rolling probe. Every argument above is shared verbatim with the muon
+    # arm, so the arms differ by the probe and nothing else.
+    #   probe_rank=0 -> None = FULL-RANK micro-vote: state is manas_d + manas_prev_g, both bf16
+    #   (~2.5 GB here), no Q/omega/QR/sketch. Chosen because the 137M rank ladder was monotone
+    #   (r8 < r32 <= r64 < r512 on train AND bpb) -- the low-rank sketch was the bottleneck.
+    #   probe_gamma: dose, per the measured law gamma = 0.08*sqrt(lr/3e-4)*k/sqrt(m) (train.py computes
+    #   it). 0 = probe never engages and this is EXACTLY FusedMuon -- the plumbing control arm.
+    if optim == "manas":
+        from kernels.sm120.manas import ManasOptimizer
+        muon = ManasOptimizer(groups, micro_vote=True, probe_rank=(probe_rank or None),
+                              probe_rho=1.0, probe_rho_step=probe_rho_step,
+                              probe_gamma=probe_gamma, **_mk)
+        print(f"[optim] MANAS probe: gamma={probe_gamma:g} rho_step={probe_rho_step:g} "
+              f"rank={probe_rank or 'full'} micro_vote=True (engages at >= {muon.probe_min_votes} votes/step)",
+              flush=True)
+    elif optim == "muon":
+        muon = FusedMuon(groups, **_mk)
+    else:
+        raise ValueError(f"unknown optim {optim!r}; valid: muon, manas")
     # act_scale_lr: the per-expert activation scales (situ_alpha/gamma) need to travel FAR -- alpha
     # must reach ~5 to lift a Muon-pinned gate from RMS 0.18 into SiLU's nonlinear region, and AdamW
     # at adam_lr=5e-4 can only move it ~0.5 over 2000 steps. Own group, own lr, and wd=0 -- decay on

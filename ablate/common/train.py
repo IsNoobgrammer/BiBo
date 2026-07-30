@@ -295,6 +295,25 @@ def main():
     # 0.67674, rad-n 0.67669) was trained NON-cautious, so any cautious run must be A/B'd against
     # them rather than against another cautious run. Runs are tagged _cwd when this is on.
     ap.add_argument("--cautious_decay", type=_bool, default=True)
+    # ---- OPTIMIZER AXIS: muon (every baseline on the board) | manas (muon + rolling probe) ----
+    # Manas runs the SAME sm120 gram-NS Muon step and takes every Muon argument verbatim; it adds a
+    # lookahead probe -- forward/backward evaluate at theta + gamma*D, where D is a long-memory
+    # consensus of UNIT-normalized micro-batch gradient directions (one vote per grad_accum micro).
+    # It is a GRADIENT-ACCUMULATION optimizer: at 1 vote/step it self-gates to plain Muon (measured
+    # wall-clock negative there); the edge grows with votes (-0.046 @ 4v, -0.140 @ 8v vs LR-TUNED
+    # muon on the legacy 137M harness, 300-step train loss). --grad_accum IS the vote count.
+    # Everything measured to date is 300-step TRAIN loss on a different harness, and train loss is
+    # read AT THE PROBED THETA (downhill), so the bpb eval here is the first honest verdict.
+    ap.add_argument("--optim", choices=["muon", "manas"], default="muon")   # tag _manas
+    # probe dose. 0 = AUTO from the measured law gamma = 0.08*sqrt(lr/3e-4)*k/sqrt(m), k=grad_accum,
+    # m=--batch (validated 6/6 blind across 32/64/128 x ga1/2/4). Set explicitly to override.
+    # gamma is a function of LR -- if you change --muon_lr, the auto value tracks it.
+    ap.add_argument("--probe_gamma", type=float, default=0.0)
+    ap.add_argument("--probe_rho_step", type=float, default=0.96)  # consensus memory in STEPS (1/(1-rho)); flat 0.96-0.99
+    # 0 = FULL RANK (state = manas_d + manas_prev_g, both bf16, ~2.5 GB at 64 experts; no QR).
+    # >0 = the legacy low-rank sketch at that rank. The 137M rank ladder was monotone in rank, so
+    # full rank is the limit of the trend at ~zero compute -- and it has never run on a box.
+    ap.add_argument("--probe_rank", type=int, default=0)
     # LatentMoE: shared W_down before dispatch / W_up after combine; experts run at width d.
     # I' / E / k already have flags (--moe_inter / --polyglu_mult / --top_k), so the matched-budget
     # family is k*I' = const with E = 8k -- see the round config. 0 = off. Run tag _lat<d>.
@@ -450,6 +469,16 @@ def main():
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
     # router mechanics traced on the TRAINING stream (eval-time MoEStats sees eval data only, every
     # eval_every steps). GPU-resident accumulators -> one device->host transfer per log_every.
+    # Manas dose law (measured, .autoresearch/manas/): per-vote gamma scales with the vote count and
+    # with per-vote gradient noise, and tracks sqrt(LR). k = votes/step = grad_accum, m = micro batch.
+    probe_gamma = args.probe_gamma
+    if args.optim == "manas" and probe_gamma == 0.0:
+        probe_gamma = 0.08 * (args.muon_lr / 3e-4) ** 0.5 * args.grad_accum / args.batch ** 0.5
+        print(f"[optim] manas auto-gamma = 0.08*sqrt({args.muon_lr:g}/3e-4)*{args.grad_accum}"
+              f"/sqrt({args.batch}) = {probe_gamma:g}", flush=True)
+    if args.optim == "manas" and args.grad_accum < 2:
+        print("[optim] WARNING: manas with grad_accum < 2 self-gates to plain Muon (1 vote/step is "
+              "the measured info cap) -- slice the batch to get votes", flush=True)
     _n_exp = getattr(cfg, "num_routed_experts", None) or getattr(cfg, "num_experts", 0)
     rtrace = RouterTrace(model, _n_exp, DEV) if (args.router_log and _n_exp >= 2) else None
     opts, n_mat, n_oth = build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt,
@@ -458,7 +487,10 @@ def main():
                                           xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where,
                                           router_adamw=(args.router_optim == "adamw"),
                                           act_scale_lr=args.act_scale_lr,
-                                          cautious_decay=args.cautious_decay)
+                                          cautious_decay=args.cautious_decay,
+                                          optim=args.optim, probe_gamma=probe_gamma,
+                                          probe_rho_step=args.probe_rho_step,
+                                          probe_rank=args.probe_rank)
     if args.compile:                                            # compile the transformer body only; the
         model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
         print(f"[{args.arm}_seed{args.seed}] torch.compile(model.model) on; fused CE + liger/moe/flash kernels stay eager",
@@ -489,6 +521,8 @@ def main():
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
                    else (f"_wd{args.wd:g}" if args.wd != 0.1 else ""))
                 + ("_cwd" if args.cautious_decay else "")
+                + (f"_manas-g{probe_gamma:g}" + (f"-r{args.probe_rank}" if args.probe_rank else "")
+                   if args.optim == "manas" else "")
                 + (f"_lat{args.moe_latent_dim}" + ("" if args.latent_norm else "-nonorm")
                    if args.moe_latent_dim else "")
                 + (f"_e{args.polyglu_mult * POLYGLU_GROUP}" if args.polyglu_mult != 2 else "")
@@ -586,16 +620,26 @@ def main():
     from collections import deque
     LOSS_WINDOW = 20
     _loss_hist = deque(maxlen=LOSS_WINDOW)
+    # Probe hooks, resolved once: under --optim muon these are nullcontext / no-op, so the muon
+    # arm's inner loop is byte-identical to every run on the board.
+    _mns = opts[0] if hasattr(opts[0], "probe") else None
+    _probe = _mns.probe if _mns is not None else contextlib.nullcontext
+    _vote = _mns.vote if _mns is not None else (lambda: None)
     for step in range(total_steps):
         for o in opts:
             o.zero_grad(set_to_none=True)
         loss_val = 0.0
         for _ in range(args.grad_accum):                     # gradient accumulation -> global batch
             ids = next(gen)
-            with amp:
-                loss = _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
-                           getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok) / args.grad_accum
-            loss.backward()
+            # MANAS: fwd/bwd run at theta + gamma*D (the probe), then vote() folds this micro's
+            # gradient direction into D. vote() MUST be outside the probe context (it raises
+            # otherwise) and theta is restored exactly inside step(). Both are no-ops under muon.
+            with _probe():
+                with amp:
+                    loss = _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
+                               getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok) / args.grad_accum
+                loss.backward()
+            _vote()
             loss_val += loss.item()
         _loss_hist.append(loss_val)
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) if args.grad_clip > 0 else \
