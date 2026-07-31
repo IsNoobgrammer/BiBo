@@ -29,9 +29,15 @@ DEV = "cuda"
 _DT = {"bf16": torch.bfloat16, "fp32": torch.float32}
 # --act name -> (kernel act code, run-tag letter). Tag letters are FROZEN so acts-s / acts-n / acts-X
 # runs stay comparable with the pre-Jul-26 W&B history.
-ACT_CODES = {"silu": 0, "relu2": 1, "normsilu": 2, "situ": 5, "normrelu2": 6, "normsitu": 7,
-             "radial": 8, "siluag": 9}
-ACT_TAGS = {0: "s", 1: "r", 2: "n", 5: "t", 6: "Z", 7: "X", 8: "R", 9: "G"}
+# THE MENU IS THREE (Jul 31 2026). Codes 1/5/6/7/9 and the per-expert gamma were deleted from the
+# kernel; radial is the default. Decided at 1B tokens, bpb vs a 0.00037 same-seed floor:
+#   radial 0.64313 < silu-a 0.64429 < normsilu 0.64646 < silu 0.64768
+# radial wins because its magnitude control is BOUNDED: p = sigmoid(theta) in (0,1) makes p->0
+# exactly normsilu and p->1 full magnitude, and the learned p is a DEPTH RAMP 0.11 -> 0.93, so a
+# layer runs as normsilu early and full-magnitude late. Numeric codes are unchanged so old
+# checkpoints and run names still resolve.
+ACT_CODES = {"silu": 0, "normsilu": 2, "radial": 8}
+ACT_TAGS = {0: "s", 2: "n", 8: "R"}
 
 
 class _QwenAuxCollector:
@@ -215,7 +221,7 @@ def main():
     # -> 0,5,0,5,...), which is how a future NormSiLU+NormSiTU mixture would be run.
     #   silu 0 (default) | relu2 1 | normsilu 2 | situ 5 | normrelu2 6 | normsitu 7
     # Measured @e30 500M tok: acts-n (normsilu) 0.7273, acts-s (silu) 0.7444, Z (normrelu2) 0.8345.
-    ap.add_argument("--act", default="silu")             # comma list allowed; cycles across the GLU experts
+    ap.add_argument("--act", default="radial")           # comma list allowed; cycles across the GLU experts
     # Per-expert INPUT SCALE alpha for ANY activation: act(alpha_e * x), x = gate (silu/relu2) or
     # gate/rms(gate) (the normed codes; alpha sits AFTER the rms or it is exactly inert). Reuses the
     # situ (alpha,gamma) params -- gamma gets ZERO gradient for non-SiTU codes and stays 1.0, since a
@@ -422,13 +428,15 @@ def main():
     # code 8 (radial) carries its exponent in the act-scale param, so the kernel raises without it.
     # Fail here with the actionable message instead of deep in the first forward.
     if 8 in act_cycle or 8 in tail_cycle:
-        assert args.act_scale_learnable, (
-            "act 'radial' (code 8) stores its exponent logit theta in the act-scale param -- pass "
-            "--act_scale_learnable 1 (and --act_scale_init 0 so p=sigmoid(0)=0.5)")
-    if 9 in act_cycle or 9 in tail_cycle:
-        assert args.act_scale_learnable, (
-            "act 'siluag' (code 9) = gamma*SiLU(alpha*g) needs BOTH per-expert params -- pass "
-            "--act_scale_learnable 1 (keep --act_scale_init 1 so it starts as plain silu)")
+        # radial keeps its exponent logit theta IN the act-scale param, so the param is not optional
+        # -- it is part of the activation. Now that radial is the DEFAULT act, asserting here would
+        # make a bare `--arm bibo_min` run fail; auto-enable instead, with init 0 so p=sigmoid(0)=0.5.
+        if not args.act_scale_learnable:
+            args.act_scale_learnable = True
+            if not args.act_scale_init:
+                args.act_scale_init = 0.0
+            print("[act] radial (code 8) needs its exponent param: act_scale_learnable=1, "
+                  f"act_scale_init={args.act_scale_init:g} (p=sigmoid(init))", flush=True)
     if act_cycle != [0, 1, 2]:
         assert "moe" in patch_list, "custom act subset needs the 'moe' patch (eager experts keep the built-in triple)"
     patchmod.ACT_CYCLE = act_cycle

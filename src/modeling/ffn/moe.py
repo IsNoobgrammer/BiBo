@@ -15,7 +15,15 @@ from ..norm import BiBoRMSNorm
 __all__ = ['BiBoMoELayer']
 
 
-_POLYGLU_ACTIVATIONS = ("silu", "relu2", "normsilu")   # expert e uses [e % 3]
+# RADIAL NormSiLU is the activation (Jul 31 2026). The old PolyGLU menu -- a per-expert CYCLE over
+# (silu, relu2, normsilu) -- is retired: at 1B tokens radial beat every alternative on bpb
+# (0.64313 vs silu-a 0.64429, normsilu 0.64646, silu 0.64768, against a 0.00037 same-seed floor)
+# and the mixing rounds never found a cycle that beat the best single act. Kept as a 3-tuple so
+# `[e % 3]` indexing and every caller are unchanged; all three entries are the same activation.
+# NOTE the EAGER path below cannot express radial (it needs the per-expert exponent theta, which
+# lives in the act-scale param and only the Triton path reads) -- eager falls back to normsilu,
+# which is radial's p->0 floor. Eager is a reference/CPU path only; training uses --patches moe.
+_POLYGLU_ACTIVATIONS = ("normsilu", "normsilu", "normsilu")   # radial's floor; see note above
 _NORMSILU_EPS = 1e-6  # MUST match _NS_EPS in the tkf kernel (kernels/sm75/moe.py)
 
 
