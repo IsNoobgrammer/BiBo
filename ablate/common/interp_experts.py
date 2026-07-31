@@ -25,6 +25,7 @@ Usage:
 """
 from . import _paths  # noqa: F401
 import argparse
+import contextlib
 import json
 
 import torch
@@ -102,18 +103,29 @@ def main():
     p.add_argument("--polyglu_mult", type=int, default=32)
     p.add_argument("--top_k", type=int, default=8)
     p.add_argument("--dataset", default="/home/marimo/work/data/bip2")
+    p.add_argument("--device", default="cuda")
     a = p.parse_args()
-    dev = "cuda"
+    dev = a.device
 
     from ablate.common import patches as patchmod
     from ablate.common.models import build_arm
     from ablate.common.data import token_batches
     from ablate.common.train import ACT_CODES
     patchmod.ACT_CYCLE = [ACT_CODES[a.act]]
+    # THE EAGER EXPERT PATH DOES NOT READ ACT_CYCLE. src/modeling/ffn/moe.py:103 indexes a
+    # HARDCODED module-level tuple, ("silu", "relu2", "normsilu")[e % 3]; ACT_CYCLE is only
+    # consulted by the patched Triton forward (patches.py:223). Setting ACT_CYCLE alone therefore
+    # runs 2/3 of the experts on the WRONG activation, which corrupts the residual stream from
+    # layer 1 onward and silently poisons every downstream layer's routing and statistics.
+    # Override the tuple so the eager path is uniform in the checkpoint's own activation.
+    import src.modeling.ffn.moe as _moemod
+    _moemod._POLYGLU_ACTIVATIONS = (a.act,) * 3
 
     model, _cfg = build_arm("bibo_min", device=dev, dtype=torch.float32, attn_impl="sdpa",
                             polyglu_mult=a.polyglu_mult, top_k=a.top_k)
-    sd = torch.load(a.ckpt, map_location=dev)
+    # load to CPU first: on a shared GPU the checkpoint copy is a 2.6 GB spike that can OOM a
+    # training run sharing the device. load_state_dict copies onto the (already-placed) model.
+    sd = torch.load(a.ckpt, map_location="cpu")
     if isinstance(sd, dict):
         sd = sd.get("model", sd.get("state_dict", sd))
     missing, unexpected = model.load_state_dict(sd, strict=False)
@@ -129,6 +141,7 @@ def main():
 
     ST = [dict(gate=[Acc() for _ in range(E)], up=[Acc() for _ in range(E)],
                act=[Acc() for _ in range(E)], outn=[Acc() for _ in range(E)],
+               zin=[Acc() for _ in range(E)],
                tokrms=[Acc() for _ in range(E)],
                load=[0] * E, lin=[0] * E, dead=[0] * E, band=[0] * E, tot=[0] * E,
                w_top1=Acc(), w_ent=Acc())
@@ -144,10 +157,47 @@ def main():
     handles = [m.register_forward_pre_hook(mk(i)) for i, (_n, m) in enumerate(experts)]
     gen = token_batches(a.batch, a.seq_len, dev, dataset=a.dataset)
 
+    # ---- END-TO-END SELF-CHECK -------------------------------------------------------------
+    # Assert the MODEL computes what this script assumes, by recomputing one expert layer's output
+    # from the weights and comparing to what the module actually returned. A stats script that
+    # merely runs without error proves nothing about which activation the forward used -- that is
+    # exactly how the _POLYGLU_ACTIVATIONS mismatch above went unnoticed.
+    got = {}
+    h_out = experts[0][1].register_forward_hook(lambda _m, _i, o: got.__setitem__("y", o.detach()))
+    ids0 = next(gen)
+    with torch.no_grad():
+        model.model(input_ids=ids0[:, :-1], use_cache=False)
+    h_out.remove()
+    _mod = experts[0][1]
+    _h, _idx, _w = cap[0]
+    _h = _h.reshape(-1, _h.shape[-1]).float()
+    _idx = _idx.reshape(_h.shape[0], -1)
+    _w = _w.reshape(_h.shape[0], -1).float()
+    ref = torch.zeros_like(_h)
+    for e in range(E):
+        m_ = (_idx == e)
+        sel = m_.any(-1)
+        if not bool(sel.any()):
+            continue
+        he = _h[sel]
+        g_, u_ = (he @ _mod.gate_up_proj[e].float().T).chunk(2, dim=-1)
+        z_ = (g_ / g_.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-6)) if a.act == "normsilu" else g_
+        y_ = (F.silu(z_) * u_) @ _mod.down_proj[e].float().T
+        ref[sel] += y_ * (_w[sel] * m_[sel].float()).sum(-1, keepdim=True)
+    y = got["y"].reshape(-1, got["y"].shape[-1]).float()
+    err = (y - ref).abs().max().item() / max(y.abs().max().item(), 1e-9)
+    print(f"[selfcheck] layer0 expert-output rel err = {err:.3e}  (act={a.act})", flush=True)
+    if err > 5e-2:
+        raise SystemExit(f"SELFCHECK FAILED (rel err {err:.3e}): the forward is NOT computing "
+                         f"{a.act} on every expert -- stats would be meaningless. Check "
+                         f"_POLYGLU_ACTIVATIONS / ACT_CYCLE wiring before trusting any output.")
+
+    # fp32 on CPU (no autocast) -- more accurate for statistics, and bf16 autocast is CUDA-only
+    amp = (torch.autocast("cuda", dtype=torch.bfloat16) if dev == "cuda" else contextlib.nullcontext())
     with torch.no_grad():
         for b in range(a.batches):
             ids = next(gen)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with amp:
                 model.model(input_ids=ids[:, :-1], use_cache=False)
             for i, (_n, mod) in enumerate(experts):
                 h, idx, w = cap[i]
@@ -170,17 +220,23 @@ def main():
                     st["gate"][e].add(g)
                     st["up"][e].add(u)
                     st["tokrms"][e].add(g.pow(2).mean(-1).sqrt())     # ONE value per token
+                    # z = what SiLU ACTUALLY SEES. For normsilu that is g/r, not g, so the regime
+                    # split below has to be counted on z or the two checkpoints are not comparable
+                    # (raw g for a normsilu model says nothing about where on the curve it sits).
+                    # For silu z is g exactly, so this is a no-op there -- a built-in cross-check.
                     if a.act == "normsilu":
-                        act = F.silu(g / g.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-6))
+                        z = g / g.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
                     else:
-                        act = F.silu(g)
+                        z = g
+                    act = F.silu(z)
+                    st["zin"][e].add(z)
                     st["act"][e].add(act)
                     st["outn"][e].add(((act * u) @ mod.down_proj[e].float().T).pow(2).mean(-1).sqrt())
                     # SiLU degeneracy: >+3 is within ~5% of identity, <-3 within ~5% of zero
-                    st["lin"][e] += int((g > 3).sum())
-                    st["dead"][e] += int((g < -3).sum())
-                    st["band"][e] += int((g.abs() <= 3).sum())
-                    st["tot"][e] += g.numel()
+                    st["lin"][e] += int((z > 3).sum())
+                    st["dead"][e] += int((z < -3).sum())
+                    st["band"][e] += int((z.abs() <= 3).sum())
+                    st["tot"][e] += z.numel()
             print(f"  batch {b + 1}/{a.batches}", flush=True)
     for hh in handles:
         hh.remove()
@@ -196,6 +252,7 @@ def main():
             cv = (tr["std"] / tr["mean"]) if tr.get("mean") else float("nan")
             exs.append(dict(expert=e, load_frac=st["load"][e] / tot_load,
                             gate=st["gate"][e].out(), up=st["up"][e].out(),
+                            silu_input=st["zin"][e].out(),
                             act=st["act"][e].out(), out_rms=st["outn"][e].out(),
                             tok_rms_gate=tr, cv_tok_rms_gate=cv,
                             frac_linear=st["lin"][e] / max(st["tot"][e], 1),
@@ -235,14 +292,15 @@ def main():
     print(f"wrote {a.out}", flush=True)
 
     print("\n" + "=" * 108)
-    print(f"{'L':>2} {'gate_rms':>9} {'CV_tok':>7} {'CV_exp':>7} {'%lin':>6} {'%dead':>6} {'%band':>6} "
+    print(f"{'L':>2} {'gate_rms':>9} {'z_rms':>7} {'CV_tok':>7} {'CV_exp':>7} {'%lin':>6} {'%dead':>6} {'%band':>6} "
           f"{'kurt':>6} {'top1w':>6} {'rent':>6} {'ldmx/mn':>8} {'xcorr':>7} {'out_rms':>8} {'dead_e':>6}")
     print("=" * 108)
     for L in report["layers"]:
         ex = L["experts"]
         k = _nanmean([x["gate"]["kurtosis"] for x in ex])
         orms = _nanmean([x["out_rms"]["mean"] for x in ex])
-        print(f"{L['idx']:>2} {L['gate_rms_across_experts']['mean']:>9.3f} "
+        zr = _nanmean([x["silu_input"]["rms"] for x in ex])
+        print(f"{L['idx']:>2} {L['gate_rms_across_experts']['mean']:>9.3f} {zr:>7.3f} "
               f"{L['cv_tok_rms_gate_layer']:>7.3f} {L['gate_rms_across_experts']['cv']:>7.3f} "
               f"{100 * L['frac_linear_layer']:>6.2f} {100 * L['frac_dead_layer']:>6.2f} "
               f"{100 * L['frac_band_layer']:>6.2f} {k:>6.2f} {L['router']['top1_weight']:>6.3f} "
