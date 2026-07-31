@@ -4,7 +4,6 @@ from src.modeling.embed import BiBoRotaryEmbedding, apply_rotary_pos_emb, rotate
 from src.modeling.attn import BiBoAttention, repeat_kv, apply_ssmax_query_scaling
 from src.modeling.ffn import (
     BiBoMLP,
-    BiBoPolyGLUExpert,
     BiBoCausalConv1D,
     BiBoMoERouter,
     BiBoFusedExperts,
@@ -17,7 +16,7 @@ __all__ = [
     'BiBoRMSNorm',
     'BiBoRotaryEmbedding', 'apply_rotary_pos_emb', 'rotate_half',
     'BiBoAttention', 'repeat_kv', 'apply_ssmax_query_scaling',
-    'BiBoMLP', 'BiBoPolyGLUExpert', 'BiBoCausalConv1D',
+    'BiBoMLP', 'BiBoCausalConv1D',
     'BiBoMoERouter', 'BiBoFusedExperts', 'BiBoMoELayer',
     'BiBoDecoderLayer',
     'BiBoPreTrainedModel', 'BiBoModel', 'BiBoForCausalLM',

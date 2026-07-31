@@ -24,65 +24,52 @@ def test_mlp_only_layers_dedupes_single_layer_model():
 
 
 def test_bias_update_factor_is_a_fixed_step_not_a_function_of_n():
-    """u must NOT scale with num_routed_experts. Its correct scale is set by the MODE (prop: u is a
-    gain on the deviation; sign: u IS the per-update step and the steady-state routing-noise floor),
-    never by the expert count."""
-    assert make_config().bias_update_factor == 0.4, "prop is the default; its scale is ~0.4"
-    for mode, want in (("prop", 0.4), ("sign", 0.001)):
-        for mult in (1, 2, 10, 42):     # 5 .. 128 routed experts
-            c = make_config(polyglu_expert_multiplier=mult, special_expert_pairs=1,
-                            num_experts_per_tok=1, bias_update_mode=mode)
-            assert c.bias_update_factor == want, \
-                f"u must not depend on n (got {c.bias_update_factor} at n={c.num_routed_experts})"
+    """u must NOT scale with num_routed_experts. It is a gain on the deviation (which is already in
+    share units), never a function of the expert count — the old auto-Hill grew u with n, which is
+    backwards: the k|k+1 selection-boundary gap SHRINKS as experts are added."""
+    assert make_config().bias_update_factor == 0.4
+    for n in (4, 8, 22, 128):
+        c = make_config(num_routed_experts=n, special_expert_pairs=1, num_experts_per_tok=1)
+        assert c.bias_update_factor == 0.4, \
+            f"u must not depend on n (got {c.bias_update_factor} at n={c.num_routed_experts})"
 
 
 def test_explicit_bias_update_factor_wins():
     assert make_config(bias_update_factor=3e-2).bias_update_factor == 3e-2
-    assert make_config(bias_update_factor=None).bias_update_factor == 0.4, "None -> prop default"
-    assert make_config(bias_update_factor=None,
-                       bias_update_mode="sign").bias_update_factor == 0.001, "None -> sign default"
+    assert make_config(bias_update_factor=None).bias_update_factor == 0.4
     assert make_config(bias_update_factor=0.0).bias_update_factor == 0.0, "0 disables balancing"
 
 
-def test_negative_bias_update_factor_is_rejected():
-    with pytest.raises(ValueError):
-        make_config(bias_update_factor=-1.0)
-
-
 @pytest.mark.parametrize("overrides,reason", [
-    (dict(gate_type="sigmiod"), "typo'd gate_type must not fall through to softmax"),
-    (dict(gate_type="situ", norm_topk_prob=False), "signed gate needs softmax normalization"),
-    (dict(router_activation="gelu"), "unknown router_activation"),
+    (dict(norm_topk_prob="divsum"), "typo'd norm_topk_prob must not silently fall through"),
+    (dict(norm_topk_prob="none"), "'none' is not off — pass False"),
     (dict(num_experts_per_tok=99), "top_k > num_routed_experts"),
-    (dict(num_key_value_heads=0), "kv_heads must be > 0"),
-    (dict(bias_update_threshold=0), "threshold must be > 0"),
+    (dict(num_experts_per_tok=0), "top_k must be >= 1"),
+    (dict(num_routed_experts=2, special_expert_pairs=1), "specials would leave 0 GLU experts"),
     (dict(hidden_size=63), "hidden_size % num_attention_heads != 0"),
-    (dict(layer_norm_type="layernorm"), "only rms is supported"),
-    (dict(shared_expert_type="lstm"), "unknown shared_expert_type"),
+    (dict(partial_rotary_factor=0.05), "rope_dim < 2"),
     (dict(use_ssmax=True, add_full_attention_sink_bias=True), "G1 (global sink + SSMax) is guarded"),
     (dict(hybrid_layer_pattern=[1, 0, 0, 0], sliding_window=0), "SWA needs a positive window"),
+    (dict(hybrid_layer_pattern=[1, 0]), "pattern length != num_hidden_layers"),
 ])
 def test_validation_guards(overrides, reason):
     with pytest.raises(ValueError):
         make_config(**overrides)
 
 
-@pytest.mark.parametrize("knob,value", [("router_noise", 0.5),
-                                        ("zero_expert", True), ("identity_expert", False)])
-def test_removed_knobs_are_dropped_not_stored(knob, value):
-    """PretrainedConfig setattr()s unknown kwargs, so a stale knob would reappear as an attribute
-    AND be re-serialized into config.json as if the feature still existed."""
-    c = make_config(**{knob: value})
-    assert not hasattr(c, knob), f"{knob} leaked onto the config"
-    assert knob not in c.to_dict(), f"{knob} would be written back to config.json"
+def test_legacy_bool_norm_topk_prob_maps_to_sum():
+    """Pre-debloat configs serialize `norm_topk_prob: true`; True meant "normalize", now "sum"."""
+    assert make_config(norm_topk_prob=True).norm_topk_prob == "sum"
+    assert make_config().norm_topk_prob == "sum", "sum is the default"
+    assert make_config(norm_topk_prob=False).norm_topk_prob is False, "False = raw scores, still legal"
 
 
 def test_config_round_trip_preserves_derived_fields():
-    c = make_config(gate_type="situ", hybrid_layer_pattern=[0, 1, 1, 0], use_ssmax=False)
+    c = make_config(norm_topk_prob="softmax", hybrid_layer_pattern=[0, 1, 1, 0], use_ssmax=False)
     with tempfile.TemporaryDirectory() as d:
         c.save_pretrained(d)
         c2 = BiBoConfig.from_pretrained(d)
-    for k in ("head_dim", "rope_dim", "num_routed_experts", "gate_type", "norm_topk_prob",
+    for k in ("head_dim", "rope_dim", "num_routed_experts", "norm_topk_prob",
               "moe_intermediate_size", "bias_update_factor", "layer_types", "sliding_window"):
         assert getattr(c, k, None) == getattr(c2, k, None), f"{k} did not survive save/load"
 
@@ -102,8 +89,12 @@ def test_sliding_window_serializes_as_none_without_swa_layers():
                             "sliding_attention", "full_attention"]
 
 
-def test_num_routed_experts_derivation():
-    for mult, pairs in ((2, 1), (3, 0), (1, 2), (10, 1)):
-        c = make_config(polyglu_expert_multiplier=mult, special_expert_pairs=pairs,
-                        num_experts_per_tok=1)
-        assert c.num_routed_experts == mult * 3 + pairs * 2
+def test_glu_expert_count_is_derived_from_num_routed_experts():
+    """num_routed_experts is THE knob (polyglu_expert_multiplier x POLYGLU_GROUP was deleted Aug 1
+    2026). The GLU block is whatever the ±Identity specials leave behind."""
+    for n, pairs in ((8, 1), (6, 0), (8, 2), (128, 1)):
+        c = make_config(num_routed_experts=n, special_expert_pairs=pairs, num_experts_per_tok=1)
+        assert c.num_routed_experts == n
+        assert c.num_glu_experts == n - pairs * 2
+    c = make_config(num_routed_experts=8, special_expert_pairs=1, neg_identity_expert=False)
+    assert c.num_glu_experts == 7, "a disabled sign is a zero-width block, not a reserved slot"

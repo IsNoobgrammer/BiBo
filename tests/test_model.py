@@ -119,10 +119,10 @@ def test_save_pretrained_writes_the_in_memory_weights():
         assert (v.to(DEVICE).float() - sd[k].float()).abs().max().item() == 0, f"{k} saved wrong"
 
 
-@pytest.mark.parametrize("gate", ["sigmoid", "situ"])
-def test_from_pretrained_does_not_reinitialize_loaded_weights(gate):
+@pytest.mark.parametrize("norm", ["sum", "softmax"])
+def test_from_pretrained_does_not_reinitialize_loaded_weights(norm):
     """REGRESSION: `.data.normal_()` in _init_weights re-randomized 25/54 loaded tensors."""
-    _, reloaded, disk = _save_and_reload(gate_type=gate)
+    _, reloaded, disk = _save_and_reload(norm_topk_prob=norm)
     sd = reloaded.state_dict()
     clobbered = [k for k in disk
                  if (disk[k].to(DEVICE).float() - sd[k].float()).abs().max().item() > 0]
@@ -145,7 +145,7 @@ def test_from_pretrained_rebuilds_non_persistent_buffers():
 
 
 def test_save_load_round_trip_is_logit_exact():
-    m, reloaded, _ = _save_and_reload(gate_type="situ")
+    m, reloaded, _ = _save_and_reload(norm_topk_prob="softmax")
     x = tokens(1, 6, seed=8)
     assert (m(x).logits - reloaded(x).logits).abs().max().item() == 0
 

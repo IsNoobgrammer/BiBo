@@ -26,7 +26,7 @@ DEVICE = "cuda" if (torch.cuda.is_available() and torch.cuda.device_count() > 0)
 # Small enough to be fast, big enough to exercise every branch:
 #  - 4 layers with mlp_only_layers=[0, 3] -> dense at the ends, MoE in the middle
 #  - 4 heads / 2 kv heads -> GQA with group size 2
-#  - polyglu_mult=2 + 1 special pair -> 6 GLU experts + (+Identity) + (-Identity) = 8 routed
+#  - 8 routed experts = 6 GLU + (+Identity) + (-Identity)
 BASE = dict(
     vocab_size=512,
     hidden_size=64,
@@ -35,7 +35,7 @@ BASE = dict(
     num_key_value_heads=2,
     intermediate_size=96,
     moe_intermediate_size=96,
-    polyglu_expert_multiplier=2,
+    num_routed_experts=8,
     special_expert_pairs=1,
     num_experts_per_tok=2,
     max_position_embeddings=256,

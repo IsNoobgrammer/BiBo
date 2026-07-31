@@ -4,7 +4,6 @@ from .embed import BiBoRotaryEmbedding, apply_rotary_pos_emb, rotate_half
 from .attn import BiBoAttention, apply_ssmax_query_scaling, repeat_kv
 from .ffn import (
     BiBoMLP,
-    BiBoPolyGLUExpert,
     BiBoCausalConv1D,
     BiBoMoERouter,
     BiBoFusedExperts,
@@ -26,7 +25,6 @@ __all__ = [
     'repeat_kv',
     # FFN
     'BiBoMLP',
-    'BiBoPolyGLUExpert',
     'BiBoCausalConv1D',
     'BiBoMoERouter',
     'BiBoFusedExperts',

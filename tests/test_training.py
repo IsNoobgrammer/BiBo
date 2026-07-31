@@ -8,19 +8,21 @@ import pytest
 import torch
 from conftest import DEVICE, make_model, tokens
 
-GATES = ["sigmoid", "situ", "softmax"]
 HYBRID = [0, 1, 1, 0]
 
 
-@pytest.mark.parametrize("gate", GATES)
+@pytest.mark.parametrize("norm", ["sum", "softmax", False])
 @pytest.mark.parametrize("hybrid", [None, HYBRID], ids=["global", "hybrid"])
-def test_every_trainable_param_receives_a_gradient(gate, hybrid):
-    m = make_model(gate_type=gate, hybrid_layer_pattern=hybrid,
+def test_every_trainable_param_receives_a_gradient(norm, hybrid):
+    m = make_model(norm_topk_prob=norm, hybrid_layer_pattern=hybrid,
                    use_ssmax=(hybrid is None), use_xsa=True, use_shared_expert=True)
     x = tokens(2, 8)
     m(x, labels=x).loss.backward()
     missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
     assert not missing, f"no gradient for {missing[:5]}"
+    # radial_theta is a real parameter now (it used to be injected by ablate as `situ_alpha`), so it
+    # has to be in that sweep — an inert exponent would leave the model stuck at normsilu's floor.
+    assert any("radial_theta" in n for n, _ in m.named_parameters())
 
 
 @pytest.mark.parametrize("shared_type", ["mlp", "conv"])
@@ -51,7 +53,7 @@ def test_bf16_autocast_forward_backward_is_nan_free():
 
 def test_five_step_overfit_decreases_loss_and_runs_the_balancer():
     torch.manual_seed(0)
-    m = make_model(load_balance_strategy="bias", bias_update_threshold=32).train()
+    m = make_model(bias_update_threshold=32).train()
     opt = torch.optim.AdamW(m.parameters(), lr=3e-3)
     x = tokens(2, 16, seed=11)
     losses = []
@@ -70,7 +72,7 @@ def test_five_step_overfit_decreases_loss_and_runs_the_balancer():
 
 
 def test_eval_mode_skips_the_balancer():
-    m = make_model(load_balance_strategy="bias", bias_update_threshold=1).eval()
+    m = make_model(bias_update_threshold=1).eval()
     m(tokens(2, 8))
     assert all(l.mlp.gate.bias.abs().max() == 0
                for l in m.model.layers if hasattr(l.mlp, "gate")), \
