@@ -20,10 +20,10 @@ __all__ = ['BiBoMoELayer']
 # (0.64313 vs silu-a 0.64429, normsilu 0.64646, silu 0.64768, against a 0.00037 same-seed floor)
 # and the mixing rounds never found a cycle that beat the best single act. Kept as a 3-tuple so
 # `[e % 3]` indexing and every caller are unchanged; all three entries are the same activation.
-# NOTE the EAGER path below cannot express radial (it needs the per-expert exponent theta, which
-# lives in the act-scale param and only the Triton path reads) -- eager falls back to normsilu,
-# which is radial's p->0 floor. Eager is a reference/CPU path only; training uses --patches moe.
-_POLYGLU_ACTIVATIONS = ("normsilu", "normsilu", "normsilu")   # radial's floor; see note above
+# The EAGER path below now implements radial too (it reads `situ_alpha` for theta), so eager and
+# the Triton path agree. Eager is slow but real: it is what runs on CPU, in reference checks, and
+# anywhere Triton is unavailable. ReLU^2 dropped with the rest of the retired menu.
+_POLYGLU_ACTIVATIONS = ("radial", "radial", "radial")
 _NORMSILU_EPS = 1e-6  # MUST match _NS_EPS in the tkf kernel (kernels/sm75/moe.py)
 
 
@@ -111,16 +111,27 @@ class BiBoFusedExperts(nn.Module):
                 act_name = _POLYGLU_ACTIVATIONS[expert_idx % 3]
                 if act_name == "silu":
                     activated = F.silu(gate)
-                elif act_name == "relu2":
-                    r = F.relu(gate)
-                    activated = (r.float() * r.float()).to(gate.dtype)  # fp32: fp16 overflows >256
                 else:
                     # normsilu = SiLU(gate / rms(gate)) — DECO's intra-expert stage. The
                     # inter-expert mean stage is deliberately skipped: its gradient couples every
                     # expert's up-weights and breaks per-expert dispatch.
+                    # radial  = r^p * SiLU(gate / r), r = rms(gate), p = sigmoid(theta) in (0,1).
+                    #   p -> 0 IS normsilu and p -> 1 is full magnitude, so the SAME two lines serve
+                    #   both codes; radial just scales the normsilu result by r^p.
                     g = gate.float()
-                    g = g * torch.rsqrt(g.square().mean(-1, keepdim=True) + _NORMSILU_EPS)
-                    activated = F.silu(g).to(gate.dtype)
+                    r = torch.sqrt(g.square().mean(-1, keepdim=True) + _NORMSILU_EPS)
+                    act32 = F.silu(g / r)
+                    if act_name == "radial":
+                        theta = getattr(self, "situ_alpha", None)
+                        if theta is None:
+                            raise RuntimeError(
+                                "eager radial needs the per-expert exponent theta, which lives in "
+                                "`situ_alpha` -- call patches.add_situ_params(model) before the "
+                                "forward (train.py auto-enables it for act code 8). Without it the "
+                                "layer would silently run as normsilu, radial's p->0 floor.")
+                        # keep theta in the graph: this is how the exponent LEARNS on the eager path
+                        act32 = act32 * r.pow(torch.sigmoid(theta[expert_idx].float()))
+                    activated = act32.to(gate.dtype)
 
                 expert_output = F.linear(activated * up, self.down_proj[expert_idx])
                 output.index_add_(0, token_idx, expert_output * weights)
