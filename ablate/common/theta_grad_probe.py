@@ -65,8 +65,8 @@ def main():
         with torch.autocast("cuda", dtype=torch.bfloat16):
             out = model.model(input_ids=ids[:, :-1], use_cache=False)
             h = out[0] if isinstance(out, (tuple, list)) else out.last_hidden_state
-        loss = fused_linear_cross_entropy(h.float(), model.lm_head.weight.float(),
-                                          ids[:, 1:].reshape(-1))
+        sh = h.reshape(-1, h.shape[-1])          # fused CE takes (N, H), not (B, S, H)
+        loss = fused_linear_cross_entropy(sh, model.lm_head.weight, ids[:, 1:].reshape(-1))
         loss.backward()
         grads.append(torch.stack([p.grad.detach().float().clone() for _, p in thetas]))
         print(f"  batch {b+1}/{a.batches}  loss={loss.item():.4f}", flush=True)
