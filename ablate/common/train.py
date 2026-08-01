@@ -604,12 +604,23 @@ def main():
             aS_s = ""
             _th = [m.radial_theta for m in model.modules() if hasattr(m, "radial_theta")]
             if _th:
-                _p = torch.sigmoid(torch.cat([t.detach().float().flatten() for t in _th]))
-                rt.update({"train/radial_p_mean": _p.mean().item(),
+                _t = torch.cat([t.detach().float().flatten() for t in _th])
+                _p = torch.sigmoid(_t)
+                # BOTH units, on purpose. train/act_alpha_* is raw THETA under the key the pre-Aug-1
+                # runs used -- keeping it is what lets a new run overlay the old ones on the same
+                # W&B panel (bibo-act-1b). train/radial_p_* is sigmoid(theta), the interpretable
+                # one: p->0 IS normsilu, p->1 full magnitude. Logging only p silently breaks the
+                # comparison twice over -- new key AND new scale, so 0.500 vs 0.000 at step 0 reads
+                # as a changed init when the tensor is identical (both zeros).
+                rt.update({"train/act_alpha_mean": _t.mean().item(),
+                           "train/act_alpha_min": _t.min().item(),
+                           "train/act_alpha_max": _t.max().item(),
+                           "train/radial_p_mean": _p.mean().item(),
                            "train/radial_p_min": _p.min().item(),
                            "train/radial_p_max": _p.max().item()})
                 aS_s = (f" p={rt['train/radial_p_mean']:.3f}"
-                        f"[{rt['train/radial_p_min']:.2f},{rt['train/radial_p_max']:.2f}]")
+                        f"[{rt['train/radial_p_min']:.2f},{rt['train/radial_p_max']:.2f}]"
+                        f" th={rt['train/act_alpha_mean']:+.3f}")
             print(f"  step {step}/{total_steps} loss={lv:.4f} run{len(_loss_hist)}={lv_run:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
                   f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{rt_s}{aS_s}"
