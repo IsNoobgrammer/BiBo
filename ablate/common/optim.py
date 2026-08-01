@@ -61,7 +61,7 @@ NS8 = (_KJ,) * 6 + (_PIN,) * 2
 def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, ns_dtype=torch.bfloat16,
                      scale_mode="aurora", xorth_post=0.0, xorth_gate_ref=0.3, xorth_ema=0.95,
                      xorth_warmup_steps=0, xorth_where="post", router_adamw=False,
-                     act_scale_lr=None, cautious_decay=True,
+                     act_scale_lr=None, cautious_decay=False,
                      optim="muon", probe_gamma=0.0, probe_rho_step=0.96, probe_rank=0):
     from kernels.sm120.muon import FusedMuon   # Blackwell: gram-NS (self-gates to symmul/cuBLAS on small mats) + 8M knee
     stacks, mats, other = [], [], []

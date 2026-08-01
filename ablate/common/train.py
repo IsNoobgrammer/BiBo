@@ -284,7 +284,7 @@ def main():
     # WARNING on comparability: every baseline on the board (normsilu 0.67726, silu 0.68171, aS-s
     # 0.67674, rad-n 0.67669) was trained NON-cautious, so any cautious run must be A/B'd against
     # them rather than against another cautious run. Runs are tagged _cwd when this is on.
-    ap.add_argument("--cautious_decay", type=_bool, default=True)
+    ap.add_argument("--cautious_decay", type=_bool, default=False)   # OFF by default: the whole board is non-cautious, so a default-on run is not comparable to it
     # ---- OPTIMIZER AXIS: muon (every baseline on the board) | manas (muon + rolling probe) ----
     # Manas runs the SAME sm120 gram-NS Muon step and takes every Muon argument verbatim; it adds a
     # lookahead probe -- forward/backward evaluate at theta + gamma*D, where D is a long-memory

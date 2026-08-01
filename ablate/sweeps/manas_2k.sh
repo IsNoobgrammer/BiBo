@@ -25,7 +25,7 @@
 # 2000 steps is 5x further down that curve.
 #
 # --eval_every 0 is FINAL-ONLY (not off; -1 is off) -- matches every baseline on the board.
-# --cautious_decay false is explicit: the flag defaults TRUE and the board is non-cautious.
+# --cautious_decay false is explicit here; it is also the default now, and the board is non-cautious.
 #
 #   bash ablate/sweeps/manas_2k.sh
 set -u
