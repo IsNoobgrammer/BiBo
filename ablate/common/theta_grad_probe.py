@@ -93,6 +93,22 @@ def main():
         print(f"{L:5d} {int(lo.sum()):6d} {gl.mean().item():+11.3e} {al:12.2f} "
               f"{(gh.mean().item() if hi.sum() else float('nan')):+12.3e} {ah:11.2f} {ratio:16.2f}")
 
+    # dL/dp, NOT dL/dtheta. Chain rule: dL/dtheta = dL/dp * p(1-p), and p(1-p) -> 0 as p -> 0, so a
+    # vanishing THETA gradient is guaranteed at low p whether or not the model wants to go lower --
+    # sigmoid's own saturation manufactures the "interior" answer. dL/dp is what actually says
+    # whether the objective still improves by lowering p past the floor.
+    dLdp = gmean / (p * (1 - p)).clamp_min(1e-12)
+    print()
+    print("  UNCONFOUNDED: dL/dp = dL/dtheta / (p(1-p)). Large positive at low p = bound BINDS.")
+    print("LAYER   <dL/dp | low p>   <dL/dp | high p>    ratio low/high")
+    for L in range(p.shape[0]):
+        lo = p[L] < a.low_p
+        hi = ~lo
+        if lo.sum() == 0 or hi.sum() == 0:
+            continue
+        dl, dh = dLdp[L][lo].mean().item(), dLdp[L][hi].mean().item()
+        print("%5d %16.3e %18.3e %17.2f" % (L, dl, dh, abs(dl) / (abs(dh) + 1e-30)))
+
     lo_all = p < a.low_p
     if lo_all.any():
         g_lo = gmean[lo_all]
@@ -105,6 +121,9 @@ def main():
         # scale it: how far would theta actually move over a real run at this gradient?
         travel = g_lo.abs().mean().item() * 0.01 * 4000
         print(f"    implied theta travel at lr=0.01 over 4000 steps = {travel:.3f}")
+        _d = dLdp[lo_all]
+        print(f"    mean dL/dp at low p   = {_d.mean().item():+.4e}  "
+              f"(vs {dLdp[~lo_all].mean().item():+.4e} at high p)")
         print(f"    (theta already sits at {torch.log(p[lo_all]/(1-p[lo_all])).mean().item():+.2f}; "
               f"a travel much smaller than 1 means the optimum is INTERIOR, not clipped)")
 
