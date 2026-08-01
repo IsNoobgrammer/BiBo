@@ -96,11 +96,10 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--act", default="silu", choices=["silu", "normsilu"])
     p.add_argument("--batches", type=int, default=16)
     p.add_argument("--batch", type=int, default=2)
     p.add_argument("--seq_len", type=int, default=1024)
-    p.add_argument("--polyglu_mult", type=int, default=32)
+    p.add_argument("--experts", type=int, default=64)   # TOTAL routed (GLU + specials)
     p.add_argument("--top_k", type=int, default=8)
     p.add_argument("--dataset", default="/home/marimo/work/data/bip2")
     p.add_argument("--device", default="cuda")
@@ -110,19 +109,14 @@ def main():
     from ablate.common import patches as patchmod
     from ablate.common.models import build_arm
     from ablate.common.data import token_batches
-    from ablate.common.train import ACT_CODES
-    patchmod.ACT_CYCLE = [ACT_CODES[a.act]]
-    # THE EAGER EXPERT PATH DOES NOT READ ACT_CYCLE. src/modeling/ffn/moe.py:103 indexes a
-    # HARDCODED module-level tuple, ("silu", "relu2", "normsilu")[e % 3]; ACT_CYCLE is only
-    # consulted by the patched Triton forward (patches.py:223). Setting ACT_CYCLE alone therefore
-    # runs 2/3 of the experts on the WRONG activation, which corrupts the residual stream from
-    # layer 1 onward and silently poisons every downstream layer's routing and statistics.
-    # Override the tuple so the eager path is uniform in the checkpoint's own activation.
-    import src.modeling.ffn.moe as _moemod
-    _moemod._POLYGLU_ACTIVATIONS = (a.act,) * 3
+    # The activation is radial NormSiLU on BOTH paths now -- src's eager expert loop and the Triton
+    # patch read the same radial_theta parameter, so they cannot disagree. They USED to: the eager
+    # path indexed a hardcoded ("silu","relu2","normsilu")[e%3] tuple while ACT_CYCLE steered only
+    # the patched forward, which ran 2/3 of the experts on the wrong activation and silently
+    # corrupted every downstream layer's routing. The selfcheck below still verifies it end-to-end.
 
     model, _cfg = build_arm("bibo_min", device=dev, dtype=torch.float32, attn_impl="sdpa",
-                            polyglu_mult=a.polyglu_mult, top_k=a.top_k)
+                            num_experts=a.experts, top_k=a.top_k)
     # load to CPU first: on a shared GPU the checkpoint copy is a 2.6 GB spike that can OOM a
     # training run sharing the device. load_state_dict copies onto the (already-placed) model.
     sd = torch.load(a.ckpt, map_location="cpu")
@@ -181,16 +175,16 @@ def main():
             continue
         he = _h[sel]
         g_, u_ = (he @ _mod.gate_up_proj[e].float().T).chunk(2, dim=-1)
-        z_ = (g_ / g_.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-6)) if a.act == "normsilu" else g_
-        y_ = (F.silu(z_) * u_) @ _mod.down_proj[e].float().T
+        r_ = g_.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
+        p_ = torch.sigmoid(_mod.radial_theta[e].float())
+        y_ = (F.silu(g_ / r_) * r_.pow(p_) * u_) @ _mod.down_proj[e].float().T
         ref[sel] += y_ * (_w[sel] * m_[sel].float()).sum(-1, keepdim=True)
     y = got["y"].reshape(-1, got["y"].shape[-1]).float()
     err = (y - ref).abs().max().item() / max(y.abs().max().item(), 1e-9)
-    print(f"[selfcheck] layer0 expert-output rel err = {err:.3e}  (act={a.act})", flush=True)
+    print(f"[selfcheck] layer0 expert-output rel err = {err:.3e}  (act=radial)", flush=True)
     if err > 5e-2:
         raise SystemExit(f"SELFCHECK FAILED (rel err {err:.3e}): the forward is NOT computing "
-                         f"{a.act} on every expert -- stats would be meaningless. Check "
-                         f"_POLYGLU_ACTIVATIONS / ACT_CYCLE wiring before trusting any output.")
+                         f"radial NormSiLU on every expert -- stats would be meaningless.")
 
     # fp32 on CPU (no autocast) -- more accurate for statistics, and bf16 autocast is CUDA-only
     amp = (torch.autocast("cuda", dtype=torch.bfloat16) if dev == "cuda" else contextlib.nullcontext())
@@ -220,15 +214,13 @@ def main():
                     st["gate"][e].add(g)
                     st["up"][e].add(u)
                     st["tokrms"][e].add(g.pow(2).mean(-1).sqrt())     # ONE value per token
-                    # z = what SiLU ACTUALLY SEES. For normsilu that is g/r, not g, so the regime
-                    # split below has to be counted on z or the two checkpoints are not comparable
-                    # (raw g for a normsilu model says nothing about where on the curve it sits).
-                    # For silu z is g exactly, so this is a no-op there -- a built-in cross-check.
-                    if a.act == "normsilu":
-                        z = g / g.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
-                    else:
-                        z = g
-                    act = F.silu(z)
+                    # z = what SiLU ACTUALLY SEES. For radial that is g/r, not g, so the regime
+                    # split below has to be counted on z -- raw g says nothing about where on the
+                    # curve a normalized model sits. gain = r^p is the magnitude radial puts BACK.
+                    _r = g.pow(2).mean(-1, keepdim=True).sqrt().clamp_min(1e-6)
+                    z = g / _r
+                    gain = _r.pow(torch.sigmoid(mod.radial_theta[e].float()))
+                    act = F.silu(z) * gain
                     st["zin"][e].add(z)
                     st["act"][e].add(act)
                     st["outn"][e].add(((act * u) @ mod.down_proj[e].float().T).pow(2).mean(-1).sqrt())
@@ -241,7 +233,7 @@ def main():
     for hh in handles:
         hh.remove()
 
-    report = dict(ckpt=a.ckpt, act=a.act, E=E, I=I, d=D,
+    report = dict(ckpt=a.ckpt, act="radial", E=E, I=I, d=D,
                   tokens_seen=a.batches * a.batch * a.seq_len, layers=[])
     for i, (name, mod) in enumerate(experts):
         st = ST[i]

@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Manas 3-way, 400 steps, eval OFF: does annealing the probe dose with the LR matter?
 #
+# !! NOT COMPARABLE TO THIS ROUND'S RECORDED NUMBERS (updated Aug 1 2026) !!
+# These arms ran `--act silu` on 64 GLU experts. src deleted every activation except radial
+# NormSiLU, so re-running this script trains a DIFFERENT model under the same run names. The
+# recorded manas verdict (bpb 0.6812 muon vs 0.6817 manas, a tie at 0.36 sigma) stands as history;
+# any new number from this script belongs to a new baseline, not to that comparison.
+#
 #   mu_anchor   plain Muon -- the in-session anchor. NEVER compare across sessions.
 #   mn_fixed    manas, probe_gamma pinned at the law value for the whole run
 #   mn_gs       manas, same gamma but tracking the LR schedule (held at peak through warmup,
@@ -31,12 +37,12 @@ mkdir -p "$OUT"
 
 BASE=(--arm bibo_min --seed 42069
       --data real --dataset /home/marimo/work/data/bip2
-      --act silu --polyglu_mult 32 --top_k 8
+      --experts 64 --top_k 8
       --batch 64 --grad_accum 4 --seq_len 1024 --precision bf16
       --muon_lr 0.01 --adam_lr 5e-4 --wd 0.1 --cautious_decay false
-      --load_balance bias --bias_update_mode prop --bias_update_factor 0.4
+      --bias_update_factor 0.4
       --bias_update_threshold 2621440 --aux_coef 0.001
-      --router_type mlp --router_gate sigmoid --router_norm sum --router_optim muon
+      --router_optim muon
       --scheduler cosine --warmup_frac 0.1 --decay_frac 0.2 --grad_clip 1
       --patches liger_norm,liger_rope,ce,moe --attn sdpa
       --peak_tflops 480 --log_every 25

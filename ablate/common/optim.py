@@ -72,11 +72,10 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
         # Both routers are 2D so the ndim rule ALREADY sends them to Muon -> `mats` (never whitened);
         # that is the default and every result to date was produced that way. router_adamw=True is the
         # ablation arm that moves the router to AdamW instead.
-        #   .gate.gate_proj  -> MLP router,  (E, H)
-        #   .gate.gate_conv  -> conv router, (E, H*K) -- 2D ON PURPOSE, see the module docstring.
-        # The `.gate.` prefix is load-bearing: the conv SHARED EXPERT is at
+        #   .gate.gate_proj  -> MLP router, (E, H). The conv router was deleted from src Aug 1 2026.
+        # The `.gate.` prefix is load-bearing: a conv SHARED EXPERT is at
         # shared_experts_list.*.gate_conv (an actual nn.Conv1d, 3D) and must NOT match here.
-        is_router = ".gate.gate_proj." in n or ".gate.gate_conv" in n
+        is_router = ".gate.gate_proj." in n
         # Guard the axis rule: a 3D routing param means someone reintroduced an nn.Conv1d router and
         # NS would silently whiten kernel taps instead of experts.
         if is_router and p.ndim != 2:
@@ -141,11 +140,11 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
         muon = FusedMuon(groups, **_mk)
     else:
         raise ValueError(f"unknown optim {optim!r}; valid: muon, manas")
-    # act_scale_lr: the per-expert activation scales (situ_alpha/gamma) need to travel FAR -- alpha
-    # must reach ~5 to lift a Muon-pinned gate from RMS 0.18 into SiLU's nonlinear region, and AdamW
-    # at adam_lr=5e-4 can only move it ~0.5 over 2000 steps. Own group, own lr, and wd=0 -- decay on
-    # a gain would just re-impose the lr/wd scale equilibrium this axis exists to escape.
-    _is_as = lambda n: "situ_alpha" in n or "situ_gamma" in n
+    # act_scale_lr: radial_theta is the exponent LOGIT (p = sigmoid(theta)), and the measured depth
+    # ramp runs p 0.11 -> 0.93, i.e. theta from about -2.1 to +2.6. AdamW at adam_lr=5e-4 moves it
+    # ~0.5 over 2000 steps, so it needs its own group and its own lr. wd=0: decay on an exponent
+    # would just re-impose the lr/wd equilibrium this axis exists to escape.
+    _is_as = lambda n: "radial_theta" in n
     a_scale = [p for n, p in other if _is_as(n)]
     rest = [p for n, p in other if not _is_as(n)]
     if a_scale and act_scale_lr:

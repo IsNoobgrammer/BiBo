@@ -30,12 +30,9 @@ import json
 import torch
 import torch.nn.functional as F
 
-ARMS = {  # name -> (act code name, act_scale_learnable, act_scale_init)
-    "silu":     ("silu",     False, 1.0),
-    "normsilu": ("normsilu", False, 1.0),
-    "radial":   ("radial",   True,  0.0),
-    "silu-a":   ("silu",     True,  1.0),
-}
+# RADIAL ONLY as of Aug 1 2026. silu / normsilu / silu-a were deleted from src, so this tool can no
+# longer BUILD them -- the 1B four-way that picked radial is recorded in .autoresearch, not re-runnable.
+ARMS = ("radial",)
 
 
 class Stat:
@@ -96,19 +93,15 @@ def _nm(xs):
     return sum(v) / len(v) if v else float("nan")
 
 
-def build(arm, ckpt, dev, polyglu_mult, top_k):
-    """Mirror train.py's setup exactly, then load. add_situ_params MUST precede load_state_dict."""
+def build(arm, ckpt, dev, num_experts, top_k):
+    """Mirror train.py's setup exactly, then load. radial_theta is a real src parameter now, so it
+    arrives with the module and no injection step has to happen before load_state_dict."""
     from ablate.common import patches as patchmod
     from ablate.common.models import build_arm
-    from ablate.common.train import ACT_CODES
-    act, learn, init = ARMS[arm]
-    patchmod.ROUTER_GATE, patchmod.ROUTER_NORM, patchmod.ROUTER_SCALE = "sigmoid", "sum", 1.0
-    patchmod.ACT_CYCLE = [ACT_CODES[act]]
+    assert arm in ARMS, f"unknown arm {arm!r}; src only implements {ARMS}"
     model, cfg = build_arm("bibo_min", device=dev, dtype=torch.float32, attn_impl="sdpa",
-                           polyglu_mult=polyglu_mult, top_k=top_k)
-    if learn:
-        patchmod.add_situ_params(model, init=init)
-    patchmod.apply(["liger_norm", "liger_rope", "moe", "router_gate"])
+                           num_experts=num_experts, top_k=top_k)
+    patchmod.apply(["liger_norm", "liger_rope", "moe"])
     sd = torch.load(ckpt, map_location="cpu")
     if isinstance(sd, dict):
         sd = sd.get("model", sd.get("state_dict", sd))
@@ -142,7 +135,7 @@ def main():
     ap.add_argument("--batches", type=int, default=12)
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--seq_len", type=int, default=1024)
-    ap.add_argument("--polyglu_mult", type=int, default=32)
+    ap.add_argument("--experts", type=int, default=64)   # TOTAL routed (GLU + specials)
     ap.add_argument("--top_k", type=int, default=8)
     ap.add_argument("--dataset", default="/home/marimo/work/data/bip2")
     ap.add_argument("--device", default="cuda")
@@ -150,7 +143,7 @@ def main():
     dev = a.device
     from ablate.common.data import token_batches
 
-    model, _cfg, missing, unexpected = build(a.arm, a.ckpt, dev, a.polyglu_mult, a.top_k)
+    model, _cfg, missing, unexpected = build(a.arm, a.ckpt, dev, a.experts, a.top_k)
     print(f"[{a.arm}] loaded missing={len(missing)} unexpected={len(unexpected)}", flush=True)
 
     experts = [(n, m) for n, m in model.named_modules() if hasattr(m, "gate_up_proj")]
@@ -158,7 +151,7 @@ def main():
     I = twoI // 2
     # per-expert act scalar (radial theta / silu-a alpha), else None
     def scal(mod):
-        for nm_ in ("situ_alpha", "alpha", "act_alpha"):
+        for nm_ in ("radial_theta",):
             v = getattr(mod, nm_, None)
             if v is not None:
                 return v.detach().float().reshape(-1)

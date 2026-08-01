@@ -89,7 +89,7 @@ class RouterTrace:
         for _, mod in model.named_modules():
             if mod.__class__.__name__ in _EXPERT_CLASSES:
                 if not self._handles:
-                    self.n_glu = int(getattr(mod, "num_polyglu_experts", self.E))
+                    self.n_glu = int(getattr(mod, "num_glu_experts", self.E))
                     self.pos_end = int(getattr(mod, "pos_end", self.E))
                 self._handles.append(mod.register_forward_pre_hook(self._hook))
         # Routers, for the selection-BOUNDARY gap (rank-k vs rank-k+1 raw score). The expert hook

@@ -15,7 +15,7 @@ import argparse
 import contextlib
 import torch
 from .models import build_arm, count_params
-from src.configuration_bibo import GATE_TYPES, SIGNED_GATES, ROUTER_INPUT_NORMS, MOE_OUT_NORMS, POLYGLU_GROUP
+from .configs import SHARED, glu_count
 from . import patches as patchmod
 from .optim import build_optimizers
 from .schedule import make_scheduler, make_wd_schedule
@@ -27,17 +27,14 @@ from kernels.sm120.cross_entropy import fused_linear_cross_entropy   # sm120 (Bl
 
 DEV = "cuda"
 _DT = {"bf16": torch.bfloat16, "fp32": torch.float32}
-# --act name -> (kernel act code, run-tag letter). Tag letters are FROZEN so acts-s / acts-n / acts-X
-# runs stay comparable with the pre-Jul-26 W&B history.
-# THE MENU IS THREE (Jul 31 2026). Codes 1/5/6/7/9 and the per-expert gamma were deleted from the
-# kernel; radial is the default. Decided at 1B tokens, bpb vs a 0.00037 same-seed floor:
-#   radial 0.64313 < silu-a 0.64429 < normsilu 0.64646 < silu 0.64768
+# THE ACTIVATION IS RADIAL NormSiLU, and as of Aug 1 2026 it is the ONLY one src implements --
+# --act, --act_tail and the whole act-cycle plumbing are gone with it. Decided at 1B tokens, bpb vs
+# a 0.00037 same-seed floor: radial 0.64313 < silu-a 0.64429 < normsilu 0.64646 < silu 0.64768.
 # radial wins because its magnitude control is BOUNDED: p = sigmoid(theta) in (0,1) makes p->0
 # exactly normsilu and p->1 full magnitude, and the learned p is a DEPTH RAMP 0.11 -> 0.93, so a
-# layer runs as normsilu early and full-magnitude late. Numeric codes are unchanged so old
-# checkpoints and run names still resolve.
-ACT_CODES = {"silu": 0, "normsilu": 2, "radial": 8}
-ACT_TAGS = {0: "s", 2: "n", 8: "R"}
+# layer runs as normsilu early and full-magnitude late. Kernel act code 8; theta lives on
+# BiBoFusedExperts.radial_theta and trains through AdamW (--act_scale_lr gives it its own rate).
+RADIAL_ACT_CODE = 8
 
 
 class _QwenAuxCollector:
@@ -212,22 +209,19 @@ def main():
     ap.add_argument("--seq_len", type=int, default=1024)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")  # NEVER fp16
     ap.add_argument("--attn", choices=["sdpa", "flash_attention_4"], default="sdpa")
-    ap.add_argument("--load_balance", choices=["none", "bias"], default="bias")   # BiBo: bias=DeepSeek sigmoid+balance; none=softmax
     ap.add_argument("--aux_coef", type=float, default=0.001)                      # Qwen aux load-balancing loss coef (0=off; paper 0.001)
-    ap.add_argument("--polyglu_mult", type=int, default=2)                        # BiBo GLU experts = polyglu_mult*3 (= Qwen num_experts); default 6 experts
+    ap.add_argument("--experts", type=int, default=0)   # TOTAL routed experts (GLU + specials); 0 = SHARED (6). GLU count = experts - 2*special_pairs -- see configs.glu_count
     # PolyGLU expert activation. THE ACTIVATION AXIS IS CLOSED (Jul 26 2026): the six on/off switches
     # it was ablated with are gone and this is a single choice, DEFAULT silu. The other codes stay in
     # the kernel and stay selectable -- pass a comma list to revive a MIXED cycle (e.g. --act silu,situ
     # -> 0,5,0,5,...), which is how a future NormSiLU+NormSiTU mixture would be run.
     #   silu 0 (default) | relu2 1 | normsilu 2 | situ 5 | normrelu2 6 | normsitu 7
     # Measured @e30 500M tok: acts-n (normsilu) 0.7273, acts-s (silu) 0.7444, Z (normrelu2) 0.8345.
-    ap.add_argument("--act", default="radial")           # comma list allowed; cycles across the GLU experts
     # Per-expert INPUT SCALE alpha for ANY activation: act(alpha_e * x), x = gate (silu/relu2) or
     # gate/rms(gate) (the normed codes; alpha sits AFTER the rms or it is exactly inert). Reuses the
     # situ (alpha,gamma) params -- gamma gets ZERO gradient for non-SiTU codes and stays 1.0, since a
     # per-expert OUTPUT gain is redundant with the router weight (g_e*w*f == (g_e*w)*f). 1D (E,) ->
     # AdamW by the ndim rule. Tag _aS.
-    ap.add_argument("--act_scale_learnable", type=_bool, default=False)
     # alpha must travel from 1 to ~5 to matter; AdamW moves a param ~lr/step, cosine-averaged ~0.5*lr,
     # so reachable travel over N steps is ~0.5*lr*N. At adam_lr 5e-4 / 2000 steps that is 0.5 -- alpha
     # cannot get there and the arm reads as a null for the wrong reason. 1e-2 gives travel ~10.
@@ -235,48 +229,30 @@ def main():
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
     # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
-    ap.add_argument("--act_scale_init", type=float, default=1.0)
     # gamma init, code 9 only (gamma is inert elsewhere). Needed because gamma*SiLU(alpha*g) is
     # DEGENERATE once |alpha*g| is large -- it collapses to gamma*alpha*g, so only the product
     # matters and AdamW moves both params together. Starting alpha near 1/rms(gate) and gamma near
     # rms(gate)^p puts the gate in its curved region from step 0, where the two grads differ.
-    ap.add_argument("--act_gamma_init", type=float, default=1.0)
     # PER-LAYER activation: MoE layers >= --act_tail_from use --act_tail, earlier layers use --act.
     # Motivated by measurement: CV(rms(gate)) across tokens is 28% at MoE layer 0 but only ~4% from
     # layer 2 on, so NormSiLU's per-token norm earns its keep early and is nearly a constant divide
     # later -- where a per-expert scalar reproduces it and skips the RMS pre-pass.
-    ap.add_argument("--act_tail", default="")            # comma list, same names as --act; "" = off
-    ap.add_argument("--act_tail_from", type=int, default=-1)   # first MoE layer index using --act_tail
-    ap.add_argument("--situ_learnable", type=int, default=0)   # per-expert gamma*tanh(alpha*g)*sigmoid(g); AdamW 1D params
     ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free special experts, per-type count
     ap.add_argument("--no_pos_identity", dest="pos_identity_expert", action="store_false")  # drop +Identity (code 3); test -Identity alone
     ap.add_argument("--no_neg_identity", dest="neg_identity_expert", action="store_false")  # drop -Identity (code 4); test +Identity alone
-    ap.add_argument("--router_type", choices=["mlp", "conv"], default="mlp")  # conv = causal Conv1d router (run tag _rconv{K}); weight is 2D (E,H*K) so Muon whitens EXPERTS not taps -- see ablate/common/optim.py
-    ap.add_argument("--router_kernel", type=int, default=3)                   # conv router tap count (only used when --router_type conv)
-    ap.add_argument("--router_gate", choices=list(GATE_TYPES), default="sigmoid")  # router score fn (run tag _rt-<gate>-<norm>); shapes documented at GATE_TYPES in src/configuration_bibo.py
-    ap.add_argument("--router_norm", choices=["auto", "sum", "softmax", "l1"], default="auto")  # auto: sum for sigmoid, softmax for situ (the sum-to-1 pick per gate)
     ap.add_argument("--norm_topk_prob", type=int, default=1)  # 1 = normalize top-k weights to sum to 1 (BiBo model default). 0 = raw scores as weights (old ablate behavior)
     ap.add_argument("--router_log", type=int, default=1)
     ap.add_argument("--router_optim", choices=["muon","adamw"], default="muon")  # router proj optimizer; muon = current default (2D -> Muon by the ndim rule); tag _radamw      # per-step router mechanics (GPU-accumulated, 1 sync per log_every)
     # MoE-branch magnitude knobs (applied AFTER the top-k norm; normalization sets the SPLIT, these set LOUDNESS)
-    ap.add_argument("--routed_scaling_factor", type=float, default=1.0)          # fixed global scale (1.0 = no-op); tag _rs<val>
-    ap.add_argument("--routed_scaling_learnable", type=_bool, default=False)     # learnable per-LAYER scalar, init 1.0; tag _rsL
-    ap.add_argument("--expert_scale_learnable", type=_bool, default=False)       # learnable per-EXPERT vector, init 1.0; tag _esL
     ap.add_argument("--use_ssmax", action="store_true")                           # ablation axis: SSMax scalable softmax (default OFF)
     ap.add_argument("--use_xsa", action="store_true")                             # ablation axis: XSA exclusive self-attention (default OFF)
-    ap.add_argument("--balance_exclude_specials", action="store_true")            # ablation axis: bias balancer ignores the ±Identity experts (freezes their bias at 0; router learns special usage) — only matters with special_pairs>0
     ap.add_argument("--n_shared", type=int, default=0)   # shared experts as a WIDTH multiple of moe_intermediate_size (Kimi K3 form). 0 = no shared expert. Added UNSCALED to the routed sum. Tag _sh<N>
     # Per-token norm on the MoE BLOCK OUTPUT (combined expert sum) just before the residual add.
     # "rms" keeps a learnable per-channel gain; "unit" is gain-free so ONLY the mixture direction
     # survives. Pairs with --norm_topk_prob 0: let the router weights run unbounded, then pin the
     # branch magnitude here instead. Tag _mon-<v>
-    ap.add_argument("--moe_out_norm", choices=list(MOE_OUT_NORMS), default="none")
-    ap.add_argument("--router_input_norm", choices=list(ROUTER_INPUT_NORMS), default="none")  # per-token norm on the ROUTER INPUT ONLY (expert input untouched). Tag _rin-<v>
-    ap.add_argument("--router_temp", type=float, default=1.0)      # logits /= T before the gate. T>1 FLATTENS scores (derivative scales 1/T). Not absorbable by the weight: Muon pins its spectral norm. Tag _T<v>
     ap.add_argument("--top_k", type=int, default=0)                # 0 = SHARED (2). Raising it WITHOUT --moe_inter multiplies active expert FLOPs by the same factor. Tag _k<n>
     ap.add_argument("--moe_inter", type=int, default=0)            # 0 = SHARED (768). Halve it when doubling top_k to hold compute constant. Tag _mi<n>
-    ap.add_argument("--bias_update_mode", choices=["sign", "prop"], default="sign")  # LongCat uses NO sign(): "prop" applies u*(target-actual) directly -> proportional control, has a fixed point (no dither) and cannot drift common-mode. u is NOT comparable across modes. Tag _prop
-    ap.add_argument("--glu_budget", type=float, default=-1.0)                     # LongCat K_e/K (arXiv:2509.01322): target share of routing slots for the GLU block, e.g. 0.75 -> GLU 3/4 / specials 1/4. <0 = off (DeepSeek mean-relative). Tag _gb<val>
     ap.add_argument("--bias_update_threshold", type=int, default=10240)           # tokens between bias updates (if bias)
     ap.add_argument("--bias_update_factor", type=float, default=-1.0)             # <0 = config default, which is MODE-DEPENDENT (prop 0.4, sign 0.001) because u means different things; 0 = balancing off
     ap.add_argument("--compile", action="store_true")           # torch.compile the transformer body
@@ -340,10 +316,8 @@ def main():
     # untagged, so it never splits a run name away from its baseline.
     ap.add_argument("--clean_loss", type=_bool, default=False)
     # LatentMoE: shared W_down before dispatch / W_up after combine; experts run at width d.
-    # I' / E / k already have flags (--moe_inter / --polyglu_mult / --top_k), so the matched-budget
+    # I' / E / k already have flags (--moe_inter / --experts / --top_k), so the matched-budget
     # family is k*I' = const with E = 8k -- see the round config. 0 = off. Run tag _lat<d>.
-    ap.add_argument("--moe_latent_dim", type=int, default=0)
-    ap.add_argument("--latent_norm", type=_bool, default=True)   # RMSNorm on the latent pre-up-proj
     ap.add_argument("--wd_schedule", choices=["none", "rcos"], default="none")
     ap.add_argument("--wd_end", type=float, default=0.1)   # only used when --wd_schedule rcos
     ap.add_argument("--scheduler", choices=["wsd", "cosine"], default="wsd")  # LR schedule shape
@@ -382,116 +356,26 @@ def main():
     dt = _DT[args.precision]
     patch_list = [p.strip() for p in args.patches.split(",") if p.strip()]
     use_fused_ce = "ce" in patch_list
-    patchmod.ROUTER_GATE = args.router_gate                            # router score fn, see GATE_TYPES
-    # 'auto' picks the norm that actually sums to 1 for the chosen gate: the non-negative gates work
-    # with the shipped w/sum(w); SIGNED gates need softmax, the only all-positive sum-to-1 option.
-    router_norm = args.router_norm
-    if router_norm == "auto":
-        router_norm = "softmax" if args.router_gate in SIGNED_GATES else "sum"
-    patchmod.ROUTER_NORM = router_norm
     from . import configs as _cfgmod
-    _cfgmod.SHARED["norm_topk_prob"] = bool(args.norm_topk_prob)
+    _cfgmod.SHARED["norm_topk_prob"] = "sum" if args.norm_topk_prob else False
     if not args.norm_topk_prob:
-        print("[router] warning: norm_topk_prob=0 -> NO top-k normalization; raw gate scores are the "
-              f"combine weights (they will NOT sum to 1) and --router_norm {router_norm} is INERT.", flush=True)
-    elif args.router_gate in SIGNED_GATES and router_norm == "sum":
-        print(f"[router] warning: signed gate '{args.router_gate}' with norm 'sum' -- weights escape [0,1], can "
-              "flip sign and explode on near-cancel; 'softmax' is the all-positive sum-to-1 choice", flush=True)
-    elif args.router_gate == "sqsp" and router_norm == "sum":
-        print("[router] note: 'sqsp' is UNBOUNDED above, so under div-sum a single expert can take an "
-              "arbitrarily large share -- watch max expert load on this arm", flush=True)
-    print(f"[router] gate={args.router_gate} norm={router_norm} norm_topk_prob={bool(args.norm_topk_prob)}", flush=True)
-    patchmod.ROUTER_SCALE = args.routed_scaling_factor
-    _scale_on = (args.routed_scaling_factor != 1.0 or args.routed_scaling_learnable
-                 or args.expert_scale_learnable)
-    # WHICH NORMS THE NATIVE ROUTER CAN DO: only softmax (norm_topk_prob=1) or none (=0). 'sum'
-    # (w/sum w) and 'l1' exist ONLY in the ablate patch. The old condition skipped the patch whenever
-    # router_norm=="sum", so `--norm_topk_prob 1 --router_norm sum` silently ran SOFTMAX -- and since
-    # 'auto' resolves to "sum" for a sigmoid gate, EVERY ntp=1 sigmoid run was labelled sum while
-    # actually running softmax. Patch whenever the requested norm is one the native path cannot do.
-    _norm_needs_patch = bool(args.norm_topk_prob) and router_norm not in ("softmax",)
-    if (args.router_gate != "sigmoid" or _norm_needs_patch or _scale_on) and "router_gate" not in patch_list:
-        patch_list.append("router_gate")            # eager router swap (also carries the magnitude scales)
-    # --act name[,name...] -> the act-code cycle for the fused moe patch
-    act_names = [a.strip() for a in args.act.split(",") if a.strip()]
-    unknown = [a for a in act_names if a not in ACT_CODES]
-    assert act_names and not unknown, f"--act: unknown {unknown}; pick from {sorted(ACT_CODES)}"
-    act_cycle = [ACT_CODES[a] for a in act_names]
-    tail_names = [a.strip() for a in args.act_tail.split(",") if a.strip()]
-    unknown_t = [a for a in tail_names if a not in ACT_CODES]
-    assert not unknown_t, f"--act_tail: unknown {unknown_t}; pick from {sorted(ACT_CODES)}"
-    tail_cycle = [ACT_CODES[a] for a in tail_names]
-    assert bool(tail_cycle) == (args.act_tail_from >= 0), \
-        "--act_tail and --act_tail_from must be given together (or neither)"
-    if args.situ_learnable:
-        assert 5 in act_cycle, "--situ_learnable needs situ in --act"
-    # code 8 (radial) carries its exponent in the act-scale param, so the kernel raises without it.
-    # Fail here with the actionable message instead of deep in the first forward.
-    if 8 in act_cycle or 8 in tail_cycle:
-        # radial keeps its exponent logit theta IN the act-scale param, so the param is not optional
-        # -- it is part of the activation. Now that radial is the DEFAULT act, asserting here would
-        # make a bare `--arm bibo_min` run fail; auto-enable instead, with init 0 so p=sigmoid(0)=0.5.
-        if not args.act_scale_learnable:
-            args.act_scale_learnable = True
-            if not args.act_scale_init:
-                args.act_scale_init = 0.0
-            print("[act] radial (code 8) needs its exponent param: act_scale_learnable=1, "
-                  f"act_scale_init={args.act_scale_init:g} (p=sigmoid(init))", flush=True)
-    if act_cycle != [0, 1, 2]:
-        assert "moe" in patch_list, "custom act subset needs the 'moe' patch (eager experts keep the built-in triple)"
-    patchmod.ACT_CYCLE = act_cycle
-    n_glu_experts = args.polyglu_mult * POLYGLU_GROUP
-    print(f"[experts] polyglu_mult {args.polyglu_mult} x POLYGLU_GROUP {POLYGLU_GROUP} = {n_glu_experts} "
-          f"GLU experts, special_pairs={args.special_pairs}", flush=True)
-    if n_glu_experts % len(act_cycle):
-        print(f"[acts] warning: cycle {act_cycle} does not tile {n_glu_experts} experts evenly "
-              f"(counts will differ by one)", flush=True)
-
-    model, cfg = build_arm(args.arm, device=DEV, dtype=torch.float32, attn_impl=args.attn,  # fp32 master weights
-                           load_balance=args.load_balance, bias_update_threshold=args.bias_update_threshold,
+        print("[router] warning: norm_topk_prob=0 -> NO top-k normalization; raw sigmoid scores are "
+              "the combine weights and they will NOT sum to 1.", flush=True)
+    n_total = args.experts or SHARED["num_experts"]
+    n_glu = glu_count(n_total, args.special_pairs, args.pos_identity_expert, args.neg_identity_expert)
+    print(f"[experts] {n_total} routed = {n_glu} GLU (radial) + {n_total - n_glu} +/-Identity "
+          f"(special_pairs={args.special_pairs})", flush=True)
+    assert "moe" in patch_list, "the fused-moe patch is required: eager experts are ~3x slower"
+    model, cfg = build_arm(args.arm, device=DEV, dtype=torch.float32, attn_impl=args.attn,  # fp32 master
+                           bias_update_threshold=args.bias_update_threshold,
                            bias_update_factor=(None if args.bias_update_factor < 0 else args.bias_update_factor),
-                           aux_coef=args.aux_coef, polyglu_mult=args.polyglu_mult, special_pairs=args.special_pairs,
+                           aux_coef=args.aux_coef, num_experts=n_total, special_pairs=args.special_pairs,
                            use_ssmax=args.use_ssmax, use_xsa=args.use_xsa,
-                           balance_exclude_specials=args.balance_exclude_specials,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
-                           router_type=args.router_type, kernel_size=args.router_kernel,
-                           glu_token_budget=(None if args.glu_budget < 0 else args.glu_budget),
-                           bias_update_mode=args.bias_update_mode,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
-                           router_temperature=args.router_temp,
-                           router_input_norm=args.router_input_norm,
-                           moe_out_norm=args.moe_out_norm,
-                           moe_latent_dim=args.moe_latent_dim,
-                           latent_moe_use_norm=args.latent_norm,
                            num_shared_experts=args.n_shared)
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
-    if args.situ_learnable or args.act_scale_learnable:
-        n_ap = patchmod.add_situ_params(model, init=args.act_scale_init,
-                                        gamma_init=args.act_gamma_init)
-        print(f"[acts] learnable act scales: (alpha,gamma) on {n_ap} MoE layers, alpha init "
-              f"{args.act_scale_init:g}"
-              + (f" -> p=sigmoid={torch.sigmoid(torch.tensor(args.act_scale_init)):.3f}"
-                 if 8 in act_cycle or 8 in tail_cycle else ""), flush=True)
-    # PER-LAYER act override: stamp _act_cycle on the MoE modules at/after --act_tail_from. Indices
-    # are MoE-MODULE order, not model-layer order -- model layer 0 is a DENSE FFN, so MoE index 0 is
-    # model layer 1. The printout below names both so the mapping is never in doubt.
-    if tail_cycle and args.act_tail_from >= 0:
-        from src.modeling.ffn.moe import BiBoFusedExperts
-        _mods = [(n, m) for n, m in model.named_modules() if isinstance(m, BiBoFusedExperts)]
-        for i, (n, m) in enumerate(_mods):
-            m._act_cycle = list(tail_cycle) if i >= args.act_tail_from else list(act_cycle)
-        print(f"[acts] per-layer: {len(_mods)} MoE modules; "
-              f"idx<{args.act_tail_from} -> {act_cycle}, idx>={args.act_tail_from} -> {tail_cycle}",
-              flush=True)
-        for i, (n, m) in enumerate(_mods):
-            print(f"    MoE idx {i}  ({n})  codes={m._act_cycle}", flush=True)
-    if args.routed_scaling_learnable or args.expert_scale_learnable:
-        n_rs = patchmod.add_router_scales(model, bool(args.routed_scaling_learnable),
-                                          bool(args.expert_scale_learnable))
-        print(f"[router] learnable scales on {n_rs} routers: "
-              f"layer={bool(args.routed_scaling_learnable)} per-expert={bool(args.expert_scale_learnable)}",
-              flush=True)
     total, trainable, active = count_params(model)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
     # router mechanics traced on the TRAINING stream (eval-time MoEStats sees eval data only, every
@@ -534,17 +418,11 @@ def main():
         print(f"[optim] wd schedule rcos: {args.wd:g} -> {args.wd_end:g} (reverse cosine, rises as lr decays)",
               flush=True)
     amp = contextlib.nullcontext() if args.precision == "fp32" else torch.autocast("cuda", dtype=dt)
-    # acts-<subset> is the primary axis of this ablation; special_pairs / conv kernel etc. keep
-    # their suffixes so variants don't collide on ckpt/log/run names (they otherwise share arm+seed)
-    acts_tag = ("".join(ACT_TAGS[c] for c in act_cycle)
-                + (f"-t{args.act_tail_from}" + "".join(ACT_TAGS[c] for c in tail_cycle)
-                   if tail_cycle else ""))
+    # Suffixes exist so variants don't collide on ckpt/log/run names (they otherwise share arm+seed).
+    # The acts- tag is gone: radial is the only activation src implements, so every bibo_min run has it.
     run_name = (f"{args.arm}_seed{args.seed}"
-                + (f"_acts-{acts_tag}" if args.arm == "bibo_min" else "")
-                + ("_situL" if args.situ_learnable else "")
-                + (("_aS" + (f"{args.act_scale_lr:g}" if args.act_scale_lr else ""))
-                   if args.act_scale_learnable else "")
-                # wd is an ablation axis now (scale-equilibrium test) -- untagged runs would collide
+                + (("_aS" + f"{args.act_scale_lr:g}") if args.act_scale_lr else "")
+                # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
                    else (f"_wd{args.wd:g}" if args.wd != 0.1 else ""))
@@ -552,42 +430,23 @@ def main():
                 + (f"_manas-g{probe_gamma:g}" + (f"-r{args.probe_rank}" if args.probe_rank else "")
                    + ("-gs" if args.probe_gamma_schedule == "lr" else "")
                    if args.optim == "manas" else "")
-                + (f"_lat{args.moe_latent_dim}" + ("" if args.latent_norm else "-nonorm")
-                   if args.moe_latent_dim else "")
-                + (f"_e{args.polyglu_mult * POLYGLU_GROUP}" if args.polyglu_mult != 2 else "")
+                + (f"_e{n_total}" if n_total != SHARED["num_experts"] else "")
                 + (f"_se{args.special_pairs}" if args.special_pairs else "")
                 + (("_posonly" if not args.neg_identity_expert else "") if args.special_pairs else "")
                 + (("_negonly" if not args.pos_identity_expert else "") if args.special_pairs else "")
-                + (f"_rconv{args.router_kernel}" if args.router_type == "conv" else "")
-                + ("_xsp" if args.balance_exclude_specials else "")
-                + (f"_gb{args.glu_budget:g}" if args.glu_budget >= 0 else "")
                 # bias_update_factor MUST be in the tag: it is a first-class ablation axis (it sets
                 # the balancer's authority relative to the router boundary gap), and two arms that
                 # differ only in u would otherwise share a run name -- silently overwriting each
                 # other's ..._final.pt / _result.json and colliding in W&B. That already happened
                 # once: se2-xsp (u=0.001) was clobbered by se2-xsp-u01 (u=0.01).
                 + (f"_u{args.bias_update_factor:g}" if args.bias_update_factor >= 0 else "")
-                + ("_prop" if args.bias_update_mode == "prop" else "")
                 + (f"_k{args.top_k}" if args.top_k else "")
-                + (f"_T{args.router_temp:g}" if args.router_temp != 1.0 else "")
-                + (f"_rin-{args.router_input_norm}" if args.router_input_norm != "none" else "")
-                + (f"_mon-{args.moe_out_norm}" if args.moe_out_norm != "none" else "")
                 + (f"_sh{args.n_shared}" if args.n_shared else "")
                 + (f"_mi{args.moe_inter}" if args.moe_inter else "")
                 + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
-                # Tag the norm whenever it is ACTIVE (ntp=1). The old rule stayed silent for
-                # sigmoid+sum, so a real sum-normalized run was named identically to an
-                # unnormalized one bar the _nontp marker -- indistinguishable at a glance, and
-                # we just lost time to exactly that class of mislabelling.
-                + (f"_rt-{args.router_gate}-{router_norm}"
-                   if (args.router_gate != "sigmoid" or router_norm != "sum"
-                       or bool(args.norm_topk_prob)) else "")
-                + ("" if args.norm_topk_prob else "_nontp")   # normalization is now the default; mark when OFF
-                + (f"_rs{args.routed_scaling_factor:g}" if args.routed_scaling_factor != 1.0 else "")
+                + ("" if args.norm_topk_prob else "_nontp")   # normalization is the default; mark when OFF
                 + ("_radamw" if args.router_optim == "adamw" else "")
-                + ("_rsL" if args.routed_scaling_learnable else "")
-                + ("_esL" if args.expert_scale_learnable else "")
                 + ("_cos" if args.scheduler == "cosine" else ""))
     out_dir = args.out or os.path.join(os.path.dirname(__file__), "..", "runs")
     os.makedirs(out_dir, exist_ok=True)
@@ -723,8 +582,6 @@ def main():
             ecorr = _expert_corr(model)                                    # cross-expert redundancy — logged every run
             rcorr = _router_corr(model)                                    # ROUTER expert-direction collapse (the conv-axis metric)
             rt = rtrace.flush() if rtrace else {}                          # router mechanics over the interval
-            if args.routed_scaling_learnable or args.expert_scale_learnable:
-                rt.update(patchmod.router_scale_stats(model))               # where the learned magnitude landed
             rt_s = (f" top1w={rt['train/router_top1_weight']:.3f} rent={rt['train/router_entropy']:.3f}"
                     f" bal={rt['train/balance_entropy']:.3f}"
                     f" gap={rt['train/router_boundary_gap']:.4f}"
@@ -732,31 +589,19 @@ def main():
                     # --glu_budget r it should settle near 1-r. 0.000 means no special experts.
                     + (f" spl={rt['train/special_load']:.3f}({rt['train/neg_identity_load']:.3f})"
                        if rt.get("train/special_load", 0.0) > 0 else "")) if rt else ""
-            # aS = where the per-expert input scale landed. The arm is only informative if alpha
-            # actually TRAVELS -- it must reach ~5 to pull a Muon-pinned gate (RMS ~0.18) into
-            # SiLU's nonlinear band, so an alpha stuck near 1.0 means the lr is too low, NOT that
-            # scale does not matter. Must come after rt_s: rt is {} when --router_log is off and
-            # rt_s keys off `if rt`. min/mean/max over every expert in the model.
+            # aS = where the radial exponent landed, reported as p = sigmoid(theta) because p is the
+            # interpretable quantity: p->0 IS normsilu, p->1 is full magnitude. The trained shape is a
+            # DEPTH RAMP (0.11 early -> 0.93 late), so a p pinned near its 0.5 init across every layer
+            # means theta is not travelling and --act_scale_lr is too low, NOT that the axis is dead.
             aS_s = ""
-            if args.act_scale_learnable or args.situ_learnable:
-                _a = torch.cat([m.situ_alpha.detach().float().flatten()
-                                for m in model.modules() if hasattr(m, "situ_alpha")])
-                rt.update({"train/act_alpha_mean": _a.mean().item(),
-                           "train/act_alpha_min": _a.min().item(),
-                           "train/act_alpha_max": _a.max().item()})
-                aS_s = (f" aS={rt['train/act_alpha_mean']:.3f}"
-                        f"[{rt['train/act_alpha_min']:.2f},{rt['train/act_alpha_max']:.2f}]")
-                # gamma matters only where it is LIVE: code 5 (situ) and code 9 (decoupled silu).
-                # For code 9 the whole hypothesis is that alpha FALLS (gate temperature) while gamma
-                # RISES (magnitude) -- which is unreadable unless both are logged.
-                if 9 in act_cycle or 9 in tail_cycle or args.situ_learnable:
-                    _gm = torch.cat([m.situ_gamma.detach().float().flatten()
-                                     for m in model.modules() if hasattr(m, "situ_gamma")])
-                    rt.update({"train/act_gamma_mean": _gm.mean().item(),
-                               "train/act_gamma_min": _gm.min().item(),
-                               "train/act_gamma_max": _gm.max().item()})
-                    aS_s += (f" gG={rt['train/act_gamma_mean']:.3f}"
-                             f"[{rt['train/act_gamma_min']:.2f},{rt['train/act_gamma_max']:.2f}]")
+            _th = [m.radial_theta for m in model.modules() if hasattr(m, "radial_theta")]
+            if _th:
+                _p = torch.sigmoid(torch.cat([t.detach().float().flatten() for t in _th]))
+                rt.update({"train/radial_p_mean": _p.mean().item(),
+                           "train/radial_p_min": _p.min().item(),
+                           "train/radial_p_max": _p.max().item()})
+                aS_s = (f" p={rt['train/radial_p_mean']:.3f}"
+                        f"[{rt['train/radial_p_min']:.2f},{rt['train/radial_p_max']:.2f}]")
             print(f"  step {step}/{total_steps} loss={lv:.4f} run{len(_loss_hist)}={lv_run:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
                   f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{rt_s}{aS_s}"

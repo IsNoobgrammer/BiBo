@@ -1,43 +1,46 @@
-"""Arm configs for the BiBo-min vs Qwen ablation — parameter-matched by construction.
+"""Arm configs for the BiBo-min vs Qwen ablation -- parameter-matched by construction.
 
-Both arms share identical dims / experts / top_k. Because PolyGLU==SwiGLU in params and
+Both arms share identical dims / experts / top_k. Because a GLU expert == SwiGLU in params and
 partial-vs-full RoPE is parameter-free, the two models have the SAME parameter count exactly.
 
-Arms (2, bundled per the design):
   'qwen'     : stock Qwen3MoE (SwiGLU experts, full RoPE, softmax router).
-  'bibo_min' : BiBo stripped to Qwen-equivalence EXCEPT PolyGLU experts + partial RoPE.
-               no SWA, no conv router, no XSA, no SSMax, no sinks, no shared expert,
-               softmax router with NO load-balancing (matches Qwen with aux-loss OFF).
+  'bibo_min' : BiBo stripped to Qwen-equivalence EXCEPT radial-NormSiLU experts + partial RoPE.
 
-Every knob here is a plain dict field -> swappable. Flip PARTIAL_ROPE / router / balancing
-to re-scope the ablation (e.g. a 3rd 'isolate RoPE' arm) without touching model code.
+EXPERT COUNTING CHANGED Aug 1 2026. num_routed_experts is now the TOTAL and the GLU count is
+DERIVED as total - 2*special_pairs. It used to be the other way round (polyglu_mult*3 GLU experts
+PLUS the specials), so the same numbers now build a DIFFERENT model: at num_experts=6,
+special_pairs=1 you get 4 GLU + 2 specials, where the old code gave 6 GLU + 2 specials = 8 routed.
+Qwen's num_experts is matched to BiBo's GLU count, so the param match still holds -- but a run tagged
+with an expert count before this date is not comparable to one after it.
 """
 from . import _paths  # noqa: F401  (sys.path bootstrap)
 
-# ---- shared, matched dimensions (team-standard 137M total / 71M active) ----
 SHARED = dict(
-    vocab_size=81920,             # QTK-81K tokenizer: real len(tokenizer)=81920 (ids up to 81919 in the
-                                  # packed corpus). NOT 81000 (that old-bench value overflows the embedding).
+    vocab_size=81920,             # QTK-81K tokenizer: real len(tokenizer)=81920. NOT 81000 (overflows).
     hidden_size=512,
     num_hidden_layers=10,
     num_attention_heads=4,
-    num_key_value_heads=2,        # GQA 2:1
-    intermediate_size=1024,       # dense MLP (mlp_only_layers)
+    num_key_value_heads=2,
+    intermediate_size=1024,
     moe_intermediate_size=768,
-    num_experts=6,                # == BiBo num_routed_experts (polyglu_mult=2 -> 6 GLU experts; LCM of 2,3
-                                  # so any enabled act subset {silu,relu2,normsilu} cycles evenly)
-    num_experts_per_tok=2,        # top-k
+    num_experts=6,                # TOTAL routed experts (GLU + specials)
+    num_experts_per_tok=2,
     max_position_embeddings=2048,
-    mlp_only_layers=[0, 9],       # first + last dense, rest MoE
+    mlp_only_layers=[0, 9],
     rms_norm_eps=1e-6,
     rope_theta=10000.0,
-    tie_word_embeddings=True,     # SAME on both -> param match holds; tied -> ~137M total / ~71M active
-    norm_topk_prob=True,          # renormalize top-k weights to sum to 1 (matches the BiBo model default).
-                                  # WAS False -> every run before Jul 24 2026 used RAW gate scores as combine
-                                  # weights (measured sum ~1.34, never 1). train.py --norm_topk_prob overrides.
+    tie_word_embeddings=True,
+    norm_topk_prob="sum",         # "sum" (MiMo div-sum) | "softmax" | False
 )
 
-PARTIAL_ROPE = 0.334              # BiBo-min partial rotary; 1.0 == Qwen full RoPE (flip to isolate)
+PARTIAL_ROPE = 0.334              # BiBo-min partial rotary; 1.0 == Qwen full RoPE
+
+
+def glu_count(num_experts, special_pairs, pos_identity=True, neg_identity=True):
+    """GLU experts left after the param-free specials take their slots. This is the number Qwen has
+    to be built with for the param match, and it is what a run's expert count should be read as."""
+    n_special = (special_pairs if pos_identity else 0) + (special_pairs if neg_identity else 0)
+    return num_experts - n_special
 
 
 def make_qwen_config(attn_impl="sdpa", aux_coef=0.001, num_experts=None):
@@ -46,68 +49,49 @@ def make_qwen_config(attn_impl="sdpa", aux_coef=0.001, num_experts=None):
         vocab_size=SHARED["vocab_size"], hidden_size=SHARED["hidden_size"],
         intermediate_size=SHARED["intermediate_size"], num_hidden_layers=SHARED["num_hidden_layers"],
         num_attention_heads=SHARED["num_attention_heads"], num_key_value_heads=SHARED["num_key_value_heads"],
-        num_experts=num_experts or SHARED["num_experts"],   # == BiBo GLU count (polyglu_mult*3) -> param-matched
+        num_experts=num_experts or SHARED["num_experts"],
         num_experts_per_tok=SHARED["num_experts_per_tok"],
-        moe_intermediate_size=SHARED["moe_intermediate_size"], norm_topk_prob=SHARED["norm_topk_prob"],
+        moe_intermediate_size=SHARED["moe_intermediate_size"],
+        norm_topk_prob=bool(SHARED["norm_topk_prob"]),
         max_position_embeddings=SHARED["max_position_embeddings"], mlp_only_layers=SHARED["mlp_only_layers"],
         rms_norm_eps=SHARED["rms_norm_eps"], rope_theta=SHARED["rope_theta"],
-        tie_word_embeddings=SHARED["tie_word_embeddings"], router_aux_loss_coef=aux_coef,  # Switch aux LB loss (Qwen native)
+        tie_word_embeddings=SHARED["tie_word_embeddings"], router_aux_loss_coef=aux_coef,
     )
-    cfg._attn_implementation = attn_impl        # "sdpa" | "flash_attention_4" (native HF dispatch)
+    cfg._attn_implementation = attn_impl
     return cfg
 
 
-def make_bibo_min_config(load_balance="bias", bias_update_threshold=10240, bias_update_factor=None,
-                         polyglu_mult=2, special_pairs=0,
-                         use_ssmax=False, use_xsa=False, balance_exclude_specials=False,
+def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
+                         num_experts=None, special_pairs=0,
+                         use_ssmax=False, use_xsa=False,
                          pos_identity_expert=True, neg_identity_expert=True,
-                         router_type="mlp", kernel_size=3, glu_token_budget=None,
-                         bias_update_mode="sign", top_k=None, moe_intermediate_size=None,
-                         router_temperature=1.0, router_input_norm="none", num_shared_experts=0,
-                         moe_out_norm="none", moe_latent_dim=0, latent_moe_use_norm=True):
+                         top_k=None, moe_intermediate_size=None, num_shared_experts=0):
     from src.configuration_bibo import BiBoConfig
-    # DeepSeek-style aux-loss-free balancing pairs with SIGMOID gating (bias added to sigmoid scores);
-    # with no balancing we use softmax (Qwen-matched). So gate_type follows load_balance.
-    gate = "sigmoid" if load_balance == "bias" else "softmax"
     return BiBoConfig(
-        load_balance_strategy=load_balance,         # "bias" (DeepSeek-style, sigmoid) | "none" (softmax, Qwen-matched)
-        bias_update_threshold=bias_update_threshold,  # tokens between router-bias updates (only if load_balance="bias")
-        bias_update_factor=bias_update_factor,        # None -> BiBoConfig default (0.001)
-        balance_exclude_specials=balance_exclude_specials,  # ablation: freeze ±Identity bias (router learns their use)
-        glu_token_budget=glu_token_budget,  # LongCat K_e/K: absolute GLU-block share target (None = DeepSeek mean-relative)
-        bias_update_mode=bias_update_mode,  # "sign" (DeepSeek bang-bang) | "prop" (LongCat proportional)
+        bias_update_threshold=bias_update_threshold,
+        bias_update_factor=bias_update_factor,      # None -> BiBoConfig default (0.4, proportional)
         vocab_size=SHARED["vocab_size"], hidden_size=SHARED["hidden_size"],
         intermediate_size=SHARED["intermediate_size"], num_hidden_layers=SHARED["num_hidden_layers"],
         num_attention_heads=SHARED["num_attention_heads"], num_key_value_heads=SHARED["num_key_value_heads"],
-        # top_k / moe_intermediate_size default to SHARED. Raising top_k WITHOUT shrinking
-        # moe_intermediate_size multiplies active expert FLOPs by the same factor -- pass both to
-        # hold compute constant (the DeepSeek fine-grained-expert scaling).
+        # Raising top_k WITHOUT shrinking moe_intermediate_size multiplies active expert FLOPs by the
+        # same factor -- pass both to hold compute constant.
         moe_intermediate_size=(moe_intermediate_size or SHARED["moe_intermediate_size"]),
         num_experts_per_tok=(top_k or SHARED["num_experts_per_tok"]),
         max_position_embeddings=SHARED["max_position_embeddings"], mlp_only_layers=SHARED["mlp_only_layers"],
         rms_norm_eps=SHARED["rms_norm_eps"], rope_theta=SHARED["rope_theta"],
         tie_word_embeddings=SHARED["tie_word_embeddings"], norm_topk_prob=SHARED["norm_topk_prob"],
-        # --- the ablation delta: PolyGLU experts + partial RoPE ---
-        polyglu_expert_multiplier=polyglu_mult,  # GLU experts = polyglu_mult*3 (silu/relu2/normsilu); == Qwen num_experts
-        special_expert_pairs=special_pairs,      # per-type count of param-FREE special experts
-        pos_identity_expert=pos_identity_expert,  # ablation: include +Identity special expert(s) (code 3)
-        neg_identity_expert=neg_identity_expert,  # ablation: include -Identity special expert(s) (code 4)
+        # --- the ablation delta: radial-NormSiLU experts + partial RoPE ---
+        num_routed_experts=(num_experts or SHARED["num_experts"]),
+        special_expert_pairs=special_pairs,
+        pos_identity_expert=pos_identity_expert,
+        neg_identity_expert=neg_identity_expert,
         partial_rotary_factor=PARTIAL_ROPE,
         # --- everything else stripped to Qwen-equivalence ---
-        use_xsa=use_xsa, use_ssmax=use_ssmax,    # ablation axes (default OFF): XSA + scalable-softmax
+        use_xsa=use_xsa, use_ssmax=use_ssmax,
         add_full_attention_sink_bias=False, add_swa_attention_sink_bias=False,
-        hybrid_layer_pattern=None,        # all-global attention (no SWA)
-        gate_type=gate, router_activation="none", router_temperature=router_temperature,
-        router_input_norm=router_input_norm,
-        moe_out_norm=moe_out_norm,
-        moe_latent_dim=moe_latent_dim, latent_moe_use_norm=latent_moe_use_norm,
+        hybrid_layer_pattern=None,
         use_shared_expert=bool(num_shared_experts),
         num_shared_experts=max(int(num_shared_experts), 1),
-        # ablation axis: "mlp" (Linear, default) | "conv" (causal Conv1d over kernel_size taps).
-        # The conv router weight is stored 2D (E, H*kernel_size) so Muon orthogonalizes per EXPERT,
-        # not per kernel tap -- see the big note atop ablate/common/optim.py before touching this.
-        router_type=router_type, kernel_size=kernel_size,
-        routed_scaling_factor=1.0,
     )
 
 
