@@ -225,7 +225,15 @@ def main():
     # alpha must travel from 1 to ~5 to matter; AdamW moves a param ~lr/step, cosine-averaged ~0.5*lr,
     # so reachable travel over N steps is ~0.5*lr*N. At adam_lr 5e-4 / 2000 steps that is 0.5 -- alpha
     # cannot get there and the arm reads as a null for the wrong reason. 1e-2 gives travel ~10.
-    ap.add_argument("--act_scale_lr", type=float, default=0.0)  # 0 = share --adam_lr
+    # DEFAULT 0.01, not adam_lr. theta is an exponent LOGIT that has to TRAVEL: the measured depth
+    # ramp is p 0.11 -> 0.93, i.e. theta from -2.08 to +2.56, a span of 4.6 from an init of 0.
+    # AdamW's per-step displacement is ~lr (the update is sqrt(v)-normalized to O(1)), so at
+    # adam_lr=5e-4 over 4000 steps the ENTIRE travel budget is 2.0 -- under the 2.56 the deep layers
+    # need, and that assumes a perfectly sign-consistent gradient. Every radial result on the board
+    # was produced at 0.01 (20x adam_lr), where the budget is 40 and the constraint is not binding.
+    # Sharing adam_lr would leave p stuck near its 0.5 init and look like "the axis does nothing".
+    # 0 = share --adam_lr (the old default; kept so the A/B is one flag).
+    ap.add_argument("--act_scale_lr", type=float, default=0.01)
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
     # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
