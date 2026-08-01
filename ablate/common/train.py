@@ -207,6 +207,11 @@ def main():
     ap.add_argument("--batch", type=int, default=64)             # per micro-step
     ap.add_argument("--grad_accum", type=int, default=2)          # global batch = batch * grad_accum
     ap.add_argument("--seq_len", type=int, default=1024)
+    # Eval context is PINNED separately from training context. bpb depends strongly on how much
+    # context the model gets, so a --seq_len 2048 run evaluated at 2048 is not comparable to the
+    # board, which is all 1024 -- the number would move for a reason that has nothing to do with
+    # the arm. 0 = follow --seq_len (old behaviour).
+    ap.add_argument("--eval_seq_len", type=int, default=0)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")  # NEVER fp16
     ap.add_argument("--attn", choices=["sdpa", "flash_attention_4"], default="sdpa")
     ap.add_argument("--aux_coef", type=float, default=0.001)                      # Qwen aux load-balancing loss coef (0=off; paper 0.001)
@@ -645,7 +650,7 @@ def main():
         # multiple after 0 still runs, so curves are unaffected.
         if do_eval and args.eval_every > 0 and step > 0 and step % args.eval_every == 0:   # periodic eval -> W&B curves
             with _eager(model):                                # eval on the un-compiled module (see _eager)
-                _, flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.eval_mcq_n, bpb_n=args.eval_bpb_n,
+                _, flat = evaluate(model, tok, seq_len=(args.eval_seq_len or args.seq_len), mcq_n=args.eval_mcq_n, bpb_n=args.eval_bpb_n,
                                    extrap_lengths=ev_extrap, do_samples=False,
                                    do_icl=not args.no_eval_icl, icl_n=args.eval_icl_n, device=DEV, dtype=dt)
             if wb:
@@ -673,7 +678,7 @@ def main():
         try:                                                   # best-effort: a final-eval failure must NOT
             fe = tuple(int(x) for x in args.final_extrap.split(",") if x.strip()) or None   # abort the HF
             with _eager(model):                                # drain / result.json / wb.finish below
-                final_eval, full_flat = evaluate(model, tok, seq_len=args.seq_len, mcq_n=args.final_mcq_n,
+                final_eval, full_flat = evaluate(model, tok, seq_len=(args.eval_seq_len or args.seq_len), mcq_n=args.final_mcq_n,
                                                  extrap_lengths=fe, do_icl=not args.no_eval_icl, icl_n=100,
                                                  device=DEV, dtype=dt)
             if wb:
