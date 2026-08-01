@@ -142,6 +142,26 @@ def patch_fused_moe():
     Qwen3MoeExperts.forward = _nc(_qwen_moe)
 
 
+# ───────────────────────── fused XSA (BiBo only) ─────────────────────────
+def patch_fused_xsa():
+    """Route src's eager apply_xsa through the tkf Triton kernel.
+
+    Without this, --use_xsa runs the EAGER rejection: src reads V twice and materializes the
+    normalized V and the projection intermediate. The kernel fuses it into one pass. Both compute
+    the same thing (Y - (Y.Vn)Vn), so this is a throughput patch, not a behaviour change -- which
+    is exactly why it needs a numeric gate rather than a shrug: a silently-wrong fused XSA would
+    look like 'XSA hurts quality' in an A/B and send the whole round the wrong way.
+
+    Slices V to the query positions before the call, mirroring eager. For packed training
+    q_len == kv_len so it is a no-op; it matters only for cached decode."""
+    from kernels.sm120.xsa import fused_xsa
+    import src.modeling.attn.base as base
+
+    def _xsa(attn_output, value_states, enable_gqa=True):
+        return fused_xsa(attn_output, value_states[:, :, -attn_output.shape[2]:, :])
+    base.apply_xsa = _nc(_xsa)
+
+
 # ───────────────────────── FlashAttention (both arms) ─────────────────────────
 def flash_available():
     try:
@@ -189,11 +209,12 @@ def patch_bibo_flash():
     base.full_attention = _wrapped
 
 
-_APPLY = {"liger_norm": patch_liger_norm, "liger_rope": patch_liger_rope, "moe": patch_fused_moe}
+_APPLY = {"liger_norm": patch_liger_norm, "liger_rope": patch_liger_rope, "moe": patch_fused_moe,
+          "xsa": patch_fused_xsa}
 
 
 def apply(components):
-    """components: iterable subset of {'liger_norm','liger_rope','moe'} ('ce' lives in the loop)."""
+    """components: subset of {'liger_norm','liger_rope','moe','xsa'} ('ce' lives in the loop)."""
     done = []
     for c in components:
         if c == "ce":
