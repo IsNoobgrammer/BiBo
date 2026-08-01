@@ -111,7 +111,14 @@ def patch_fused_moe():
             self._act_codes = codes
         # radial_theta is the exponent LOGIT, and the kernel reads it from act_params column 0.
         # It is not optional -- code 8 raises without it (see parity_check/parity_radial.py).
-        ap = self.radial_theta.unsqueeze(1)
+        # act_params rows are indexed by EXPERT ID, so the ±Identity specials need rows too even
+        # though nothing reads them: radial_theta is only (num_glu,). Passing the short tensor makes
+        # backward hand autograd a gradient of the wrong shape, several frames from the cause.
+        n_pad = self.neg_end - self.num_glu_experts
+        ap = self.radial_theta
+        if n_pad:
+            ap = torch.cat([ap, ap.new_zeros(n_pad)])
+        ap = ap.unsqueeze(1)
         if _DISPATCH != "per_expert" and _code_max(codes) <= 4:
             from kernels.sm120.moe_grouped import moe_grouped_cublas_polyglu, grouped_supported
             if grouped_supported(hidden_states, self.gate_up_proj, self.down_proj):
