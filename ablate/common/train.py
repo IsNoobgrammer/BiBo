@@ -463,6 +463,11 @@ def main():
                 # control and overwrites its _final.pt / _result.json. That happened once --
                 # the control had to be rescued mid-flight by renaming its artifacts.
                 + ("_xsa" if args.use_xsa else "")
+                + (f"_xaI{args.xsa_alpha_init:g}" if args.use_xsa and args.xsa_alpha_init else "")
+                # Same rule, same reason: an --use_ssmax arm run against an XSA baseline differs
+                # from that baseline by nothing else in the name, so it would overwrite the very
+                # control it is being compared to.
+                + ("_ssmax" if args.use_ssmax else "")
                 # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
