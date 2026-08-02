@@ -51,7 +51,7 @@ all = ["bibo[train,dev]"]
 Repository = "https://github.com/IsNoobgrammer/BiBo"
 
 [tool.setuptools.packages.find]
-include = ["src*", "baseline*", "bench*"]
+include = ["src*", "exp*", "baseline*", "bench*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml", "*.yml", "*.json", "*.md"]
