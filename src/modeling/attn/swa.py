@@ -59,8 +59,12 @@ def _flex_call():
     limit is the fix; the compiles themselves are cheap and cached."""
     global _FLEX
     if _FLEX is None:
+        # Modest bump only. The flex path is training-only and training is ONE shape, so a handful
+        # of entries covers it (plus a per-layer window if the heterogeneous-window arm is running).
+        # Raising this high was a mistake: it let the eval grind through 128 compiles before
+        # falling back, instead of failing over cheaply.
         torch._dynamo.config.recompile_limit = max(
-            getattr(torch._dynamo.config, "recompile_limit", 8), 128)
+            getattr(torch._dynamo.config, "recompile_limit", 8), 16)
         _FLEX = torch.compile(flex_attention, dynamic=False)
     return _FLEX
 
@@ -91,6 +95,16 @@ def swa_attention(query, key, value, sinks, *, sliding_window, num_key_value_gro
     q_len, kv_len = query.shape[-2], key.shape[-2]
     shape_key = (q_len, kv_len, sliding_window)
     use_flex = (_HAS_FLEX and padding_mask is None and query.is_cuda
+                # TRAINING ONLY, and this is the load-bearing condition. Dynamo guards flex on the
+                # exact (q_len, kv_len, window), so one graph is compiled PER SEQUENCE LENGTH. The
+                # training loop has a single fixed length and compiles once. The eval feeds ~150
+                # distinct lengths: measured, it blew through a 128-recompile budget ("size
+                # mismatch at index 2. expected 280, actual 209"), then silently dropped to the
+                # unfused path -- paying every compile AND getting the slow kernel, 93 s/step.
+                # Raising the recompile limit makes that worse, not better. Eval is explicitly not
+                # perf-critical (train.py swaps compiled -> orig for it), so it takes the eager
+                # core, which is the numerics reference and shape-agnostic.
+                and training
                 and not (training and dropout > 0.0)
                 # SHORT SEQUENCES KILL FLEX, they do not merely slow it. A sequence small enough to
                 # be one block gives Inductor's flex template no valid kernel choice and it raises
