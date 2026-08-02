@@ -37,6 +37,10 @@ except ImportError:                                    # torch < 2.5
 # that made a Triton autotune key on S cost 4.1x on the eval path.
 _BLOCK_MASK_CACHE = {}
 _FLEX = None
+# Flex's block templates need at least a full block to work with; below that Inductor finds no
+# valid kernel and raises rather than falling back. 128 is the default block size.
+_FLEX_MIN_LEN = 128
+_FLEX_UNSUPPORTED = set()      # (q_len, kv_len, window) that raised -- do not retry them
 
 
 def _flex_call():
@@ -85,18 +89,37 @@ def swa_attention(query, key, value, sinks, *, sliding_window, num_key_value_gro
     FlexAttention handles the hot path. Anything it cannot express falls back to the eager core:
     a padding mask (data-dependent, and packed training never has one), dropout, or CPU."""
     q_len, kv_len = query.shape[-2], key.shape[-2]
+    shape_key = (q_len, kv_len, sliding_window)
     use_flex = (_HAS_FLEX and padding_mask is None and query.is_cuda
-                and not (training and dropout > 0.0))
+                and not (training and dropout > 0.0)
+                # SHORT SEQUENCES KILL FLEX, they do not merely slow it. A sequence small enough to
+                # be one block gives Inductor's flex template no valid kernel choice and it raises
+                # LoweringException: NoValidChoicesError. That killed a 2000-step run at its first
+                # eval (step 1000, 25 min in): training is a fixed 1024 and fine, but the eval feeds
+                # short variable-length real texts. Eval is explicitly not perf-critical, so the
+                # eager core -- which is the numerics reference anyway -- takes those.
+                and min(q_len, kv_len) >= _FLEX_MIN_LEN
+                and shape_key not in _FLEX_UNSUPPORTED)
     if use_flex:
-        # enable_gqa keeps key/value GROUPED -- no repeat_kv copy, matching the eager core's inputs.
-        out, lse = _flex_call()(
-            query, key, value, block_mask=_block_mask(q_len, kv_len, sliding_window, query.device),
-            scale=scaling, enable_gqa=True, return_lse=True)
-        if sinks is not None:
-            # lse is natural-log and already over SCALED scores, the same units as beta.
-            beta = sinks.to(torch.float32).reshape(1, -1, 1)
-            out = out * torch.sigmoid(lse.to(torch.float32) - beta).unsqueeze(-1).to(out.dtype)
-        return out, None
+        try:
+            # enable_gqa keeps key/value GROUPED -- no repeat_kv copy, matching the eager inputs.
+            out, lse = _flex_call()(
+                query, key, value,
+                block_mask=_block_mask(q_len, kv_len, sliding_window, query.device),
+                scale=scaling, enable_gqa=True, return_lse=True)
+            if sinks is not None:
+                # lse is natural-log and already over SCALED scores, the same units as beta.
+                beta = sinks.to(torch.float32).reshape(1, -1, 1)
+                out = out * torch.sigmoid(lse.to(torch.float32) - beta).unsqueeze(-1).to(out.dtype)
+            return out, None
+        except Exception as exc:
+            # Never let a compile failure destroy a training run. Falling back is FREE in
+            # correctness terms -- parity_check/parity_swa_flex.py pins flex == eager to 2e-7 --
+            # and costs only speed. Remembered per shape so it is not retried every call, and
+            # printed once per shape so a silent slow path cannot hide.
+            _FLEX_UNSUPPORTED.add(shape_key)
+            print(f"[swa] flex_attention failed at q={q_len} kv={kv_len} w={sliding_window} "
+                  f"-> eager for this shape ({type(exc).__name__}: {str(exc)[:120]})", flush=True)
 
     # Band mask is built even at q_len==1 decode so the window is enforced when the cache
     # holds more than sliding_window keys (uncropped/external caches).
