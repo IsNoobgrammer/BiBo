@@ -48,13 +48,19 @@ def test_explicit_bias_update_factor_wins():
     (dict(num_routed_experts=2, special_expert_pairs=1), "specials would leave 0 GLU experts"),
     (dict(hidden_size=63), "hidden_size % num_attention_heads != 0"),
     (dict(partial_rotary_factor=0.05), "rope_dim < 2"),
-    (dict(use_ssmax=True, add_full_attention_sink_bias=True), "G1 (global sink + SSMax) is guarded"),
     (dict(hybrid_layer_pattern=[1, 0, 0, 0], sliding_window=0), "SWA needs a positive window"),
     (dict(hybrid_layer_pattern=[1, 0]), "pattern length != num_hidden_layers"),
 ])
 def test_validation_guards(overrides, reason):
     with pytest.raises(ValueError):
         make_config(**overrides)
+
+
+def test_global_attention_sink_is_no_longer_gated():
+    """The G1 guard existed only because a global sink had to be scaled by SSMax's C=s*log(n).
+    SSMax was removed Aug 2 2026, so a sink on global layers is now just a sink."""
+    c = make_config(add_full_attention_sink_bias=True)
+    assert c.add_full_attention_sink_bias is True
 
 
 def test_legacy_bool_norm_topk_prob_maps_to_sum():
@@ -65,7 +71,7 @@ def test_legacy_bool_norm_topk_prob_maps_to_sum():
 
 
 def test_config_round_trip_preserves_derived_fields():
-    c = make_config(norm_topk_prob="softmax", hybrid_layer_pattern=[0, 1, 1, 0], use_ssmax=False)
+    c = make_config(norm_topk_prob="softmax", hybrid_layer_pattern=[0, 1, 1, 0])
     with tempfile.TemporaryDirectory() as d:
         c.save_pretrained(d)
         c2 = BiBoConfig.from_pretrained(d)

@@ -1,50 +1,22 @@
-"""Attention: SSMax, XSA, SWA banding, attention sinks, GQA, padding masks."""
-import math
-
+"""Attention: XSA, SWA banding, attention sinks, GQA, padding masks."""
 import pytest
 import torch
 from conftest import DEVICE, make_model, tokens
 
-from src.modeling.attn.ssmax import apply_ssmax_query_scaling
 from src.modeling.attn.xsa import apply_xsa
 
 HYBRID = [0, 1, 1, 0]
 
 
-# ── SSMax ────────────────────────────────────────────────────────────────────
-def test_ssmax_init_is_one_over_log_half_max_pos():
-    """Starts attention ~neutral instead of ~6x sharper than standard softmax."""
-    m = make_model(use_ssmax=True)
-    want = 1.0 / math.log(max(m.config.max_position_embeddings / 2, 2.0))
+def test_query_scaling_is_gone():
+    """SSMax was removed Aug 2 2026 (refuted). No module, no per-head scale parameter, no knob."""
+    with pytest.raises(ImportError):
+        from src.modeling.attn.ssmax import apply_ssmax_query_scaling  # noqa: F401
+    m = make_model(hybrid_layer_pattern=HYBRID)
     for layer in m.model.layers:
         a = layer.self_attn
-        if a.use_ssmax:
-            assert a.ssmax_scale.shape == (1, m.config.num_attention_heads, 1, 1)
-            assert abs(a.ssmax_scale.flatten()[0].item() - want) < 1e-6
-
-
-def test_ssmax_is_forced_off_and_unallocated_on_swa_layers():
-    """A window caps n, so a per-query log(n) term is a redundant constant there."""
-    m = make_model(use_ssmax=True, hybrid_layer_pattern=HYBRID,
-                   add_swa_attention_sink_bias=True, add_full_attention_sink_bias=False)
-    for i, layer in enumerate(m.model.layers):
-        a = layer.self_attn
-        if a.is_swa:
-            assert not a.use_ssmax, f"layer {i} is SWA but SSMax is on"
-            assert not hasattr(a, "ssmax_scale"), f"layer {i} allocated an unused ssmax_scale"
-        else:
-            assert a.use_ssmax, f"global layer {i} lost SSMax"
-
-
-def test_ssmax_counts_real_keys_under_padding():
-    """Grid positions over-count by the pad width; n must come from mask.cumsum."""
-    q = torch.randn(2, 4, 5, 16, device=DEVICE)
-    scale = torch.full((1, 4, 1, 1), 0.14, device=DEVICE)
-    mask = torch.tensor([[1] * 8, [0] * 3 + [1] * 5], device=DEVICE)
-    masked = apply_ssmax_query_scaling(q, 8, scale, mask.cumsum(-1)[:, -5:])
-    plain = apply_ssmax_query_scaling(q, 8, scale, None)
-    assert torch.allclose(masked[0], plain[0], atol=1e-5), "unpadded row must be unaffected"
-    assert not torch.allclose(masked[1], plain[1]), "padded row must differ"
+        assert not hasattr(a, "ssmax_scale") and not hasattr(a, "use_ssmax")
+    assert not hasattr(m.config, "use_ssmax")
 
 
 # ── XSA ──────────────────────────────────────────────────────────────────────
@@ -68,7 +40,7 @@ def test_xsa_handles_decode_where_q_len_differs_from_kv_len():
 # ── SWA banding + sinks ──────────────────────────────────────────────────────
 def test_swa_band_mask_is_exact():
     W, S = 4, 12
-    m = make_model(hybrid_layer_pattern=[1] * 4, sliding_window=W, use_ssmax=False,
+    m = make_model(hybrid_layer_pattern=[1] * 4, sliding_window=W,
                    add_swa_attention_sink_bias=False)
     attn = m(tokens(1, S), output_attentions=True).attentions[1][0, 0]
     for q in range(S):
@@ -79,7 +51,7 @@ def test_swa_band_mask_is_exact():
 
 
 def test_sink_placement_follows_the_config():
-    m = make_model(use_ssmax=True, hybrid_layer_pattern=HYBRID,
+    m = make_model(hybrid_layer_pattern=HYBRID,
                    add_swa_attention_sink_bias=True, add_full_attention_sink_bias=False)
     for i, layer in enumerate(m.model.layers):
         a = layer.self_attn
@@ -96,7 +68,7 @@ def test_all_global_model_builds_zero_sink_params():
 
 
 def test_attention_sink_receives_gradient():
-    m = make_model(hybrid_layer_pattern=[1] * 4, sliding_window=4, use_ssmax=False,
+    m = make_model(hybrid_layer_pattern=[1] * 4, sliding_window=4,
                    add_swa_attention_sink_bias=True)
     x = tokens(2, 8)
     m(x, labels=x).loss.backward()
@@ -118,7 +90,7 @@ def test_gqa_projection_geometry():
 # ── padding ──────────────────────────────────────────────────────────────────
 def test_left_padded_forward_matches_unpadded_reference():
     torch.manual_seed(0)
-    m = make_model(use_ssmax=True).eval()
+    m = make_model().eval()
     real = tokens(1, 6, seed=1)
     ref = m(real).logits
     pad = 3
@@ -143,7 +115,7 @@ def test_four_dimensional_mask_is_rejected():
 
 
 def test_padded_hybrid_model_is_finite():
-    m = make_model(hybrid_layer_pattern=HYBRID, sliding_window=4, use_ssmax=True, use_xsa=True)
+    m = make_model(hybrid_layer_pattern=HYBRID, sliding_window=4, use_xsa=True)
     x = tokens(2, 12)
     mask = torch.ones_like(x)
     mask[0, :4] = 0

@@ -37,7 +37,7 @@ def test_incremental_decode_matches_full_forward():
 def test_swa_layers_use_a_window_evicted_cache():
     """Windowed layers must hold O(sliding_window) KV during decode, not O(total_len)."""
     W, S = 4, 16
-    m = make_model(hybrid_layer_pattern=[0, 1, 1, 0], sliding_window=W, use_ssmax=False).eval()
+    m = make_model(hybrid_layer_pattern=[0, 1, 1, 0], sliding_window=W).eval()
     cache = m(tokens(1, S, seed=4), use_cache=True).past_key_values
     swa_len = cache.layers[1].keys.shape[-2]
     global_len = cache.layers[0].keys.shape[-2]

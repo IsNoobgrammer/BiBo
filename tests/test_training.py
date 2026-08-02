@@ -15,7 +15,7 @@ HYBRID = [0, 1, 1, 0]
 @pytest.mark.parametrize("hybrid", [None, HYBRID], ids=["global", "hybrid"])
 def test_every_trainable_param_receives_a_gradient(norm, hybrid):
     m = make_model(norm_topk_prob=norm, hybrid_layer_pattern=hybrid,
-                   use_ssmax=(hybrid is None), use_xsa=True, use_shared_expert=True)
+                   use_xsa=True, use_shared_expert=True)
     x = tokens(2, 8)
     m(x, labels=x).loss.backward()
     missing = [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None]
@@ -40,7 +40,7 @@ def test_shared_expert_variants_train(shared_type):
 @pytest.mark.skipif(DEVICE != "cuda", reason="autocast(bf16) needs CUDA")
 def test_bf16_autocast_forward_backward_is_nan_free():
     """Training precision is bf16 (fp16 was removed 2026-07-08 — Muon + fp16 overflowed experts)."""
-    m = make_model(use_ssmax=True, use_xsa=True, hybrid_layer_pattern=HYBRID)
+    m = make_model(use_xsa=True, hybrid_layer_pattern=HYBRID)
     x = tokens(2, 16)
     with torch.autocast("cuda", dtype=torch.bfloat16):
         loss = m(x, labels=x).loss
