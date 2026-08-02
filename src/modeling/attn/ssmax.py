@@ -62,11 +62,21 @@ def apply_ssmax_query_scaling(query_states: torch.Tensor, kv_len: int, ssmax_sca
     else:
         # Causal context length per query position: n_j = (kv_len - q_len) + j + 1
         log_n = _log_n(kv_len, q_len, query_states.device)
-    # Collapse s and log(n) into ONE broadcast scale before touching q. Written as
-    # `q * ssmax_scale * log_n` this is TWO passes over the full (B,H,q_len,D) tensor, each
-    # materializing an fp32 copy of it (q is bf16 under autocast; the fp32 ssmax_scale promotes
-    # it) and each saved for backward. Measured 174.7k -> 168.1k tok/s at 64x4x1024. The combined
-    # scale is (1,H,q_len,1) -- 8k elements -- so folding it costs nothing and leaves one pass.
-    # Kept in fp32 deliberately: ds/dL is a reduction over every element q touches, and doing that
-    # reduction in bf16 would quantize the gradient of the one parameter this feature is about.
-    return query_states * (ssmax_scale * log_n)
+    # Collapse s and log(n) into ONE broadcast scale, IN q's dtype, before touching q.
+    #
+    # Two separate costs hide in the naive `q * ssmax_scale * log_n`:
+    #   1. two passes over the full (B,H,q_len,D) tensor instead of one. The combined scale is
+    #      (1,H,q_len,1) -- 8k elements -- so folding it is free.
+    #   2. dtype promotion. ssmax_scale is an fp32 Parameter and q is bf16 under autocast, so the
+    #      product is fp32: a full-size fp32 q gets materialized, handed to SDPA against bf16 k/v
+    #      (measured: sdpa_in = (float32, bfloat16, bfloat16)), and immediately cast back down to
+    #      bf16 -- double the bytes and an extra kernel for a value that is discarded.
+    # Together: 174.7k -> 168.1k tok/s at 64x4x1024.
+    #
+    # Casting the scale is safe for ds/dL, which is the non-obvious part. d(q*s)/ds = q, so the
+    # scale's own rounding never enters the gradient; the only bf16 exposure is grad_out, and
+    # grad_out is ALREADY bf16-valued here -- SDPA emits bf16, so its backward produces bf16
+    # gradients and the autocast cast-node merely re-types them to fp32. Keeping the scale in fp32
+    # buys precision against an fp32 grad_out that does not occur in training.
+    # (In an fp32 run .to() is a no-op and everything stays fp32, as before.)
+    return query_states * (ssmax_scale * log_n).to(query_states.dtype)
