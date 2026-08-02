@@ -261,7 +261,6 @@ def main():
     ap.add_argument("--router_log", type=int, default=1)
     ap.add_argument("--router_optim", choices=["muon","adamw"], default="muon")  # router proj optimizer; muon = current default (2D -> Muon by the ndim rule); tag _radamw      # per-step router mechanics (GPU-accumulated, 1 sync per log_every)
     # MoE-branch magnitude knobs (applied AFTER the top-k norm; normalization sets the SPLIT, these set LOUDNESS)
-    ap.add_argument("--use_ssmax", action="store_true")                           # ablation axis: SSMax scalable softmax (default OFF)
     ap.add_argument("--use_xsa", action="store_true")                             # ablation axis: XSA exclusive self-attention (default OFF)
     # Per-head rejection-strength LOGIT; strength = tanh(init). Ships with --use_xsa, it is not a
     # separate axis: learnable-alpha XSA beat fixed full-strength XSA by 20x the noise floor at
@@ -398,7 +397,7 @@ def main():
                            bias_update_threshold=args.bias_update_threshold,
                            bias_update_factor=(None if args.bias_update_factor < 0 else args.bias_update_factor),
                            aux_coef=args.aux_coef, num_experts=n_total, special_pairs=args.special_pairs,
-                           use_ssmax=args.use_ssmax, use_xsa=args.use_xsa,
+                           use_xsa=args.use_xsa,
                            xsa_alpha_init=args.xsa_alpha_init,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
@@ -464,10 +463,6 @@ def main():
                 # the control had to be rescued mid-flight by renaming its artifacts.
                 + ("_xsa" if args.use_xsa else "")
                 + (f"_xaI{args.xsa_alpha_init:g}" if args.use_xsa and args.xsa_alpha_init else "")
-                # Same rule, same reason: an --use_ssmax arm run against an XSA baseline differs
-                # from that baseline by nothing else in the name, so it would overwrite the very
-                # control it is being compared to.
-                + ("_ssmax" if args.use_ssmax else "")
                 # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
@@ -643,14 +638,10 @@ def main():
             # full rejection. Reported in tanh units, not logits, because "off" has to be readable
             # at a glance -- an arm that never switches XSA on is a null, not a win.
             rt.update(patchmod.xsa_alpha_stats(model))
-            rt.update(patchmod.ssmax_stats(model))
             xa_s = ((f" xa={rt['train/xsa_a_mean']:+.3f}"
                      f"[{rt['train/xsa_a_min']:+.2f},{rt['train/xsa_a_max']:+.2f}]"
                      if "train/xsa_a_mean" in rt else "")
-                    # C = s*log(1024): 1.0 is plain softmax, >1 sharper, <0 would be inverted
-                    + (f" C={rt['train/ssmax_C_mean']:.3f}"
-                       f"[{rt['train/ssmax_s_min']:+.3f},{rt['train/ssmax_s_max']:+.3f}]"
-                       if "train/ssmax_C_mean" in rt else ""))
+                    )
             aS_s = xa_s
             _th = [m.radial_theta for m in model.modules() if hasattr(m, "radial_theta")]
             if _th:

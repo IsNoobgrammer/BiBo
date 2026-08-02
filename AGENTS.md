@@ -1,5 +1,7 @@
 # BiBo — Agent Onboarding
 
+> **SSMax is REFUTED and disabled** (524M A/B, Aug 2 2026): worse training loss than the XSA baseline in every window from step 500 on, and +0.00263 bpb. Any SSMax reference below is historical. See [docs/ssmax.md](docs/ssmax.md).
+
 > This file is the system prompt for any AI agent working on this repo.
 > Read this FIRST before doing anything.
 

@@ -1,5 +1,7 @@
 # Kaggle Guide — Training & Benchmarking BiBo vs Qwen3MoE
 
+> **SSMax is REFUTED and disabled** (524M A/B, Aug 2 2026): worse training loss than the XSA baseline in every window from step 500 on, and +0.00263 bpb. Any SSMax reference below is historical. See [docs/ssmax.md](ssmax.md).
+
 Run the `bench/` suite on Kaggle's free **2×T4** to train BiBo and Qwen3MoE on identical data and
 compare them. **Loss is the primary metric** (MFU / tokens-sec are secondary). Qwen is deliberately
 sized *larger* so a BiBo loss win is conservative.

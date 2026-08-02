@@ -1,5 +1,7 @@
 # Attention Layer Design Verdict — SWA vs Global (SSMax × Sink × Value-Scale)
 
+> **SSMax is REFUTED and disabled** (524M A/B, Aug 2 2026): worse training loss than the XSA baseline in every window from step 500 on, and +0.00263 bpb. Any SSMax reference below is historical. See [docs/ssmax.md](ssmax.md).
+
 > **Status:** IMPLEMENTED (2026-07-01) — hybrid SWA + attention sink + dim-wise partial RoPE are live
 > in `src/modeling/attn/base.py` (single parameterized `BiBoAttention`). This file is the binding spec
 > for how SSMax/sink/value-scale combine on each layer type. Currently wired: **SWA = sink + no SSMax**

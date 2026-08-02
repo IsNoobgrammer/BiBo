@@ -1,5 +1,7 @@
 # BiBo Benchmarking Guide
 
+> **SSMax is REFUTED and disabled** (524M A/B, Aug 2 2026): worse training loss than the XSA baseline in every window from step 500 on, and +0.00263 bpb. Any SSMax reference below is historical. See [docs/ssmax.md](../ssmax.md).
+
 > How to properly benchmark BiBo: smoke tests, throughput measurements, training runs, and config editing from Jupyter/Kaggle notebooks.
 
 ---

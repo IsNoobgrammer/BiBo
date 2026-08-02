@@ -15,7 +15,6 @@ a real nn.Parameter (`radial_theta`) on BiBoFusedExperts, so no injection step i
 """
 from . import _paths  # noqa: F401
 import os
-import math
 import torch
 
 try:
@@ -160,20 +159,6 @@ def xsa_alpha_stats(model):
     a = torch.tanh(torch.cat([v.detach().float().flatten() for v in vals]))
     return {"train/xsa_a_mean": a.mean().item(), "train/xsa_a_min": a.min().item(),
             "train/xsa_a_max": a.max().item()}
-
-
-def ssmax_stats(model):
-    """SSMax's learnable per-head s. Logged because s is UNBOUNDED: s < 0 inverts the softmax
-    (sharpens the least-attended keys) and a large s drives it toward argmax, and both would show
-    up as 'SSMax is a null' with no way to tell which. Reported as s and as C = s*log(1024), the
-    temperature at a full-length context -- C = 1 is exactly plain softmax."""
-    vals = [m.ssmax_scale for m in model.modules() if getattr(m, "ssmax_scale", None) is not None]
-    if not vals:
-        return {}
-    s = torch.cat([v.detach().float().flatten() for v in vals])
-    return {"train/ssmax_s_mean": s.mean().item(), "train/ssmax_s_min": s.min().item(),
-            "train/ssmax_s_max": s.max().item(),
-            "train/ssmax_C_mean": (s.mean() * math.log(1024.0)).item()}
 
 
 def patch_fused_xsa():

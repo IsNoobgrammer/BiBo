@@ -1,369 +1,236 @@
-# SSMax (Scalable-Softmax) Technical Documentation
+# SSMax (Scalable-Softmax) — REFUTED at 524M, removed from BiBo
 
-## Overview
+> **Status: REFUTED and disabled.** Measured on real BiBo pretraining at 524M tokens, August 2 2026.
+> SSMax is **worse than the XSA baseline on training loss in every window from step 500 onward**
+> (+0.0097 by `[1500, 2000)`) and worse on held-out bpb (+0.00263). It is off in the ablation
+> (`use_ssmax=False`, pinned in `ablate/common/configs.py`) and slated for removal from `src/`.
+>
+> The mechanism is not broken — it does exactly what the paper says, and the long-context numbers
+> below confirm that. It is simply **not what limits BiBo at our operating length**, and it charges
+> for a benefit we cannot cash. The theory section is retained at the bottom because it remains
+> correct and is the reason this was worth testing.
 
-**SSMax (Scalable-Softmax)** is a novel attention mechanism designed to address the **attention fading problem** in Transformer models when processing long contexts. It replaces the standard softmax function in attention layers with a sequence-length-aware variant that maintains attention sharpness regardless of context size.
+## What was measured
 
-**Paper**: [Scalable-Softmax Is Superior for Attention](https://arxiv.org/abs/2501.19399) by Ken M. Nakanishi
+Five arms, all `seed 42069`, 64 experts, `top_k 6`, `64 x 4 x 1024`, 2000 steps = 524M tokens,
+radial NormSiLU, cosine LR. **All five share an identical LR schedule** (`lr@0 = 5.00e-05`, warmup
+peak at step 200) — verified before comparing, because a mismatched warmup invalidates everything.
 
-## The Problem: Attention Fading
+### Training loss, mean per 500-step window
 
-### Standard Softmax Behavior
+| arm | `[0,500)` | `[500,1000)` | `[1000,1500)` | `[1500,2000)` |
+|---|---|---|---|---|
+| **xsa + learnable alpha** (baseline) | 4.0052 | **2.0952** | **1.9048** | **1.7442** |
+| control (no XSA, no SSMax) | 4.0032 | 2.1046 | 1.9076 | 1.7521 |
+| **xsa + SSMax** | 4.0090 | 2.1071 | 1.9107 | 1.7539 |
+| ptanh | 3.9961 | 2.1095 | 1.9121 | 1.7551 |
+| xsa (fixed alpha) | 3.9874 | 2.1179 | 1.9152 | 1.7565 |
 
-In standard Transformer attention, softmax is applied to compute attention scores:
+SSMax is **third of five** and loses to the baseline in every window after warmup. The ordering is
+stable across all three late windows, so this is not window-selection noise.
 
-```
-attention_score_i = exp(z_i) / Σ exp(z_j)
-```
+### Held-out bpb
 
-As the sequence length `n` increases:
-- The **denominator** grows (sum of more exponentials)
-- The **numerator** stays constant (single exponential)
-- Result: Maximum attention scores approach zero → **attention distribution flattens**
-
-This phenomenon, called **attention fading**, reduces the model's ability to focus on key information in long contexts.
-
-### Mathematical Analysis
-
-For an input vector of size `n`, the maximum element after softmax:
-
-```
-max_output ≤ exp(z_max) / [(n-1)·exp(z_min) + exp(z_max)]
-           = 1 / [(n-1)/exp(z_max - z_min) + 1]
-```
-
-As `n → ∞`, this approaches **0** unless `z_max - z_min` grows proportionally with `n`.
-
-## The Solution: SSMax
-
-### Core Formula
-
-SSMax replaces the exponential base with a sequence-length-dependent term:
-
-```
-SSMax(z_i) = n^(s·z_i) / Σ n^(s·z_j)
-           = exp((s·log(n))·z_i) / Σ exp((s·log(n))·z_j)
-```
-
-Where:
-- `n` = sequence length (number of keys)
-- `s` = **learnable scaling parameter** (per-head, per-layer)
-- `z_i` = attention logit for position i
-
-### Key Properties
-
-1. **Prevents Attention Fading**: Maximum attention score approaches 1 when `z_max - z_2nd > 1/s`, regardless of sequence length
-2. **Adaptive Temperature**: Effective temperature scales with `s·log(n)`, automatically adjusting for context size
-3. **Learnable Control**: Each attention head learns its own `s` parameter to control sharpness
-
-### Mathematical Guarantees
-
-For SSMax with scaling parameter `s > 0`:
-
-```
-max_output ≥ 1 / [(n-1)/n^(s·(z_max - z_2nd)) + 1]
-```
-
-- If `z_max - z_2nd > 1/s`: max_output → 1 (focused attention)
-- If `z_max - z_min < 1/s`: max_output → 0 (distributed attention)
-
-This means attention focuses on elements exceeding others by approximately `1/s`, independent of sequence length.
-
-## Theoretical Grounding: `log n` is the *critical* scaling (MIT, 2025)
-
-The SSMax paper motivates `s·log(n)` empirically. A separate theory paper proves it is the **right
-order of magnitude** — not a heuristic.
-
-**Paper**: [Critical attention scaling in long-context transformers](https://arxiv.org/abs/2510.05554)
-(Chen, Lin, Polyanskiy, Rigollet — MIT, 2025).
-
-They analyze attention scaled as `β_n = γ·log n` (which is **exactly SSMax** with `γ ↔ s`) and prove a
-**phase transition** in how tokens contract as `n → ∞`, governed by a critical constant `γ* = 1/(1−ρ)`
-where `ρ` is the background token–token inner product (a representation-geometry property):
-
-| regime | condition | behavior |
+| arm | bpb | vs baseline |
 |---|---|---|
-| **subcritical** | `γ < γ*` | rank collapse — attention → uniform, tokens cluster, **vanishing gradients** |
-| **critical** | `γ = γ*` | sparse, **content-adaptive** attention (the target) |
-| **supercritical** | `γ > γ*` | attention → identity-like, **token interaction suppressed** |
+| xsa + learnable alpha | **0.67505** | — |
+| xsa (fixed alpha) | 0.67444 | −0.00061 |
+| control | 0.67633 | +0.00128 |
+| **xsa + SSMax** | **0.67768** | **+0.00263** |
+| ptanh | 0.68096 | +0.00591 |
 
-What this establishes for BiBo:
+Training loss and bpb **agree in direction**, which is what makes this conclusive rather than a
+single-metric artifact.
 
-1. **The `log n` form is critical, not arbitrary.** The paper singles out `log n` as the knife-edge
-   (it notes YaRN uses `(log n)²`, Qwen/SSMax use `log n`). This is first-principles backing for
-   SSMax's functional form — the subcritical regime *is* the "attention fading + vanishing gradients"
-   failure SSMax was built to prevent.
+## Why it fails here — the hypothesis, and the evidence for it
 
-2. **`s` is a critical threshold, not a free "bigger = sharper" knob.** Being on the wrong side is a
-   **qualitative** failure: too small → fading *and* dead gradients; too large → a *frozen*,
-   identity-like layer that suppresses interaction. The right target is `s·log(n) ≈ γ*` at your
-   operating length — consistent with the neutral-init recipe above (`s ≈ 1/log(max_pos/2)`).
+**SSMax solves attention fading. At 1024 tokens BiBo does not have attention fading. We pay the
+premium and collect nothing.**
 
-3. **⚠️ Two-sided extrapolation risk — supercritical over-sharpening.** Because `C = s·log(n)` grows
-   with `n`, a model that learns a large `s` at a **short** training length can be pushed
-   **supercritical** at long test lengths (e.g. `s≈2.4` learned at L=64 gives `C≈33` at n=1M →
-   near-identity attention, interaction dies). This is a *distinct* long-context failure from the
-   attention-sink escape problem (see `docs/attention_layers.md`). **Calibrate `s` so that at your
-   maximum intended context you sit near-critical, not past it** — i.e. train/anneal `s` against the
-   longest length you care about, and monitor that `s·log(n_max)` stays in the critical band.
+`s` was learned enthusiastically — it is not inert, and this is not a plumbing failure:
 
-4. **Corroborates disabling SSMax on SWA layers.** Rank collapse is an `n → ∞` phenomenon; a fixed
-   window caps `n ≤ W`, so the pathology never sets in — independent confirmation of the "no SSMax on
-   windowed layers" rule below and in `docs/attention_layers.md`.
+| step | `s` (mean) | `s` range across heads | `C = s·log(1024)` |
+|---|---|---|---|
+| 0 | 0.1443 | [0.1443, 0.1443] | 1.000 |
+| 250 | 0.1904 | [0.1401, 0.2497] | 1.320 |
+| 500 | 0.2070 | [0.1533, 0.2740] | 1.435 |
+| 950 | 0.2192 | [0.1579, 0.2765] | 1.519 |
 
-Scope note: the paper uses standard sum-to-1 softmax — it says **nothing** about attention sinks,
-opt-out, or letting weights sum to `< 1` (that is the orthogonal sink mechanism in
-`docs/attention_layers.md`), nor about value/output scaling.
+`s` rose 52% off its neutral init and the heads spread 1.75× apart, so the model actively used the
+knob. The cost is what it bought with it: `C` climbing to 1.52 means the model **re-tuned itself into
+a sharper-attention regime**, and that regime is worse for next-token prediction at this length.
 
-## Extrapolation Plan (train ~128K → serve ~1M, the ~10× buffer)
+Two independent measurements support "the mechanism works, the problem is absent":
 
-**Target:** train at ~128K context, expect clean serving to ~1M (≈8×, inside SSMax's demonstrated
-~10× envelope). No inference-time tricks required.
+**1. Long-context degradation collapses — SSMax does its job.**
 
-**Why it works — critical `s` is scale-invariant.** The regime is set by `s` (the *coefficient* of
-`log n`) vs `γ* = 1/(1−ρ)`, **not** by the product `s·log(n)`. So if `s` lands in the critical band at
-the training length, `β_n = s·log n` is the critical trajectory at *every* `n` — including 1M. There is
-**no mechanical over-sharpening at long `n`**; the only failure is `s` being learned off-`γ*` (hot →
-supercritical, cold → fading), and that risk shrinks the longer you train. Hence: get `s` critical at
-128K and the mechanism extrapolates by construction.
+| | bpb @1024 | @2048 | @4096 | degradation 1024→4096 |
+|---|---|---|---|---|
+| xsa (baseline) | 1.30236 | 1.30943 | 1.35880 | **1.0433** |
+| xsa + SSMax | 1.30822 | 1.30747 | **1.31474** | **1.0050** |
 
-**Rejected: interpolating `n` (YaRN/NTK-style).** Because SSMax enters as `s·log(n)`, compressing `n`
-in log-space is *algebraically identical to rescaling `s`* (`s·log(n^α) = (α·s)·log n`). SSMax has no
-frequency spectrum, so YaRN/NTK's frequency-selective interpolation has **no analog** — the only knob is
-`s`. Remapping `n` is therefore just a test-time `s`-rescale, and it **only helps if `s` was learned too
-hot; if `s` is already critical it under-sharpens against the real `n`-term denominator and re-introduces
-fading.** We don't do it — we get `s` right at train time instead. (YaRN's *attention-temperature* term
-— `√(1/t)=0.1·ln(scale)+1` — is the real cousin of SSMax; its *frequency* interpolation is not.)
+An **8.7× reduction** in length degradation, and bpb@4096 improves by 0.044. This is precisely the
+advertised behaviour. It is also **worthless to us right now**: we train at 1024 and score at 1024.
 
-**Two caveats (both small):**
-1. **~10× is empirical, not a theorem — verify, don't assume.** Confirm `s` sits in the critical band at
-   128K (monitor `s·log(n)` and attention entropy; watch for entropy collapse = too hot), then **eval at
-   1M**. If `s` learned a hair hot it degrades *before* 1M — that's the signal, and the fix is
-   training-length (curriculum longer), not `n`-interpolation.
-2. **SSMax is only the attention-sharpness axis.** Real 1M serving also needs *positional* extrapolation.
-   BiBo is well-set: **NoPE dims (`partial_rotary_factor=0.334`) are position-agnostic → extrapolate for free**,
-   and the RoPE heads use dynamic-NTK. The positional side complements the SSMax buffer; SSMax alone with
-   pure RoPE (no NTK/NoPE) would cap sooner.
+**2. The regression concentrates where SSMax is weakest — short sequences.** The bpb eval is short
+documents (belebele passages, gsm8k problems, a few hundred tokens). At `n ≈ 300`, `C = 0.219·log(300)
+≈ 1.25`; at `n = 1024`, `C = 1.52`. The model optimized for the sharp end of the range and is scored
+at the flat end. Per-source deltas are all positive-or-zero (worse) on the short-text sources.
 
-**Plan in one line:** train `s` critical at ~128K → lean on the NoPE heads for position → expect ~10×
-headroom → **validate at 1M** rather than trusting it. No interpolation, no extra machinery.
+### The honest caveat on significance
 
-## Implementation in Attention
+Per-source, the bpb regression is **not individually significant**:
 
-### Standard Attention (Softmax)
+| source | xsa | xsa+SSMax | delta | sigma |
+|---|---|---|---|---|
+| belebele_en | 1.27440 | 1.27890 | +0.00450 | 0.4 |
+| belebele_hi | 0.55920 | 0.56130 | +0.00210 | 0.5 |
+| gsm8k_en | 0.85340 | 0.86200 | +0.00860 | 0.9 |
+| gsm8k_hi | 0.48130 | 0.48110 | −0.00020 | 0.0 |
 
-```python
-attn_scores = (Q @ K^T) / sqrt(d)
-attn_weights = softmax(attn_scores)
-output = attn_weights @ V
-```
+No source clears 1σ, and our **between-seed** sigma is 0.007 (n=1 arms resolve little under 0.02).
+**The bpb result alone would not carry this decision.** What carries it is the training-loss
+comparison: monotone, ordered identically across three consecutive windows, on a metric with no
+sampling error, against a matched LR schedule. bpb agrees in sign, which is corroboration rather than
+proof.
 
-### SSMax Attention
+Also worth recording: SSMax **improved ICL** (0-shot 0.20→0.30, 8-shot 0.73→0.78, lower NLL at every
+shot count) and MCQ belebele_en (0.284→0.292). Those are real and they still did not save it — the
+pretraining loss is the axis that decides.
 
-```python
-# Apply SSMax scaling to queries — PER CAUSAL POSITION (not a single global kv_len).
-# Query at position t attends to t+1 keys under the causal mask, so n varies along the
-# sequence. n_j = (kv_len - q_len) + j + 1 for query j:
-#   training (q_len==kv_len==L):  n = 1..L   (the real length-adaptive signal)
-#   single-token decode:          n = kv_len (one query)
-log_n = log(n_per_position)          # shape (q_len,), broadcast as (1,1,q_len,1)
-scaled_Q = Q * ssmax_scale * log_n
+## What would change this verdict
 
-# Rest is identical to standard attention
-attn_scores = (scaled_Q @ K^T) / sqrt(d)
-attn_weights = softmax(attn_scores)  # Standard softmax!
-output = attn_weights @ V
-```
+SSMax is refuted **for BiBo at 1024-token training**, not in general. Reopen it if:
 
-**Key Insight**: SSMax is implemented by scaling the query vectors by `s·log(n)` before computing attention scores. The softmax itself remains unchanged.
+1. **Training context grows to 8K+.** Attention fading is an `n → ∞` pathology. The 4096 numbers
+   above say the mechanism is already paying off outside the training window; at a long training
+   length the ledger could invert.
+2. **Long-context retrieval becomes a target metric.** If needle-in-haystack or 32K+ serving enters
+   the eval suite, the 8.7× degradation improvement stops being free money we throw away.
+3. **`s` is re-anchored to the eval length rather than the training length.** The diagnosed cause is
+   a train/eval temperature mismatch. Pinning `C ≈ 1` at eval-typical `n` instead of at `n = 1024`
+   is a one-line change and directly targets the mechanism. **Untested** — it was the recommended
+   next step when the axis was closed.
 
-## The Initialization Bug
+Anything reopening this needs a **second seed**, given the between-seed sigma above.
 
-### Problem Description
+## Implementation notes, if it is ever restored
 
-**Current (Buggy) Initialization**:
-```python
-self.ssmax_scale = nn.Parameter(torch.full((1, num_heads, 1, 1), 1.0))
-```
+Two throughput bugs were found and fixed while this was live; both would recur in a naive
+reimplementation.
 
-This initializes `ssmax_scale = 1.0` per head, which causes:
+**1. Two passes over `q` instead of one.** Written the obvious way, `q * ssmax_scale * log_n` walks
+the full `(B, H, q_len, D)` tensor twice. The combined scale is `(1, H, q_len, 1)` — 8k elements — so
+folding it first is free: `q * (ssmax_scale * log_n)`.
 
-1. **Immediate Over-Sharpening**: During early training with `kv_len=512`:
-   ```
-   effective_scale = ssmax_scale × log(512) / sqrt(head_dim)
-                   ≈ 1.0 × 6.2 / 8
-                   ≈ 0.78
-   ```
+**2. Silent dtype promotion — the expensive one.** `ssmax_scale` is an fp32 Parameter and `q` is bf16
+under autocast, so the product is **fp32**: a full-size fp32 `q` gets materialized, handed to SDPA
+against bf16 `k`/`v` (measured `sdpa_in = (float32, bfloat16, bfloat16)`), then cast straight back
+down. Fix is `.to(query_states.dtype)` on the combined scale.
 
-2. **Comparison to Standard Attention**:
-   - Standard: `1/sqrt(head_dim) = 1/sqrt(64) ≈ 0.125`
-   - SSMax (buggy): `≈ 0.78` → **~6× sharper**
+Measured at `64 x 4 x 1024`:
 
-3. **Consequences**:
-   - Attention entropy collapses in first few thousand steps
-   - Model focuses too aggressively on single tokens
-   - Training instability and poor generalization
-
-### Why This Happens
-
-The effective query scale becomes:
-```
-Q_effective = Q × ssmax_scale × log(n) / sqrt(d)
-```
-
-With `ssmax_scale=1.0` and typical `n=512-2048`:
-- `log(512) ≈ 6.2`
-- `log(2048) ≈ 7.6`
-
-This makes attention **much sharper** than the standard `1/sqrt(d)` scaling, causing premature convergence to peaked distributions.
-
-### Correct Initialization
-
-**Fixed Initialization**:
-```python
-import math
-
-# Initialize so ssmax_scale × log(typical_seq_len) ≈ 1.0
-typical_log = math.log(max(config.max_position_embeddings / 2, 2.0))
-init_val = 1.0 / typical_log  # ≈ 0.13 for max_pos_emb=2048
-
-self.ssmax_scale = nn.Parameter(
-    torch.full((1, num_heads, 1, 1), init_val),
-    requires_grad=True
-)
-```
-
-**Rationale**:
-- For `max_position_embeddings=2048`: `typical_log = log(1024) ≈ 6.9`
-- `init_val = 1.0 / 6.9 ≈ 0.145`
-- Effective scale at start: `0.145 × log(512) ≈ 0.9` → close to standard attention
-- Model can learn to deviate from this baseline as needed
-
-## Empirical Results from Paper
-
-### Training Efficiency
-- SSMax models achieve **~0.008 lower training loss** compared to standard Transformers
-- Faster convergence throughout pretraining
-
-### Long-Context Generalization
-- Standard Transformer: Loss increases significantly beyond training length
-- SSMax: Maintains low loss up to **10× training sequence length**
-- Robust to RoPE theta modifications (50× increase without retraining)
-
-### Key Information Retrieval (Needle-in-Haystack)
-- Standard Transformer: Fails beyond short contexts
-- SSMax: High retrieval accuracy at **10× training length**
-- Attention scores show SSMax focuses on key tokens even in long contexts
-
-### Attention Score Analysis
-- Standard softmax: Needle scores approach zero in long contexts
-- SSMax: Maintains high attention allocation to key information
-- Scaling parameter `s` is crucial for effective retrieval
-
-## Design Variants
-
-### With Bias Parameter (Not Recommended for Long Context)
-```python
-SSMax_bias(z_i) = exp((s·log(n) + b)·z_i) / Σ exp((s·log(n) + b)·z_j)
-```
-
-- Improves training efficiency slightly
-- **Degrades long-context performance**
-- Not recommended for length generalization tasks
-
-### Without Scaling Parameter (Simplified)
-```python
-SSMax_fixed(z_i) = n^z_i / Σ n^z_j  # Equivalent to s=1.0
-```
-
-- Similar training curves to full SSMax
-- **Lower key information retrieval accuracy**
-- Scaling parameter provides important adaptability
-
-## Implementation Guidelines
-
-### When to Use SSMax
-- ✅ Models requiring long-context generalization
-- ✅ Tasks with key information retrieval (RAG, QA)
-- ✅ Training from scratch with length generalization goals
-- ⚠️ Can be added mid-training with warmup (partial benefits)
-- ❌ Not needed for fixed short-context tasks
-- ✅ **Full / global causal attention layers** — where the attended key count `n` grows with the
-  sequence. This is where SSMax does real work.
-
-### ⚠️ Do NOT use SSMax on sliding-window-attention (SWA) layers — it's redundant
-
-**Recommendation: disable SSMax on any fixed-window layer (set its per-head `s = 0`, or don't apply
-it there).** With a sliding window of fixed size `W` (e.g. 128, optionally + a few attention-sink
-tokens), every query attends to **at most `W` keys regardless of total sequence length**, so:
-
-1. **No length growth to compensate.** SSMax exists to counter fading *as `n` grows*; the window
-   already caps `n ≤ W`, so fading never occurs at that layer. SWA and SSMax fight the same problem
-   two ways — the window already holds it, SSMax has nothing to compensate (belt-and-suspenders).
-2. **`n` is constant ⇒ SSMax degenerates to a constant temperature.** After the first `W` positions
-   every query has `n = W`, so `s·log(n) = s·log(W)` is a fixed scalar — absorbable into the q/k
-   weight norms, i.e. SSMax provides **zero additional inductive signal** there (same degeneracy as
-   applying a single global `n` in training). It's not harmful, just dead weight.
-
-The only place SSMax earns its keep under windowing is a **hybrid** model (some global layers, some
-SWA): keep SSMax (`s > 0`) on the **global** layers, turn it off (`s = 0`) on the **windowed** ones.
-Per-layer control is the right tool there (see the partial-SSMax research scope). Note: BiBo
-currently uses full causal attention everywhere — this guidance applies if/when SWA is added.
-
-### Initialization Best Practices
-1. **Use sequence-aware initialization**: `init_val = 1.0 / log(typical_seq_len)`
-2. **Typical sequence length**: Use `max_position_embeddings / 2` as estimate
-3. **Per-head parameters**: Each head learns its own `s` (minimal overhead: 1 param/head)
-4. **Make learnable**: Always set `requires_grad=True`
-
-### Integration Checklist
-- [ ] Initialize `ssmax_scale` with `1.0 / log(typical_seq_len)`
-- [ ] Apply scaling in attention **per causal position**: `Q_scaled = Q × ssmax_scale × log(n_t)`, `n_t = (kv_len − q_len) + t + 1` (NOT a single global `log(kv_len)` — that collapses to a constant temperature during fixed-length training)
-- [ ] Use standard softmax after scaling (no other changes needed)
-- [ ] Monitor attention entropy during early training
-- [ ] Verify no entropy collapse in first 1000 steps
-
-## QK-norm × SSMax interaction (internal ablation, June 2026)
-
-BiBo applies **QK-norm** (RMSNorm on Q and K) *and* **SSMax**. A 2×2 ablation on a synthetic passkey
-length-generalization probe (tiny model, train @ 128, eval to 32×, dynamic-NTK RoPE, 3 seeds) shows
-the pairing is **necessary, not incidental** — numbers are extrapolation accuracy (mean over 256–4096):
-
-| | no SSMax | SSMax |
+| | tok/s | tax vs base |
 |---|---|---|
-| **no QK-norm** | 0.86 | 0.97 |
-| **QK-norm** | 0.57 | 0.96 |
+| base | 174.7k | — |
+| SSMax, naive | 168.1k | 3.8% |
+| SSMax, folded scale | 170.0k | 2.7% |
+| SSMax, folded + dtype fix | **172.6k** | **1.2%** |
 
-- **QK-norm alone hurts length generalization** (0.86 → 0.57): bounding the logits removes the model's
-  ability to sharpen attention by growing Q/K magnitude, and gives nothing back.
-- **SSMax restores it** (0.57 → 0.96): with QK-norm on, SSMax is the *only* remaining sharpening lever,
-  so it is far more load-bearing — SSMax's gain is **+0.39 with QK-norm vs +0.11 without**.
-- **Takeaway:** in BiBo, SSMax is not optional decoration — it is the **required compensation** for the
-  sharpening that QK-norm removes. QK-norm is kept for large-model training stability; SSMax is what
-  makes that choice safe for length generalization. The two are a matched pair.
+Casting the scale is **not** gradient-neutral — `ds/dL` shifts by rel 1.9e-3 (worst head 8.5e-3),
+because a bf16 output rounds each `grad_out·q` product before the fp32 reduction. That was accepted:
+`grad_out` is bf16-valued regardless (SDPA emits bf16), so it matches every other gradient in the
+model. `d(q·s)/ds = q`, so the scale's own rounding never enters the gradient.
 
-## Computational Overhead
+**3. `n` must be per causal position.** Query `j` attends to `n_j = (kv_len − q_len) + j + 1` keys.
+Using one global `log(kv_len)` collapses SSMax to a constant temperature during fixed-length
+training — absorbable into the q/k weight norms, i.e. the mechanism does nothing at all. Under a
+padding mask, `n` must come from `mask.cumsum(-1)`, not the grid position.
 
-**Minimal**: SSMax adds only:
-- 1 learnable parameter per attention head
-- 1 logarithm computation per forward pass
-- 1 multiplication per query vector
+**4. SSMax must be applied AFTER QK-norm.** RMSNorm is scale-invariant, so scaling `q` beforehand is
+erased exactly (measured: max abs difference 2.4e-06, i.e. fp32 rounding — a true no-op). There is no
+design choice here; only one order is meaningful. Order versus RoPE does not matter — RoPE is a
+rotation and scaling commutes with it exactly.
 
-For a 12-layer, 12-head model: **144 additional parameters** (negligible vs. 162M total)
-
-## References
-
-1. **Original Paper**: Nakanishi, K. M. (2025). "Scalable-Softmax Is Superior for Attention." arXiv:2501.19399
-2. **Key Insight**: Attention fading occurs because softmax denominator grows with sequence length while numerator doesn't
-3. **Solution**: Make exponential base sequence-length-dependent: `n^(s·z)` instead of `e^z`
-
-## Related Work
-
-- **RoPE (Rotary Position Embedding)**: Complementary positional encoding method
-- **Sliding Window Attention**: Reduces computation but doesn't address attention fading
-- **Linear Attention**: Different approach to long contexts with different tradeoffs
-- **Focal Attention**: Uses temperature scaling but not sequence-length-aware
+**5. Disable on sliding-window layers.** A window caps `n ≤ W`, so after the first `W` positions
+`s·log(n)` is a fixed scalar and SSMax degenerates to a constant temperature — dead weight, not harm.
 
 ---
 
-**Status**: SSMax is production-ready and can be seamlessly integrated into existing Transformer architectures with minimal code changes. The initialization fix is critical for stable training and optimal performance.
+# Retained: the original theory
+
+The analysis below is unchanged and remains correct. It is why the axis was worth testing. Nothing
+here is contradicted by the refutation — the theory says SSMax fixes fading as `n → ∞`, and our
+measurement says we do not have fading at `n = 1024`.
+
+## The problem: attention fading
+
+In standard attention, `attention_score_i = exp(z_i) / Σ exp(z_j)`. As `n` grows the denominator
+grows while the numerator does not, so the maximum attention score approaches zero and the
+distribution flattens. Formally:
+
+```
+max_output <= exp(z_max) / [(n-1)·exp(z_min) + exp(z_max)]
+```
+
+which tends to 0 as `n → ∞` unless `z_max − z_min` grows with `n`.
+
+## The mechanism
+
+```
+SSMax(z_i) = n^(s·z_i) / Σ n^(s·z_j) = exp((s·log n)·z_i) / Σ exp((s·log n)·z_j)
+```
+
+with `s` learnable per head. Implemented by scaling queries — the softmax itself is untouched:
+
+```python
+log_n = log(n_per_position)          # (q_len,), broadcast as (1,1,q_len,1)
+scaled_Q = Q * ssmax_scale * log_n
+```
+
+**Paper**: [Scalable-Softmax Is Superior for Attention](https://arxiv.org/abs/2501.19399), Nakanishi 2025.
+
+## `log n` is the *critical* scaling (MIT, 2025)
+
+[Critical attention scaling in long-context transformers](https://arxiv.org/abs/2510.05554) (Chen,
+Lin, Polyanskiy, Rigollet) analyzes attention scaled as `β_n = γ·log n` — exactly SSMax with `γ ↔ s`
+— and proves a phase transition governed by `γ* = 1/(1−ρ)`, where `ρ` is the background token–token
+inner product:
+
+| regime | condition | behavior |
+|---|---|---|
+| subcritical | `γ < γ*` | rank collapse — attention → uniform, vanishing gradients |
+| critical | `γ = γ*` | sparse, content-adaptive attention (the target) |
+| supercritical | `γ > γ*` | attention → identity-like, token interaction suppressed |
+
+So `log n` is a knife-edge, not a heuristic, and `s` is a **critical threshold rather than a
+bigger-is-sharper knob**. Both sides fail qualitatively. This also independently confirms the
+no-SSMax-on-windowed-layers rule: rank collapse is an `n → ∞` phenomenon and a window caps `n ≤ W`.
+
+Note this theory is about behaviour as `n → ∞`. Our refutation is a measurement at `n = 1024`. They
+do not conflict; they describe different regimes, and the 4096 result is the theory being visible.
+
+## QK-norm × SSMax (synthetic probe, June 2026)
+
+A 2×2 on a synthetic passkey length-generalization probe (tiny model, train @128, eval to 32×, 3
+seeds), extrapolation accuracy averaged over 256–4096:
+
+| | no SSMax | SSMax |
+|---|---|---|
+| no QK-norm | 0.86 | 0.97 |
+| QK-norm | 0.57 | 0.96 |
+
+This was the strongest argument for SSMax in BiBo: QK-norm alone hurts length generalization
+(0.86→0.57) because bounding the logits removes the model's ability to sharpen by growing Q/K
+magnitude, and SSMax restores it (0.57→0.96).
+
+**How to read this now.** It measured *length extrapolation on a synthetic passkey task*, and the
+524M run reproduces that finding — degradation 1.0433→1.0050. It never measured pretraining loss at
+the training length, which is the axis that decided the outcome. A synthetic probe on the metric a
+mechanism is designed to improve will confirm the mechanism; it cannot tell you what the mechanism
+costs on the objective you actually train.
+
+## Overhead
+
+1 parameter per head, 1 log, 1 multiply per query. For 12 layers × 12 heads: 144 parameters.
+The real cost was never the parameters — see the dtype-promotion note above.

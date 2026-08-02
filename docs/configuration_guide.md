@@ -1,5 +1,7 @@
 # BiBo Configuration Guide
 
+> **SSMax is REFUTED and disabled** (524M A/B, Aug 2 2026): worse training loss than the XSA baseline in every window from step 500 on, and +0.00263 bpb. Any SSMax reference below is historical. See [docs/ssmax.md](ssmax.md).
+
 Complete reference for all BiBo model configuration parameters with implementation details, tuning guidance, and research references.
 
 ---

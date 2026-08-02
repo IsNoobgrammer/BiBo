@@ -1,5 +1,7 @@
 # XSA (Exclusive Self Attention) Technical Documentation
 
+> **SSMax is REFUTED and disabled** (524M A/B, Aug 2 2026): worse training loss than the XSA baseline in every window from step 500 on, and +0.00263 bpb. Any SSMax reference below is historical. See [docs/ssmax.md](ssmax.md).
+
 ## Overview
 
 **XSA (Exclusive Self Attention)** is a parameter-free, two-line modification to standard

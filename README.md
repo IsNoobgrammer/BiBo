@@ -1,5 +1,7 @@
 # BiBo: Diverse-Expert MoE Transformer with SSMax Attention
 
+> **SSMax is REFUTED and disabled** (524M A/B, Aug 2 2026): worse training loss than the XSA baseline in every window from step 500 on, and +0.00263 bpb. Any SSMax reference below is historical. See [docs/ssmax.md](docs/ssmax.md).
+
 **BiBo** is a research Mixture-of-Experts (MoE) Transformer for causal language modeling. It explores diverse expert architectures and sequence-length-aware attention scaling for improved long-context performance and expert utilization.
 
 ## Key Innovations
