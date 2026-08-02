@@ -41,9 +41,22 @@ _FLEX = None
 
 def _flex_call():
     """torch.compile'd flex_attention. Compiled lazily and once -- flex is substantially slower
-    interpreted, but compiling at import time would pay the cost even for CPU/eager-only runs."""
+    interpreted, but compiling at import time would pay the cost even for CPU/eager-only runs.
+
+    UNCOMPILED FLEX IS A TRAP, NOT A SLOWDOWN. Called outside torch.compile, flex_attention falls
+    back to an unfused implementation that materializes the full score matrix -- i.e. exactly the
+    eager cost this path exists to avoid, with no error and identical numerics. It only warns.
+
+    Dynamo guards on the WINDOW captured in the mask_mod closure, so every distinct
+    (window, q_len, kv_len) is a fresh compile. Training is one shape and one window, but the
+    variable-length eval and heterogeneous per-layer windows both multiply that, and once the
+    recompile limit is hit dynamo silently drops to the unfused path -- observed in
+    parity_swa_flex.py, which swept 5 windows and tripped the default limit of 8. Raising the
+    limit is the fix; the compiles themselves are cheap and cached."""
     global _FLEX
     if _FLEX is None:
+        torch._dynamo.config.recompile_limit = max(
+            getattr(torch._dynamo.config, "recompile_limit", 8), 128)
         _FLEX = torch.compile(flex_attention, dynamic=False)
     return _FLEX
 
