@@ -29,8 +29,6 @@ class BiBoConfig(PretrainedConfig):
         hybrid_layer_pattern=None,
         sliding_window=128,
         swa_qk_norm=True,
-        add_swa_attention_sink_bias=True,
-        add_full_attention_sink_bias=False,
         rope_theta=None,
         rope_scaling=None,
         partial_rotary_factor=0.334,
@@ -80,8 +78,6 @@ class BiBoConfig(PretrainedConfig):
         # QK-norm on WINDOWED layers only. Global layers always keep it. MiMo-V2.5-Pro ships no
         # QK-norm anywhere, Gemma 4 applies it on every layer; this flag tests the middle.
         self.swa_qk_norm = swa_qk_norm
-        self.add_swa_attention_sink_bias = add_swa_attention_sink_bias
-        self.add_full_attention_sink_bias = add_full_attention_sink_bias
 
         self.rope_scaling = rope_scaling
         self.partial_rotary_factor = partial_rotary_factor

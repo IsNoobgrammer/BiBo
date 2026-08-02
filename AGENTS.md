@@ -39,7 +39,7 @@ src/
     ├── embed.py                   # BiBoRotaryEmbedding (Qwen3-compatible RoPE)
     ├── attn/
     │   ├── base.py                # BiBoAttention — minimal shell: proj/QK-norm/RoPE/cache/SSMax → flavor dispatch → XSA
-    │   ├── swa.py                 # swa_attention — SWA flavor (EAGER ONLY: band mask + sink; kernel target)
+    │   ├── swa.py                 # swa_attention — SWA flavor (FlexAttention block-sparse band; eager = numerics target)
     │   ├── full_attention.py      # full_attention — global flavor (SDPA is_causal fast path / mask path)
     │   ├── ssmax.py               # apply_ssmax_query_scaling (mask-aware context_lens)
     │   ├── xsa.py                  # apply_xsa (Exclusive Self Attention rejection)
@@ -154,8 +154,6 @@ BiBoForCausalLM
 | `rope_theta` | 1e7 | RoPE base. Default raised 10000→1e7 (matched to dim-wise partial RoPE / MiMo-V2.5). |
 | `hybrid_layer_pattern` | None | Per-layer list: 1=sliding-window (SWA), 0=full/global. None = all-global (current). |
 | `sliding_window` | 128 | SWA window `W` (keys visible per query on windowed layers). |
-| `add_swa_attention_sink_bias` | True | Learnable per-head attention sink on SWA layers (unscaled; the norm). |
-| `add_full_attention_sink_bias` | False | Sink on global layers (True → G1/G3; False → G2, current). |
 
 ---
 
@@ -627,12 +625,11 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   the flavors live in `attn/swa.py` and `attn/full_attention.py` (imported like ssmax/xsa),
   with shared helpers (`causal_band_mask`, `padding_bias`, `eager_attention_forward`) in
   `attn/utils.py`. **SWA is EAGER-ONLY by design** — no SDPA/mem-efficient on windowed layers;
-  the eager core is the exact numerics target for a future dedicated sink-aware banded kernel.
-  **Global layers** keep the SDPA `is_causal` fast path; padding / cached prefill / G3 sink use
-  SDPA with an explicit mask — the per-head sink rides as one extra additive-mask column (β_h)
-  + a zero K/V column (no fp32 S² prob materialization; sink grads flow through the mask,
-  Δ9e-10 vs eager). All flavor masking is built INSIDE the flavor modules; base passes only
-  q/k/v/sinks + the raw 2D padding mask.
+  the eager core is the exact numerics target for the FlexAttention block-sparse band that is
+  now SWA's fast path. **Global layers** keep the SDPA `is_causal` fast path; padding and cached
+  prefill use SDPA with an explicit mask. All flavor masking is built INSIDE the flavor modules;
+  base passes only q/k/v + the raw 2D padding mask. **Attention sinks were removed Aug 2 2026**
+  (refuted — see the changelog entry and `docs/attention_layers.md`).
   (3) **SWA KV cache is window-evicted**: `DynamicCache(config=...)` + new `config.layer_types`
   builds `DynamicSlidingWindowLayer` for SWA layers → O(W) decode memory (verified swa_kv=7 vs
   global_kv=24 at W=8; incremental decode == full forward 3.7e-7). Bottom-right mask slices
@@ -642,7 +639,7 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   graph break on the default path; the sync survives only as a fallback for external callers.
   (5) `config.sliding_window` serializes as **None when no layer is SWA** (interop: HF machinery
   keys off it); `config.layer_types` always emitted. (6) `eager_attention_forward` uses its
-  `sinks` param (was reading the module attr). (7) type hints are `Optional[Cache]` (legacy
+  (7) type hints are `Optional[Cache]` (legacy
   tuple lie removed); (8) both forwards take `**kwargs` (GenerationMixin 5.x injects unfiltered
   model inputs); (9) deprecated `config.use_return_dict` dropped (`return_dict` defaults True).
   (10) this file's Design Decision #1 updated (SWA is implemented, not "removed"). All verified:
@@ -668,7 +665,7 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   sync, no ragged-batch `all_reduce` deadlock); MoE boundary slices use one `.tolist()` (was a sync
   per expert).
   (9) **dynamic-NTK is stateless** (order-independent `inv_freq`; in-window it's a no-op).
-  (10) **G1 (global sink + SSMax) is GUARDED** (config raises) — the C-scaled sink is NOT implemented
+  (10) **G1/G3 are moot** — both SSMax and attention sinks have been removed
   yet; enable only when it lands. (11) `_init_weights` now resets RMSNorm(→1.0)/Conv1d; RMSNorm eps
   default 1e-5→1e-6; router `getattr` fallbacks match config defaults; dead `masks.py` + unused
   imports/attrs removed; new config guards (`num_key_value_heads>0`, `bias_update_threshold>0`,
@@ -696,7 +693,7 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   `pyproject.toml` (`testpaths=["tests"]`). Uses CUDA when present, CPU otherwise (the one
   `@pytest.mark.gpu` test — bf16 autocast — auto-skips on CPU); tiny models, ≤5 optimizer steps,
   peak ~25 MiB VRAM. Files: `test_config.py` (derivation/validation/serialization),
-  `test_rope.py` (dim-wise partial + dynamic NTK), `test_attention.py` (SSMax/XSA/SWA band/sinks/
+  `test_rope.py` (dim-wise partial + dynamic NTK), `test_attention.py` (XSA/SWA band/
   GQA/padding), `test_moe.py` (layout/PolyGLU cycle/router gates/load balancing),
   `test_model.py` (KV cache/tying/generate/grad-ckpt + the `from_pretrained` **regression guards**),
   `test_training.py` (grads/autocast/5-step loss). **Add a test with every architectural change** —
@@ -927,6 +924,20 @@ from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
   (the last is a stale divergent 16L config — bumped for layout consistency only). ⚠️ Existing
   8-expert checkpoints are now architecture-incompatible (router/expert dims changed) — retrain.
 - **(June 24 2026; REMOVED Jun 28 — per-expert is the only MoE path) `patch_moe_auto`** — per-call dispatch: grouped path for `n_tokens >= GROUPED_MIN_TOKENS` (default 4096), else the fixed per-expert path. Beats PyTorch eager across all token regimes by construction (both branches grad-verified). Tune `GROUPED_MIN_TOKENS` after T4 cert.
+- **(Aug 2 2026) Attention sinks REMOVED — refuted at 524M.** The `XSA+sink` arm was killed at step
+  1850/2000 once the verdict was legible: with XSA on, its train loss was superimposed on the
+  no-sink arm to within 5e-4 in EVERY 250-step window (1.7643 vs 1.7636 over [1600,1850)), while
+  costing 2.48% throughput (170.8k vs 175.1k tok/s), +0.74 GB, and **2.1x the router-boundary-gap
+  volatility** (0.00830 vs 0.00404) — the same instability signature that disqualified XSA-fixed.
+  Mechanism: XSA (`Y - tanh(α)(Y·V̂)V̂`) and the sink (`out · sigmoid(lse - β)`) drain the same
+  bucket. In a 128-token window the local readout is dominated by the token's own V, which is
+  exactly the direction XSA subtracts, so the sink's "attend to nothing" mass is already gone.
+  Evidence they compete rather than merely overlap: learned α is systematically SUPPRESSED when a
+  sink is present (0.5875 vs 0.6278 mean at step 1850, and the gap is there from step 250).
+  Removed everywhere: `add_swa/full_attention_sink_bias`, the `attention_sink_bias` Parameter, the
+  `sinks` argument on all three flavor functions, `--swa_sink`. **Also a speed win:** the flex path
+  no longer needs `return_lse=True`, so SWA layers stop computing and materializing a (B,H,q)
+  log-sum-exp and the per-(b,h,q) sigmoid rescale of the output is gone.
 - **(July 1 2026) Hybrid SWA + attention sink + DIM-WISE partial RoPE implemented.** Per-layer attention type via `hybrid_layer_pattern` (1=SWA, 0=global; None=all-global). **SWA layers** = sliding-window band mask (`sliding_window`, default 128) + a learnable per-head **attention sink** (unscaled, appended as a value-less softmax column, dropped before the V matmul) + **SSMax forced OFF** (window caps `n` → SSMax redundant). **Global layers** = current behavior (G2: SSMax on, no sink) unless `add_full_attention_sink_bias`. Single parameterized `BiBoAttention` (NOT subclasses): global-no-sink keeps the SDPA `is_causal` fast path; anything with a sink/window/`output_attentions` runs the **eager core** (`_attn_bias_mask` builds causal-or-band; matches `src/.autoresearch/ssmax_sink_ref.py` / MiMo `eager_attention_forward`). QK-norm, XSA, GQA, cache shared across both. **Partial RoPE switched head-wise → dim-wise** (`partial_rotary_factor`, default 0.334): the first `rope_dim` of EVERY head rotates, rest NoPE; model-level rotary emits `rope_dim`-sized cos/sin; `rope_theta` default 10000→1e7. Removes the KV-group-alignment constraint entirely. Verified: all-global builds with 0 sink params; hybrid puts sink params + SSMax-off only on SWA layers; fwd+bwd NaN-free; SWA window exact in `output_attentions` (q=20,W=8 → keys 13–20). Full spec: `docs/attention_layers.md`. ⚠️ Existing checkpoints incompatible (RoPE layout + new params). Sink is ON for SWA by default per the verdict; global sink is opt-in (G1/G3 not wired into bench configs).
 - **(June 26 2026; head-wise SUPERSEDED Jul 1 2026 — see above; kept for its ablation data) Partial RoPE head-split (`rope_nope_ratio=0.5` = 2:2, DEFAULT)** — first `round(num_heads*(1-ratio))` query heads + corresponding KV heads get full RoPE+NTK; the remaining heads are NoPE (no positional encoding). At the **12h/2kv default**: 6 RoPE+NTK heads (1 RoPE KV group) + 6 NoPE content heads (1 NoPE KV group) — clean KV-group split, no GQA geometry change needed (group size 6; 6%6=0). Empirical (synthetic passkey + MQAR length-gen, train@128, eval to 32×, 3 seeds): more NoPE monotonically improves extrapolation — pure NoPE hits XG=1.000 on both tasks vs full-RoPE+NTK 0.93 (passkey) / 0.33 (MQAR); 2:2 gets 0.99 (passkey) / 0.50 (MQAR). **2:2 chosen as the default** (not higher NoPE): our retrieval evals treat position as *noise* (RoPE's worst case), so they overstate NoPE's value for a general LM where position is signal — 2:2 keeps half the heads positional, and is the only partial ratio that's KV-aligned at 12h/2kv without changing GQA. Mechanism: RoPE position-encodes key tokens by *where* they're planted → breaks key-matching; NoPE heads match position-independently; SSMax sharpens; causal mask gives implicit scale-free position. **The boundary must align with KV groups** (config validation enforced; only {0.0, 0.5} valid at 12h/2kv). `rope_nope_ratio=0.0` restores original all-RoPE. **IID/downstream cost of NoPE is UNMEASURED** (our synthetic evals saturate to 1.00 at train length) — Kaggle ablation on real-LM perplexity needed before pushing the ratio higher (would require changing GQA geometry to unlock 0.25/0.75). See `src/.autoresearch/FINDINGS.md` (2026-06-26 V10 + MQAR).
 
@@ -974,7 +985,7 @@ Liger RMSNorm/RoPE), the kernel benches, and the vendored fused Muon were remove
 2. Read `src/modeling/attn/base.py` for attention logic (SDPA + SSMax)
 3. Read `src/modeling/ffn/moe.py` for MoE dispatch logic
 4. Read `src/modeling/ffn/router.py` for routing logic (logit norm + bias heuristics)
-5. Read `docs/ssmax.md` for SSMax theory; `docs/xsa.md` for Exclusive Self Attention; `docs/attention_layers.md` for the SWA/global layer verdict (sink × SSMax × value-scale)
+5. Read `docs/ssmax.md` and the sink section of `docs/attention_layers.md` for two REFUTED axes (both removed Aug 2 2026); `docs/xsa.md` for Exclusive Self Attention
 6. Read `docs/deprecated.md` for removed components
 7. Read `docs/configuration_guide.md` for tuning guidance
 8. Read `shaurya_notes.md` for research insights and findings

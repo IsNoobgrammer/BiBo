@@ -270,12 +270,10 @@ def main():
     ap.add_argument("--router_optim", choices=["muon","adamw"], default="muon")  # router proj optimizer; muon = current default (2D -> Muon by the ndim rule); tag _radamw      # per-step router mechanics (GPU-accumulated, 1 sync per log_every)
     # MoE-branch magnitude knobs (applied AFTER the top-k norm; normalization sets the SPLIT, these set LOUDNESS)
     # SWA. "block3" = [G,S,S] x N + a global tail (configs.swa_block_pattern); "none" = all global;
-    # or an explicit comma list of 0/1 per layer. The sink defaults ON with SWA -- see configs.
     ap.add_argument("--swa_pattern", default="none")
     # int = uniform. Comma list = HIERARCHICAL: the cycle applied to the windowed layers within
     # each block, e.g. "128,512" -> first windowed layer of every block 128, second 512.
     ap.add_argument("--sliding_window", default="128")
-    ap.add_argument("--swa_sink", type=_bool, default=True)   # False = the no-sink ablation arm
     # QK-norm on the WINDOWED layers only (global layers always keep it). False = the arm that
     # asks whether a 128-token span already bounds logits well enough to make it redundant.
     ap.add_argument("--swa_qk_norm", type=_bool, default=True)
@@ -423,7 +421,7 @@ def main():
     _swa_pat, _win = resolve_swa(args.swa_pattern, args.sliding_window, SHARED["num_hidden_layers"])
     if _swa_pat is not None:
         print(f"[swa] pattern {_swa_pat} (1=windowed) window={_win} "
-              f"sink={args.swa_sink} qk_norm={args.swa_qk_norm}", flush=True)
+              f"qk_norm={args.swa_qk_norm}", flush=True)
     model, cfg = build_arm(args.arm, device=DEV, dtype=torch.float32, attn_impl=args.attn,  # fp32 master
                            bias_update_threshold=args.bias_update_threshold,
                            bias_update_factor=(None if args.bias_update_factor < 0 else args.bias_update_factor),
@@ -431,7 +429,7 @@ def main():
                            use_xsa=args.use_xsa,
                            xsa_alpha_init=args.xsa_alpha_init,
                            hybrid_layer_pattern=_swa_pat, sliding_window=_win,
-                           swa_sink=args.swa_sink, swa_qk_norm=args.swa_qk_norm,
+                           swa_qk_norm=args.swa_qk_norm,
                            attn_res=args.attn_res,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
@@ -503,7 +501,6 @@ def main():
                 # arm overwrites the uniform one it is being compared against.
                 + (f"_swa{args.swa_pattern}w{str(args.sliding_window).replace(',', '-')}"
                    if args.swa_pattern != "none" else "")
-                + ("_nosink" if args.swa_pattern != "none" and not args.swa_sink else "")
                 + ("_noqkn" if args.swa_pattern != "none" and not args.swa_qk_norm else "")
                 # activation is an axis again; an untagged silu arm would overwrite the radial
                 # control's ckpt/_result.json on the same seed+experts

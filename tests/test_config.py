@@ -56,11 +56,13 @@ def test_validation_guards(overrides, reason):
         make_config(**overrides)
 
 
-def test_global_attention_sink_is_no_longer_gated():
-    """The G1 guard existed only because a global sink had to be scaled by SSMax's C=s*log(n).
-    SSMax was removed Aug 2 2026, so a sink on global layers is now just a sink."""
-    c = make_config(add_full_attention_sink_bias=True)
-    assert c.add_full_attention_sink_bias is True
+def test_sink_config_keys_are_gone():
+    """add_swa/full_attention_sink_bias were deleted Aug 2 2026 with the feature. PretrainedConfig
+    swallows unknown kwargs into the instance, so assert the ATTRIBUTE is absent rather than
+    expecting a raise -- a resurrected key would otherwise sit there doing nothing."""
+    c = make_config()
+    assert not hasattr(c, "add_swa_attention_sink_bias")
+    assert not hasattr(c, "add_full_attention_sink_bias")
 
 
 def test_legacy_bool_norm_topk_prob_maps_to_sum():

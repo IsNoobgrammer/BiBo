@@ -216,17 +216,17 @@ def resolve_attn(impl):
 
 
 def patch_bibo_flash():
-    """Route BiBo's global-attention HOT PATH (training: no mask/sink/padding) through flash_attn_func.
+    """Route BiBo's global-attention HOT PATH (training: no mask/padding) through flash_attn_func.
     Any failure (flash missing, fp32, mask needed) falls back to the original SDPA path.
     Qwen gets flash via config._attn_implementation instead (native HF dispatch)."""
     import src.modeling.attn.base as base
     _orig = getattr(base, "_orig_full_attention", None) or base.full_attention
     base._orig_full_attention = _orig
 
-    def _wrapped(query, key, value, sinks, *, num_key_value_groups, scaling,
+    def _wrapped(query, key, value, *, num_key_value_groups, scaling,
                  padding_mask=None, dropout=0.0, training=False, output_attentions=False):
         q_len, kv_len = query.shape[-2], key.shape[-2]
-        need_mask = (output_attentions or sinks is not None or padding_mask is not None
+        need_mask = (output_attentions or padding_mask is not None
                      or (q_len > 1 and kv_len > q_len))
         if not need_mask:
             try:
@@ -239,7 +239,7 @@ def patch_bibo_flash():
                 return o.transpose(1, 2), None
             except Exception:
                 pass                                          # fall through to SDPA
-        return _orig(query, key, value, sinks, num_key_value_groups=num_key_value_groups,
+        return _orig(query, key, value, num_key_value_groups=num_key_value_groups,
                      scaling=scaling, padding_mask=padding_mask, dropout=dropout,
                      training=training, output_attentions=output_attentions)
     base.full_attention = _wrapped

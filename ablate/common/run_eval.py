@@ -56,7 +56,6 @@ def _arch_kwargs(c):
         num_shared_experts=c.get("n_shared", 0),
         hybrid_layer_pattern=pattern,
         sliding_window=window,
-        swa_sink=c.get("swa_sink", True),
         swa_qk_norm=c.get("swa_qk_norm", True),
         attn_res=c.get("attn_res", "off"),
         bias_update_threshold=c.get("bias_update_threshold", 10240),
@@ -106,7 +105,7 @@ def main():
         print(f"[eval] architecture from {os.path.basename(res_path)}: "
               f"act={patchmod.EXPERT_ACT} experts={kw['num_experts']} top_k={kw['top_k']} "
               f"xsa={kw['use_xsa']} swa={kw['hybrid_layer_pattern']} window={kw['sliding_window']} "
-              f"sink={kw['swa_sink']} qk_norm={kw['swa_qk_norm']}", flush=True)
+              f"qk_norm={kw['swa_qk_norm']}", flush=True)
     elif args.allow_default_arch:
         print("[eval] WARNING: no _result.json found; building the DEFAULT architecture. This is "
               "only correct for a checkpoint trained with stock settings.", flush=True)

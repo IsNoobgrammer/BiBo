@@ -1,6 +1,6 @@
 """BiBoAttention — minimal shared shell: projections, QK-norm, partial RoPE, KV cache,
 per-layer dispatch to the SWA or full-attention flavor module, XSA, output projection.
-The attention flavors themselves live in swa.py (eager-only band + sink) and
+The attention flavors themselves live in swa.py (flex band + eager reference) and
 full_attention.py (SDPA fast path / mask path)."""
 import torch
 import torch.nn as nn
@@ -39,12 +39,6 @@ class BiBoAttention(nn.Module):
         _per = getattr(config, "sliding_window_per_layer", None)
         _sw = _per[layer_idx] if _per is not None else config.sliding_window
         self.sliding_window = _sw if self.is_swa else None
-        # One learnable scalar per head, appended as a value-less softmax column (GPT-OSS / MiMo).
-        # SWA gets it by default; global layers opt in. Both are unconditional now — the sink used
-        # to be gated against a query-scaling temperature that no longer exists.
-        use_sink = ((self.is_swa and config.add_swa_attention_sink_bias)
-                    or (not self.is_swa and config.add_full_attention_sink_bias))
-        self.attention_sink_bias = nn.Parameter(torch.zeros(self.num_heads)) if use_sink else None
 
         # XSA rejection strength, one LEARNABLE logit per head; the applied strength is
         # tanh(xsa_alpha). Default init 0 -> tanh(0) = 0 -> XSA starts OFF and the model has to
@@ -102,14 +96,14 @@ class BiBoAttention(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        # All masking (band/causal/padding) and sink handling lives inside the flavor modules;
+        # All masking (band/causal/padding) lives inside the flavor modules;
         # `attention_mask` here is the raw 2D (B, K_total) padding mask (1=real, 0=pad) or None.
         # value_states stays GROUPED so XSA's enable_gqa broadcast is consistent on every path.
         if self.is_swa:
-            # Eager only by design: SWA's fast path is a dedicated sink-aware banded kernel, not
-            # SDPA, and this eager core is that kernel's exact numerics target.
+            # SWA's fast path is FlexAttention's block-sparse band, not SDPA; the eager core
+            # in utils.py is that path's exact numerics target.
             attn_output, probs = swa_attention(
-                query_states, key_states, value_states, self.attention_sink_bias,
+                query_states, key_states, value_states,
                 sliding_window=self.sliding_window,
                 num_key_value_groups=self.num_key_value_groups, scaling=self.scaling,
                 padding_mask=attention_mask,
@@ -117,7 +111,7 @@ class BiBoAttention(nn.Module):
             attn_weights = probs if output_attentions else None
         else:
             attn_output, attn_weights = full_attention(
-                query_states, key_states, value_states, self.attention_sink_bias,
+                query_states, key_states, value_states,
                 num_key_value_groups=self.num_key_value_groups, scaling=self.scaling,
                 padding_mask=attention_mask,
                 dropout=self.attention_dropout, training=self.training,

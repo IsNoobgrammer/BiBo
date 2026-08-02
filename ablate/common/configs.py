@@ -125,7 +125,7 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          use_xsa=False, xsa_alpha_init=0.0,
                          pos_identity_expert=True, neg_identity_expert=True,
                          top_k=None, moe_intermediate_size=None, num_shared_experts=0,
-                         hybrid_layer_pattern=None, sliding_window=128, swa_sink=True,
+                         hybrid_layer_pattern=None, sliding_window=128,
                          swa_qk_norm=True, attn_res="off"):
     # attn_res: "off" = stable src model. Anything else routes to exp/ (Kimi K3 Attention
     # Residuals): "control" builds exp's model with residuals DISABLED, an int is the block size
@@ -158,13 +158,6 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
         partial_rotary_factor=PARTIAL_ROPE,
         # --- everything else stripped to Qwen-equivalence ---
         use_xsa=use_xsa, xsa_alpha_init=xsa_alpha_init,
-        add_full_attention_sink_bias=False,
-        # The sink is the DESIGN NORM for windowed layers, not an optional extra: a window slides
-        # past BOS, so the natural always-visible dump bucket disappears exactly when the window
-        # moves on (docs/attention_layers.md S3). It therefore defaults ON whenever SWA is on, and
-        # `swa_sink=False` is a deliberate ablation arm, not a config you should reach by accident.
-        # It stays False on an all-global model so the pattern=None default allocates no sink params.
-        add_swa_attention_sink_bias=bool(hybrid_layer_pattern) and swa_sink,
         hybrid_layer_pattern=hybrid_layer_pattern,
         sliding_window=sliding_window,
         # Only meaningful with SWA; global layers keep QK-norm regardless.

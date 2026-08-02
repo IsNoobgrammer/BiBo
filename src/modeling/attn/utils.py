@@ -47,16 +47,14 @@ def padding_bias(padding_mask, kv_len, dtype):
 
 
 def eager_attention_forward(query, key, value, attention_mask, scaling, num_key_value_groups,
-                            dropout=0.0, training=False, sinks=None):
-    """Eager attention core — faithful to MiMo-V2.5 `eager_attention_forward` (GPT-OSS-style sink).
+                            dropout=0.0, training=False):
+    """Eager attention core.
 
-    Two deviations from MiMo: the final `.transpose(1,2)` is deferred to the caller (BiBo runs
-    XSA on the (B,H,q,d) output first, then the shared tail transposes), and the pre-softmax
-    row-max subtraction is dropped (see inline note). `key`/`value` are GROUPED (GQA) and
-    repeated here. `attention_mask` is additive (0 / -inf), broadcast over (B,H). `sinks` is a
-    per-head bias (or None): when set, one value-less per-head sink column is concatenated AFTER
-    the mask, included in the softmax denominator, then dropped before the V matmul.
-    Returns (attn_output (B,H,q,d), probs (real weights, sink dropped))."""
+    Two deviations from MiMo-V2.5's `eager_attention_forward`: the final `.transpose(1,2)` is
+    deferred to the caller (BiBo runs XSA on the (B,H,q,d) output first, then the shared tail
+    transposes), and the pre-softmax row-max subtraction is dropped (see inline note).
+    `key`/`value` are GROUPED (GQA) and repeated here. `attention_mask` is additive (0 / -inf),
+    broadcast over (B,H). Returns (attn_output (B,H,q,d), probs)."""
     key_states = repeat_kv(key, num_key_value_groups)
     value_states = repeat_kv(value, num_key_value_groups)
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
@@ -65,15 +63,9 @@ def eager_attention_forward(query, key, value, attention_mask, scaling, num_key_
         # (SWA cache layers crop from the front). No-op for an exact-size mask.
         causal_mask = attention_mask[:, :, :, -key_states.shape[-2]:]
         attn_weights = attn_weights + causal_mask
-    if sinks is not None:
-        s = sinks.reshape(1, -1, 1, 1).to(attn_weights.dtype).expand(
-            query.shape[0], -1, query.shape[-2], -1)
-        attn_weights = torch.cat([attn_weights, s], dim=-1)
     # ponytail: no pre-softmax row-max subtraction — F.softmax upcasts to fp32 and is
-    # shift-stable on its own (rows are never all -inf: the causal diagonal / sink col is finite)
+    # shift-stable on its own (rows are never all -inf: the causal diagonal is finite)
     probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    if sinks is not None:
-        probs = probs[..., :-1]
     probs = F.dropout(probs, p=dropout, training=training)
     attn_output = torch.matmul(probs, value_states)
     return attn_output, probs

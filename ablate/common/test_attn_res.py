@@ -35,7 +35,7 @@ def _build(attn_res, pattern):
     model, cfg = build_arm("bibo_min", device="cpu", dtype=torch.float32,
                            num_experts=6, special_pairs=0, use_xsa=True,
                            hybrid_layer_pattern=pattern, sliding_window=128,
-                           swa_sink=False, attn_res=attn_res)
+                           attn_res=attn_res)
     return model.eval(), cfg
 
 

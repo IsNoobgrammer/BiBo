@@ -32,7 +32,7 @@ def _build(qk_norm, pattern):
     model, cfg = build_arm("bibo_min", device="cpu", dtype=torch.float32,
                            num_experts=6, special_pairs=0, use_xsa=True,
                            hybrid_layer_pattern=pattern, sliding_window=128,
-                           swa_sink=False, swa_qk_norm=qk_norm)
+                           swa_qk_norm=qk_norm)
     return model.eval(), cfg
 
 

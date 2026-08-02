@@ -50,7 +50,7 @@ def main():
         try:
             model.load_state_dict(sd, strict=True)
             print(f"  OK   {name[:60]}  act={patchmod.EXPERT_ACT} experts={kw['num_experts']} "
-                  f"window={kw['sliding_window']} sink={kw['swa_sink']} qkn={kw['swa_qk_norm']}")
+                  f"window={kw['sliding_window']} qkn={kw['swa_qk_norm']}")
         except RuntimeError as e:
             bad += 1
             print(f"  FAIL {name[:60]}\n       {str(e)[:400]}")

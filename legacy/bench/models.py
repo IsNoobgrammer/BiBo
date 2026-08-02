@@ -42,8 +42,6 @@ def build_model_from_config(cfg: dict):
             partial_rotary_factor=model_cfg.get("partial_rotary_factor", 0.334),
             hybrid_layer_pattern=model_cfg.get("hybrid_layer_pattern", None),
             sliding_window=model_cfg.get("sliding_window", 128),
-            add_swa_attention_sink_bias=model_cfg.get("add_swa_attention_sink_bias", True),
-            add_full_attention_sink_bias=model_cfg.get("add_full_attention_sink_bias", False),
             polyglu_expert_multiplier=model_cfg.get("polyglu_expert_multiplier", 2),
             special_expert_pairs=model_cfg.get("special_expert_pairs", 1),
             num_experts_per_tok=model_cfg.get("num_experts_per_tok", 2),

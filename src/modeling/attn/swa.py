@@ -10,16 +10,12 @@ skipped, since a 4x smaller window should be far cheaper.
 FlexAttention is block-sparse: `create_block_mask` marks whole 128x128 blocks outside the band as
 skippable and the kernel never visits them, so cost actually tracks the window.
 
-The sink is applied in closed form rather than as an extra column. With one value-less column of
-logit beta appended to the softmax, the real weights are
-    w_i = exp(z_i) / (sum_j exp(z_j) + exp(beta))
-        = [exp(z_i) / sum_j exp(z_j)] * sum_j exp(z_j) / (sum_j exp(z_j) + exp(beta))
-        = p_i * sigmoid(lse - beta)
-so the sink output is just the ordinary attention output scaled per (batch, head, query) by
-sigmoid(lse - beta). `flex_attention(..., return_lse=True)` returns that lse directly. This is
-exact -- not an approximation of the eager path -- and avoids appending a column that would push
-KV_LEN off a block multiple. beta is compared against SCALED logits, matching the eager core where
-the sink is concatenated after `* scaling`.
+Attention sinks were removed Aug 2 2026 after the 524M board refuted them: with XSA on, the sink
+bought nothing (train loss superimposed on the no-sink arm to 5e-4 in every window) while costing
+throughput, memory, and 2.1x the router-gap volatility -- the two mechanisms drain the same
+bucket. Removing it also lets this path drop `return_lse=True`, so flex no longer computes or
+materializes a (B,H,q) log-sum-exp per layer, and the per-(b,h,q) sigmoid rescale of the output
+is gone with it.
 """
 import torch
 from .utils import causal_band_mask, padding_bias, eager_attention_forward
@@ -84,10 +80,10 @@ def _block_mask(q_len, kv_len, window, device):
     return bm
 
 
-def swa_attention(query, key, value, sinks, *, sliding_window, num_key_value_groups, scaling,
+def swa_attention(query, key, value, *, sliding_window, num_key_value_groups, scaling,
                   padding_mask=None, dropout=0.0, training=False):
-    """SWA forward. `query` (B,H,q,d); `key`/`value` GROUPED (B,H_kv,kv,d); `sinks` per-head
-    bias (H,) or None; `padding_mask` 2D (B,K_total) 1=real/0=pad or None.
+    """SWA forward. `query` (B,H,q,d); `key`/`value` GROUPED (B,H_kv,kv,d); `padding_mask` 2D
+    (B,K_total) 1=real/0=pad or None.
     Returns (attn_output (B,H,q,d), probs (B,H,q,kv) or None).
 
     FlexAttention handles the hot path. Anything it cannot express falls back to the eager core:
@@ -117,14 +113,10 @@ def swa_attention(query, key, value, sinks, *, sliding_window, num_key_value_gro
     if use_flex:
         try:
             # enable_gqa keeps key/value GROUPED -- no repeat_kv copy, matching the eager inputs.
-            out, lse = _flex_call()(
+            out = _flex_call()(
                 query, key, value,
                 block_mask=_block_mask(q_len, kv_len, sliding_window, query.device),
-                scale=scaling, enable_gqa=True, return_lse=True)
-            if sinks is not None:
-                # lse is natural-log and already over SCALED scores, the same units as beta.
-                beta = sinks.to(torch.float32).reshape(1, -1, 1)
-                out = out * torch.sigmoid(lse.to(torch.float32) - beta).unsqueeze(-1).to(out.dtype)
+                scale=scaling, enable_gqa=True)
             return out, None
         except Exception as exc:
             # Never let a compile failure destroy a training run. Falling back is FREE in
@@ -142,4 +134,4 @@ def swa_attention(query, key, value, sinks, *, sliding_window, num_key_value_gro
         attn_mask = attn_mask + padding_bias(padding_mask, kv_len, query.dtype)
     return eager_attention_forward(
         query, key, value, attn_mask, scaling, num_key_value_groups,
-        dropout=dropout, training=training, sinks=sinks)
+        dropout=dropout, training=training)

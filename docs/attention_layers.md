@@ -1,12 +1,37 @@
-# Attention Layer Design Verdict — SWA vs Global (SSMax × Sink × Value-Scale)
+# Attention Layer Design Verdict — SWA vs Global (HISTORICAL)
 
-> **SSMax is REFUTED and disabled** (524M A/B, Aug 2 2026): worse training loss than the XSA baseline in every window from step 500 on, and +0.00263 bpb. Any SSMax reference below is historical. See [docs/ssmax.md](ssmax.md).
-
-> **Status:** IMPLEMENTED (2026-07-01) — hybrid SWA + attention sink + dim-wise partial RoPE are live
-> in `src/modeling/attn/base.py` (single parameterized `BiBoAttention`). This file is the binding spec
-> for how SSMax/sink/value-scale combine on each layer type. Currently wired: **SWA = sink + no SSMax**
-> (this doc's SWA row) and **global = G2** (SSMax, no sink); G1/G3 (global sink) are supported by the
-> code but off by default in bench configs. Reference impl + grad-checks: `src/.autoresearch/ssmax_sink_ref.py`.
+> **BOTH AXES THIS DOCUMENT SPECIFIES ARE NOW REFUTED AND REMOVED. Everything below is history.**
+>
+> **SSMax — REFUTED, removed Aug 2 2026** (524M A/B): worse training loss than the XSA baseline in
+> every window from step 500 on, +0.00263 bpb. See [docs/ssmax.md](ssmax.md).
+>
+> **Attention sinks — REFUTED, removed Aug 2 2026** (524M board). Section 3 below argues the sink is
+> the design norm for windowed layers because a window slides past BOS and loses its always-visible
+> dump bucket. That argument is sound in isolation and wrong once XSA is on:
+>
+> * **It buys nothing.** `SWA128+XSA+sink` vs `SWA128+XSA+nosink`: train loss superimposed to within
+>   5e-4 in every 250-step window (1.7643 vs 1.7636 over [1600,1850)). The sink arm was also BEHIND
+>   on bpb at its step-1000 eval (0.75676 vs 0.75421).
+> * **It costs.** 170.8k vs 175.1k tok/s (-2.48%) and +0.74 GB.
+> * **It destabilises.** Router-boundary-gap volatility 0.00830 vs 0.00404 — **2.1x** — the same
+>   signature that disqualified XSA-fixed.
+> * **Mechanism: XSA and the sink drain the same bucket.** The sink is `out · sigmoid(lse - beta)`,
+>   a per-(head,query) scalar that lets a head attenuate its readout. XSA is `Y - tanh(alpha)(Y·V̂)V̂`,
+>   which removes the readout's component along the token's own value direction. In a 128-token
+>   window the local readout is dominated by that direction, so the "attend to nothing" mass the
+>   sink exists to absorb is largely what XSA already subtracts.
+> * **They compete, not merely overlap.** Learned alpha is systematically SUPPRESSED when a sink is
+>   present — 0.5875 vs 0.6278 mean at step 1850, with the gap present from step 250 onward. The
+>   model gives XSA less to do exactly when a sink is available. Two knobs on one hinge is a flat
+>   direction in the loss landscape, which is the likely source of the router instability.
+>
+> Removed: `add_swa_attention_sink_bias`, `add_full_attention_sink_bias`, the
+> `attention_sink_bias` Parameter, the `sinks` argument on `swa_attention` / `full_attention` /
+> `eager_attention_forward`, and `--swa_sink`. Dropping it also let the flex path drop
+> `return_lse=True`, so SWA no longer computes or materializes a per-(B,H,q) log-sum-exp.
+>
+> The sink remains the right default for a windowed layer WITHOUT XSA — `SWA128+sink` (0.67720) does
+> beat `SWA128 nosink` (0.67965). The refutation is specifically of stacking it on top of XSA.
 
 ---
 

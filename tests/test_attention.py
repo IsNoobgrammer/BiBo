@@ -1,4 +1,4 @@
-"""Attention: XSA, SWA banding, attention sinks, GQA, padding masks."""
+"""Attention: XSA, SWA banding, GQA, padding masks."""
 import pytest
 import torch
 from conftest import DEVICE, make_model, tokens
@@ -37,11 +37,10 @@ def test_xsa_handles_decode_where_q_len_differs_from_kv_len():
     assert torch.isfinite(step.logits).all()
 
 
-# ── SWA banding + sinks ──────────────────────────────────────────────────────
+# ── SWA banding ──────────────────────────────────────────────────────
 def test_swa_band_mask_is_exact():
     W, S = 4, 12
-    m = make_model(hybrid_layer_pattern=[1] * 4, sliding_window=W,
-                   add_swa_attention_sink_bias=False)
+    m = make_model(hybrid_layer_pattern=[1] * 4, sliding_window=W)
     attn = m(tokens(1, S), output_attentions=True).attentions[1][0, 0]
     for q in range(S):
         lo = max(0, q - W + 1)
@@ -50,33 +49,27 @@ def test_swa_band_mask_is_exact():
         assert attn[q, lo:q + 1].sum().item() > 0.99, f"query {q} band mass != 1"
 
 
-def test_sink_placement_follows_the_config():
-    m = make_model(hybrid_layer_pattern=HYBRID,
-                   add_swa_attention_sink_bias=True, add_full_attention_sink_bias=False)
+def test_attention_sinks_are_gone():
+    """Removed Aug 2 2026. The 524M board refuted them: with XSA on, the sink arm's train loss was
+    superimposed on the no-sink arm to 5e-4 in every window while costing 2.5% throughput, 0.74 GB,
+    and 2.1x the router-gap volatility -- XSA and the sink drain the same bucket. No parameter, no
+    config key, no argument on the flavor modules."""
+    import inspect
+    from src.modeling.attn.swa import swa_attention
+    from src.modeling.attn.full_attention import full_attention
+    from src.modeling.attn.utils import eager_attention_forward
+
+    m = make_model(hybrid_layer_pattern=HYBRID, sliding_window=4)
     for i, layer in enumerate(m.model.layers):
-        a = layer.self_attn
-        if a.is_swa:
-            assert a.attention_sink_bias is not None, f"SWA layer {i} has no sink"
-            assert a.attention_sink_bias.shape == (m.config.num_attention_heads,)
-        else:
-            assert a.attention_sink_bias is None, f"global layer {i} got an unrequested sink"
-
-
-def test_all_global_model_builds_zero_sink_params():
-    m = make_model()
-    assert all(l.self_attn.attention_sink_bias is None for l in m.model.layers)
-
-
-def test_attention_sink_receives_gradient():
-    m = make_model(hybrid_layer_pattern=[1] * 4, sliding_window=4,
-                   add_swa_attention_sink_bias=True)
-    x = tokens(2, 8)
-    m(x, labels=x).loss.backward()
-    sinks = [l.self_attn.attention_sink_bias for l in m.model.layers
-             if l.self_attn.attention_sink_bias is not None]
-    assert sinks
-    for s in sinks:
-        assert s.grad is not None and torch.isfinite(s.grad).all() and s.grad.abs().max() > 0
+        assert not hasattr(layer.self_attn, "attention_sink_bias"), f"layer {i} still has a sink"
+    assert not any("sink" in n for n, _ in m.named_parameters())
+    for fn in (swa_attention, full_attention, eager_attention_forward):
+        assert not any("sink" in p for p in inspect.signature(fn).parameters), \
+            f"{fn.__name__} still takes a sink argument"
+    # No pytest.raises here: PretrainedConfig swallows unknown kwargs onto the instance instead of
+    # rejecting them, so a resurrected key would sit there inert. Absence is the assertion.
+    assert not hasattr(m.config, "add_swa_attention_sink_bias")
+    assert not hasattr(m.config, "add_full_attention_sink_bias")
 
 
 # ── GQA ──────────────────────────────────────────────────────────────────────
