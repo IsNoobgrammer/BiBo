@@ -74,6 +74,26 @@ def swa_block_pattern(n_layers):
     return [0 if i % 3 == 0 else 1 for i in range(n_layers - 1)] + [0]
 
 
+def hswa_windows(pattern, windows):
+    """Per-layer sliding_window list for HIERARCHICAL SWA.
+
+    `windows` is the cycle applied to the windowed layers WITHIN each block, in order. With
+    pattern [0,1,1]*3+[0] and windows (128, 512): the first windowed layer of every block gets
+    128, the second 512 -- refine locally, then widen. Global layers get 0 (ignored).
+
+    Returned per LAYER, not per windowed layer, so the index stays layer_idx and cannot drift
+    out of step with hybrid_layer_pattern.
+    """
+    out, k = [], 0
+    for v in pattern:
+        if not v:
+            out.append(0)
+            continue
+        out.append(int(windows[k % len(windows)]))
+        k += 1
+    return out
+
+
 def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          num_experts=None, special_pairs=0,
                          use_xsa=False, xsa_alpha_init=0.0,

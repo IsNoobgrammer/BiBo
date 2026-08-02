@@ -34,7 +34,11 @@ class BiBoAttention(nn.Module):
 
         pattern = getattr(config, "hybrid_layer_pattern", None)
         self.is_swa = bool(pattern[layer_idx]) if pattern is not None else False
-        self.sliding_window = config.sliding_window if self.is_swa else None
+        # Hierarchical SWA reads its per-layer window off `sliding_window_per_layer`; plain
+        # `sliding_window` stays scalar because transformers' cache indexes with it directly.
+        _per = getattr(config, "sliding_window_per_layer", None)
+        _sw = _per[layer_idx] if _per is not None else config.sliding_window
+        self.sliding_window = _sw if self.is_swa else None
         # One learnable scalar per head, appended as a value-less softmax column (GPT-OSS / MiMo).
         # SWA gets it by default; global layers opt in. Both are unconditional now — the sink used
         # to be gated against a query-scaling temperature that no longer exists.

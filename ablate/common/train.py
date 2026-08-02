@@ -15,7 +15,7 @@ import argparse
 import contextlib
 import torch
 from .models import build_arm, count_params
-from .configs import SHARED, glu_count, swa_block_pattern
+from .configs import SHARED, glu_count, swa_block_pattern, hswa_windows
 from . import patches as patchmod
 from .optim import build_optimizers
 from .schedule import make_scheduler, make_wd_schedule
@@ -264,7 +264,9 @@ def main():
     # SWA. "block3" = [G,S,S] x N + a global tail (configs.swa_block_pattern); "none" = all global;
     # or an explicit comma list of 0/1 per layer. The sink defaults ON with SWA -- see configs.
     ap.add_argument("--swa_pattern", default="none")
-    ap.add_argument("--sliding_window", type=int, default=128)
+    # int = uniform. Comma list = HIERARCHICAL: the cycle applied to the windowed layers within
+    # each block, e.g. "128,512" -> first windowed layer of every block 128, second 512.
+    ap.add_argument("--sliding_window", default="128")
     ap.add_argument("--swa_sink", type=_bool, default=True)   # False = the no-sink ablation arm
     ap.add_argument("--use_xsa", action="store_true")                             # ablation axis: XSA exclusive self-attention (default OFF)
     # Per-head rejection-strength LOGIT; strength = tanh(init). Ships with --use_xsa, it is not a
@@ -407,8 +409,15 @@ def main():
         assert len(_swa_pat) == SHARED["num_hidden_layers"], (
             f"--swa_pattern has {len(_swa_pat)} entries, model has "
             f"{SHARED['num_hidden_layers']} layers")
+    _win = [int(v) for v in str(args.sliding_window).split(",")]
+    if len(_win) == 1:
+        _win = _win[0]                                   # uniform: keep the plain int
+    elif _swa_pat is None:
+        raise SystemExit("--sliding_window got a list but --swa_pattern is none")
+    else:
+        _win = hswa_windows(_swa_pat, _win)              # hierarchical: per-LAYER list
     if _swa_pat is not None:
-        print(f"[swa] pattern {_swa_pat} (1=windowed) window={args.sliding_window} "
+        print(f"[swa] pattern {_swa_pat} (1=windowed) window={_win} "
               f"sink={args.swa_sink}", flush=True)
     model, cfg = build_arm(args.arm, device=DEV, dtype=torch.float32, attn_impl=args.attn,  # fp32 master
                            bias_update_threshold=args.bias_update_threshold,
@@ -416,7 +425,7 @@ def main():
                            aux_coef=args.aux_coef, num_experts=n_total, special_pairs=args.special_pairs,
                            use_xsa=args.use_xsa,
                            xsa_alpha_init=args.xsa_alpha_init,
-                           hybrid_layer_pattern=_swa_pat, sliding_window=args.sliding_window,
+                           hybrid_layer_pattern=_swa_pat, sliding_window=_win,
                            swa_sink=args.swa_sink,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
@@ -484,7 +493,9 @@ def main():
                 + (f"_xaI{args.xsa_alpha_init:g}" if args.use_xsa and args.xsa_alpha_init else "")
                 # SWA arms differ from their control by nothing else in the name; untagged they
                 # would overwrite the control's _final.pt / _result.json.
-                + (f"_swa{args.swa_pattern}w{args.sliding_window}"
+                # w128 vs w128-512 must be distinguishable in the filename or the hierarchical
+                # arm overwrites the uniform one it is being compared against.
+                + (f"_swa{args.swa_pattern}w{str(args.sliding_window).replace(',', '-')}"
                    if args.swa_pattern != "none" else "")
                 + ("_nosink" if args.swa_pattern != "none" and not args.swa_sink else "")
                 # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide

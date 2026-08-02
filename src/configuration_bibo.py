@@ -75,6 +75,7 @@ class BiBoConfig(PretrainedConfig):
 
         self.hybrid_layer_pattern = hybrid_layer_pattern
         self.sliding_window = sliding_window
+        self.sliding_window_per_layer = None   # set below iff a per-layer list is given
         self.add_swa_attention_sink_bias = add_swa_attention_sink_bias
         self.add_full_attention_sink_bias = add_full_attention_sink_bias
 
@@ -169,7 +170,36 @@ class BiBoConfig(PretrainedConfig):
                     f"hybrid_layer_pattern length ({len(self.hybrid_layer_pattern)}) must equal "
                     f"num_hidden_layers ({self.num_hidden_layers})"
                 )
-            if any(self.hybrid_layer_pattern) and not (
+            # sliding_window is either ONE int (uniform) or a per-layer list -- the hierarchical
+            # form, e.g. 128 on the first windowed layer of a block and 512 on the second, so a
+            # block refines locally then widens. A list must cover EVERY layer, not just the
+            # windowed ones, so the index is the plain layer_idx and cannot drift out of step with
+            # hybrid_layer_pattern. Entries at global layers are ignored (write 0 or None there).
+            if isinstance(self.sliding_window, (list, tuple)):
+                if len(self.sliding_window) != self.num_hidden_layers:
+                    raise ValueError(
+                        f"sliding_window is a list of {len(self.sliding_window)} but the model has "
+                        f"{self.num_hidden_layers} layers; give one entry per layer (use 0/None on "
+                        f"global layers) so the index is layer_idx."
+                    )
+                per_layer = list(self.sliding_window)
+                bad = [(i, w) for i, (v, w) in enumerate(zip(self.hybrid_layer_pattern, per_layer))
+                       if v and not (isinstance(w, int) and w > 0)]
+                if bad:
+                    raise ValueError(
+                        f"hybrid_layer_pattern marks layer(s) {[i for i, _ in bad]} as windowed but "
+                        f"their sliding_window entries are {[w for _, w in bad]} -- those layers "
+                        f"would silently run FULL attention."
+                    )
+                # `sliding_window` itself must stay a SCALAR: transformers' DynamicCache reads it
+                # off the config to crop sliding layers (`-self.sliding_window + 1`) and a list
+                # raises TypeError there. Training never notices (use_cache=False); the eval and
+                # sampling paths would die. Keep the MAX here so the cache retains at least what
+                # the widest layer needs -- over-retaining is harmless because the band mask still
+                # restricts attention -- and read the real per-layer value off the attribute below.
+                self.sliding_window_per_layer = per_layer
+                self.sliding_window = max(w for w in per_layer if isinstance(w, int) and w > 0)
+            elif any(self.hybrid_layer_pattern) and not (
                 isinstance(self.sliding_window, int) and self.sliding_window > 0):
                 raise ValueError(
                     "hybrid_layer_pattern marks SWA layers but sliding_window is not a positive int "
