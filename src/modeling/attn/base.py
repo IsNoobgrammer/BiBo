@@ -60,8 +60,14 @@ class BiBoAttention(nn.Module):
 
         if config.layer_norm_type != "rms":
             raise ValueError("Only 'rms' layer_norm_type supported")
-        self.q_norm = BiBoRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = BiBoRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        # QK-norm is unconditional on GLOBAL layers. On windowed layers it is an ablation axis:
+        # MiMo-V2.5-Pro ships none anywhere, Gemma 4 applies it everywhere, and the argument for
+        # dropping it here is that a 128-token span already bounds the logit range that QK-norm
+        # exists to control. Identity keeps the forward path byte-identical and allocates no
+        # parameters, so the arm shows up as a real param-count delta rather than a dead flag.
+        _qk_norm = (not self.is_swa) or getattr(config, "swa_qk_norm", True)
+        self.q_norm = BiBoRMSNorm(self.head_dim, eps=config.rms_norm_eps) if _qk_norm else nn.Identity()
+        self.k_norm = BiBoRMSNorm(self.head_dim, eps=config.rms_norm_eps) if _qk_norm else nn.Identity()
 
     def forward(
         self,

@@ -268,6 +268,9 @@ def main():
     # each block, e.g. "128,512" -> first windowed layer of every block 128, second 512.
     ap.add_argument("--sliding_window", default="128")
     ap.add_argument("--swa_sink", type=_bool, default=True)   # False = the no-sink ablation arm
+    # QK-norm on the WINDOWED layers only (global layers always keep it). False = the arm that
+    # asks whether a 128-token span already bounds logits well enough to make it redundant.
+    ap.add_argument("--swa_qk_norm", type=_bool, default=True)
     ap.add_argument("--use_xsa", action="store_true")                             # ablation axis: XSA exclusive self-attention (default OFF)
     # Per-head rejection-strength LOGIT; strength = tanh(init). Ships with --use_xsa, it is not a
     # separate axis: learnable-alpha XSA beat fixed full-strength XSA by 20x the noise floor at
@@ -418,7 +421,7 @@ def main():
         _win = hswa_windows(_swa_pat, _win)              # hierarchical: per-LAYER list
     if _swa_pat is not None:
         print(f"[swa] pattern {_swa_pat} (1=windowed) window={_win} "
-              f"sink={args.swa_sink}", flush=True)
+              f"sink={args.swa_sink} qk_norm={args.swa_qk_norm}", flush=True)
     model, cfg = build_arm(args.arm, device=DEV, dtype=torch.float32, attn_impl=args.attn,  # fp32 master
                            bias_update_threshold=args.bias_update_threshold,
                            bias_update_factor=(None if args.bias_update_factor < 0 else args.bias_update_factor),
@@ -426,7 +429,7 @@ def main():
                            use_xsa=args.use_xsa,
                            xsa_alpha_init=args.xsa_alpha_init,
                            hybrid_layer_pattern=_swa_pat, sliding_window=_win,
-                           swa_sink=args.swa_sink,
+                           swa_sink=args.swa_sink, swa_qk_norm=args.swa_qk_norm,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
@@ -498,6 +501,7 @@ def main():
                 + (f"_swa{args.swa_pattern}w{str(args.sliding_window).replace(',', '-')}"
                    if args.swa_pattern != "none" else "")
                 + ("_nosink" if args.swa_pattern != "none" and not args.swa_sink else "")
+                + ("_noqkn" if args.swa_pattern != "none" and not args.swa_qk_norm else "")
                 # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"

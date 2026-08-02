@@ -99,7 +99,8 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          use_xsa=False, xsa_alpha_init=0.0,
                          pos_identity_expert=True, neg_identity_expert=True,
                          top_k=None, moe_intermediate_size=None, num_shared_experts=0,
-                         hybrid_layer_pattern=None, sliding_window=128, swa_sink=True):
+                         hybrid_layer_pattern=None, sliding_window=128, swa_sink=True,
+                         swa_qk_norm=True):
     from src.configuration_bibo import BiBoConfig
     return BiBoConfig(
         bias_update_threshold=bias_update_threshold,
@@ -131,6 +132,8 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
         add_swa_attention_sink_bias=bool(hybrid_layer_pattern) and swa_sink,
         hybrid_layer_pattern=hybrid_layer_pattern,
         sliding_window=sliding_window,
+        # Only meaningful with SWA; global layers keep QK-norm regardless.
+        swa_qk_norm=swa_qk_norm,
         use_shared_expert=bool(num_shared_experts),
         num_shared_experts=max(int(num_shared_experts), 1),
     )
