@@ -73,10 +73,13 @@ def apply_ssmax_query_scaling(query_states: torch.Tensor, kv_len: int, ssmax_sca
     #      bf16 -- double the bytes and an extra kernel for a value that is discarded.
     # Together: 174.7k -> 168.1k tok/s at 64x4x1024.
     #
-    # Casting the scale is safe for ds/dL, which is the non-obvious part. d(q*s)/ds = q, so the
-    # scale's own rounding never enters the gradient; the only bf16 exposure is grad_out, and
-    # grad_out is ALREADY bf16-valued here -- SDPA emits bf16, so its backward produces bf16
-    # gradients and the autocast cast-node merely re-types them to fp32. Keeping the scale in fp32
-    # buys precision against an fp32 grad_out that does not occur in training.
+    # What casting costs on ds/dL, measured rather than assumed: rel 1.9e-3, worst head 8.5e-3.
+    # d(q*s)/ds = q, so the scale's own rounding never enters the gradient. The error is that a
+    # bf16 output makes each grad_out*q PRODUCT round to bf16 before the (still fp32) reduction.
+    # Accepted: grad_out is already bf16-valued anyway -- SDPA emits bf16 and its backward hands
+    # back bf16 gradients that the autocast cast-node merely re-types -- so 0.2% puts ds/dL on
+    # exactly the same footing as every other gradient in the model, all of which come off bf16
+    # GEMMs, and AdamW normalizes by sqrt(v) before it reaches s. An exact-gradient version means
+    # a custom Function that upcasts inside the reduction; not worth 0.2%.
     # (In an fp32 run .to() is a no-op and everything stays fp32, as before.)
     return query_states * (ssmax_scale * log_n).to(query_states.dtype)
