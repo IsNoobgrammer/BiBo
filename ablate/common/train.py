@@ -243,6 +243,10 @@ def main():
     # p go NEGATIVE (gain r^p < 1, shrinking high-rms rows), which sigmoid cannot express.
     # Kernel act code 8 vs 10. Tag _ptanh.
     ap.add_argument("--radial_p", choices=["sigmoid", "tanh"], default="sigmoid")
+    # Expert activation. "radial" = r^p*SiLU(g/r), the adopted default. "silu" = plain SwiGLU
+    # (kernel act code 0), the arm that asks what the activation is still worth inside the current
+    # SWA+XSA stack. Kernel-path only -- src eager has been radial-only since the Aug 1 debloat.
+    ap.add_argument("--act", choices=["radial", "silu"], default="radial")
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
     # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
@@ -398,11 +402,19 @@ def main():
           f"(special_pairs={args.special_pairs})", flush=True)
     assert "moe" in patch_list, "the fused-moe patch is required: eager experts are ~3x slower"
     patchmod.RADIAL_P = args.radial_p
+    patchmod.EXPERT_ACT = args.act
+    assert args.act == "radial" or "moe" in patch_list, (
+        "--act silu steers the PATCHED expert forward; without the 'moe' patch src eager would "
+        "silently run radial anyway")
     # src's eager expert path hardcodes sigmoid, so --radial_p tanh is only real on the
     # patched Triton forward. Without the patch the run would silently be a sigmoid run.
     assert args.radial_p == "sigmoid" or "moe" in patch_list, (
         "--radial_p tanh requires the 'moe' patch (src eager is sigmoid-only)")
-    print(f"[act] radial p = {args.radial_p} (kernel act code {patchmod.RADIAL_CODES[args.radial_p]})", flush=True)
+    _glu_code = (patchmod.SILU_CODE if args.act == "silu"
+                 else patchmod.RADIAL_CODES[args.radial_p])
+    print(f"[act] expert activation = {args.act}"
+          + (f", radial p = {args.radial_p}" if args.act == "radial" else " (plain SwiGLU)")
+          + f" -> kernel act code {_glu_code}", flush=True)
     if args.swa_pattern == "none":
         _swa_pat = None
     elif args.swa_pattern == "block3":
@@ -502,6 +514,9 @@ def main():
                    if args.swa_pattern != "none" else "")
                 + ("_nosink" if args.swa_pattern != "none" and not args.swa_sink else "")
                 + ("_noqkn" if args.swa_pattern != "none" and not args.swa_qk_norm else "")
+                # activation is an axis again; an untagged silu arm would overwrite the radial
+                # control's ckpt/_result.json on the same seed+experts
+                + (f"_act{args.act}" if args.act != "radial" else "")
                 # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"

@@ -59,6 +59,12 @@ def patch_liger_rope():
 # silently compute code 8. train.py asserts the patch is present.
 RADIAL_P = "sigmoid"
 RADIAL_CODES = {"sigmoid": 8, "tanh": 10}
+# train.py sets this from --act. "silu" swaps the GLU experts to plain SwiGLU (kernel act code 0,
+# the same code the Qwen arm uses) so the activation itself becomes an ablation axis again inside
+# the otherwise-current stack. src's eager path has been radial-only since the Aug 1 debloat and is
+# NOT switched by this -- training runs the patched path, and train.py asserts the patch is on.
+EXPERT_ACT = "radial"
+SILU_CODE = 0
 POS_IDENTITY_CODE = 3
 NEG_IDENTITY_CODE = 4
 
@@ -112,7 +118,8 @@ def patch_fused_moe():
                 _assert_kernel_does_neg_identity(hidden_states.device, hidden_states.dtype)
                 _neg_identity_checked.append(True)
                 print("[moe] kernel probe: act code 4 == -Identity (-w*x) OK", flush=True)
-            lst = ([RADIAL_CODES[RADIAL_P]] * self.num_glu_experts
+            _glu_code = SILU_CODE if EXPERT_ACT == "silu" else RADIAL_CODES[RADIAL_P]
+            lst = ([_glu_code] * self.num_glu_experts
                    + [POS_IDENTITY_CODE] * (self.pos_end - self.pos_start)
                    + [NEG_IDENTITY_CODE] * n_neg)
             codes = torch.tensor(lst, dtype=torch.int32, device=hidden_states.device)
@@ -122,11 +129,18 @@ def patch_fused_moe():
         # act_params rows are indexed by EXPERT ID, so the ±Identity specials need rows too even
         # though nothing reads them: radial_theta is only (num_glu,). Passing the short tensor makes
         # backward hand autograd a gradient of the wrong shape, several frames from the cause.
-        n_pad = self.neg_end - self.num_glu_experts
-        ap = self.radial_theta
-        if n_pad:
-            ap = torch.cat([ap, ap.new_zeros(n_pad)])
-        ap = ap.unsqueeze(1)
+        # act code 0 does not read act_params. Passing None rather than the tensor makes that
+        # explicit: radial_theta then provably cannot reach the kernel, so it takes no gradient and
+        # `p` stays pinned at its init in the log -- a live check that the --act silu arm really is
+        # SiLU and not radial wearing a different tag.
+        if EXPERT_ACT == "silu":
+            ap = None
+        else:
+            n_pad = self.neg_end - self.num_glu_experts
+            ap = self.radial_theta
+            if n_pad:
+                ap = torch.cat([ap, ap.new_zeros(n_pad)])
+            ap = ap.unsqueeze(1)
         if _DISPATCH != "per_expert" and _code_max(codes) <= 4:
             from kernels.sm120.moe_grouped import moe_grouped_cublas_polyglu, grouped_supported
             if grouped_supported(hidden_states, self.gate_up_proj, self.down_proj):
