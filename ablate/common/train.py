@@ -15,7 +15,7 @@ import argparse
 import contextlib
 import torch
 from .models import build_arm, count_params
-from .configs import SHARED, glu_count
+from .configs import SHARED, glu_count, swa_block_pattern
 from . import patches as patchmod
 from .optim import build_optimizers
 from .schedule import make_scheduler, make_wd_schedule
@@ -261,6 +261,11 @@ def main():
     ap.add_argument("--router_log", type=int, default=1)
     ap.add_argument("--router_optim", choices=["muon","adamw"], default="muon")  # router proj optimizer; muon = current default (2D -> Muon by the ndim rule); tag _radamw      # per-step router mechanics (GPU-accumulated, 1 sync per log_every)
     # MoE-branch magnitude knobs (applied AFTER the top-k norm; normalization sets the SPLIT, these set LOUDNESS)
+    # SWA. "block3" = [G,S,S] x N + a global tail (configs.swa_block_pattern); "none" = all global;
+    # or an explicit comma list of 0/1 per layer. The sink defaults ON with SWA -- see configs.
+    ap.add_argument("--swa_pattern", default="none")
+    ap.add_argument("--sliding_window", type=int, default=128)
+    ap.add_argument("--swa_sink", type=_bool, default=True)   # False = the no-sink ablation arm
     ap.add_argument("--use_xsa", action="store_true")                             # ablation axis: XSA exclusive self-attention (default OFF)
     # Per-head rejection-strength LOGIT; strength = tanh(init). Ships with --use_xsa, it is not a
     # separate axis: learnable-alpha XSA beat fixed full-strength XSA by 20x the noise floor at
@@ -393,12 +398,26 @@ def main():
     assert args.radial_p == "sigmoid" or "moe" in patch_list, (
         "--radial_p tanh requires the 'moe' patch (src eager is sigmoid-only)")
     print(f"[act] radial p = {args.radial_p} (kernel act code {patchmod.RADIAL_CODES[args.radial_p]})", flush=True)
+    if args.swa_pattern == "none":
+        _swa_pat = None
+    elif args.swa_pattern == "block3":
+        _swa_pat = swa_block_pattern(SHARED["num_hidden_layers"])
+    else:
+        _swa_pat = [int(v) for v in args.swa_pattern.split(",")]
+        assert len(_swa_pat) == SHARED["num_hidden_layers"], (
+            f"--swa_pattern has {len(_swa_pat)} entries, model has "
+            f"{SHARED['num_hidden_layers']} layers")
+    if _swa_pat is not None:
+        print(f"[swa] pattern {_swa_pat} (1=windowed) window={args.sliding_window} "
+              f"sink={args.swa_sink}", flush=True)
     model, cfg = build_arm(args.arm, device=DEV, dtype=torch.float32, attn_impl=args.attn,  # fp32 master
                            bias_update_threshold=args.bias_update_threshold,
                            bias_update_factor=(None if args.bias_update_factor < 0 else args.bias_update_factor),
                            aux_coef=args.aux_coef, num_experts=n_total, special_pairs=args.special_pairs,
                            use_xsa=args.use_xsa,
                            xsa_alpha_init=args.xsa_alpha_init,
+                           hybrid_layer_pattern=_swa_pat, sliding_window=args.sliding_window,
+                           swa_sink=args.swa_sink,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
@@ -463,6 +482,11 @@ def main():
                 # the control had to be rescued mid-flight by renaming its artifacts.
                 + ("_xsa" if args.use_xsa else "")
                 + (f"_xaI{args.xsa_alpha_init:g}" if args.use_xsa and args.xsa_alpha_init else "")
+                # SWA arms differ from their control by nothing else in the name; untagged they
+                # would overwrite the control's _final.pt / _result.json.
+                + (f"_swa{args.swa_pattern}w{args.sliding_window}"
+                   if args.swa_pattern != "none" else "")
+                + ("_nosink" if args.swa_pattern != "none" and not args.swa_sink else "")
                 # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"

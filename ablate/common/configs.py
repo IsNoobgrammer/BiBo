@@ -61,11 +61,25 @@ def make_qwen_config(attn_impl="sdpa", aux_coef=0.001, num_experts=None):
     return cfg
 
 
+def swa_block_pattern(n_layers):
+    """[global, swa, swa] x N, plus a final global layer.
+
+    n_layers=10 -> [0,1,1, 0,1,1, 0,1,1, 0]: three blocks then a global tail. Global layers land on
+    0 and 9, which are exactly SHARED['mlp_only_layers'] -- the dense-FFN layers are also the
+    full-attention ones, so every block is (global attn + dense FFN) followed by two windowed MoE
+    layers. Requires n_layers % 3 == 1 to come out even."""
+    if n_layers % 3 != 1:
+        raise ValueError(f"swa_block_pattern wants n_layers % 3 == 1 (got {n_layers}); the "
+                         f"[G,S,S] block plus a global tail does not tile otherwise")
+    return [0 if i % 3 == 0 else 1 for i in range(n_layers - 1)] + [0]
+
+
 def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          num_experts=None, special_pairs=0,
                          use_xsa=False, xsa_alpha_init=0.0,
                          pos_identity_expert=True, neg_identity_expert=True,
-                         top_k=None, moe_intermediate_size=None, num_shared_experts=0):
+                         top_k=None, moe_intermediate_size=None, num_shared_experts=0,
+                         hybrid_layer_pattern=None, sliding_window=128, swa_sink=True):
     from src.configuration_bibo import BiBoConfig
     return BiBoConfig(
         bias_update_threshold=bias_update_threshold,
@@ -88,14 +102,15 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
         partial_rotary_factor=PARTIAL_ROPE,
         # --- everything else stripped to Qwen-equivalence ---
         use_xsa=use_xsa, xsa_alpha_init=xsa_alpha_init,
-        # PINNED OFF, and it must stay pinned until src drops the flag. BiBoConfig still defaults
-        # use_ssmax=True, so DELETING this line does not make the ablation SSMax-free -- it turns
-        # SSMax ON in every arm, silently. Refuted at 524M: worse training loss than the XSA
-        # baseline in every window from step 500 on (+0.0097 by [1500,2000)) and +0.00263 bpb.
-        # See docs/ssmax.md.
-        use_ssmax=False,
-        add_full_attention_sink_bias=False, add_swa_attention_sink_bias=False,
-        hybrid_layer_pattern=None,
+        add_full_attention_sink_bias=False,
+        # The sink is the DESIGN NORM for windowed layers, not an optional extra: a window slides
+        # past BOS, so the natural always-visible dump bucket disappears exactly when the window
+        # moves on (docs/attention_layers.md S3). It therefore defaults ON whenever SWA is on, and
+        # `swa_sink=False` is a deliberate ablation arm, not a config you should reach by accident.
+        # It stays False on an all-global model so the pattern=None default allocates no sink params.
+        add_swa_attention_sink_bias=bool(hybrid_layer_pattern) and swa_sink,
+        hybrid_layer_pattern=hybrid_layer_pattern,
+        sliding_window=sliding_window,
         use_shared_expert=bool(num_shared_experts),
         num_shared_experts=max(int(num_shared_experts), 1),
     )
