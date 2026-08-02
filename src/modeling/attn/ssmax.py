@@ -3,6 +3,22 @@ import torch
 
 __all__ = ['apply_ssmax_query_scaling']
 
+# log(n) per query position depends only on (kv_len, q_len, device) -- never on the data -- and
+# training calls this with one shape forever. Caching it drops an arange + clamp + log from every
+# attention layer of every micro-batch. ponytail: unbounded dict, but the keys are shapes; the
+# variable-length eval tops out around 150 entries of <=2048 floats. Bound it if that ever changes.
+_LOGN = {}
+
+
+def _log_n(kv_len, q_len, device):
+    key = (kv_len, q_len, device)
+    v = _LOGN.get(key)
+    if v is None:
+        n = torch.arange(kv_len - q_len + 1, kv_len + 1, device=device, dtype=torch.float32)
+        v = torch.log(n.clamp(min=1.0)).view(1, 1, q_len, 1)
+        _LOGN[key] = v
+    return v
+
 
 def apply_ssmax_query_scaling(query_states: torch.Tensor, kv_len: int, ssmax_scale: torch.nn.Parameter,
                               context_lens: torch.Tensor = None) -> torch.Tensor:
@@ -42,9 +58,15 @@ def apply_ssmax_query_scaling(query_states: torch.Tensor, kv_len: int, ssmax_sca
     q_len = query_states.shape[-2]
     if context_lens is not None:
         n = context_lens.to(torch.float32).view(context_lens.shape[0], 1, q_len, 1)
+        log_n = torch.log(n.clamp(min=1.0))
     else:
         # Causal context length per query position: n_j = (kv_len - q_len) + j + 1
-        n = torch.arange(kv_len - q_len + 1, kv_len + 1,
-                         device=query_states.device, dtype=torch.float32).view(1, 1, q_len, 1)
-    log_n = torch.log(n.clamp(min=1.0)).to(query_states.dtype)
-    return query_states * ssmax_scale * log_n
+        log_n = _log_n(kv_len, q_len, query_states.device)
+    # Collapse s and log(n) into ONE broadcast scale before touching q. Written as
+    # `q * ssmax_scale * log_n` this is TWO passes over the full (B,H,q_len,D) tensor, each
+    # materializing an fp32 copy of it (q is bf16 under autocast; the fp32 ssmax_scale promotes
+    # it) and each saved for backward. Measured 174.7k -> 168.1k tok/s at 64x4x1024. The combined
+    # scale is (1,H,q_len,1) -- 8k elements -- so folding it costs nothing and leaves one pass.
+    # Kept in fp32 deliberately: ds/dL is a reduction over every element q touches, and doing that
+    # reduction in bf16 would quantize the gradient of the one parameter this feature is about.
+    return query_states * (ssmax_scale * log_n)

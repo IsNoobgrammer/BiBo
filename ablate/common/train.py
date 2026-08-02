@@ -638,9 +638,14 @@ def main():
             # full rejection. Reported in tanh units, not logits, because "off" has to be readable
             # at a glance -- an arm that never switches XSA on is a null, not a win.
             rt.update(patchmod.xsa_alpha_stats(model))
-            xa_s = (f" xa={rt['train/xsa_a_mean']:+.3f}"
-                    f"[{rt['train/xsa_a_min']:+.2f},{rt['train/xsa_a_max']:+.2f}]"
-                    if "train/xsa_a_mean" in rt else "")
+            rt.update(patchmod.ssmax_stats(model))
+            xa_s = ((f" xa={rt['train/xsa_a_mean']:+.3f}"
+                     f"[{rt['train/xsa_a_min']:+.2f},{rt['train/xsa_a_max']:+.2f}]"
+                     if "train/xsa_a_mean" in rt else "")
+                    # C = s*log(1024): 1.0 is plain softmax, >1 sharper, <0 would be inverted
+                    + (f" C={rt['train/ssmax_C_mean']:.3f}"
+                       f"[{rt['train/ssmax_s_min']:+.3f},{rt['train/ssmax_s_max']:+.3f}]"
+                       if "train/ssmax_C_mean" in rt else ""))
             aS_s = xa_s
             _th = [m.radial_theta for m in model.modules() if hasattr(m, "radial_theta")]
             if _th:
