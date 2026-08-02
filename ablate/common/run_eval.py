@@ -2,6 +2,14 @@
 Use this to re-score an old checkpoint or run the full suite (incl length-extrap) on demand.
 
   python -m ablate.common.run_eval --arm bibo_min --ckpt runs/bibo_min_seed0_final.pt --wandb
+
+ARCHITECTURE COMES FROM THE CHECKPOINT'S OWN _result.json, not from flags here. This used to call
+build_arm() with no architecture kwargs at all, so a 64-expert SWA+XSA checkpoint was loaded into a
+default 6-expert global model -- and because the load was strict=False, every mismatched key was
+dropped in silence and the eval reported confident nonsense. train.py already writes
+`{"config": vars(args)}` into <run>_result.json next to the .pt, so the run is reproducible from
+disk; this just reads it. The load is strict by default now, which turns that whole failure class
+into an exception instead of a plausible number.
 """
 from . import _paths  # noqa: F401
 import os
@@ -9,6 +17,7 @@ import json
 import argparse
 import torch
 from .models import build_arm
+from .configs import SHARED, resolve_swa
 from . import patches as patchmod
 from .evaluate import evaluate, Tok, summarize
 
@@ -16,10 +25,56 @@ DEV = "cuda"
 _DT = {"bf16": torch.bfloat16, "fp32": torch.float32}
 
 
+def _sidecar(ckpt):
+    """<run>_final.pt / <run>_step900.pt -> <run>_result.json, or None."""
+    base = os.path.basename(ckpt)
+    for suf in ("_final.pt", ".pt"):
+        if base.endswith(suf):
+            stem = base[: -len(suf)]
+            break
+    stem = stem.split("_step")[0]
+    p = os.path.join(os.path.dirname(os.path.abspath(ckpt)), f"{stem}_result.json")
+    return p if os.path.exists(p) else None
+
+
+def _arch_kwargs(c):
+    """build_arm(**kwargs) reproducing the architecture a training run built from `c` = its saved
+    vars(args). Every key defaulted, so a result.json written before an axis existed still loads."""
+    pattern, window = resolve_swa(c.get("swa_pattern", "none"),
+                                  c.get("sliding_window", 128),
+                                  SHARED["num_hidden_layers"])
+    bias_factor = c.get("bias_update_factor", -1)
+    return dict(
+        num_experts=c.get("experts") or None,
+        special_pairs=c.get("special_pairs", 0),
+        use_xsa=c.get("use_xsa", False),
+        xsa_alpha_init=c.get("xsa_alpha_init", 0.0),
+        pos_identity_expert=c.get("pos_identity_expert", True),
+        neg_identity_expert=c.get("neg_identity_expert", True),
+        top_k=(c.get("top_k") or None),
+        moe_intermediate_size=(c.get("moe_inter") or None),
+        num_shared_experts=c.get("n_shared", 0),
+        hybrid_layer_pattern=pattern,
+        sliding_window=window,
+        swa_sink=c.get("swa_sink", True),
+        swa_qk_norm=c.get("swa_qk_norm", True),
+        bias_update_threshold=c.get("bias_update_threshold", 10240),
+        bias_update_factor=(None if bias_factor is not None and bias_factor < 0 else bias_factor),
+        aux_coef=c.get("aux_coef", 0.001),
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", choices=["qwen", "bibo_min"], required=True)
     ap.add_argument("--ckpt", required=True)
+    # Architecture source. Defaults to the <run>_result.json sitting next to the checkpoint.
+    ap.add_argument("--result_json", default=None,
+                    help="training run's _result.json; auto-discovered from --ckpt if omitted")
+    ap.add_argument("--allow_default_arch", action="store_true",
+                    help="build the stock architecture when no _result.json exists (unsafe)")
+    ap.add_argument("--loose_load", action="store_true",
+                    help="strict=False state_dict load; hides architecture mismatches")
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")
     ap.add_argument("--attn", choices=["sdpa", "flash_attention_4"], default="sdpa")
     ap.add_argument("--patches", default="liger_norm,liger_rope,moe")
@@ -36,9 +91,36 @@ def main():
     args = ap.parse_args()
 
     dt = _DT[args.precision]
-    model, cfg = build_arm(args.arm, device=DEV, dtype=torch.float32, attn_impl=args.attn)
+
+    # Architecture + activation from the run's own saved args. The activation lives on patchmod
+    # (module-level, read at kernel-dispatch time), so it MUST be set before the first forward or
+    # a silu checkpoint gets evaluated with radial experts.
+    res_path = args.result_json or _sidecar(args.ckpt)
+    kw = {}
+    if res_path:
+        saved = json.load(open(res_path))["config"]
+        kw = _arch_kwargs(saved)
+        patchmod.RADIAL_P = saved.get("radial_p", "sigmoid")
+        patchmod.EXPERT_ACT = saved.get("act", "radial")
+        print(f"[eval] architecture from {os.path.basename(res_path)}: "
+              f"act={patchmod.EXPERT_ACT} experts={kw['num_experts']} top_k={kw['top_k']} "
+              f"xsa={kw['use_xsa']} swa={kw['hybrid_layer_pattern']} window={kw['sliding_window']} "
+              f"sink={kw['swa_sink']} qk_norm={kw['swa_qk_norm']}", flush=True)
+    elif args.allow_default_arch:
+        print("[eval] WARNING: no _result.json found; building the DEFAULT architecture. This is "
+              "only correct for a checkpoint trained with stock settings.", flush=True)
+    else:
+        raise SystemExit(
+            f"no _result.json next to {args.ckpt} and --result_json not given. The architecture "
+            f"cannot be inferred from the state dict, and guessing it produced silent nonsense "
+            f"before this check existed. Pass --result_json, or --allow_default_arch if you are "
+            f"certain the checkpoint is stock.")
+
+    model, cfg = build_arm(args.arm, device=DEV, dtype=torch.float32, attn_impl=args.attn, **kw)
     patchmod.apply([p for p in args.patches.split(",") if p.strip() and p.strip() != "ce"])
-    model.load_state_dict(torch.load(args.ckpt, map_location=DEV), strict=False)
+    # strict by default: a shape/key mismatch means the rebuilt architecture is wrong, and a
+    # silently partial load is indistinguishable from a real result downstream.
+    model.load_state_dict(torch.load(args.ckpt, map_location=DEV), strict=not args.loose_load)
     tok = Tok()
     lengths = tuple(int(x) for x in args.extrap_lengths.split(",") if x.strip()) or None
 

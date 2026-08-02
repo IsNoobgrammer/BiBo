@@ -15,7 +15,7 @@ import argparse
 import contextlib
 import torch
 from .models import build_arm, count_params
-from .configs import SHARED, glu_count, swa_block_pattern, hswa_windows
+from .configs import SHARED, glu_count, swa_block_pattern, hswa_windows, resolve_swa
 from . import patches as patchmod
 from .optim import build_optimizers
 from .schedule import make_scheduler, make_wd_schedule
@@ -398,7 +398,7 @@ def main():
               "the combine weights and they will NOT sum to 1.", flush=True)
     n_total = args.experts or SHARED["num_experts"]
     n_glu = glu_count(n_total, args.special_pairs, args.pos_identity_expert, args.neg_identity_expert)
-    print(f"[experts] {n_total} routed = {n_glu} GLU (radial) + {n_total - n_glu} +/-Identity "
+    print(f"[experts] {n_total} routed = {n_glu} GLU ({args.act}) + {n_total - n_glu} +/-Identity "
           f"(special_pairs={args.special_pairs})", flush=True)
     assert "moe" in patch_list, "the fused-moe patch is required: eager experts are ~3x slower"
     patchmod.RADIAL_P = args.radial_p
@@ -415,22 +415,8 @@ def main():
     print(f"[act] expert activation = {args.act}"
           + (f", radial p = {args.radial_p}" if args.act == "radial" else " (plain SwiGLU)")
           + f" -> kernel act code {_glu_code}", flush=True)
-    if args.swa_pattern == "none":
-        _swa_pat = None
-    elif args.swa_pattern == "block3":
-        _swa_pat = swa_block_pattern(SHARED["num_hidden_layers"])
-    else:
-        _swa_pat = [int(v) for v in args.swa_pattern.split(",")]
-        assert len(_swa_pat) == SHARED["num_hidden_layers"], (
-            f"--swa_pattern has {len(_swa_pat)} entries, model has "
-            f"{SHARED['num_hidden_layers']} layers")
-    _win = [int(v) for v in str(args.sliding_window).split(",")]
-    if len(_win) == 1:
-        _win = _win[0]                                   # uniform: keep the plain int
-    elif _swa_pat is None:
-        raise SystemExit("--sliding_window got a list but --swa_pattern is none")
-    else:
-        _win = hswa_windows(_swa_pat, _win)              # hierarchical: per-LAYER list
+    # Shared with run_eval.py so a checkpoint's architecture can be reproduced exactly.
+    _swa_pat, _win = resolve_swa(args.swa_pattern, args.sliding_window, SHARED["num_hidden_layers"])
     if _swa_pat is not None:
         print(f"[swa] pattern {_swa_pat} (1=windowed) window={_win} "
               f"sink={args.swa_sink} qk_norm={args.swa_qk_norm}", flush=True)

@@ -94,6 +94,32 @@ def hswa_windows(pattern, windows):
     return out
 
 
+def resolve_swa(swa_pattern, sliding_window, n_layers):
+    """(--swa_pattern, --sliding_window) -> (hybrid_layer_pattern, sliding_window) for build_arm.
+
+    Lives here rather than in train.py because run_eval.py has to reproduce a checkpoint's
+    architecture EXACTLY. Two copies of this drift, and the failure is silent: the eval builds a
+    subtly different model, load_state_dict swallows the mismatch, and the numbers are garbage
+    with no error anywhere.
+    """
+    if swa_pattern in (None, "none"):
+        pattern = None
+    elif swa_pattern == "block3":
+        pattern = swa_block_pattern(n_layers)
+    else:
+        pattern = [int(v) for v in str(swa_pattern).split(",")]
+        if len(pattern) != n_layers:
+            raise ValueError(f"swa_pattern has {len(pattern)} entries, model has {n_layers} layers")
+    win = [int(v) for v in str(sliding_window).split(",")]
+    if len(win) == 1:
+        win = win[0]                                  # uniform: keep the plain int
+    elif pattern is None:
+        raise ValueError("sliding_window is a list but swa_pattern is none")
+    else:
+        win = hswa_windows(pattern, win)              # hierarchical: per-LAYER list
+    return pattern, win
+
+
 def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          num_experts=None, special_pairs=0,
                          use_xsa=False, xsa_alpha_init=0.0,
