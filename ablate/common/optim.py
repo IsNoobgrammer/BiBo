@@ -144,7 +144,7 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
     # ramp runs p 0.11 -> 0.93, i.e. theta from about -2.1 to +2.6. AdamW at adam_lr=5e-4 moves it
     # ~0.5 over 2000 steps, so it needs its own group and its own lr. wd=0: decay on an exponent
     # would just re-impose the lr/wd equilibrium this axis exists to escape.
-    _is_as = lambda n: "radial_theta" in n
+    _is_as = lambda n: "radial_theta" in n or "xsa_alpha" in n
     a_scale = [p for n, p in other if _is_as(n)]
     rest = [p for n, p in other if not _is_as(n)]
     if a_scale and act_scale_lr:

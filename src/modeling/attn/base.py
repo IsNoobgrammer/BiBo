@@ -44,6 +44,13 @@ class BiBoAttention(nn.Module):
                     or (not self.is_swa and config.add_full_attention_sink_bias))
         self.attention_sink_bias = nn.Parameter(torch.zeros(self.num_heads)) if use_sink else None
 
+        # XSA rejection strength, one LEARNABLE logit per head; the applied strength is
+        # tanh(xsa_alpha). Default init 0 -> tanh(0) = 0 -> XSA starts OFF and the model has to
+        # switch it on, which is the configuration that won the 524M A/B. Not optional when
+        # use_xsa: XSA and its learnable strength ship together.
+        self.xsa_alpha = (nn.Parameter(torch.full((self.num_heads,), float(config.xsa_alpha_init)))
+                          if self.use_xsa else None)
+
         if self.use_ssmax:
             # init so scale*log(typical_kv_len) ≈ 1.0 at step 0 — starts neutral instead of ~6x sharp
             typical_log = math.log(max(config.max_position_embeddings / 2, 2.0))
@@ -127,7 +134,8 @@ class BiBoAttention(nn.Module):
 
         # XSA: enable_gqa broadcasts V across the query group (no repeat_kv copy).
         if self.use_xsa:
-            attn_output = apply_xsa(attn_output, value_states, enable_gqa=True)
+            attn_output = apply_xsa(attn_output, value_states, enable_gqa=True,
+                                    alpha=self.xsa_alpha)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(*input_shape, -1)

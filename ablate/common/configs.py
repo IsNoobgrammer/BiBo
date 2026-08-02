@@ -63,7 +63,7 @@ def make_qwen_config(attn_impl="sdpa", aux_coef=0.001, num_experts=None):
 
 def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          num_experts=None, special_pairs=0,
-                         use_ssmax=False, use_xsa=False,
+                         use_ssmax=False, use_xsa=False, xsa_alpha_init=0.0,
                          pos_identity_expert=True, neg_identity_expert=True,
                          top_k=None, moe_intermediate_size=None, num_shared_experts=0):
     from src.configuration_bibo import BiBoConfig
@@ -87,7 +87,7 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
         neg_identity_expert=neg_identity_expert,
         partial_rotary_factor=PARTIAL_ROPE,
         # --- everything else stripped to Qwen-equivalence ---
-        use_xsa=use_xsa, use_ssmax=use_ssmax,
+        use_xsa=use_xsa, xsa_alpha_init=xsa_alpha_init, use_ssmax=use_ssmax,
         add_full_attention_sink_bias=False, add_swa_attention_sink_bias=False,
         hybrid_layer_pattern=None,
         use_shared_expert=bool(num_shared_experts),

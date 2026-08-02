@@ -50,7 +50,15 @@ def patch_liger_rope():
 
 
 # ───────────────────────── fused MoE ─────────────────────────
-RADIAL_CODE = 8       # kernels: 8 = radial NormSiLU (r^p * SiLU(g/r), p = sigmoid(theta))
+# 8  = radial NormSiLU, p = sigmoid(theta) in (0,1): gain r^p bounded by [1, r], p->0 IS normsilu.
+# 10 = radial NormSiLU, p = tanh(theta) in (-1,1): additionally admits gain < 1 (r^-1 shrinks
+#      high-rms rows). Motivated by measured dL/dp > 0 in 6/6 layers at low p on a trained k=8
+#      checkpoint -- the model asking for a steeper ramp than sigmoid's floor allows.
+# train.py sets RADIAL_P from --radial_p. NOTE this steers the PATCHED (Triton) forward only;
+# src's eager BiBoFusedExperts hardcodes sigmoid, so a code-10 run without the 'moe' patch would
+# silently compute code 8. train.py asserts the patch is present.
+RADIAL_P = "sigmoid"
+RADIAL_CODES = {"sigmoid": 8, "tanh": 10}
 POS_IDENTITY_CODE = 3
 NEG_IDENTITY_CODE = 4
 
@@ -104,7 +112,7 @@ def patch_fused_moe():
                 _assert_kernel_does_neg_identity(hidden_states.device, hidden_states.dtype)
                 _neg_identity_checked.append(True)
                 print("[moe] kernel probe: act code 4 == -Identity (-w*x) OK", flush=True)
-            lst = ([RADIAL_CODE] * self.num_glu_experts
+            lst = ([RADIAL_CODES[RADIAL_P]] * self.num_glu_experts
                    + [POS_IDENTITY_CODE] * (self.pos_end - self.pos_start)
                    + [NEG_IDENTITY_CODE] * n_neg)
             codes = torch.tensor(lst, dtype=torch.int32, device=hidden_states.device)
@@ -143,6 +151,16 @@ def patch_fused_moe():
 
 
 # ───────────────────────── fused XSA (BiBo only) ─────────────────────────
+def xsa_alpha_stats(model):
+    """tanh(alpha) summary for the log line: 0 = XSA off on that head, 1 = full rejection."""
+    vals = [m.xsa_alpha for m in model.modules() if getattr(m, "xsa_alpha", None) is not None]
+    if not vals:
+        return {}
+    a = torch.tanh(torch.cat([v.detach().float().flatten() for v in vals]))
+    return {"train/xsa_a_mean": a.mean().item(), "train/xsa_a_min": a.min().item(),
+            "train/xsa_a_max": a.max().item()}
+
+
 def patch_fused_xsa():
     """Route src's eager apply_xsa through the tkf Triton kernel.
 
@@ -153,12 +171,16 @@ def patch_fused_xsa():
     look like 'XSA hurts quality' in an A/B and send the whole round the wrong way.
 
     Slices V to the query positions before the call, mirroring eager. For packed training
-    q_len == kv_len so it is a no-op; it matters only for cached decode."""
+    q_len == kv_len so it is a no-op; it matters only for cached decode.
+
+    `alpha` is src's per-head logit, forwarded verbatim: the kernel applies tanh(alpha) and
+    returns the gradient already chained through the tanh, so both paths take the same argument
+    and mean the same thing by it (parity_check/parity_xsa_alpha.py pins that)."""
     from kernels.sm120.xsa import fused_xsa
     import src.modeling.attn.base as base
 
-    def _xsa(attn_output, value_states, enable_gqa=True):
-        return fused_xsa(attn_output, value_states[:, :, -attn_output.shape[2]:, :])
+    def _xsa(attn_output, value_states, enable_gqa=True, alpha=None):
+        return fused_xsa(attn_output, value_states[:, :, -attn_output.shape[2]:, :], alpha)
     base.apply_xsa = _nc(_xsa)
 
 

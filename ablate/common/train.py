@@ -239,6 +239,10 @@ def main():
     # Sharing adam_lr would leave p stuck near its 0.5 init and look like "the axis does nothing".
     # 0 = share --adam_lr (the old default; kept so the A/B is one flag).
     ap.add_argument("--act_scale_lr", type=float, default=0.01)
+    # radial p parameterization. sigmoid = every result on the board; tanh additionally lets
+    # p go NEGATIVE (gain r^p < 1, shrinking high-rms rows), which sigmoid cannot express.
+    # Kernel act code 8 vs 10. Tag _ptanh.
+    ap.add_argument("--radial_p", choices=["sigmoid", "tanh"], default="sigmoid")
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
     # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
@@ -259,6 +263,11 @@ def main():
     # MoE-branch magnitude knobs (applied AFTER the top-k norm; normalization sets the SPLIT, these set LOUDNESS)
     ap.add_argument("--use_ssmax", action="store_true")                           # ablation axis: SSMax scalable softmax (default OFF)
     ap.add_argument("--use_xsa", action="store_true")                             # ablation axis: XSA exclusive self-attention (default OFF)
+    # Per-head rejection-strength LOGIT; strength = tanh(init). Ships with --use_xsa, it is not a
+    # separate axis: learnable-alpha XSA beat fixed full-strength XSA by 20x the noise floor at
+    # matched step 1000, so full strength (init inf) is not on the menu. 0 = XSA starts OFF and the
+    # model has to switch it on, which is what that run did. Tag _xaI<v> when moved off 0.
+    ap.add_argument("--xsa_alpha_init", type=float, default=0.0)
     ap.add_argument("--n_shared", type=int, default=0)   # shared experts as a WIDTH multiple of moe_intermediate_size (Kimi K3 form). 0 = no shared expert. Added UNSCALED to the routed sum. Tag _sh<N>
     # Per-token norm on the MoE BLOCK OUTPUT (combined expert sum) just before the residual add.
     # "rms" keeps a learnable per-channel gain; "unit" is gain-free so ONLY the mixture direction
@@ -379,16 +388,30 @@ def main():
     print(f"[experts] {n_total} routed = {n_glu} GLU (radial) + {n_total - n_glu} +/-Identity "
           f"(special_pairs={args.special_pairs})", flush=True)
     assert "moe" in patch_list, "the fused-moe patch is required: eager experts are ~3x slower"
+    patchmod.RADIAL_P = args.radial_p
+    # src's eager expert path hardcodes sigmoid, so --radial_p tanh is only real on the
+    # patched Triton forward. Without the patch the run would silently be a sigmoid run.
+    assert args.radial_p == "sigmoid" or "moe" in patch_list, (
+        "--radial_p tanh requires the 'moe' patch (src eager is sigmoid-only)")
+    print(f"[act] radial p = {args.radial_p} (kernel act code {patchmod.RADIAL_CODES[args.radial_p]})", flush=True)
     model, cfg = build_arm(args.arm, device=DEV, dtype=torch.float32, attn_impl=args.attn,  # fp32 master
                            bias_update_threshold=args.bias_update_threshold,
                            bias_update_factor=(None if args.bias_update_factor < 0 else args.bias_update_factor),
                            aux_coef=args.aux_coef, num_experts=n_total, special_pairs=args.special_pairs,
                            use_ssmax=args.use_ssmax, use_xsa=args.use_xsa,
+                           xsa_alpha_init=args.xsa_alpha_init,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
                            num_shared_experts=args.n_shared)
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
+    if args.use_xsa:
+        # An --use_xsa arm whose alpha never got built would silently be a control run wearing the
+        # xsa tag. Count them rather than trust the config plumbing (that failure has happened).
+        _nxa = sum(1 for m in model.modules() if getattr(m, "xsa_alpha", None) is not None)
+        assert _nxa, "--use_xsa but 0 modules carry xsa_alpha -- the arm would be silently inert"
+        print(f"[xsa] learnable alpha on {_nxa} attn modules, init {args.xsa_alpha_init:g} "
+              f"-> tanh = {math.tanh(args.xsa_alpha_init):.3f}", flush=True)
     total, trainable, active = count_params(model)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
     # router mechanics traced on the TRAINING stream (eval-time MoEStats sees eval data only, every
@@ -435,6 +458,11 @@ def main():
     # The acts- tag is gone: radial is the only activation src implements, so every bibo_min run has it.
     run_name = (f"{args.arm}_seed{args.seed}"
                 + (("_aS" + f"{args.act_scale_lr:g}") if args.act_scale_lr else "")
+                + ("_ptanh" if args.radial_p == "tanh" else "")
+                # XSA MUST be tagged: without it the xsa arm shares a run name with its own
+                # control and overwrites its _final.pt / _result.json. That happened once --
+                # the control had to be rescued mid-flight by renaming its artifacts.
+                + ("_xsa" if args.use_xsa else "")
                 # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
@@ -606,7 +634,14 @@ def main():
             # interpretable quantity: p->0 IS normsilu, p->1 is full magnitude. The trained shape is a
             # DEPTH RAMP (0.11 early -> 0.93 late), so a p pinned near its 0.5 init across every layer
             # means theta is not travelling and --act_scale_lr is too low, NOT that the axis is dead.
-            aS_s = ""
+            # xa = tanh(xsa_alpha), the APPLIED rejection strength: 0 = XSA off on that head, 1 =
+            # full rejection. Reported in tanh units, not logits, because "off" has to be readable
+            # at a glance -- an arm that never switches XSA on is a null, not a win.
+            rt.update(patchmod.xsa_alpha_stats(model))
+            xa_s = (f" xa={rt['train/xsa_a_mean']:+.3f}"
+                    f"[{rt['train/xsa_a_min']:+.2f},{rt['train/xsa_a_max']:+.2f}]"
+                    if "train/xsa_a_mean" in rt else "")
+            aS_s = xa_s
             _th = [m.radial_theta for m in model.modules() if hasattr(m, "radial_theta")]
             if _th:
                 _t = torch.cat([t.detach().float().flatten() for t in _th])
@@ -623,7 +658,7 @@ def main():
                            "train/radial_p_mean": _p.mean().item(),
                            "train/radial_p_min": _p.min().item(),
                            "train/radial_p_max": _p.max().item()})
-                aS_s = (f" p={rt['train/radial_p_mean']:.3f}"
+                aS_s = (xa_s + f" p={rt['train/radial_p_mean']:.3f}"
                         f"[{rt['train/radial_p_min']:.2f},{rt['train/radial_p_max']:.2f}]"
                         f" th={rt['train/act_alpha_mean']:+.3f}")
             print(f"  step {step}/{total_steps} loss={lv:.4f} run{len(_loss_hist)}={lv_run:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "

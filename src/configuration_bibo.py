@@ -23,6 +23,7 @@ class BiBoConfig(PretrainedConfig):
         layer_norm_type="rms",
         exp_post_embed_norm=False,
         use_xsa=True,
+        xsa_alpha_init=0.0,
         use_ssmax=True,
         attention_dropout=0.0,
         attention_bias=False,
@@ -69,6 +70,7 @@ class BiBoConfig(PretrainedConfig):
         self.exp_post_embed_norm = exp_post_embed_norm
 
         self.use_xsa = use_xsa
+        self.xsa_alpha_init = xsa_alpha_init   # per-head logit; strength = tanh(init), 0 = XSA off
         self.use_ssmax = use_ssmax
         self.attention_dropout = attention_dropout
         self.attention_bias = attention_bias
