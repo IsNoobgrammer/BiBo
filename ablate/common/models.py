@@ -12,7 +12,7 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
               pos_identity_expert=True, neg_identity_expert=True,
               top_k=None, moe_intermediate_size=None, num_shared_experts=0,
               hybrid_layer_pattern=None, sliding_window=128, swa_sink=True,
-              swa_qk_norm=True):
+              swa_qk_norm=True, attn_res="off"):
     """arm in {'qwen','bibo_min'} -> (model, config). Params in `dtype` (fp32 master; bf16 via autocast).
     Balancing, each native: BiBo router-bias updates; Qwen Switch aux loss (aux_coef).
     PARAM MATCH: Qwen's num_experts is set to BiBo's GLU count, which is num_experts MINUS the
@@ -28,7 +28,14 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
         cfg = make_qwen_config(eff, aux_coef=aux_coef, num_experts=n_glu)
         model = Qwen3MoeForCausalLM(cfg)
     elif arm == "bibo_min":
-        from src.modeling.models import BiBoForCausalLM
+        # exp/ reimplements only the residual topology (decoder layer + trunk); it imports
+        # BiBoAttention/BiBoMoELayer from src, so SWA, per-layer windows, XSA and swa_qk_norm
+        # compose with AttnRes for free. The 'moe' Triton patch is installed on the src class,
+        # so it applies to the exp model too.
+        if attn_res == "off":
+            from src.modeling.models import BiBoForCausalLM
+        else:
+            from exp.modeling_bibo import BiBoForCausalLM
         cfg = make_bibo_min_config(bias_update_threshold, bias_update_factor,
                                    num_experts=n_total, special_pairs=special_pairs,
                                    use_xsa=use_xsa,
@@ -39,7 +46,7 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
                                    num_shared_experts=num_shared_experts,
                                    hybrid_layer_pattern=hybrid_layer_pattern,
                                    sliding_window=sliding_window, swa_sink=swa_sink,
-                                   swa_qk_norm=swa_qk_norm)
+                                   swa_qk_norm=swa_qk_norm, attn_res=attn_res)
         model = BiBoForCausalLM(cfg)
         if eff.startswith("flash"):
             patches.patch_bibo_flash()
