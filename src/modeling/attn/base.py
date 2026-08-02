@@ -1,8 +1,7 @@
-"""BiBoAttention — minimal shared shell: projections, QK-norm, partial RoPE, KV cache, SSMax,
+"""BiBoAttention — minimal shared shell: projections, QK-norm, partial RoPE, KV cache,
 per-layer dispatch to the SWA or full-attention flavor module, XSA, output projection.
 The attention flavors themselves live in swa.py (eager-only band + sink) and
 full_attention.py (SDPA fast path / mask path)."""
-import math
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
@@ -10,7 +9,6 @@ from transformers.cache_utils import Cache
 from src.configuration_bibo import BiBoConfig
 from ..norm import BiBoRMSNorm
 from ..embed import apply_rotary_pos_emb
-from .ssmax import apply_ssmax_query_scaling
 from .xsa import apply_xsa
 from .swa import swa_attention
 from .full_attention import full_attention
@@ -19,7 +17,7 @@ __all__ = ['BiBoAttention']
 
 
 class BiBoAttention(nn.Module):
-    """GQA attention with optional SSMax scaling, XSA, and per-layer SWA/global dispatch."""
+    """GQA attention with learnable XSA and per-layer SWA/global dispatch."""
     def __init__(self, config: BiBoConfig, layer_idx: int, **kwargs):
         super().__init__()
         self.config = config
@@ -37,9 +35,9 @@ class BiBoAttention(nn.Module):
         pattern = getattr(config, "hybrid_layer_pattern", None)
         self.is_swa = bool(pattern[layer_idx]) if pattern is not None else False
         self.sliding_window = config.sliding_window if self.is_swa else None
-        self.use_ssmax = config.use_ssmax and not self.is_swa   # window caps n => SSMax redundant
         # One learnable scalar per head, appended as a value-less softmax column (GPT-OSS / MiMo).
-        # SWA gets it by default; global only under G1/G3. See docs/attention_layers.md.
+        # SWA gets it by default; global layers opt in. Both are unconditional now — the sink used
+        # to be gated against a query-scaling temperature that no longer exists.
         use_sink = ((self.is_swa and config.add_swa_attention_sink_bias)
                     or (not self.is_swa and config.add_full_attention_sink_bias))
         self.attention_sink_bias = nn.Parameter(torch.zeros(self.num_heads)) if use_sink else None
@@ -50,15 +48,6 @@ class BiBoAttention(nn.Module):
         # use_xsa: XSA and its learnable strength ship together.
         self.xsa_alpha = (nn.Parameter(torch.full((self.num_heads,), float(config.xsa_alpha_init)))
                           if self.use_xsa else None)
-
-        if self.use_ssmax:
-            # init so scale*log(typical_kv_len) ≈ 1.0 at step 0 — starts neutral instead of ~6x sharp
-            typical_log = math.log(max(config.max_position_embeddings / 2, 2.0))
-            init_val = 1.0 / typical_log
-            self.ssmax_scale = nn.Parameter(
-                torch.full((1, self.num_heads, 1, 1), init_val),
-                requires_grad=True
-            )
 
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
@@ -102,14 +91,6 @@ class BiBoAttention(nn.Module):
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        # SSMax's n must count REAL keys only — grid positions over-count by the pad width, and
-        # mask.cumsum at a query's grid position is exactly its real causal context length.
-        kv_len = key_states.shape[-2]
-        if self.use_ssmax:
-            context_lens = (attention_mask.cumsum(-1)[:, -query_states.shape[-2]:]
-                            if attention_mask is not None else None)
-            query_states = apply_ssmax_query_scaling(query_states, kv_len, self.ssmax_scale, context_lens)
 
         # All masking (band/causal/padding) and sink handling lives inside the flavor modules;
         # `attention_mask` here is the raw 2D (B, K_total) padding mask (1=real, 0=pad) or None.

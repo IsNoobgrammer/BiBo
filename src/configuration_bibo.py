@@ -24,7 +24,6 @@ class BiBoConfig(PretrainedConfig):
         exp_post_embed_norm=False,
         use_xsa=True,
         xsa_alpha_init=0.0,
-        use_ssmax=True,
         attention_dropout=0.0,
         attention_bias=False,
         hybrid_layer_pattern=None,
@@ -71,7 +70,6 @@ class BiBoConfig(PretrainedConfig):
 
         self.use_xsa = use_xsa
         self.xsa_alpha_init = xsa_alpha_init   # per-head logit; strength = tanh(init), 0 = XSA off
-        self.use_ssmax = use_ssmax
         self.attention_dropout = attention_dropout
         self.attention_bias = attention_bias
 
@@ -164,11 +162,6 @@ class BiBoConfig(PretrainedConfig):
             raise ValueError(
                 f"norm_topk_prob must be one of {NORM_TOPK_MODES} (or False for raw scores), "
                 f"got {self.norm_topk_prob!r}"
-            )
-        if self.add_full_attention_sink_bias and self.use_ssmax:
-            raise ValueError(
-                "add_full_attention_sink_bias=True with use_ssmax=True (global sink + SSMax, 'G1') "
-                "needs the sink scaled by the SSMax factor C=s*log(n); not implemented."
             )
         if self.hybrid_layer_pattern is not None:
             if len(self.hybrid_layer_pattern) != self.num_hidden_layers:

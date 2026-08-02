@@ -1,7 +1,7 @@
 """BiBo modeling components"""
 from .norm import BiBoRMSNorm
 from .embed import BiBoRotaryEmbedding, apply_rotary_pos_emb, rotate_half
-from .attn import BiBoAttention, apply_ssmax_query_scaling, repeat_kv
+from .attn import BiBoAttention, repeat_kv
 from .ffn import (
     BiBoMLP,
     BiBoCausalConv1D,
@@ -21,7 +21,6 @@ __all__ = [
     'rotate_half',
     # Attention
     'BiBoAttention',
-    'apply_ssmax_query_scaling',
     'repeat_kv',
     # FFN
     'BiBoMLP',
