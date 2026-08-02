@@ -64,11 +64,15 @@ def main():
 
     # (3) the removed norms were doing work. Same weights for every shared parameter, so any
     #     logit difference is attributable to the norms alone and not to a different init.
-    missing = off.load_state_dict(on.state_dict(), strict=False)
-    assert not missing.unexpected_keys, f"unexpected keys: {missing.unexpected_keys}"
-    assert all("q_norm" in k or "k_norm" in k for k in missing.missing_keys), (
-        f"non-QK-norm keys differ between the two models: "
-        f"{[k for k in missing.missing_keys if 'q_norm' not in k and 'k_norm' not in k]}")
+    #     `off` has no q_norm/k_norm on the windowed layers, so those keys arrive UNEXPECTED --
+    #     that is the whole point of the arm. Anything else differing would mean the two models
+    #     are not otherwise identical and the logit diff below could not be attributed.
+    r = off.load_state_dict(on.state_dict(), strict=False)
+    assert not r.missing_keys, f"`off` wants keys `on` does not have: {r.missing_keys}"
+    stray = [k for k in r.unexpected_keys if "q_norm" not in k and "k_norm" not in k]
+    assert not stray, f"non-QK-norm keys differ between the two models: {stray}"
+    assert len(r.unexpected_keys) == n_swa * 2, (
+        f"expected {n_swa * 2} dropped norm tensors, got {len(r.unexpected_keys)}")
 
     ids = torch.randint(0, cfg.vocab_size, (2, 256))
     with torch.no_grad():
