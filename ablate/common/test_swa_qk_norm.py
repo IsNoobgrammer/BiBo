@@ -18,17 +18,22 @@ from . import _paths  # noqa: F401
 import torch
 import torch.nn as nn
 
-from .configs import make_bibo_min_config, swa_block_pattern, SHARED
+from .configs import swa_block_pattern, SHARED
+from .models import build_arm
 from src.modeling.norm import BiBoRMSNorm
-from src.modeling_bibo import BiBoForCausalLM
 
 
 def _build(qk_norm, pattern):
+    """Through build_arm, NOT make_bibo_min_config. The first cut of this test called the config
+    factory directly, passed clean, and the real run then died instantly on
+    `build_arm() got an unexpected keyword argument 'swa_qk_norm'` -- the flag was never forwarded
+    down the launcher's path. Test the path train.py takes or the test proves nothing."""
     torch.manual_seed(0)
-    cfg = make_bibo_min_config(num_experts=6, special_pairs=0, use_xsa=True,
-                               hybrid_layer_pattern=pattern, sliding_window=128,
-                               swa_sink=False, swa_qk_norm=qk_norm)
-    return BiBoForCausalLM(cfg).eval(), cfg
+    model, cfg = build_arm("bibo_min", device="cpu", dtype=torch.float32,
+                           num_experts=6, special_pairs=0, use_xsa=True,
+                           hybrid_layer_pattern=pattern, sliding_window=128,
+                           swa_sink=False, swa_qk_norm=qk_norm)
+    return model.eval(), cfg
 
 
 def main():
