@@ -131,6 +131,38 @@ def _router_corr(model):
     return sum(vals) / len(vals) if vals else 0.0
 
 
+@torch.no_grad()
+def _typed_memory_stats(model):
+    """Learned depth timescales and innovation strength for typed-memory runs."""
+    fast, slow, innovation, controller_rms = [], [], [], []
+    for module in model.modules():
+        if hasattr(module, "typed_attn_res_fast_decay_logit"):
+            f = module.typed_attn_res_fast_decay_logit.detach().float().sigmoid()
+            gap = module.typed_attn_res_slow_decay_gap_logit.detach().float().sigmoid()
+            fast.append(f)
+            slow.append(f + (1.0 - f) * gap)
+            controller_rms.append(
+                module.typed_attn_res_slow_write_controller.detach().float().square().mean().sqrt()
+            )
+        if hasattr(module, "typed_attn_res_innovation_logit"):
+            innovation.append(
+                module.typed_attn_res_innovation_logit.detach().float().sigmoid()
+            )
+    result = {}
+    for name, values in (
+        ("typed_fast_decay", fast),
+        ("typed_slow_decay", slow),
+        ("typed_innovation_alpha", innovation),
+        ("typed_slow_write_controller_rms", controller_rms),
+    ):
+        if values:
+            stacked = torch.stack(values)
+            result[f"train/{name}_mean"] = stacked.mean().item()
+            result[f"train/{name}_min"] = stacked.min().item()
+            result[f"train/{name}_max"] = stacked.max().item()
+    return result
+
+
 def _save_hf_ckpt(model, tokenizer, out_dir):
     """Write a reload-ready bf16 HF checkpoint (config.json + safetensors + tokenizer) to out_dir. Runs on
     the MAIN thread between steps (fast). Casts only the big matrices (ndim>=2: linears, embeddings, expert
@@ -271,6 +303,20 @@ def main():
     # so it is a strict generalization of plain carry. Logged as cs= to get the depth profile.
     ap.add_argument("--attn_res_carry_scale",
                     choices=["none", "unbounded", "sigmoid", "tanh"], default="none")
+    # Typed thought/memory extension (exp/ only): keep attention and MLP contributions as
+    # distinct candidates and add a token-conditioned type score to each AttnRes read.
+    ap.add_argument("--typed_attn_res", action="store_true")
+    # Archive one memory-only state per completed block in addition to the canonical block state.
+    ap.add_argument("--typed_attn_res_long_memory", type=_bool, default=True)
+    # Relative initial prior of each extra typed candidate versus a canonical K3 candidate.
+    ap.add_argument("--typed_attn_res_extra_init", type=float, default=0.01)
+    # Two depth timescales: fast memory resets at block boundaries; slow memory persists.
+    ap.add_argument("--typed_attn_res_fast_slow_memory", action="store_true")
+    ap.add_argument("--typed_attn_res_fast_decay_init", type=float, default=0.5)
+    ap.add_argument("--typed_attn_res_slow_decay_init", type=float, default=0.95)
+    # Store the part of each MLP output not already parallel to the current thought stream.
+    ap.add_argument("--typed_attn_res_innovation_write", action="store_true")
+    ap.add_argument("--typed_attn_res_innovation_init", type=float, default=0.01)
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
     # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
@@ -459,6 +505,14 @@ def main():
                            attn_res_carry=args.attn_res_carry,
                            attn_res_fp32_stream=args.attn_res_fp32_stream,
                            attn_res_carry_scale=args.attn_res_carry_scale,
+                           use_typed_attn_res=args.typed_attn_res,
+                           typed_attn_res_long_memory=args.typed_attn_res_long_memory,
+                           typed_attn_res_extra_init=args.typed_attn_res_extra_init,
+                           use_typed_attn_res_fast_slow_memory=args.typed_attn_res_fast_slow_memory,
+                           typed_attn_res_fast_decay_init=args.typed_attn_res_fast_decay_init,
+                           typed_attn_res_slow_decay_init=args.typed_attn_res_slow_decay_init,
+                           use_typed_attn_res_innovation_write=args.typed_attn_res_innovation_write,
+                           typed_attn_res_innovation_init=args.typed_attn_res_innovation_init,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
@@ -544,6 +598,16 @@ def main():
                 + ("f32s" if args.attn_res != "off" and args.attn_res_fp32_stream else "")
                 + (f"cs{args.attn_res_carry_scale}" if args.attn_res != "off"
                    and args.attn_res_carry_scale != "none" else "")
+                + ("_typed" if args.typed_attn_res else "")
+                + ("-nolm" if args.typed_attn_res
+                   and not args.typed_attn_res_long_memory else "")
+                + (f"-x{args.typed_attn_res_extra_init:g}" if args.typed_attn_res
+                   and args.typed_attn_res_extra_init != 0.01 else "")
+                + (f"-fs{args.typed_attn_res_fast_decay_init:g}"
+                   f"-{args.typed_attn_res_slow_decay_init:g}"
+                   if args.typed_attn_res_fast_slow_memory else "")
+                + (f"-iw{args.typed_attn_res_innovation_init:g}"
+                   if args.typed_attn_res_innovation_write else "")
                 # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
@@ -719,6 +783,7 @@ def main():
             # full rejection. Reported in tanh units, not logits, because "off" has to be readable
             # at a glance -- an arm that never switches XSA on is a null, not a win.
             rt.update(patchmod.xsa_alpha_stats(model))
+            rt.update(_typed_memory_stats(model))
             xa_s = ((f" xa={rt['train/xsa_a_mean']:+.3f}"
                      f"[{rt['train/xsa_a_min']:+.2f},{rt['train/xsa_a_max']:+.2f}]"
                      if "train/xsa_a_mean" in rt else "")
@@ -751,6 +816,14 @@ def main():
                         f"[{_c.min().item():.2f},{_c.max().item():.2f}]")
                 aS_s = xa_s + cs_s        # covers the no-radial case; the radial block below
                                           # rebuilds from xa_s + cs_s so neither clobbers the other
+            typed_s = ""
+            if "train/typed_fast_decay_mean" in rt:
+                typed_s += (
+                    f" memdecay={rt['train/typed_fast_decay_mean']:.3f}"
+                    f"/{rt['train/typed_slow_decay_mean']:.3f}"
+                )
+            if "train/typed_innovation_alpha_mean" in rt:
+                typed_s += f" innov={rt['train/typed_innovation_alpha_mean']:.3f}"
             _th = [m.radial_theta for m in model.modules() if hasattr(m, "radial_theta")]
             if _th:
                 _t = torch.cat([t.detach().float().flatten() for t in _th])
@@ -772,7 +845,7 @@ def main():
                         f" th={rt['train/act_alpha_mean']:+.3f}")
             print(f"  step {step}/{total_steps} loss={lv:.4f} run{len(_loss_hist)}={lv_run:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
-                  f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{rt_s}{aS_s}"
+                  f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{rt_s}{aS_s}{typed_s}"
                   f"{f' wd={cur_wd:.4f}' if wd_sched is not None else ''}"
                   # clean = loss at RESTORED theta; probe = how much of `loss` is the probe sitting
                   # downhill. Under muon probe is ~0 by construction (nothing to restore).
