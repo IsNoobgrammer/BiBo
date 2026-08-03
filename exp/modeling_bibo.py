@@ -14,6 +14,7 @@ Only the experimental package imports stable BiBo components. Nothing under
 ``src`` imports or probes ``exp``.
 """
 
+import contextlib
 from typing import Optional, Tuple, Union
 
 import torch
@@ -106,6 +107,15 @@ def apply_attention_residual(
     if _HAS_FUSED_AR and prefix_sum.is_cuda:
         return _fused_ar(block_residual, prefix_sum, score_weight, norm.variance_epsilon)
 
+    # AUTOCAST MUST BE OFF HERE. Under torch.autocast(bf16) `torch.matmul` is autocast-eligible,
+    # so the two matmuls below get their fp32 inputs silently cast back to bf16 and the whole
+    # "fp32 scores and aggregation" this function documents does not happen. K3's reference has
+    # the same hole. The Triton kernel accumulates in true fp32, so without this the two paths
+    # disagree by bf16-level error compounded over every layer -- 3.9e-01 in the hidden state,
+    # measured by test_attn_res_gpu.
+    _ac = (torch.autocast("cuda", enabled=False) if prefix_sum.is_cuda
+           else contextlib.nullcontext())
+
     values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
     values_float = values.float()
 
@@ -117,12 +127,12 @@ def apply_attention_residual(
     # normalized keys and the keys*weight product -- and both were kept alive for backward, at
     # every residual site of every layer. This form contracts with a single GEMV straight to
     # (tokens, blocks+1) and allocates nothing of hidden size.
-    sq_sum = torch.linalg.vector_norm(values_float, dim=-1).square()   # fused; no squared copy
-    inv_rms = torch.rsqrt(sq_sum / values_float.shape[-1] + norm.variance_epsilon)
-    scores = torch.matmul(values_float, score_weight) * inv_rms
-
-    probabilities = scores.softmax(dim=-1).unsqueeze(1)
-    mixed = torch.matmul(probabilities, values_float).squeeze(1)
+    with _ac:
+        sq_sum = torch.linalg.vector_norm(values_float, dim=-1).square()
+        inv_rms = torch.rsqrt(sq_sum / values_float.shape[-1] + norm.variance_epsilon)
+        scores = torch.matmul(values_float, score_weight) * inv_rms
+        probabilities = scores.softmax(dim=-1).unsqueeze(1)
+        mixed = torch.matmul(probabilities, values_float).squeeze(1)
     return mixed.to(values.dtype)
 
 
