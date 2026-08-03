@@ -713,6 +713,7 @@ def main():
                      if "train/xsa_a_mean" in rt else "")
                     )
             aS_s = xa_s
+            cs_s = ""
             # cs = the learnable carry coefficient, reported as 2*sigmoid(theta) because that is
             # what multiplies attn_output. Init is exactly 1.0, so a cs pinned at 1.000 across
             # every layer means the MLP does not want the knob and it can be removed; a DEPTH
@@ -735,8 +736,10 @@ def main():
                 # was only visible per layer and its global mean actively misled.
                 rt.update({f"train/attn_res_s/L{i}": v
                            for i, v in enumerate(_c.tolist())})
-                aS_s += (f" s={_c.mean().item():.3f}"
-                         f"[{_c.min().item():.2f},{_c.max().item():.2f}]")
+                cs_s = (f" s={_c.mean().item():.3f}"
+                        f"[{_c.min().item():.2f},{_c.max().item():.2f}]")
+                aS_s = xa_s + cs_s        # covers the no-radial case; the radial block below
+                                          # rebuilds from xa_s + cs_s so neither clobbers the other
             _th = [m.radial_theta for m in model.modules() if hasattr(m, "radial_theta")]
             if _th:
                 _t = torch.cat([t.detach().float().flatten() for t in _th])
@@ -753,7 +756,7 @@ def main():
                            "train/radial_p_mean": _p.mean().item(),
                            "train/radial_p_min": _p.min().item(),
                            "train/radial_p_max": _p.max().item()})
-                aS_s = (xa_s + f" p={rt['train/radial_p_mean']:.3f}"
+                aS_s = (xa_s + cs_s + f" p={rt['train/radial_p_mean']:.3f}"
                         f"[{rt['train/radial_p_min']:.2f},{rt['train/radial_p_max']:.2f}]"
                         f" th={rt['train/act_alpha_mean']:+.3f}")
             print(f"  step {step}/{total_steps} loss={lv:.4f} run{len(_loss_hist)}={lv_run:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
