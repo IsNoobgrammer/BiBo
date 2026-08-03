@@ -50,7 +50,16 @@ def main():
                              attn_res=ar, attn_res_sites=sites, attn_res_carry=carry)
         model.train()
 
+        # The MoE mutates gate.bias on every TRAINING forward (moe.py:164, the load-balancing
+        # bias update), so a second forward does not start from the same state as the first.
+        # Snapshot every buffer and restore it before each run, or the comparison measures the
+        # bias drift rather than the kernel.
+        snap = {n: b.detach().clone() for n, b in model.named_buffers()}
+
         def run():
+            with torch.no_grad():
+                for n, b in model.named_buffers():
+                    b.copy_(snap[n])
             for p in model.parameters():
                 p.grad = None
             with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -62,8 +71,15 @@ def main():
                      for n, p in model.named_parameters() if p.grad is not None}
             return h.detach().float(), named
 
+        # determinism control FIRST: same setting twice must be bit-identical, otherwise any
+        # kernel-vs-eager number below is meaningless.
         E._HAS_FUSED_AR = True
         h_k, g_k = run()
+        h_k2, _ = run()
+        d_self = (h_k - h_k2).abs().max().item()
+        assert d_self == 0.0, (
+            f"{tag}: two identical runs differ by {d_self:.2e} -- residual state is leaking "
+            f"between runs, so kernel-vs-eager cannot be measured")
         E._HAS_FUSED_AR = False
         h_e, g_e = run()
         E._HAS_FUSED_AR = True
