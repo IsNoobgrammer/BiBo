@@ -242,6 +242,10 @@ def main():
     # Route (1,H) "matrices" -- AttnRes pseudo-queries are nn.Linear(hidden,1) -- to AdamW instead
     # of Muon. Default False = the ndim rule as it stands, which is what every arm so far ran.
     ap.add_argument("--vec_matrices_adamw", type=_bool, default=False)
+    # ...and WHICH AdamW group they land in. "default" = lr adam_lr, wd wd (step 0.0027 measured);
+    # "act" = the act-scale group, lr act_scale_lr, wd 0 (step 0.054). Muon's is 0.0449, so the two
+    # settings bracket it. Only meaningful with --vec_matrices_adamw true.
+    ap.add_argument("--vec_adamw_group", choices=("default", "act"), default="default")
     # radial p parameterization. sigmoid = every result on the board; tanh additionally lets
     # p go NEGATIVE (gain r^p < 1, shrinking high-rms rows), which sigmoid cannot express.
     # Kernel act code 8 vs 10. Tag _ptanh.
@@ -491,6 +495,7 @@ def main():
                                           router_adamw=(args.router_optim == "adamw"),
                                           act_scale_lr=args.act_scale_lr,
                                           vec_matrices_adamw=args.vec_matrices_adamw,
+                                          vec_adamw_group=args.vec_adamw_group,
                                           cautious_decay=args.cautious_decay,
                                           optim=args.optim, probe_gamma=probe_gamma,
                                           probe_rho_step=args.probe_rho_step,
@@ -514,7 +519,8 @@ def main():
     # The acts- tag is gone: radial is the only activation src implements, so every bibo_min run has it.
     run_name = (f"{args.arm}_seed{args.seed}"
                 + (("_aS" + f"{args.act_scale_lr:g}") if args.act_scale_lr else "")
-                + ("_vecadamw" if args.vec_matrices_adamw else "")
+                + (("_vecadamw" + ("act" if args.vec_adamw_group == "act" else ""))
+                   if args.vec_matrices_adamw else "")
                 + ("_ptanh" if args.radial_p == "tanh" else "")
                 # XSA MUST be tagged: without it the xsa arm shares a run name with its own
                 # control and overwrites its _final.pt / _result.json. That happened once --
