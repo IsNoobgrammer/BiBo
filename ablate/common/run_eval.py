@@ -59,6 +59,7 @@ def _arch_kwargs(c):
         swa_qk_norm=c.get("swa_qk_norm", True),
         attn_res=c.get("attn_res", "off"),
         attn_res_sites=c.get("attn_res_sites", 2),
+        attn_res_carry=c.get("attn_res_carry", False),
         bias_update_threshold=c.get("bias_update_threshold", 10240),
         bias_update_factor=(None if bias_factor is not None and bias_factor < 0 else bias_factor),
         aux_coef=c.get("aux_coef", 0.001),

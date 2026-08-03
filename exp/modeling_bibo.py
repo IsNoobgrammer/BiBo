@@ -131,6 +131,12 @@ class BiBoDecoderLayer(nn.Module):
         # MLP sublayer. 1 = ONE mix per layer, at the layer input only; the MLP then takes an
         # ordinary PreNorm residual. Halves the depth-attention work and the AttnRes parameters.
         self.attn_res_sites = getattr(config, "attn_res_sites", 2)
+        # What the MLP reads when sites==1. False = the raw within-block prefix sum (MEASURED,
+        # LOST: +0.00815 bpb -- it removes depth-mixing from the MLP entirely rather than halving
+        # it). True = Ht + A, the layer's own site-1 mix plus this layer's attention output, so the
+        # MLP keeps a depth-mixed base one sublayer stale AND still sees attention. Default False
+        # so a config written before this flag existed rebuilds to what it actually ran.
+        self.attn_res_carry = getattr(config, "attn_res_carry", False)
         if self.use_attn_residuals:
             self.self_attention_res_norm = BiBoRMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -209,6 +215,11 @@ class BiBoDecoderLayer(nn.Module):
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
             ).reshape(batch_size, seq_len, hidden_size)
+        # K3's site-1 read, unchanged. Kept for the carry variant: the mix computed at the END of
+        # layer l-1 from (S, B) is the SAME tensor as this one -- S and B do not change across the
+        # layer boundary -- so "defer the mix to the end of the layer" and "keep K3's site-1 mix"
+        # are the same computation, differing only in which layer owns the parameters.
+        attn_read = hidden_states
 
         # K3 measures block size in decoder layers. Layer zero is a boundary:
         # the embedding is stored, and the new partial block starts at attn_out.
@@ -237,12 +248,14 @@ class BiBoDecoderLayer(nn.Module):
                 self.mlp_res_proj,
                 self.mlp_res_norm,
             ).reshape(batch_size, seq_len, hidden_size)
+        elif self.attn_res_carry:
+            # ONE mix per layer, CARRY: the MLP reads the site-1 mix plus this layer's attention
+            # output. Depth-mixed (one sublayer stale) and attention IS visible, which the plain
+            # prefix-sum variant below is not -- that one deleted depth-mixing from the MLP rather
+            # than halving it, and cost +0.00815 bpb for it.
+            hidden_states = attn_read + attn_output
         else:
-            # ONE mix per layer: the MLP reads the plain running prefix sum. It cannot reuse the
-            # pre-attention mix -- that tensor predates attn_output, so feeding it to the MLP would
-            # hide this layer's attention output from the MLP entirely. Sharing the mix means
-            # spending it where it is cheapest to compute and letting the MLP take a normal
-            # residual, not literally passing the same tensor to both reads.
+            # ONE mix per layer, PREFIX: the MLP reads the raw within-block sum. Measured and lost.
             hidden_states = prefix_sum
 
         if self.use_selective_checkpointing and self.training:

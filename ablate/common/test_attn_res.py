@@ -133,6 +133,25 @@ def main():
     assert (ys1 - y_ctl).abs().max().item() > 1e-3, "sites=1 matches the control -- inert"
     print(f"  [4] sites=1 adds {want1} params (half of {want}); differs from sites=2 by "
           f"{(ys1 - y3).abs().max():.3f}")
+
+    # (5) carry: same cost as sites=1, but the MLP reads (site-1 mix + attn_output) rather than the
+    #     raw prefix sum -- so it must differ from BOTH the prefix variant and from sites=2, while
+    #     costing exactly the same parameters as the prefix variant.
+    torch.manual_seed(0)
+    mc, _ = build_arm("bibo_min", device="cpu", dtype=torch.float32, num_experts=6,
+                      special_pairs=0, use_xsa=True, hybrid_layer_pattern=pattern,
+                      sliding_window=128, attn_res="3", attn_res_sites=1, attn_res_carry=True)
+    mc.eval()
+    mc.load_state_dict(src_m.state_dict(), strict=False)
+    nc = sum(p.numel() for p in mc.parameters())
+    assert nc == n1, f"carry changed the parameter count: {nc} vs {n1}"
+    with torch.no_grad():
+        yc = mc(input_ids=ids).logits
+    dp = (yc - ys1).abs().max().item()
+    dd = (yc - y3).abs().max().item()
+    assert dp > 1e-3, f"carry == prefix variant ({dp:.2e}) -- the flag did nothing"
+    assert dd > 1e-3, f"carry == sites=2 ({dd:.2e})"
+    print(f"  [5] carry: same {nc - n_ctl} params as sites=1; vs prefix {dp:.3f}, vs sites=2 {dd:.3f}")
     print("PASS")
 
 
