@@ -69,6 +69,15 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
+        # Typed AttnRes controllers are five-class routing logits, not representation matrices.
+        # Sending their (5,H) tensors through Muon would impose row orthogonality between residual
+        # TYPES and turn the optimizer into part of the architecture. Keep controller and bias in
+        # AdamW; a dedicated zero-decay group is built below.
+        is_typed_read = (
+            "_res_type_controller" in n
+            or "_res_type_bias" in n
+            or "typed_attn_res_" in n
+        )
         # Both routers are 2D so the ndim rule ALREADY sends them to Muon -> `mats` (never whitened);
         # that is the default and every result to date was produced that way. router_adamw=True is the
         # ablation arm that moves the router to AdamW instead.
@@ -88,7 +97,9 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
             )
         if is_router:
             n_router += 1
-        if router_adamw and is_router:
+        if is_typed_read:
+            other.append((n, p))
+        elif router_adamw and is_router:
             other.append((n, p))            # -> AdamW (ablation: router off Muon)
         elif "embed" in n or p.ndim not in (2, 3):
             other.append((n, p))            # -> AdamW (1D norms/biases, embeddings)
@@ -145,13 +156,24 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
     # ~0.5 over 2000 steps, so it needs its own group and its own lr. wd=0: decay on an exponent
     # would just re-impose the lr/wd equilibrium this axis exists to escape.
     _is_as = lambda n: "radial_theta" in n or "xsa_alpha" in n
+    _is_typed_read = lambda n: (
+        "_res_type_controller" in n
+        or "_res_type_bias" in n
+        or "typed_attn_res_" in n
+    )
     a_scale = [p for n, p in other if _is_as(n)]
-    rest = [p for n, p in other if not _is_as(n)]
+    typed_read = [p for n, p in other if _is_typed_read(n)]
+    rest = [p for n, p in other if not _is_typed_read(n) and not (_is_as(n) and act_scale_lr)]
+    adamw_groups = []
+    if rest:
+        adamw_groups.append({"params": rest})
+    if typed_read:
+        print(f"[optim] typed AttnRes reads: {len(typed_read)} params -> AdamW wd=0", flush=True)
+        adamw_groups.append({"params": typed_read, "weight_decay": 0.0})
     if a_scale and act_scale_lr:
         print(f"[optim] act scales: {len(a_scale)} params -> AdamW lr={act_scale_lr:g} wd=0", flush=True)
-        adamw = torch.optim.AdamW([{"params": rest},
-                                   {"params": a_scale, "lr": act_scale_lr, "weight_decay": 0.0}],
-                                  lr=adam_lr, weight_decay=wd)
-    else:
-        adamw = torch.optim.AdamW([p for _, p in other], lr=adam_lr, weight_decay=wd)
+        adamw_groups.append(
+            {"params": a_scale, "lr": act_scale_lr, "weight_decay": 0.0}
+        )
+    adamw = torch.optim.AdamW(adamw_groups, lr=adam_lr, weight_decay=wd)
     return [muon, adamw], len(stacks) + len(mats), len(other)

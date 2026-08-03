@@ -10,14 +10,29 @@ The residual topology follows Moonshot AI's official Kimi K3 Hugging Face code:
 * a final depth-wise mix is applied before the trunk's output RMSNorm; and
 * RMS normalization, scores, softmax, and aggregation are computed in fp32.
 
+The optional typed extension keeps attention-produced ``thought`` and
+MLP-produced ``memory`` streams distinct. Each site still uses K3's content
+score, plus a token-conditioned score for the candidate's type. Writes have a
+single unambiguous destination (attention -> thought, MLP -> memory), while the
+canonical prefix sum remains an always-available escape path.
+
+Optional fast/slow memory gives typed MLP writes two depth timescales: fast
+memory decays within a block and resets at its boundary, while slow memory
+decays continuously across the stack and has an attention-conditioned write
+gain. Optional innovation filtering removes the learnable thought-parallel
+fraction from typed MLP writes. The original MLP output still enters the
+canonical prefix unchanged.
+
 Only the experimental package imports stable BiBo components. Nothing under
 ``src`` imports or probes ``exp``.
 """
 
+import math
 from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 from torch.utils.checkpoint import checkpoint
 from transformers.cache_utils import Cache, DynamicCache
@@ -37,11 +52,61 @@ logger = logging.get_logger(__name__)
 
 __all__ = [
     "apply_attention_residual",
+    "apply_typed_attention_residual",
+    "apply_innovation_memory_write",
+    "update_fast_slow_memory",
     "BiBoDecoderLayer",
     "BiBoPreTrainedModel",
     "BiBoModel",
     "BiBoForCausalLM",
 ]
+
+_TYPED_FULL_BLOCK = 0
+_TYPED_BLOCK_MEMORY = 1
+_TYPED_PREFIX = 2
+_TYPED_THOUGHT = 3
+_TYPED_MEMORY = 4
+_TYPED_SLOW_MEMORY = 5
+_BASE_TYPED_RESIDUAL_TYPES = 5
+_FAST_SLOW_TYPED_RESIDUAL_TYPES = 6
+
+
+def _logit(value: float) -> float:
+    return math.log(value / (1.0 - value))
+
+
+def _new_typed_read_parameters(config: BiBoConfig):
+    """Return zero-controller and near-K3 type bias without consuming RNG."""
+    num_types = (
+        _FAST_SLOW_TYPED_RESIDUAL_TYPES
+        if config.use_typed_attn_res_fast_slow_memory
+        else _BASE_TYPED_RESIDUAL_TYPES
+    )
+    controller = nn.Parameter(
+        torch.zeros(num_types, config.hidden_size)
+    )
+    bias = torch.zeros(num_types)
+    extra_bias = math.log(config.typed_attn_res_extra_init)
+    bias[_TYPED_BLOCK_MEMORY] = extra_bias
+    bias[_TYPED_THOUGHT] = extra_bias
+    bias[_TYPED_MEMORY] = extra_bias
+    if config.use_typed_attn_res_fast_slow_memory:
+        bias[_TYPED_SLOW_MEMORY] = extra_bias
+    return controller, nn.Parameter(bias)
+
+
+def _new_fast_slow_memory_parameters(config: BiBoConfig):
+    """Parameters for ordered fast/slow decay and attention-controlled consolidation."""
+    fast = config.typed_attn_res_fast_decay_init
+    slow = config.typed_attn_res_slow_decay_init
+    # slow = fast + (1-fast)*sigmoid(gap), which guarantees slow > fast while both stay < 1.
+    gap = (slow - fast) / (1.0 - fast)
+    return (
+        nn.Parameter(torch.tensor(_logit(fast))),
+        nn.Parameter(torch.tensor(_logit(gap))),
+        nn.Parameter(torch.zeros(config.hidden_size)),
+        nn.Parameter(torch.zeros(1)),
+    )
 
 
 def apply_attention_residual(
@@ -110,6 +175,210 @@ def apply_attention_residual(
     return mixed.to(values.dtype)
 
 
+def apply_typed_attention_residual(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    thought_residual: torch.Tensor,
+    memory_residual: torch.Tensor,
+    block_memory_residual: torch.Tensor,
+    projection: nn.Linear,
+    norm: BiBoRMSNorm,
+    type_controller: torch.Tensor,
+    type_bias: torch.Tensor,
+    controller_source: torch.Tensor,
+    *,
+    slow_memory_residual: Optional[torch.Tensor] = None,
+    include_thought: bool = True,
+    include_memory: bool = True,
+    include_slow_memory: bool = True,
+    return_details: bool = False,
+):
+    """AttnRes read over full, thought, and memory residual candidates.
+
+    K3's content score remains intact. A small token-conditioned controller adds
+    a score by candidate *type*, allowing a sublayer to distinguish a complete
+    block/prefix from attention-produced thought and MLP-produced memory. The
+    MLP site uses the current attention output as ``controller_source``; thus
+    attention can influence which residual type the MLP accepts without being
+    allowed to delete any stored value.
+
+    Candidate type order is ``full block, block memory, current prefix,
+    current thought, current/fast memory, slow memory``. The sixth type exists
+    only when fast/slow memory is configured. ``return_details`` is a
+    diagnostics hook returning ``(mixed, probabilities, type_ids)``.
+    """
+    tensors_2d = {
+        "prefix_sum": prefix_sum,
+        "thought_residual": thought_residual,
+        "memory_residual": memory_residual,
+        "controller_source": controller_source,
+    }
+    for name, value in tensors_2d.items():
+        if value.ndim != 2:
+            raise ValueError(f"{name} must have shape (tokens, hidden), got {tuple(value.shape)}")
+        if value.shape != prefix_sum.shape:
+            raise ValueError(
+                f"{name} must match prefix_sum shape {tuple(prefix_sum.shape)}, "
+                f"got {tuple(value.shape)}"
+            )
+    if slow_memory_residual is not None:
+        if slow_memory_residual.ndim != 2 or slow_memory_residual.shape != prefix_sum.shape:
+            raise ValueError(
+                "slow_memory_residual must match prefix_sum shape "
+                f"{tuple(prefix_sum.shape)}, got {tuple(slow_memory_residual.shape)}"
+            )
+    for name, value in {
+        "block_residual": block_residual,
+        "block_memory_residual": block_memory_residual,
+    }.items():
+        if value.ndim != 3:
+            raise ValueError(
+                f"{name} must have shape (tokens, blocks, hidden), got {tuple(value.shape)}"
+            )
+        if value.shape[0] != prefix_sum.shape[0] or value.shape[2] != prefix_sum.shape[1]:
+            raise ValueError(
+                f"{name} disagrees with prefix_sum dimensions: "
+                f"{tuple(value.shape)} vs {tuple(prefix_sum.shape)}"
+            )
+    num_types = type_controller.shape[0]
+    if num_types not in (_BASE_TYPED_RESIDUAL_TYPES, _FAST_SLOW_TYPED_RESIDUAL_TYPES):
+        raise ValueError(
+            "type_controller must have 5 base types or 6 fast/slow types, got "
+            f"{tuple(type_controller.shape)}"
+        )
+    if type_controller.shape[1] != prefix_sum.shape[1]:
+        raise ValueError(
+            "type_controller hidden dimension must match prefix_sum, got "
+            f"{tuple(type_controller.shape)} vs {tuple(prefix_sum.shape)}"
+        )
+    if type_bias.shape != (num_types,):
+        raise ValueError(
+            f"type_bias must have shape ({num_types},), got {tuple(type_bias.shape)}"
+        )
+    if num_types == _FAST_SLOW_TYPED_RESIDUAL_TYPES and slow_memory_residual is None:
+        raise ValueError(
+            "a six-type controller requires slow_memory_residual"
+        )
+    if num_types == _BASE_TYPED_RESIDUAL_TYPES and slow_memory_residual is not None:
+        raise ValueError(
+            "slow_memory_residual requires a six-type controller"
+        )
+
+    values = []
+    type_ids = []
+    if block_residual.shape[1]:
+        values.append(block_residual)
+        type_ids.extend([_TYPED_FULL_BLOCK] * block_residual.shape[1])
+    if block_memory_residual.shape[1]:
+        values.append(block_memory_residual)
+        type_ids.extend([_TYPED_BLOCK_MEMORY] * block_memory_residual.shape[1])
+    values.append(prefix_sum.unsqueeze(1))
+    type_ids.append(_TYPED_PREFIX)
+    if include_thought:
+        values.append(thought_residual.unsqueeze(1))
+        type_ids.append(_TYPED_THOUGHT)
+    if include_memory:
+        values.append(memory_residual.unsqueeze(1))
+        type_ids.append(_TYPED_MEMORY)
+    if include_slow_memory and slow_memory_residual is not None:
+        values.append(slow_memory_residual.unsqueeze(1))
+        type_ids.append(_TYPED_SLOW_MEMORY)
+
+    candidates = torch.cat(values, dim=1)
+    candidate_types = torch.tensor(type_ids, device=prefix_sum.device, dtype=torch.long)
+    candidates_float = candidates.float()
+
+    score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
+    sq_sum = torch.linalg.vector_norm(candidates_float, dim=-1).square()
+    inv_rms = torch.rsqrt(
+        sq_sum / candidates_float.shape[-1] + norm.variance_epsilon
+    )
+    scores = torch.matmul(candidates_float, score_weight) * inv_rms
+
+    source_float = controller_source.float()
+    source_inv_rms = torch.rsqrt(
+        source_float.square().mean(dim=-1, keepdim=True) + norm.variance_epsilon
+    )
+    type_scores = F.linear(
+        source_float * source_inv_rms, type_controller.float()
+    )
+    scores = scores + type_scores[:, candidate_types] + type_bias.float()[candidate_types]
+
+    probabilities = scores.softmax(dim=-1)
+    mixed = torch.matmul(probabilities.unsqueeze(1), candidates_float).squeeze(1)
+    mixed = mixed.to(prefix_sum.dtype)
+    if return_details:
+        return mixed, probabilities, candidate_types
+    return mixed
+
+
+def apply_innovation_memory_write(
+    mlp_output: torch.Tensor,
+    thought_residual: torch.Tensor,
+    innovation_logit: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Remove a learned fraction of the MLP write parallel to current thought.
+
+    ``sigmoid(innovation_logit)`` is constrained to ``(0, 1)``. The projection
+    is per token and computed in fp32; the untouched canonical residual still
+    receives the original MLP output elsewhere in the layer.
+    """
+    if mlp_output.shape != thought_residual.shape:
+        raise ValueError(
+            "mlp_output and thought_residual must have the same shape, got "
+            f"{tuple(mlp_output.shape)} vs {tuple(thought_residual.shape)}"
+        )
+    if mlp_output.ndim != 3:
+        raise ValueError(
+            "innovation writes expect (batch, seq, hidden), got "
+            f"{tuple(mlp_output.shape)}"
+        )
+    output_float = mlp_output.float()
+    thought_float = thought_residual.float()
+    coefficient = (
+        (output_float * thought_float).sum(dim=-1, keepdim=True)
+        / thought_float.square().sum(dim=-1, keepdim=True).clamp_min(eps)
+    )
+    alpha = innovation_logit.float().sigmoid()
+    innovation = output_float - alpha * coefficient * thought_float
+    return innovation.to(mlp_output.dtype)
+
+
+def update_fast_slow_memory(
+    fast_memory: Optional[torch.Tensor],
+    slow_memory: torch.Tensor,
+    memory_write: torch.Tensor,
+    attention_output: torch.Tensor,
+    fast_decay_logit: torch.Tensor,
+    slow_decay_gap_logit: torch.Tensor,
+    slow_write_controller: torch.Tensor,
+    slow_write_bias: torch.Tensor,
+    eps: float,
+):
+    """Apply ordered depth decay and an attention-conditioned slow-memory write.
+
+    Fast memory resets when ``fast_memory is None``. Slow memory always
+    persists. The decay parameterization guarantees ``0 < fast < slow < 1``.
+    The slow write gain is ``2*sigmoid(.)``, hence exactly 1 at the zero init.
+    """
+    if slow_memory.shape != memory_write.shape or attention_output.shape != memory_write.shape:
+        raise ValueError("slow_memory, memory_write, and attention_output must have equal shapes")
+    fast_decay = fast_decay_logit.float().sigmoid()
+    slow_decay = fast_decay + (1.0 - fast_decay) * slow_decay_gap_logit.float().sigmoid()
+    source = attention_output.float()
+    source = source * torch.rsqrt(
+        source.square().mean(dim=-1, keepdim=True) + eps
+    )
+    slow_gain = 2.0 * torch.sigmoid(
+        F.linear(source, slow_write_controller.float().unsqueeze(0), slow_write_bias.float())
+    )
+    write_float = memory_write.float()
+    fast = write_float if fast_memory is None else fast_decay * fast_memory.float() + write_float
+    slow = slow_decay * slow_memory.float() + slow_gain * write_float
+    return fast.to(memory_write.dtype), slow.to(memory_write.dtype)
+
+
 class BiBoDecoderLayer(nn.Module):
     """One BiBo decoder layer with optional Kimi K3 Block AttnRes."""
 
@@ -119,6 +388,16 @@ class BiBoDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.use_attn_residuals = config.attn_res_block_size is not None
         self.attn_res_block_size = config.attn_res_block_size
+        self.use_typed_attn_res = getattr(config, "use_typed_attn_res", False)
+        self.typed_attn_res_long_memory = getattr(
+            config, "typed_attn_res_long_memory", True
+        )
+        self.use_fast_slow_memory = getattr(
+            config, "use_typed_attn_res_fast_slow_memory", False
+        )
+        self.use_innovation_write = getattr(
+            config, "use_typed_attn_res_innovation_write", False
+        )
 
         self.self_attn = BiBoAttention(config=config, layer_idx=layer_idx)
         self.is_moe_layer = layer_idx not in config.mlp_only_layers
@@ -145,6 +424,26 @@ class BiBoDecoderLayer(nn.Module):
             if self.attn_res_sites == 2:
                 self.mlp_res_norm = BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
                 self.mlp_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
+            if self.use_typed_attn_res:
+                (
+                    self.self_attention_res_type_controller,
+                    self.self_attention_res_type_bias,
+                ) = _new_typed_read_parameters(config)
+                (
+                    self.mlp_res_type_controller,
+                    self.mlp_res_type_bias,
+                ) = _new_typed_read_parameters(config)
+                if self.use_fast_slow_memory:
+                    (
+                        self.typed_attn_res_fast_decay_logit,
+                        self.typed_attn_res_slow_decay_gap_logit,
+                        self.typed_attn_res_slow_write_controller,
+                        self.typed_attn_res_slow_write_bias,
+                    ) = _new_fast_slow_memory_parameters(config)
+                if self.use_innovation_write:
+                    self.typed_attn_res_innovation_logit = nn.Parameter(
+                        torch.tensor(_logit(config.typed_attn_res_innovation_init))
+                    )
 
         self.use_selective_checkpointing = False
 
@@ -200,6 +499,10 @@ class BiBoDecoderLayer(nn.Module):
         cache_position: Optional[torch.LongTensor],
         output_attentions: bool,
         block_residual: Optional[torch.Tensor],
+        thought_residual: Optional[torch.Tensor],
+        memory_residual: Optional[torch.Tensor],
+        block_memory_residual: Optional[torch.Tensor],
+        slow_memory_residual: Optional[torch.Tensor],
     ):
         batch_size, seq_len, hidden_size = hidden_states.shape
         prefix_sum = hidden_states
@@ -208,7 +511,38 @@ class BiBoDecoderLayer(nn.Module):
             block_residual = hidden_states.new_zeros(
                 batch_size * seq_len, 0, hidden_size
             )
-        if block_residual.shape[1] > 0:
+        if self.use_typed_attn_res:
+            if thought_residual is None:
+                thought_residual = torch.zeros_like(hidden_states)
+            if memory_residual is None:
+                memory_residual = torch.zeros_like(hidden_states)
+            if block_memory_residual is None:
+                block_memory_residual = hidden_states.new_zeros(
+                    batch_size * seq_len, 0, hidden_size
+                )
+            if self.use_fast_slow_memory and slow_memory_residual is None:
+                slow_memory_residual = torch.zeros_like(hidden_states)
+            hidden_states = apply_typed_attention_residual(
+                prefix_sum.reshape(-1, hidden_size),
+                block_residual,
+                thought_residual.reshape(-1, hidden_size),
+                memory_residual.reshape(-1, hidden_size),
+                block_memory_residual,
+                self.self_attention_res_proj,
+                self.self_attention_res_norm,
+                self.self_attention_res_type_controller,
+                self.self_attention_res_type_bias,
+                prefix_sum.reshape(-1, hidden_size),
+                slow_memory_residual=(
+                    slow_memory_residual.reshape(-1, hidden_size)
+                    if self.use_fast_slow_memory
+                    else None
+                ),
+                include_thought=self.layer_idx > 0,
+                include_memory=self.layer_idx > 0,
+                include_slow_memory=self.layer_idx > 0,
+            ).reshape(batch_size, seq_len, hidden_size)
+        elif block_residual.shape[1] > 0:
             hidden_states = apply_attention_residual(
                 prefix_sum.reshape(-1, hidden_size),
                 block_residual,
@@ -228,7 +562,22 @@ class BiBoDecoderLayer(nn.Module):
                 (block_residual, prefix_sum.reshape(-1, hidden_size).unsqueeze(1)),
                 dim=1,
             )
+            if (
+                self.use_typed_attn_res
+                and self.typed_attn_res_long_memory
+                and self.layer_idx > 0
+            ):
+                block_memory_residual = torch.cat(
+                    (
+                        block_memory_residual,
+                        memory_residual.reshape(-1, hidden_size).unsqueeze(1),
+                    ),
+                    dim=1,
+                )
             prefix_sum = None
+            if self.use_typed_attn_res:
+                thought_residual = None
+                memory_residual = None
 
         hidden_states = self.input_layernorm(hidden_states)
         attn_output, self_attn_weights = self.self_attn(
@@ -240,8 +589,39 @@ class BiBoDecoderLayer(nn.Module):
             output_attentions=output_attentions,
         )
         prefix_sum = attn_output if prefix_sum is None else prefix_sum + attn_output
+        if self.use_typed_attn_res:
+            thought_residual = (
+                attn_output
+                if thought_residual is None
+                else thought_residual + attn_output
+            )
 
-        if self.attn_res_sites == 2:
+        if self.use_typed_attn_res:
+            hidden_states = apply_typed_attention_residual(
+                prefix_sum.reshape(-1, hidden_size),
+                block_residual,
+                thought_residual.reshape(-1, hidden_size),
+                (
+                    torch.zeros_like(prefix_sum)
+                    if memory_residual is None
+                    else memory_residual
+                ).reshape(-1, hidden_size),
+                block_memory_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.mlp_res_type_controller,
+                self.mlp_res_type_bias,
+                attn_output.reshape(-1, hidden_size),
+                slow_memory_residual=(
+                    slow_memory_residual.reshape(-1, hidden_size)
+                    if self.use_fast_slow_memory
+                    else None
+                ),
+                include_thought=True,
+                include_memory=memory_residual is not None,
+                include_slow_memory=self.layer_idx > 0,
+            ).reshape(batch_size, seq_len, hidden_size)
+        elif self.attn_res_sites == 2:
             hidden_states = apply_attention_residual(
                 prefix_sum.reshape(-1, hidden_size),
                 block_residual,
@@ -264,9 +644,51 @@ class BiBoDecoderLayer(nn.Module):
             )
         else:
             mlp_output = self._attn_res_mlp_forward(hidden_states)
+        # The canonical route always receives the untouched MLP result. Innovation filtering is
+        # confined to typed memory, so a bad gate can never erase the standard residual path.
         prefix_sum = prefix_sum + mlp_output
+        if self.use_typed_attn_res:
+            memory_write = (
+                apply_innovation_memory_write(
+                    mlp_output,
+                    thought_residual,
+                    self.typed_attn_res_innovation_logit,
+                    self.post_attention_layernorm.variance_epsilon,
+                )
+                if self.use_innovation_write
+                else mlp_output
+            )
+            if self.use_fast_slow_memory:
+                memory_residual, slow_memory_residual = update_fast_slow_memory(
+                    memory_residual,
+                    slow_memory_residual,
+                    memory_write,
+                    attn_output,
+                    self.typed_attn_res_fast_decay_logit,
+                    self.typed_attn_res_slow_decay_gap_logit,
+                    self.typed_attn_res_slow_write_controller,
+                    self.typed_attn_res_slow_write_bias,
+                    self.post_attention_layernorm.variance_epsilon,
+                )
+            else:
+                memory_residual = (
+                    memory_write
+                    if memory_residual is None
+                    else memory_residual + memory_write
+                )
 
-        outputs = (prefix_sum, block_residual)
+        if self.use_typed_attn_res:
+            outputs = (
+                prefix_sum,
+                block_residual,
+                thought_residual,
+                memory_residual,
+                block_memory_residual,
+            )
+            if self.use_fast_slow_memory:
+                outputs += (slow_memory_residual,)
+        else:
+            outputs = (prefix_sum, block_residual)
         if output_attentions:
             outputs += (self_attn_weights,)
         return outputs
@@ -281,6 +703,10 @@ class BiBoDecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         block_residual: Optional[torch.Tensor] = None,
+        thought_residual: Optional[torch.Tensor] = None,
+        memory_residual: Optional[torch.Tensor] = None,
+        block_memory_residual: Optional[torch.Tensor] = None,
+        slow_memory_residual: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         del use_cache, kwargs
@@ -301,6 +727,10 @@ class BiBoDecoderLayer(nn.Module):
             cache_position,
             bool(output_attentions),
             block_residual,
+            thought_residual,
+            memory_residual,
+            block_memory_residual,
+            slow_memory_residual,
         )
 
 
@@ -319,6 +749,10 @@ class BiBoModel(BiBoPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.use_attn_residuals = config.attn_res_block_size is not None
+        self.use_typed_attn_res = getattr(config, "use_typed_attn_res", False)
+        self.use_fast_slow_memory = getattr(
+            config, "use_typed_attn_res_fast_slow_memory", False
+        )
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
@@ -342,6 +776,11 @@ class BiBoModel(BiBoPreTrainedModel):
                 config.hidden_size, eps=config.rms_norm_eps
             )
             self.output_attn_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
+            if self.use_typed_attn_res:
+                (
+                    self.output_attn_res_type_controller,
+                    self.output_attn_res_type_bias,
+                ) = _new_typed_read_parameters(config)
 
         self.gradient_checkpointing = False
         self.post_init()
@@ -353,9 +792,36 @@ class BiBoModel(BiBoPreTrainedModel):
         self.embed_tokens = value
 
     def _apply_output_attention_residual(
-        self, hidden_states: torch.Tensor, block_residual: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        block_residual: torch.Tensor,
+        thought_residual: Optional[torch.Tensor] = None,
+        memory_residual: Optional[torch.Tensor] = None,
+        block_memory_residual: Optional[torch.Tensor] = None,
+        slow_memory_residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, hidden_size = hidden_states.shape
+        if self.use_typed_attn_res:
+            return apply_typed_attention_residual(
+                hidden_states.reshape(-1, hidden_size),
+                block_residual,
+                thought_residual.reshape(-1, hidden_size),
+                memory_residual.reshape(-1, hidden_size),
+                block_memory_residual,
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+                self.output_attn_res_type_controller,
+                self.output_attn_res_type_bias,
+                hidden_states.reshape(-1, hidden_size),
+                slow_memory_residual=(
+                    slow_memory_residual.reshape(-1, hidden_size)
+                    if self.use_fast_slow_memory
+                    else None
+                ),
+                include_thought=True,
+                include_memory=True,
+                include_slow_memory=self.use_fast_slow_memory,
+            ).reshape(batch_size, seq_len, hidden_size)
         return apply_attention_residual(
             hidden_states.reshape(-1, hidden_size),
             block_residual,
@@ -454,6 +920,18 @@ class BiBoModel(BiBoPreTrainedModel):
             block_residual = hidden_states.new_zeros(
                 batch_size * seq_length, 0, self.config.hidden_size
             )
+        thought_residual = None
+        memory_residual = None
+        block_memory_residual = None
+        slow_memory_residual = None
+        if self.use_typed_attn_res:
+            thought_residual = torch.zeros_like(hidden_states)
+            memory_residual = torch.zeros_like(hidden_states)
+            block_memory_residual = hidden_states.new_zeros(
+                batch_size * seq_length, 0, self.config.hidden_size
+            )
+            if self.use_fast_slow_memory:
+                slow_memory_residual = torch.zeros_like(hidden_states)
 
         for decoder_layer in self.layers:
             if output_hidden_states:
@@ -471,6 +949,10 @@ class BiBoModel(BiBoPreTrainedModel):
                         output_attentions,
                         False,
                         block_residual,
+                        thought_residual,
+                        memory_residual,
+                        block_memory_residual,
+                        slow_memory_residual,
                     )
                 else:
                     layer_outputs = self._gradient_checkpointing_func(
@@ -493,19 +975,38 @@ class BiBoModel(BiBoPreTrainedModel):
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     block_residual=block_residual,
+                    thought_residual=thought_residual,
+                    memory_residual=memory_residual,
+                    block_memory_residual=block_memory_residual,
+                    slow_memory_residual=slow_memory_residual,
                 )
 
             hidden_states = layer_outputs[0]
             if self.use_attn_residuals:
                 block_residual = layer_outputs[1]
-                if output_attentions:
+                if self.use_typed_attn_res:
+                    thought_residual = layer_outputs[2]
+                    memory_residual = layer_outputs[3]
+                    block_memory_residual = layer_outputs[4]
+                    attention_index = 5
+                    if self.use_fast_slow_memory:
+                        slow_memory_residual = layer_outputs[5]
+                        attention_index = 6
+                    if output_attentions:
+                        all_self_attns += (layer_outputs[attention_index],)
+                elif output_attentions:
                     all_self_attns += (layer_outputs[2],)
             elif output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
         if self.use_attn_residuals:
             hidden_states = self._apply_output_attention_residual(
-                hidden_states, block_residual
+                hidden_states,
+                block_residual,
+                thought_residual,
+                memory_residual,
+                block_memory_residual,
+                slow_memory_residual,
             )
         hidden_states = self.norm(hidden_states)
 
