@@ -262,7 +262,8 @@ def main():
     ap.add_argument("--attn_res_fp32_stream", type=_bool, default=False)
     # Learnable per-layer coefficient on the carry term: A_coeff = 2*sigmoid(theta), init 1.0
     # so it is a strict generalization of plain carry. Logged as cs= to get the depth profile.
-    ap.add_argument("--attn_res_carry_scale", type=_bool, default=False)
+    ap.add_argument("--attn_res_carry_scale",
+                    choices=["none", "unbounded", "sigmoid", "tanh"], default="none")
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
     # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
@@ -530,7 +531,8 @@ def main():
                    and args.attn_res_sites != 2 else "")
                 + ("c" if args.attn_res != "off" and args.attn_res_carry else "")
                 + ("f32s" if args.attn_res != "off" and args.attn_res_fp32_stream else "")
-                + ("cs" if args.attn_res != "off" and args.attn_res_carry_scale else "")
+                + (f"cs{args.attn_res_carry_scale}" if args.attn_res != "off"
+                   and args.attn_res_carry_scale != "none" else "")
                 # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
@@ -719,7 +721,11 @@ def main():
             _cs = [m.attn_res_carry_theta for m in model.modules()
                    if getattr(m, "attn_res_carry_theta", None) is not None]
             if _cs:
-                _c = 2.0 * torch.sigmoid(torch.cat([t.detach().float().flatten() for t in _cs]))
+                _mode = getattr(model.config, "attn_res_carry_scale", "none")
+                _tt = torch.cat([t.detach().float().flatten() for t in _cs])
+                _c = (_tt if _mode == "unbounded"
+                      else 2.0 * torch.sigmoid(_tt) if _mode == "sigmoid"
+                      else 2.0 * torch.tanh(_tt))
                 rt.update({"train/carry_scale_mean": _c.mean().item(),
                            "train/carry_scale_min": _c.min().item(),
                            "train/carry_scale_max": _c.max().item()})

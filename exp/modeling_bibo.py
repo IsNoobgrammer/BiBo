@@ -15,6 +15,7 @@ Only the experimental package imports stable BiBo components. Nothing under
 """
 
 import contextlib
+import math
 from typing import Optional, Tuple, Union
 
 import torch
@@ -170,20 +171,32 @@ class BiBoDecoderLayer(nn.Module):
         # every AttnRes arm non-comparable to the baseline. Setting this keeps the stream in the
         # layer-input dtype so the ONLY difference from the control is AttnRes itself.
         self.attn_res_fp32_stream = getattr(config, "attn_res_fp32_stream", False)
-        # CARRY SCALE. In carry the MLP reads Ht + A, so A enters at coefficient exactly 1 and is
-        # not competing with the blocks for softmax mass -- that is the point of carry. But 1 is
-        # an arbitrary choice, and whether the MLP wants MORE or LESS of this layer's attention is
-        # plausibly depth-dependent, the way radial p turned out to be. So make it learnable:
-        #     A_coeff = 2 * sigmoid(theta),   theta init 0  ->  coeff exactly 1.0
-        # Init at 1 makes this a STRICT GENERALIZATION of the measured carry arm -- at step 0 the
-        # two models are identical, so anything it learns is attributable. Range (0, 2): it can
-        # switch the current attention off entirely or double it. BOUNDED on purpose; every
-        # unbounded scale we have tried has run away (radial p, xsa alpha, act scales all won as
-        # bounded params). Named *_theta so optim.py routes it to the act-scale group's lr.
+        # CARRY SCALE. In carry the MLP reads Ht + A, so A enters at coefficient exactly 1,
+        # deliberately OUTSIDE the softmax simplex -- that is why carry beats sites=2, where every
+        # unit of probability spent on a previous block comes straight out of this layer's
+        # attention, and where simply having more blocks flattens the distribution and shrinks
+        # p_last for reasons that have nothing to do with what the MLP wants.
+        #
+        # 1 is still an arbitrary coefficient. Modes, ALL initialised to exactly s = 1.0 so each
+        # is a strict generalization of plain carry and the three are mutually comparable:
+        #
+        #   "unbounded"  s = theta,           init 1.0     range R    <- DIAGNOSTIC, run first
+        #   "sigmoid"    s = 2*sigmoid(theta) init th=0    range (0,2)
+        #   "tanh"       s = 2*tanh(theta)    init th=atanh(.5)  range (-2,2)
+        #
+        # Unbounded goes first ON PURPOSE and is not meant to ship: it is the only variant that
+        # can tell us WHERE the model wants s to sit, which is what picks the bound. If min/max
+        # settle inside (0,2) then sigmoid is the right cage; if they run past it, a cage at 2
+        # would be clipping the answer and the question changes. Every unbounded scale we have
+        # tried has eventually run away, so this is a measurement, not a candidate.
+        _cs_mode = getattr(config, "attn_res_carry_scale", "none")
+        _cs_mode = "none" if _cs_mode in (False, None) else str(_cs_mode)
+        self.attn_res_carry_scale = _cs_mode
+        _init = {"unbounded": 1.0, "sigmoid": 0.0, "tanh": math.atanh(0.5)}.get(_cs_mode)
         self.attn_res_carry_theta = (
-            nn.Parameter(torch.zeros(1))
-            if (self.use_attn_residuals and self.attn_res_carry
-                and getattr(config, "attn_res_carry_scale", False)) else None)
+            nn.Parameter(torch.full((1,), float(_init)))
+            if (_init is not None and self.use_attn_residuals and self.attn_res_carry) else None)
+
         if self.use_attn_residuals:
             self.self_attention_res_norm = BiBoRMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -307,7 +320,10 @@ class BiBoDecoderLayer(nn.Module):
             # prefix-sum variant below is not -- that one deleted depth-mixing from the MLP rather
             # than halving it, and cost +0.00815 bpb for it.
             if self.attn_res_carry_theta is not None:
-                _c = 2.0 * torch.sigmoid(self.attn_res_carry_theta.float())
+                _t = self.attn_res_carry_theta.float()
+                _c = (_t if self.attn_res_carry_scale == "unbounded"
+                      else 2.0 * torch.sigmoid(_t) if self.attn_res_carry_scale == "sigmoid"
+                      else 2.0 * torch.tanh(_t))
                 hidden_states = attn_read + _c.to(attn_output.dtype) * attn_output
             else:
                 hidden_states = attn_read + attn_output

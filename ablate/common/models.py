@@ -14,7 +14,7 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
               hybrid_layer_pattern=None, sliding_window=128,
               swa_qk_norm=True, attn_res="off", attn_res_sites=2,
               attn_res_carry=False, attn_res_fp32_stream=False,
-              attn_res_carry_scale=False):
+              attn_res_carry_scale="none"):
     """arm in {'qwen','bibo_min'} -> (model, config). Params in `dtype` (fp32 master; bf16 via autocast).
     Balancing, each native: BiBo router-bias updates; Qwen Switch aux loss (aux_coef).
     PARAM MATCH: Qwen's num_experts is set to BiBo's GLU count, which is num_experts MINUS the

@@ -21,7 +21,7 @@ class BiBoConfig(_StableBiBoConfig):
     model_type = "bibo_attn_res"
 
     def __init__(self, attn_res_block_size=12, attn_res_sites=2, attn_res_carry=False,
-                 attn_res_fp32_stream=False, attn_res_carry_scale=False, **kwargs):
+                 attn_res_fp32_stream=False, attn_res_carry_scale="none", **kwargs):
         if attn_res_sites not in (1, 2):
             raise ValueError(
                 f"attn_res_sites must be 2 (K3 faithful: a depth-mix before the attention "
@@ -30,7 +30,11 @@ class BiBoConfig(_StableBiBoConfig):
         self.attn_res_sites = attn_res_sites
         self.attn_res_carry = bool(attn_res_carry)
         self.attn_res_fp32_stream = bool(attn_res_fp32_stream)
-        self.attn_res_carry_scale = bool(attn_res_carry_scale)
+        _csm = "none" if attn_res_carry_scale in (False, None) else str(attn_res_carry_scale)
+        if _csm not in ("none", "unbounded", "sigmoid", "tanh"):
+            raise ValueError(f"attn_res_carry_scale must be one of none/unbounded/sigmoid/tanh, "
+                             f"got {attn_res_carry_scale!r}")
+        self.attn_res_carry_scale = _csm
         if attn_res_block_size is not None and (
             isinstance(attn_res_block_size, bool)
             or not isinstance(attn_res_block_size, int)

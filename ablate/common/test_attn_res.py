@@ -160,7 +160,7 @@ def main():
     ms, _ = build_arm("bibo_min", device="cpu", dtype=torch.float32, num_experts=6,
                       special_pairs=0, use_xsa=True, hybrid_layer_pattern=pattern,
                       sliding_window=128, attn_res="3", attn_res_sites=1,
-                      attn_res_carry=True, attn_res_carry_scale=True)
+                      attn_res_carry=True, attn_res_carry_scale="unbounded")
     ms.eval()
     ms.load_state_dict(mc.state_dict(), strict=False)
     n_theta = sum(1 for n, _ in ms.named_parameters() if "attn_res_carry_theta" in n)
@@ -170,7 +170,7 @@ def main():
     d0 = (ys - yc).abs().max().item()
     assert d0 < 1e-5, (f"carry_scale is NOT identity at init (diff {d0:.2e}); 2*sigmoid(0) must "
                        f"be exactly 1.0 or the arm is not a generalization of carry")
-    print(f"  [6] carry_scale: {n_theta} thetas, 2*sigmoid(0)=1 -> identical to carry at init "
+    print(f"  [6] carry_scale unbounded: {n_theta} thetas, init 1.0 -> identical to carry at init "
           f"({d0:.1e})")
     print("PASS")
 

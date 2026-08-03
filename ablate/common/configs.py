@@ -128,7 +128,7 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          hybrid_layer_pattern=None, sliding_window=128,
                          swa_qk_norm=True, attn_res="off", attn_res_sites=2,
                          attn_res_carry=False, attn_res_fp32_stream=False,
-                         attn_res_carry_scale=False):
+                         attn_res_carry_scale="none"):
     # attn_res: "off" = stable src model. Anything else routes to exp/ (Kimi K3 Attention
     # Residuals): "control" builds exp's model with residuals DISABLED, an int is the block size
     # in decoder layers (1 = per-layer / Full AttnRes, 3 = one block per [G,S,S]).
