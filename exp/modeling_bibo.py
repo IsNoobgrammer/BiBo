@@ -153,6 +153,13 @@ class BiBoDecoderLayer(nn.Module):
         # MLP keeps a depth-mixed base one sublayer stale AND still sees attention. Default False
         # so a config written before this flag existed rebuilds to what it actually ran.
         self.attn_res_carry = getattr(config, "attn_res_carry", False)
+        # The block-boundary reset (prefix_sum = None -> prefix_sum = attn_output) drops the fp32
+        # embedding out of the residual stream, so under bf16 autocast an AttnRes model runs a
+        # BF16 stream while the standard-residual control runs FP32 (the embedding is fp32 and
+        # `fp32 + bf16` promotes, forever). That is worth ~2-3% throughput and 0.7 GB and it made
+        # every AttnRes arm non-comparable to the baseline. Setting this keeps the stream in the
+        # layer-input dtype so the ONLY difference from the control is AttnRes itself.
+        self.attn_res_fp32_stream = getattr(config, "attn_res_fp32_stream", False)
         if self.use_attn_residuals:
             self.self_attention_res_norm = BiBoRMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -218,6 +225,7 @@ class BiBoDecoderLayer(nn.Module):
         block_residual: Optional[torch.Tensor],
     ):
         batch_size, seq_len, hidden_size = hidden_states.shape
+        _stream_dtype = hidden_states.dtype      # what the control's stream would be
         prefix_sum = hidden_states
 
         if block_residual is None:
@@ -255,7 +263,12 @@ class BiBoDecoderLayer(nn.Module):
             cache_position=cache_position,
             output_attentions=output_attentions,
         )
-        prefix_sum = attn_output if prefix_sum is None else prefix_sum + attn_output
+        if prefix_sum is None:
+            # boundary layer: the stream restarts from attn_output alone
+            prefix_sum = (attn_output.to(_stream_dtype) if self.attn_res_fp32_stream
+                          else attn_output)
+        else:
+            prefix_sum = prefix_sum + attn_output
 
         if self.attn_res_sites == 2:
             hidden_states = apply_attention_residual(

@@ -21,7 +21,7 @@ class BiBoConfig(_StableBiBoConfig):
     model_type = "bibo_attn_res"
 
     def __init__(self, attn_res_block_size=12, attn_res_sites=2, attn_res_carry=False,
-                 **kwargs):
+                 attn_res_fp32_stream=False, **kwargs):
         if attn_res_sites not in (1, 2):
             raise ValueError(
                 f"attn_res_sites must be 2 (K3 faithful: a depth-mix before the attention "
@@ -29,6 +29,7 @@ class BiBoConfig(_StableBiBoConfig):
                 f"input; the MLP takes an ordinary PreNorm residual), got {attn_res_sites!r}")
         self.attn_res_sites = attn_res_sites
         self.attn_res_carry = bool(attn_res_carry)
+        self.attn_res_fp32_stream = bool(attn_res_fp32_stream)
         if attn_res_block_size is not None and (
             isinstance(attn_res_block_size, bool)
             or not isinstance(attn_res_block_size, int)

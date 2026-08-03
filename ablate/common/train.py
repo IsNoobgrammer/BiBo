@@ -257,6 +257,9 @@ def main():
     ap.add_argument("--attn_res_sites", type=int, choices=[1, 2], default=2)
     # sites=1 only: MLP reads (site-1 mix + attn_output) instead of the raw prefix sum.
     ap.add_argument("--attn_res_carry", type=_bool, default=False)
+    # Keep the residual stream in the layer-input dtype (fp32 under autocast, as the
+    # standard-residual control does) so AttnRes is the ONLY difference from the baseline.
+    ap.add_argument("--attn_res_fp32_stream", type=_bool, default=False)
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
     # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
@@ -443,6 +446,7 @@ def main():
                            swa_qk_norm=args.swa_qk_norm,
                            attn_res=args.attn_res, attn_res_sites=args.attn_res_sites,
                            attn_res_carry=args.attn_res_carry,
+                           attn_res_fp32_stream=args.attn_res_fp32_stream,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
@@ -521,6 +525,7 @@ def main():
                 + (f"s{args.attn_res_sites}" if args.attn_res != "off"
                    and args.attn_res_sites != 2 else "")
                 + ("c" if args.attn_res != "off" and args.attn_res_carry else "")
+                + ("f32s" if args.attn_res != "off" and args.attn_res_fp32_stream else "")
                 # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
