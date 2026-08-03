@@ -88,13 +88,23 @@ def apply_attention_residual(
 
     values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
     values_float = values.float()
-    variance = values_float.square().mean(dim=-1, keepdim=True)
-    keys = values_float * torch.rsqrt(variance + norm.variance_epsilon)
 
-    # norm(values) @ projection.weight, with both parameter vectors multiplied
-    # first so the implementation matches Kimi K3's checkpoint semantics.
+    # norm(values) @ projection.weight, with both parameter vectors multiplied first so the
+    # implementation matches Kimi K3's checkpoint semantics.
     score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
-    scores = (keys * score_weight).sum(dim=-1)
+
+    # ALGEBRAICALLY IDENTICAL to `(rms_norm(values) * score_weight).sum(-1)`, but without ever
+    # building a normalized copy. The RMS factor is per (token, block) and broadcasts over hidden,
+    # so it pulls straight out of the contraction:
+    #     sum_d (v_d * inv_rms) * w_d  ==  inv_rms * sum_d v_d * w_d
+    # The naive form materialized TWO extra (tokens, blocks+1, hidden) fp32 tensors -- the
+    # normalized keys and the keys*weight product -- and both were kept alive for backward, at
+    # every residual site of every layer. This form contracts with a single GEMV straight to
+    # (tokens, blocks+1) and allocates nothing of hidden size.
+    sq_sum = torch.linalg.vector_norm(values_float, dim=-1).square()   # fused; no squared copy
+    inv_rms = torch.rsqrt(sq_sum / values_float.shape[-1] + norm.variance_epsilon)
+    scores = torch.matmul(values_float, score_weight) * inv_rms
+
     probabilities = scores.softmax(dim=-1).unsqueeze(1)
     mixed = torch.matmul(probabilities, values_float).squeeze(1)
     return mixed.to(values.dtype)
@@ -117,13 +127,18 @@ class BiBoDecoderLayer(nn.Module):
         self.input_layernorm = BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # 2 = K3 faithful: an independent depth-mix before the attention sublayer AND before the
+        # MLP sublayer. 1 = ONE mix per layer, at the layer input only; the MLP then takes an
+        # ordinary PreNorm residual. Halves the depth-attention work and the AttnRes parameters.
+        self.attn_res_sites = getattr(config, "attn_res_sites", 2)
         if self.use_attn_residuals:
             self.self_attention_res_norm = BiBoRMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
-            self.mlp_res_norm = BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.self_attention_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
-            self.mlp_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
+            if self.attn_res_sites == 2:
+                self.mlp_res_norm = BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.mlp_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
 
         self.use_selective_checkpointing = False
 
@@ -215,12 +230,20 @@ class BiBoDecoderLayer(nn.Module):
         )
         prefix_sum = attn_output if prefix_sum is None else prefix_sum + attn_output
 
-        hidden_states = apply_attention_residual(
-            prefix_sum.reshape(-1, hidden_size),
-            block_residual,
-            self.mlp_res_proj,
-            self.mlp_res_norm,
-        ).reshape(batch_size, seq_len, hidden_size)
+        if self.attn_res_sites == 2:
+            hidden_states = apply_attention_residual(
+                prefix_sum.reshape(-1, hidden_size),
+                block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+            ).reshape(batch_size, seq_len, hidden_size)
+        else:
+            # ONE mix per layer: the MLP reads the plain running prefix sum. It cannot reuse the
+            # pre-attention mix -- that tensor predates attn_output, so feeding it to the MLP would
+            # hide this layer's attention output from the MLP entirely. Sharing the mix means
+            # spending it where it is cheapest to compute and letting the MLP take a normal
+            # residual, not literally passing the same tensor to both reads.
+            hidden_states = prefix_sum
 
         if self.use_selective_checkpointing and self.training:
             mlp_output = checkpoint(

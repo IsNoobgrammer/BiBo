@@ -126,7 +126,7 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          pos_identity_expert=True, neg_identity_expert=True,
                          top_k=None, moe_intermediate_size=None, num_shared_experts=0,
                          hybrid_layer_pattern=None, sliding_window=128,
-                         swa_qk_norm=True, attn_res="off"):
+                         swa_qk_norm=True, attn_res="off", attn_res_sites=2):
     # attn_res: "off" = stable src model. Anything else routes to exp/ (Kimi K3 Attention
     # Residuals): "control" builds exp's model with residuals DISABLED, an int is the block size
     # in decoder layers (1 = per-layer / Full AttnRes, 3 = one block per [G,S,S]).
@@ -135,7 +135,8 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
         extra = {}
     else:
         from exp.configuration_bibo import BiBoConfig
-        extra = {"attn_res_block_size": None if attn_res == "control" else int(attn_res)}
+        extra = {"attn_res_block_size": None if attn_res == "control" else int(attn_res),
+                 "attn_res_sites": attn_res_sites}
     return BiBoConfig(
         **extra,
         bias_update_threshold=bias_update_threshold,

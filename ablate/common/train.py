@@ -251,6 +251,10 @@ def main():
     # residuals disabled. An INT is the block size in decoder layers: 1 = per-layer (Full AttnRes),
     # 3 = one block per [G,S,S]. At 10 layers K3's own default of 12 is degenerate (one block).
     ap.add_argument("--attn_res", default="off")
+    # 2 = K3 faithful (a depth-mix before BOTH the attention and the MLP sublayer). 1 = one mix
+    # per layer at the layer input; the MLP takes an ordinary PreNorm residual. Halves the
+    # depth-attention work and the AttnRes parameter count.
+    ap.add_argument("--attn_res_sites", type=int, choices=[1, 2], default=2)
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
     # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
@@ -430,7 +434,7 @@ def main():
                            xsa_alpha_init=args.xsa_alpha_init,
                            hybrid_layer_pattern=_swa_pat, sliding_window=_win,
                            swa_qk_norm=args.swa_qk_norm,
-                           attn_res=args.attn_res,
+                           attn_res=args.attn_res, attn_res_sites=args.attn_res_sites,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
@@ -506,6 +510,8 @@ def main():
                 # control's ckpt/_result.json on the same seed+experts
                 + (f"_act{args.act}" if args.act != "radial" else "")
                 + (f"_ares{args.attn_res}" if args.attn_res != "off" else "")
+                + (f"s{args.attn_res_sites}" if args.attn_res != "off"
+                   and args.attn_res_sites != 2 else "")
                 # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
