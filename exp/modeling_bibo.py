@@ -46,6 +46,24 @@ try:
 except Exception:                                   # no triton / no kernels checkout
     _HAS_FUSED_AR = False
 
+try:
+    # Fused carry write: h = attn_read + c*attn_out + d*emb in ONE pass instead of one elementwise
+    # pass per stream. Benched at the board shape (65536 x 512): 2.52x forward / 1.90x fwd+bwd at
+    # two streams, and the gap widens with stream count. It is also MORE ACCURATE than this file's
+    # torch path, not just faster: eager evaluates `_c.to(attn_output.dtype) * attn_output`, which
+    # rounds the learned fp32 scalar to BF16 and multiplies in bf16, while the kernel promotes
+    # every operand to fp32 and accumulates there -- measured 30,000-47,000x closer to fp64 truth
+    # on the real dtype layout. So enabling it SHIFTS TRAINING NUMERICS (toward correct); an arm
+    # run on it is not bit-comparable to one run without it.
+    from kernels.sm120.residual_add import make_mlp_input as _fused_res_add
+    _HAS_FUSED_RES_ADD = True
+except Exception:
+    _HAS_FUSED_RES_ADD = False
+
+# attn_res_carry_scale -> the kernel's transform code for the attn_out multiplier. "none" has no
+# theta at all (c is a hard 1.0) and is handled by the caller, not here.
+_CARRY_MODE = {"unbounded": "none", "sigmoid": "2sigmoid", "tanh": "2tanh"}
+
 logger = logging.get_logger(__name__)
 
 __all__ = [
@@ -202,10 +220,23 @@ class BiBoDecoderLayer(nn.Module):
         # embedding (block_residual is empty, so the depth read is skipped), so d would be a
         # duplicate of the identity path. Unnormed on purpose -- see attn_res_emb_term in the
         # config, and the MoE-output-norm round, which measured "norm the addend" at -0.010 bpb.
+        # attn_res_emb_scale picks d = f(theta). "none" keeps the raw scalar, which is what the
+        # first emb arm ran and what produced the measured profile d = [1.32, 0.55, 0.40, 0.33,
+        # 0.33, 0.49, 0.28, 0.42, 0.30]. NOTE the range: plain "sigmoid" caps d at 1.0 and would
+        # CLIP layer 1, which asked for 1.32 -- the single largest and most informative value on
+        # that axis. "2sigmoid" spans (0, 2) and covers it.
+        _es = str(getattr(config, "attn_res_emb_scale", "none"))
+        if _es not in ("none", "sigmoid", "2sigmoid", "tanh", "2tanh"):
+            raise ValueError(f"attn_res_emb_scale must be none/sigmoid/2sigmoid/tanh/2tanh, got {_es!r}")
+        self.attn_res_emb_scale = _es
         self.attn_res_emb_theta = (
             nn.Parameter(torch.zeros(1))
             if (getattr(config, "attn_res_emb_term", False) and self.use_attn_residuals
                 and self.attn_res_carry and layer_idx > 0) else None)
+        # Non-persistent so it never enters the state_dict: an extra key would break every existing
+        # checkpoint load and the exp(control) == src equality that gates this whole family.
+        if self.use_attn_residuals and self.attn_res_carry:
+            self.register_buffer("attn_res_carry_one", torch.ones(1), persistent=False)
 
         if self.use_attn_residuals:
             self.self_attention_res_norm = BiBoRMSNorm(
@@ -329,21 +360,39 @@ class BiBoDecoderLayer(nn.Module):
             # output. Depth-mixed (one sublayer stale) and attention IS visible, which the plain
             # prefix-sum variant below is not -- that one deleted depth-mixing from the MLP rather
             # than halving it, and cost +0.00815 bpb for it.
-            if self.attn_res_carry_theta is not None:
-                _t = self.attn_res_carry_theta.float()
-                _c = (_t if self.attn_res_carry_scale == "unbounded"
-                      else 2.0 * torch.sigmoid(_t) if self.attn_res_carry_scale == "sigmoid"
-                      else 2.0 * torch.tanh(_t))
-                hidden_states = attn_read + _c.to(attn_output.dtype) * attn_output
+            # block_residual[:, 0] IS the embedding, always: layer 0 is a block boundary for every
+            # block size (0 % n == 0), so the untransformed embedding is what gets archived there.
+            # Reusing it costs no new plumbing through the layer signature.
+            _has_emb = self.attn_res_emb_theta is not None and block_residual.shape[1] > 0
+            _emb = (block_residual[:, 0].reshape(batch_size, seq_len, hidden_size)
+                    if _has_emb else None)
+            if _HAS_FUSED_RES_ADD and attn_read.is_cuda:
+                # attn_res_carry_one is a non-persistent ones buffer, so carry_scale="none"
+                # (a hard c = 1.0) goes down the same fused path instead of forking the formula.
+                _m = self.attn_res_carry_theta
+                _pairs = [_m if _m is not None else self.attn_res_carry_one, attn_output]
+                _modes = [_CARRY_MODE[self.attn_res_carry_scale] if _m is not None else "none"]
+                if _has_emb:
+                    _pairs += [self.attn_res_emb_theta, _emb]
+                    _modes.append(self.attn_res_emb_scale)
+                hidden_states = _fused_res_add(attn_read, *_pairs, modes=tuple(_modes))
             else:
-                hidden_states = attn_read + attn_output
-            if self.attn_res_emb_theta is not None and block_residual.shape[1] > 0:
-                # block_residual[:, 0] IS the embedding, always: layer 0 is a block boundary for
-                # every block size (0 % n == 0), so the untransformed embedding is what gets
-                # archived there. Reusing it costs no new plumbing through the layer signature.
-                _emb = block_residual[:, 0].reshape(batch_size, seq_len, hidden_size)
-                hidden_states = hidden_states + (
-                    self.attn_res_emb_theta.float().to(hidden_states.dtype) * _emb.to(hidden_states.dtype))
+                if self.attn_res_carry_theta is not None:
+                    _t = self.attn_res_carry_theta.float()
+                    _c = (_t if self.attn_res_carry_scale == "unbounded"
+                          else 2.0 * torch.sigmoid(_t) if self.attn_res_carry_scale == "sigmoid"
+                          else 2.0 * torch.tanh(_t))
+                    hidden_states = attn_read + _c.to(attn_output.dtype) * attn_output
+                else:
+                    hidden_states = attn_read + attn_output
+                if _has_emb:
+                    _d = self.attn_res_emb_theta.float()
+                    _d = ({"none": lambda x: x, "sigmoid": torch.sigmoid,
+                           "2sigmoid": lambda x: 2.0 * torch.sigmoid(x),
+                           "tanh": torch.tanh, "2tanh": lambda x: 2.0 * torch.tanh(x)}
+                          [self.attn_res_emb_scale](_d))
+                    hidden_states = hidden_states + (
+                        _d.to(hidden_states.dtype) * _emb.to(hidden_states.dtype))
         else:
             # ONE mix per layer, PREFIX: the MLP reads the raw within-block sum. Measured and lost.
             hidden_states = prefix_sum

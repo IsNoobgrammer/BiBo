@@ -275,6 +275,11 @@ def main():
     # d is per-layer, learnable, init 0 -> strict generalization of plain carry. Tests whether
     # layer 1's negative XSA alpha is a workaround for a missing token-identity channel.
     ap.add_argument("--attn_res_emb_term", type=_bool, default=False)
+    # d = f(theta). "none" = raw (what the first emb arm ran). Plain "sigmoid" caps d at 1.0,
+    # which CLIPS layer 1 -- it asked for 1.32, the largest value on that axis. "2sigmoid"
+    # spans (0,2) and covers it.
+    ap.add_argument("--attn_res_emb_scale",
+                    choices=["none", "sigmoid", "2sigmoid", "tanh", "2tanh"], default="none")
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
     # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
@@ -464,6 +469,7 @@ def main():
                            attn_res_fp32_stream=args.attn_res_fp32_stream,
                            attn_res_carry_scale=args.attn_res_carry_scale,
                            attn_res_emb_term=args.attn_res_emb_term,
+                           attn_res_emb_scale=args.attn_res_emb_scale,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
@@ -550,6 +556,8 @@ def main():
                 + (f"cs{args.attn_res_carry_scale}" if args.attn_res != "off"
                    and args.attn_res_carry_scale != "none" else "")
                 + ("emb" if args.attn_res != "off" and args.attn_res_emb_term else "")
+                + (args.attn_res_emb_scale if args.attn_res_emb_term
+                   and args.attn_res_emb_scale != "none" else "")
                 # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
