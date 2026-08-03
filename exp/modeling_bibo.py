@@ -196,6 +196,16 @@ class BiBoDecoderLayer(nn.Module):
         self.attn_res_carry_theta = (
             nn.Parameter(torch.full((1,), float(_init)))
             if (_init is not None and self.use_attn_residuals and self.attn_res_carry) else None)
+        # d: off-simplex embedding gain on the carry write. Init EXACTLY 0 so the arm is a strict
+        # generalization -- at step 0 it is bit-identical to plain carry, and any nonzero final
+        # value is the model asking for it. Not created at layer 0: there attn_read IS the
+        # embedding (block_residual is empty, so the depth read is skipped), so d would be a
+        # duplicate of the identity path. Unnormed on purpose -- see attn_res_emb_term in the
+        # config, and the MoE-output-norm round, which measured "norm the addend" at -0.010 bpb.
+        self.attn_res_emb_theta = (
+            nn.Parameter(torch.zeros(1))
+            if (getattr(config, "attn_res_emb_term", False) and self.use_attn_residuals
+                and self.attn_res_carry and layer_idx > 0) else None)
 
         if self.use_attn_residuals:
             self.self_attention_res_norm = BiBoRMSNorm(
@@ -327,6 +337,13 @@ class BiBoDecoderLayer(nn.Module):
                 hidden_states = attn_read + _c.to(attn_output.dtype) * attn_output
             else:
                 hidden_states = attn_read + attn_output
+            if self.attn_res_emb_theta is not None and block_residual.shape[1] > 0:
+                # block_residual[:, 0] IS the embedding, always: layer 0 is a block boundary for
+                # every block size (0 % n == 0), so the untransformed embedding is what gets
+                # archived there. Reusing it costs no new plumbing through the layer signature.
+                _emb = block_residual[:, 0].reshape(batch_size, seq_len, hidden_size)
+                hidden_states = hidden_states + (
+                    self.attn_res_emb_theta.float().to(hidden_states.dtype) * _emb.to(hidden_states.dtype))
         else:
             # ONE mix per layer, PREFIX: the MLP reads the raw within-block sum. Measured and lost.
             hidden_states = prefix_sum

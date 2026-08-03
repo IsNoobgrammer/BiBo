@@ -172,6 +172,42 @@ def main():
                        f"be exactly 1.0 or the arm is not a generalization of carry")
     print(f"  [6] carry_scale unbounded: {n_theta} thetas, init 1.0 -> identical to carry at init "
           f"({d0:.1e})")
+
+    # (7) the off-simplex embedding term. Three things, and the THIRD is the one that matters:
+    #     init d=0 must be bit-identical (strict generalization), setting d must CHANGE the logits,
+    #     and each layer's d must be independently live. A knob can pass every numeric parity gate
+    #     while being dead plumbing -- that has happened here before, with xsa alpha.
+    torch.manual_seed(0)
+    me, _ = build_arm("bibo_min", device="cpu", dtype=torch.float32, num_experts=6,
+                      special_pairs=0, use_xsa=True, hybrid_layer_pattern=pattern,
+                      sliding_window=128, attn_res="3", attn_res_sites=1, attn_res_carry=True,
+                      attn_res_carry_scale="unbounded", attn_res_emb_term=True)
+    me.eval()
+    me.load_state_dict(ms.state_dict(), strict=False)
+    ds = [(n, p) for n, p in me.named_parameters() if "attn_res_emb_theta" in n]
+    assert len(ds) == NL - 1, f"expected one d per layer EXCEPT layer 0, got {len(ds)} for {NL} layers"
+    assert not any(".0.attn_res_emb_theta" in n for n, _ in ds), (
+        "layer 0 must not get a d: its attn_read IS the embedding (the depth read is skipped "
+        "there because block_residual is empty), so d would duplicate the identity path")
+    with torch.no_grad():
+        y_d0 = me(input_ids=ids).logits
+    dz = (y_d0 - ys).abs().max().item()
+    assert dz == 0.0, f"d=0 is not bit-identical to carry_scale alone ({dz:.2e}); not a generalization"
+    with torch.no_grad():
+        for _, p in ds:
+            p.fill_(0.3)
+        y_d1 = me(input_ids=ids).logits
+    dl = (y_d1 - y_d0).abs().max().item()
+    assert dl > 1e-2, f"setting d changed nothing ({dl:.2e}) -- the embedding term is dead plumbing"
+    with torch.no_grad():
+        for _, p in ds:
+            p.fill_(0.0)
+        dict(me.named_parameters())["model.layers.1.attn_res_emb_theta"].fill_(0.3)
+        y_l1 = me(input_ids=ids).logits
+    dl1 = (y_l1 - y_d0).abs().max().item()
+    assert dl1 > 1e-2, f"layer-1 d alone changed nothing ({dl1:.2e}) -- d is not per-layer"
+    print(f"  [7] emb term: {len(ds)} d (no L0); d=0 identical ({dz:.1e}), d=0.3 moves "
+          f"{dl:.3f}, L1-only moves {dl1:.3f}")
     print("PASS")
 
 

@@ -271,6 +271,10 @@ def main():
     # so it is a strict generalization of plain carry. Logged as cs= to get the depth profile.
     ap.add_argument("--attn_res_carry_scale",
                     choices=["none", "unbounded", "sigmoid", "tanh"], default="none")
+    # Third, OFF-SIMPLEX term on the carry write: h = attn_read + c*attn_out + d*embedding.
+    # d is per-layer, learnable, init 0 -> strict generalization of plain carry. Tests whether
+    # layer 1's negative XSA alpha is a workaround for a missing token-identity channel.
+    ap.add_argument("--attn_res_emb_term", type=_bool, default=False)
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
     # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
@@ -459,6 +463,7 @@ def main():
                            attn_res_carry=args.attn_res_carry,
                            attn_res_fp32_stream=args.attn_res_fp32_stream,
                            attn_res_carry_scale=args.attn_res_carry_scale,
+                           attn_res_emb_term=args.attn_res_emb_term,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
@@ -544,6 +549,7 @@ def main():
                 + ("f32s" if args.attn_res != "off" and args.attn_res_fp32_stream else "")
                 + (f"cs{args.attn_res_carry_scale}" if args.attn_res != "off"
                    and args.attn_res_carry_scale != "none" else "")
+                + ("emb" if args.attn_res != "off" and args.attn_res_emb_term else "")
                 # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
@@ -751,6 +757,20 @@ def main():
                         f"[{_c.min().item():.2f},{_c.max().item():.2f}]")
                 aS_s = xa_s + cs_s        # covers the no-radial case; the radial block below
                                           # rebuilds from xa_s + cs_s so neither clobbers the other
+            # d = the off-simplex embedding gain, PER LAYER. The whole arm is a depth-profile
+            # question -- "does layer 1 alone want a token-identity channel?" -- so a mean would
+            # answer nothing. Note d does not exist at layer 0, so L index here is layer_idx-1.
+            _de = [m.attn_res_emb_theta for m in model.modules()
+                   if getattr(m, "attn_res_emb_theta", None) is not None]
+            if _de:
+                _d = torch.cat([t.detach().float().flatten() for t in _de])
+                rt.update({"train/attn_res_d_mean": _d.mean().item(),
+                           "train/attn_res_d_min": _d.min().item(),
+                           "train/attn_res_d_max": _d.max().item()})
+                rt.update({f"train/attn_res_d/L{i + 1}": v for i, v in enumerate(_d.tolist())})
+                cs_s += (f" d={_d.mean().item():.3f}"
+                         f"[{_d.min().item():.2f},{_d.max().item():.2f}]")
+                aS_s = xa_s + cs_s
             _th = [m.radial_theta for m in model.modules() if hasattr(m, "radial_theta")]
             if _th:
                 _t = torch.cat([t.detach().float().flatten() for t in _th])

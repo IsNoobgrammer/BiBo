@@ -162,7 +162,7 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
     # equilibrium instead of the loss. Caveat: norm.weight is 1D and stays in the DEFAULT group, so
     # "act" splits the two factors of that product across two lrs -- "default" keeps them together.
     _is_as = lambda n: ("radial_theta" in n or "xsa_alpha" in n
-                        or "attn_res_carry_theta" in n
+                        or "attn_res_carry_theta" in n or "attn_res_emb_theta" in n
                         or (vec_adamw_group == "act" and "res_proj" in n))
     a_scale = [p for n, p in other if _is_as(n)]
     rest = [p for n, p in other if not _is_as(n)]
