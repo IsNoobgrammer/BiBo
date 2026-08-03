@@ -55,7 +55,8 @@ def _profile(model, ids, warmup, iters):
     for _ in range(warmup):
         _step(model, ids)
     torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CUDA], record_shapes=False) as prof:
+    acts = [ProfilerActivity.CPU, ProfilerActivity.CUDA]   # CPU too, so keys are aten:: ops
+    with profile(activities=acts, record_shapes=False) as prof:
         for _ in range(iters):
             _step(model, ids)
         torch.cuda.synchronize()
@@ -99,7 +100,7 @@ def main():
     print("-" * 82)
     for k in keys[: args.top]:
         x, y = a.get(k, 0.0), b.get(k, 0.0)
-        print(f"{k[:51]:<52}{x:>10.3f}{y:>10.3f}{y - x:>+10.3f}")
+        print(f"{k[:69]:<70}{x:>9.2f}{y:>9.2f}{y - x:>+9.2f}")
 
 
 if __name__ == "__main__":
