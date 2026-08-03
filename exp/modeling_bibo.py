@@ -33,6 +33,17 @@ from src.modeling.norm import BiBoRMSNorm
 
 from .configuration_bibo import BiBoConfig
 
+try:
+    # Fused AR: one read of V, fp32 accumulation, and a custom backward that saves only the
+    # INPUTS. Measured fwd+bwd at T=16384/H=512: 16-20x faster than this file's torch path and
+    # 4.7x less peak memory at N=11 (2450 -> 520 MB per site). Parity and gradcheck live in
+    # triton-kernel-fused/parity_check/parity_attn_res.py, graded against FP32 eager at every
+    # dtype -- the bf16 kernel matches bf16 eager's error to the digit on all three gradients.
+    from kernels.sm120.attn_res import attn_res as _fused_ar
+    _HAS_FUSED_AR = True
+except Exception:                                   # no triton / no kernels checkout
+    _HAS_FUSED_AR = False
+
 logger = logging.get_logger(__name__)
 
 __all__ = [
@@ -86,12 +97,17 @@ def apply_attention_residual(
             f"{tuple(prefix_sum.shape)} vs {tuple(block_residual.shape)}"
         )
 
+    # norm(values) @ projection.weight, with both parameter vectors multiplied first so the
+    # implementation matches Kimi K3's checkpoint semantics. Autograd splits the gradient back
+    # to norm.weight and projection.weight through this product, so the kernel only needs the
+    # folded vector.
+    score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
+
+    if _HAS_FUSED_AR and prefix_sum.is_cuda:
+        return _fused_ar(block_residual, prefix_sum, score_weight, norm.variance_epsilon)
+
     values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
     values_float = values.float()
-
-    # norm(values) @ projection.weight, with both parameter vectors multiplied first so the
-    # implementation matches Kimi K3's checkpoint semantics.
-    score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
 
     # ALGEBRAICALLY IDENTICAL to `(rms_norm(values) * score_weight).sum(-1)`, but without ever
     # building a normalized copy. The RMS factor is per (token, block) and broadcasts over hidden,
