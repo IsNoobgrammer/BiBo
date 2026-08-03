@@ -726,10 +726,16 @@ def main():
                 _c = (_tt if _mode == "unbounded"
                       else 2.0 * torch.sigmoid(_tt) if _mode == "sigmoid"
                       else 2.0 * torch.tanh(_tt))
-                rt.update({"train/carry_scale_mean": _c.mean().item(),
-                           "train/carry_scale_min": _c.min().item(),
-                           "train/carry_scale_max": _c.max().item()})
-                aS_s += (f" cs={_c.mean().item():.3f}"
+                rt.update({"train/attn_res_s_mean": _c.mean().item(),
+                           "train/attn_res_s_min": _c.min().item(),
+                           "train/attn_res_s_max": _c.max().item()})
+                # PER LAYER too. min/max/mean over 10 layers cannot answer the question this
+                # arm exists for -- "do early layers want the depth mix and late layers their
+                # own attention?" needs to know WHICH layer, the same way radial p's depth ramp
+                # was only visible per layer and its global mean actively misled.
+                rt.update({f"train/attn_res_s/L{i}": v
+                           for i, v in enumerate(_c.tolist())})
+                aS_s += (f" s={_c.mean().item():.3f}"
                          f"[{_c.min().item():.2f},{_c.max().item():.2f}]")
             _th = [m.radial_theta for m in model.modules() if hasattr(m, "radial_theta")]
             if _th:
