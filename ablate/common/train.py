@@ -260,6 +260,9 @@ def main():
     # Keep the residual stream in the layer-input dtype (fp32 under autocast, as the
     # standard-residual control does) so AttnRes is the ONLY difference from the baseline.
     ap.add_argument("--attn_res_fp32_stream", type=_bool, default=False)
+    # Learnable per-layer coefficient on the carry term: A_coeff = 2*sigmoid(theta), init 1.0
+    # so it is a strict generalization of plain carry. Logged as cs= to get the depth profile.
+    ap.add_argument("--attn_res_carry_scale", type=_bool, default=False)
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
     # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
@@ -447,6 +450,7 @@ def main():
                            attn_res=args.attn_res, attn_res_sites=args.attn_res_sites,
                            attn_res_carry=args.attn_res_carry,
                            attn_res_fp32_stream=args.attn_res_fp32_stream,
+                           attn_res_carry_scale=args.attn_res_carry_scale,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
@@ -526,6 +530,7 @@ def main():
                    and args.attn_res_sites != 2 else "")
                 + ("c" if args.attn_res != "off" and args.attn_res_carry else "")
                 + ("f32s" if args.attn_res != "off" and args.attn_res_fp32_stream else "")
+                + ("cs" if args.attn_res != "off" and args.attn_res_carry_scale else "")
                 # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
@@ -706,6 +711,20 @@ def main():
                      if "train/xsa_a_mean" in rt else "")
                     )
             aS_s = xa_s
+            # cs = the learnable carry coefficient, reported as 2*sigmoid(theta) because that is
+            # what multiplies attn_output. Init is exactly 1.0, so a cs pinned at 1.000 across
+            # every layer means the MLP does not want the knob and it can be removed; a DEPTH
+            # PROFILE (early layers wanting mixing, late wanting their own attention) is the
+            # result worth having, and is the same shape radial p turned out to have.
+            _cs = [m.attn_res_carry_theta for m in model.modules()
+                   if getattr(m, "attn_res_carry_theta", None) is not None]
+            if _cs:
+                _c = 2.0 * torch.sigmoid(torch.cat([t.detach().float().flatten() for t in _cs]))
+                rt.update({"train/carry_scale_mean": _c.mean().item(),
+                           "train/carry_scale_min": _c.min().item(),
+                           "train/carry_scale_max": _c.max().item()})
+                aS_s += (f" cs={_c.mean().item():.3f}"
+                         f"[{_c.min().item():.2f},{_c.max().item():.2f}]")
             _th = [m.radial_theta for m in model.modules() if hasattr(m, "radial_theta")]
             if _th:
                 _t = torch.cat([t.detach().float().flatten() for t in _th])

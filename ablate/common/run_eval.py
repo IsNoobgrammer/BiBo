@@ -61,6 +61,7 @@ def _arch_kwargs(c):
         attn_res_sites=c.get("attn_res_sites", 2),
         attn_res_carry=c.get("attn_res_carry", False),
         attn_res_fp32_stream=c.get("attn_res_fp32_stream", False),
+        attn_res_carry_scale=c.get("attn_res_carry_scale", False),
         bias_update_threshold=c.get("bias_update_threshold", 10240),
         bias_update_factor=(None if bias_factor is not None and bias_factor < 0 else bias_factor),
         aux_coef=c.get("aux_coef", 0.001),

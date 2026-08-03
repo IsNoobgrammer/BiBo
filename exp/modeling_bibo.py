@@ -170,6 +170,20 @@ class BiBoDecoderLayer(nn.Module):
         # every AttnRes arm non-comparable to the baseline. Setting this keeps the stream in the
         # layer-input dtype so the ONLY difference from the control is AttnRes itself.
         self.attn_res_fp32_stream = getattr(config, "attn_res_fp32_stream", False)
+        # CARRY SCALE. In carry the MLP reads Ht + A, so A enters at coefficient exactly 1 and is
+        # not competing with the blocks for softmax mass -- that is the point of carry. But 1 is
+        # an arbitrary choice, and whether the MLP wants MORE or LESS of this layer's attention is
+        # plausibly depth-dependent, the way radial p turned out to be. So make it learnable:
+        #     A_coeff = 2 * sigmoid(theta),   theta init 0  ->  coeff exactly 1.0
+        # Init at 1 makes this a STRICT GENERALIZATION of the measured carry arm -- at step 0 the
+        # two models are identical, so anything it learns is attributable. Range (0, 2): it can
+        # switch the current attention off entirely or double it. BOUNDED on purpose; every
+        # unbounded scale we have tried has run away (radial p, xsa alpha, act scales all won as
+        # bounded params). Named *_theta so optim.py routes it to the act-scale group's lr.
+        self.attn_res_carry_theta = (
+            nn.Parameter(torch.zeros(1))
+            if (self.use_attn_residuals and self.attn_res_carry
+                and getattr(config, "attn_res_carry_scale", False)) else None)
         if self.use_attn_residuals:
             self.self_attention_res_norm = BiBoRMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -292,7 +306,11 @@ class BiBoDecoderLayer(nn.Module):
             # output. Depth-mixed (one sublayer stale) and attention IS visible, which the plain
             # prefix-sum variant below is not -- that one deleted depth-mixing from the MLP rather
             # than halving it, and cost +0.00815 bpb for it.
-            hidden_states = attn_read + attn_output
+            if self.attn_res_carry_theta is not None:
+                _c = 2.0 * torch.sigmoid(self.attn_res_carry_theta.float())
+                hidden_states = attn_read + _c.to(attn_output.dtype) * attn_output
+            else:
+                hidden_states = attn_read + attn_output
         else:
             # ONE mix per layer, PREFIX: the MLP reads the raw within-block sum. Measured and lost.
             hidden_states = prefix_sum

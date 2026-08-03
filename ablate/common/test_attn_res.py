@@ -152,6 +152,26 @@ def main():
     assert dp > 1e-3, f"carry == prefix variant ({dp:.2e}) -- the flag did nothing"
     assert dd > 1e-3, f"carry == sites=2 ({dd:.2e})"
     print(f"  [5] carry: same {nc - n_ctl} params as sites=1; vs prefix {dp:.3f}, vs sites=2 {dd:.3f}")
+
+    # (6) the learnable carry coefficient is a STRICT GENERALIZATION: 2*sigmoid(0) == 1.0, so at
+    #     init it must be bit-identical to plain carry. If it is not, the knob has changed the
+    #     model before learning anything and the arm is not attributable.
+    torch.manual_seed(0)
+    ms, _ = build_arm("bibo_min", device="cpu", dtype=torch.float32, num_experts=6,
+                      special_pairs=0, use_xsa=True, hybrid_layer_pattern=pattern,
+                      sliding_window=128, attn_res="3", attn_res_sites=1,
+                      attn_res_carry=True, attn_res_carry_scale=True)
+    ms.eval()
+    ms.load_state_dict(mc.state_dict(), strict=False)
+    n_theta = sum(1 for n, _ in ms.named_parameters() if "attn_res_carry_theta" in n)
+    assert n_theta == NL, f"expected one carry theta per layer, got {n_theta}"
+    with torch.no_grad():
+        ys = ms(input_ids=ids).logits
+    d0 = (ys - yc).abs().max().item()
+    assert d0 < 1e-5, (f"carry_scale is NOT identity at init (diff {d0:.2e}); 2*sigmoid(0) must "
+                       f"be exactly 1.0 or the arm is not a generalization of carry")
+    print(f"  [6] carry_scale: {n_theta} thetas, 2*sigmoid(0)=1 -> identical to carry at init "
+          f"({d0:.1e})")
     print("PASS")
 
 
