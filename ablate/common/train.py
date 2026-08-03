@@ -239,6 +239,9 @@ def main():
     # Sharing adam_lr would leave p stuck near its 0.5 init and look like "the axis does nothing".
     # 0 = share --adam_lr (the old default; kept so the A/B is one flag).
     ap.add_argument("--act_scale_lr", type=float, default=0.01)
+    # Route (1,H) "matrices" -- AttnRes pseudo-queries are nn.Linear(hidden,1) -- to AdamW instead
+    # of Muon. Default False = the ndim rule as it stands, which is what every arm so far ran.
+    ap.add_argument("--vec_matrices_adamw", type=_bool, default=False)
     # radial p parameterization. sigmoid = every result on the board; tanh additionally lets
     # p go NEGATIVE (gain r^p < 1, shrinking high-rms rows), which sigmoid cannot express.
     # Kernel act code 8 vs 10. Tag _ptanh.
@@ -487,6 +490,7 @@ def main():
                                           xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where,
                                           router_adamw=(args.router_optim == "adamw"),
                                           act_scale_lr=args.act_scale_lr,
+                                          vec_matrices_adamw=args.vec_matrices_adamw,
                                           cautious_decay=args.cautious_decay,
                                           optim=args.optim, probe_gamma=probe_gamma,
                                           probe_rho_step=args.probe_rho_step,
@@ -510,6 +514,7 @@ def main():
     # The acts- tag is gone: radial is the only activation src implements, so every bibo_min run has it.
     run_name = (f"{args.arm}_seed{args.seed}"
                 + (("_aS" + f"{args.act_scale_lr:g}") if args.act_scale_lr else "")
+                + ("_vecadamw" if args.vec_matrices_adamw else "")
                 + ("_ptanh" if args.radial_p == "tanh" else "")
                 # XSA MUST be tagged: without it the xsa arm shares a run name with its own
                 # control and overwrites its _final.pt / _result.json. That happened once --

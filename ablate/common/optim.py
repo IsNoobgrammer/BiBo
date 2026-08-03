@@ -61,7 +61,7 @@ NS8 = (_KJ,) * 6 + (_PIN,) * 2
 def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, ns_dtype=torch.bfloat16,
                      scale_mode="aurora", xorth_post=0.0, xorth_gate_ref=0.3, xorth_ema=0.95,
                      xorth_warmup_steps=0, xorth_where="post", router_adamw=False,
-                     act_scale_lr=None, cautious_decay=False,
+                     act_scale_lr=None, cautious_decay=False, vec_matrices_adamw=False,
                      optim="muon", probe_gamma=0.0, probe_rho_step=0.96, probe_rank=0):
     from kernels.sm120.muon import FusedMuon   # Blackwell: gram-NS (self-gates to symmul/cuBLAS on small mats) + 8M knee
     stacks, mats, other = [], [], []
@@ -92,6 +92,14 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
             other.append((n, p))            # -> AdamW (ablation: router off Muon)
         elif "embed" in n or p.ndim not in (2, 3):
             other.append((n, p))            # -> AdamW (1D norms/biases, embeddings)
+        elif vec_matrices_adamw and p.ndim == 2 and 1 in p.shape:
+            # A (1, H) parameter is a VECTOR wearing a matrix shape -- AttnRes's pseudo-queries
+            # are nn.Linear(hidden, 1). The ndim rule catches them by accident: Muon's convention
+            # is 2D HIDDEN-LAYER MATRICES, with embeddings/heads/norms/biases on AdamW. For a
+            # (1,H) the spectral norm IS the L2 norm, so Newton-Schulz returns the unit-normalised
+            # row -- a fixed-L2-norm update every step regardless of gradient magnitude. Not
+            # degenerate, but a very different dynamic from AdamW, and not one we chose.
+            other.append((n, p))
         elif p.ndim == 3:
             stacks.append(p)                # 3D MoE expert stacks -> the xorth (cross-expert whitening) target
         else:
