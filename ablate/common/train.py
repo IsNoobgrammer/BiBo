@@ -274,14 +274,19 @@ def main():
     ap.add_argument("--router_optim", choices=["muon","adamw"], default="muon")  # router proj optimizer; muon = current default (2D -> Muon by the ndim rule); tag _radamw      # per-step router mechanics (GPU-accumulated, 1 sync per log_every)
     # MoE-branch magnitude knobs (applied AFTER the top-k norm; normalization sets the SPLIT, these set LOUDNESS)
     # SWA. "block3" = [G,S,S] x N + a global tail (configs.swa_block_pattern); "none" = all global;
-    ap.add_argument("--swa_pattern", default="none")
+    # DEFAULT STACK as of Aug 3 2026: [G,S,S] blocks + a global tail, w128, XSA learnable on every
+    # layer, radial experts. That is the configuration the 524M board settled on, so it is now what
+    # you get without flags; "none" is the all-global ablation.
+    ap.add_argument("--swa_pattern", default="block3")
     # int = uniform. Comma list = HIERARCHICAL: the cycle applied to the windowed layers within
     # each block, e.g. "128,512" -> first windowed layer of every block 128, second 512.
     ap.add_argument("--sliding_window", default="128")
     # QK-norm on the WINDOWED layers only (global layers always keep it). False = the arm that
     # asks whether a 128-token span already bounds logits well enough to make it redundant.
     ap.add_argument("--swa_qk_norm", type=_bool, default=True)
-    ap.add_argument("--use_xsa", action="store_true")                             # ablation axis: XSA exclusive self-attention (default OFF)
+    # XSA is part of the default stack now (learnable per-head alpha, init 0). BooleanOptionalAction
+    # so the existing `--use_xsa` spelling still parses and `--no-use_xsa` is the ablation.
+    ap.add_argument("--use_xsa", action=argparse.BooleanOptionalAction, default=True)
     # Per-head rejection-strength LOGIT; strength = tanh(init). Ships with --use_xsa, it is not a
     # separate axis: learnable-alpha XSA beat fixed full-strength XSA by 20x the noise floor at
     # matched step 1000, so full strength (init inf) is not on the menu. 0 = XSA starts OFF and the
