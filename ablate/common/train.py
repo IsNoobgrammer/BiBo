@@ -274,6 +274,12 @@ def main():
     # Third, OFF-SIMPLEX term on the carry write: h = attn_read + c*attn_out + d*embedding.
     # d is per-layer, learnable, init 0 -> strict generalization of plain carry. Tests whether
     # layer 1's negative XSA alpha is a workaround for a missing token-identity channel.
+    # Force the EAGER carry write even when the fused kernel imports. The kernel is provably
+    # correct (parity + a per-call probe at 2.5e-03, exactly the bf16 scalar rounding it removes)
+    # but it perturbs MoE top-k for ~3.9% of token-layer decisions from step 0, so a kernel run is
+    # a different TRAJECTORY, not the same model. This flag exists to run matched same-box pairs
+    # and find out whether the observed +0.0037 bpb is a real cost or seed noise.
+    ap.add_argument("--fused_res_add", type=_bool, default=True)
     ap.add_argument("--attn_res_emb_term", type=_bool, default=False)
     # d = f(theta). "none" = raw (what the first emb arm ran). Plain "sigmoid" caps d at 1.0,
     # which CLIPS layer 1 -- it asked for 1.32, the largest value on that axis. "2sigmoid"
@@ -484,6 +490,11 @@ def main():
               f"-> tanh = {math.tanh(args.xsa_alpha_init):.3f}", flush=True)
     total, trainable, active = count_params(model)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
+    if not args.fused_res_add:
+        import exp.modeling_bibo as _E
+        _E._HAS_FUSED_RES_ADD = False
+        print("[res_add] fused kernel DISABLED by --fused_res_add false; eager carry write",
+              flush=True)
     # router mechanics traced on the TRAINING stream (eval-time MoEStats sees eval data only, every
     # eval_every steps). GPU-resident accumulators -> one device->host transfer per log_every.
     # Manas dose law (measured, .autoresearch/manas/): per-vote gamma scales with the vote count and
@@ -555,6 +566,7 @@ def main():
                 + ("f32s" if args.attn_res != "off" and args.attn_res_fp32_stream else "")
                 + (f"cs{args.attn_res_carry_scale}" if args.attn_res != "off"
                    and args.attn_res_carry_scale != "none" else "")
+                + ("" if args.fused_res_add else "_eagerRA")
                 + ("emb" if args.attn_res != "off" and args.attn_res_emb_term else "")
                 + (args.attn_res_emb_scale if args.attn_res_emb_term
                    and args.attn_res_emb_scale != "none" else "")
