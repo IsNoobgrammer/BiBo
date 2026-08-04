@@ -241,20 +241,26 @@ class BiBoDecoderLayer(nn.Module):
         self.attn_res_emb_site = _es
         self.attn_res_emb_eps = config.rms_norm_eps
         _need_carry = self.attn_res_carry or _es == "ht"
+        _gain_on = bool(getattr(config, "attn_res_emb_gain", False)) and _es == "ht"
+        # theta init: -4 (p=0.018, rms ~1) only for the GAINLESS ht arm, where theta is the only
+        # magnitude knob and the raw embedding is 500-10000x too small to matter. With i present,
+        # i owns the magnitude, so theta starts NEUTRAL at 0 -> p = sigmoid(0) = 0.5.
         self.attn_res_emb_theta = (
-            nn.Parameter(torch.full((1,), -4.0 if _es == "ht" else 0.0))
+            nn.Parameter(torch.full((1,), -4.0 if (_es == "ht" and not _gain_on) else 0.0))
             if (getattr(config, "attn_res_emb_term", False) and self.use_attn_residuals
                 and _need_carry and layer_idx > 0) else None)
-        # i: a flat learnable gain on the ht skip -- i * r^p * rms_norm(emb). Init EXACTLY 1.0, so
-        # at step 0 the arm is bit-identical to the plain ht skip and any drift is the model asking.
+        # i: a flat learnable gain on the ht skip -- i * r^p * rms_norm(emb). Init EXACTLY 0, so the
+        # arm is bit-identical to plain carry at step 0 and is a STRICT GENERALIZATION -- the same
+        # discipline as d and c. The model has to ask for the skip and picks its own ramp-in rate.
+        # Note the coupling this creates: dL/dtheta is exactly 0 while i == 0 (theta only enters
+        # through the product), so i moves first and theta only starts learning once i is off zero.
+        # dL/di is NOT zero at init, so the arm can leave the inert point -- gate (8) asserts it.
         # i and p are NOT redundant but they are only weakly identifiable: p is pinned solely by
         # per-token variation in r = rms(emb); if r were constant, i would absorb r^p entirely.
         # Read them as "how much" (i) and "how much of the token's own magnitude" (p).
         self.attn_res_emb_gain = (
-            nn.Parameter(torch.ones(1))
-            if (getattr(config, "attn_res_emb_gain", False)
-                and self.attn_res_emb_theta is not None
-                and self.attn_res_emb_site == "ht") else None)
+            nn.Parameter(torch.zeros(1))
+            if (_gain_on and self.attn_res_emb_theta is not None) else None)
         # Non-persistent so it never enters the state_dict: an extra key would break every existing
         # checkpoint load and the exp(control) == src equality that gates this whole family.
         if self.use_attn_residuals and self.attn_res_carry:

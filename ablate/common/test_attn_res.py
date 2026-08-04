@@ -209,10 +209,11 @@ def main():
     print(f"  [7] emb term: {len(ds)} d (no L0); d=0 identical ({dz:.1e}), d=0.3 moves "
           f"{dl:.3f}, L1-only moves {dl1:.3f}")
 
-    # (8) the ht skip's flat gain i. Init 1.0 must be BIT-identical to the plain ht arm (a
-    #     multiply by exactly 1.0), and i must be live and per-layer -- the same dead-plumbing
-    #     gate as (7). Both arms are built from the same seed and share ms's weights, so the
-    #     only difference is the gain parameter.
+    # (8) the ht skip's flat gain i, init 0. Four gates, and the FOURTH is the one that matters:
+    #     i=0 must be bit-identical to plain carry (strict generalization), theta must start
+    #     NEUTRAL at 0 rather than the gainless arm's -4, i must be live and per-layer, and --
+    #     because i=0 zeroes the whole product -- dL/di must be NONZERO at init, or the arm is
+    #     pinned at the inert point forever and every other gate here is vacuous.
     _ht = dict(attn_res="3", attn_res_sites=1, attn_res_carry=True,
                attn_res_carry_scale="unbounded", attn_res_emb_term=True,
                attn_res_emb_site="ht", num_experts=6, special_pairs=0, use_xsa=True,
@@ -229,10 +230,23 @@ def main():
     assert len(gs) == NL - 1, f"expected one i per layer EXCEPT layer 0, got {len(gs)}"
     assert not any("attn_res_emb_gain" in n for n, _ in mh.named_parameters()), \
         "attn_res_emb_gain=False must create no parameter"
+    assert all(p.item() == 0.0 for _, p in gs), "i must init to exactly 0"
+    _tg = [p.item() for n, p in mg.named_parameters() if "attn_res_emb_theta" in n]
+    _th4 = [p.item() for n, p in mh.named_parameters() if "attn_res_emb_theta" in n]
+    assert all(t == 0.0 for t in _tg), f"with i present theta must start neutral at 0, got {_tg}"
+    assert all(t == -4.0 for t in _th4), f"the gainless ht arm must keep theta=-4, got {_th4}"
     with torch.no_grad():
-        y_h, y_g0 = mh(input_ids=ids).logits, mg(input_ids=ids).logits
-    gz = (y_g0 - y_h).abs().max().item()
-    assert gz == 0.0, f"i=1.0 is not bit-identical to the plain ht skip ({gz:.2e})"
+        y_g0 = mg(input_ids=ids).logits
+    gz = (y_g0 - ys).abs().max().item()
+    assert gz == 0.0, f"i=0 is not bit-identical to plain carry ({gz:.2e}); not a generalization"
+    # the one that matters: i must be able to LEAVE zero
+    mg.zero_grad(set_to_none=True)
+    mg(input_ids=ids, labels=ids).loss.backward()
+    gg = [(n, p.grad.abs().max().item()) for n, p in mg.named_parameters()
+          if "attn_res_emb_gain" in n]
+    assert all(g > 0.0 for _, g in gg), (
+        f"dL/di is zero at init -- i can never leave 0 and the whole arm is inert: {gg}")
+    mg.zero_grad(set_to_none=True)
     with torch.no_grad():
         for _, p in gs:
             p.fill_(3.0)
@@ -241,13 +255,14 @@ def main():
     assert gl > 1e-2, f"setting i changed nothing ({gl:.2e}) -- the gain is dead plumbing"
     with torch.no_grad():
         for _, p in gs:
-            p.fill_(1.0)
+            p.fill_(0.0)
         dict(mg.named_parameters())["model.layers.1.attn_res_emb_gain"].fill_(3.0)
         y_gl1 = mg(input_ids=ids).logits
     gl1 = (y_gl1 - y_g0).abs().max().item()
     assert gl1 > 1e-2, f"layer-1 i alone changed nothing ({gl1:.2e}) -- i is not per-layer"
-    print(f"  [8] ht gain: {len(gs)} i (no L0); i=1 identical ({gz:.1e}), i=3 moves "
-          f"{gl:.3f}, L1-only moves {gl1:.3f}")
+    print(f"  [8] ht gain: {len(gs)} i (no L0), init 0 / theta 0; i=0 identical to carry "
+          f"({gz:.1e}), min|dL/di|={min(g for _, g in gg):.2e}, i=3 moves {gl:.3f}, "
+          f"L1-only moves {gl1:.3f}")
     print("PASS")
 
 
