@@ -209,11 +209,12 @@ def main():
     print(f"  [7] emb term: {len(ds)} d (no L0); d=0 identical ({dz:.1e}), d=0.3 moves "
           f"{dl:.3f}, L1-only moves {dl1:.3f}")
 
-    # (8) the ht skip's flat gain i, init 0. Four gates, and the FOURTH is the one that matters:
-    #     i=0 must be bit-identical to plain carry (strict generalization), theta must start
-    #     NEUTRAL at 0 rather than the gainless arm's -4, i must be live and per-layer, and --
-    #     because i=0 zeroes the whole product -- dL/di must be NONZERO at init, or the arm is
-    #     pinned at the inert point forever and every other gate here is vacuous.
+    # (8) the ht skip's flat gain on the RAW embedding, i * emb, init 0. Five gates, and the last
+    #     two are the ones that matter: i=0 must be bit-identical to plain carry (strict
+    #     generalization), theta must not exist at all (the gain replaces it, it does not stack),
+    #     the skip must scale LINEARLY with the embedding (no norm hiding in there), i must be
+    #     live and per-layer, and -- because i=0 zeroes the whole product -- dL/di must be NONZERO
+    #     at init, or the arm is pinned at the inert point and every other gate here is vacuous.
     _ht = dict(attn_res="3", attn_res_sites=1, attn_res_carry=True,
                attn_res_carry_scale="unbounded", attn_res_emb_term=True,
                attn_res_emb_site="ht", num_experts=6, special_pairs=0, use_xsa=True,
@@ -248,6 +249,31 @@ def main():
     assert all(g > 0.0 for _, g in gg), (
         f"dL/di is zero at init -- i can never leave 0 and the whole arm is inert: {gg}")
     mg.zero_grad(set_to_none=True)
+    # NO NORM: HT feeds input_layernorm, so the pre-hook input IS HT. HT(i=1) - HT(i=0) is exactly
+    # the skip, everything else being identical between the two passes -- and it must come out as
+    # the RAW embedding. A unit-norm skip would give constant per-token rms instead; that is the
+    # whole point of this arm, and a stray .rsqrt() would sail past every other gate here.
+    _cap = {}
+    _h = mg.model.layers[1].input_layernorm.register_forward_pre_hook(
+        lambda m, inp: _cap.__setitem__("ht", inp[0].detach().clone()))
+    with torch.no_grad():
+        for _, p in gs:
+            p.fill_(0.0)
+        mg(input_ids=ids)
+        _ht0 = _cap["ht"]
+        for _, p in gs:
+            p.fill_(1.0)
+        mg(input_ids=ids)
+        _skip = _cap["ht"] - _ht0
+        _raw = mg.model.embed_tokens(ids)
+    _h.remove()
+    _err = (_skip - _raw).abs().max().item() / _raw.abs().max().item()
+    assert _err < 1e-5, (f"skip at i=1 is not the raw embedding (rel err {_err:.2e}) -- something "
+                         f"is still normalising it")
+    _tok_rms = _skip.float().square().mean(-1).sqrt()
+    _spread = (_tok_rms.max() / _tok_rms.min()).item()
+    assert _spread > 1.05, (f"per-token skip rms is flat (max/min {_spread:.3f}) -- that is a "
+                            f"normed skip, not i*emb")
     with torch.no_grad():
         for _, p in gs:
             p.fill_(3.0)
@@ -261,9 +287,9 @@ def main():
         y_gl1 = mg(input_ids=ids).logits
     gl1 = (y_gl1 - y_g0).abs().max().item()
     assert gl1 > 1e-2, f"layer-1 i alone changed nothing ({gl1:.2e}) -- i is not per-layer"
-    print(f"  [8] ht gain: {len(gs)} i (no L0), init 0 / theta 0; i=0 identical to carry "
-          f"({gz:.1e}), min|dL/di|={min(g for _, g in gg):.2e}, i=3 moves {gl:.3f}, "
-          f"L1-only moves {gl1:.3f}")
+    print(f"  [8] ht gain i*emb: {len(gs)} i (no L0), init 0, no theta; i=0 identical to carry "
+          f"({gz:.1e}), skip==raw emb (rel {_err:.1e}, per-token rms spread {_spread:.2f}x), "
+          f"min|dL/di|={min(g for _, g in gg):.2e}, i=3 moves {gl:.3f}, L1-only {gl1:.3f}")
     print("PASS")
 
 

@@ -243,17 +243,18 @@ class BiBoDecoderLayer(nn.Module):
         _need_carry = self.attn_res_carry or _es == "ht"
         _emb_on = (getattr(config, "attn_res_emb_term", False) and self.use_attn_residuals
                    and _need_carry and layer_idx > 0)
-        # attn_res_emb_gain REPLACES the radial exponent with a flat gain: i * rms_norm(emb),
-        # ONE scalar, and theta is not created at all. The radial version measured itself out of
-        # existence -- every layer drove theta from -4 down to [-4.55, -5.55] over 1250 steps, and
-        # all that travel moved the actual magnitude r^p from 0.944 to 0.98. A 4% range. p was
-        # asymptoting to the corner where r^p == 1, i.e. asking for the plain unit-norm embedding,
-        # so the radial machinery had already collapsed to the identity and only i is left doing
-        # work. Different job, too: p coupled the skip to the token's OWN magnitude, i just scales.
+        # attn_res_emb_gain REPLACES the radial exponent with a flat gain on the RAW embedding:
+        # i * emb, ONE scalar, no norm, and theta is not created at all. Two reasons the norm is
+        # gone. (1) The radial version measured itself out of existence -- every layer drove theta
+        # from -4 down to [-4.55, -5.55] over 1250 steps, and all that travel moved the real
+        # magnitude r^p from 0.944 to 0.98, a 4% range; p was asymptoting to r^p == 1, i.e. to a
+        # plain unit-norm skip, so the radial machinery had already collapsed to a norm. (2) That
+        # arm LOST (0.6672 vs 0.6579 c-only) while the one emb arm that ever won, mlp-site d*emb
+        # at 0.6572, was unnormed -- and the MoE-output-norm round independently measured
+        # "RMS-norm the addend" at -0.010 bpb in all 3 variants. So the norm is the suspect.
         # Init EXACTLY 0 so the arm is bit-identical to plain carry at step 0 and is a strict
         # generalization -- same discipline as c and d. dL/di is nonzero there (gate 8 asserts it),
-        # so it can leave. With pure unit norm, i IS the rms of the injected embedding: read the
-        # logged profile directly, no r^p factor to undo.
+        # so it can leave.
         _gain_on = bool(getattr(config, "attn_res_emb_gain", False)) and _es == "ht"
         self.attn_res_emb_theta = (
             nn.Parameter(torch.full((1,), -4.0 if _es == "ht" else 0.0))
@@ -343,26 +344,34 @@ class BiBoDecoderLayer(nn.Module):
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
             ).reshape(batch_size, seq_len, hidden_size)
-            if self.attn_res_emb_site == "ht" and (self.attn_res_emb_gain is not None
-                                                   or self.attn_res_emb_theta is not None):
+            if self.attn_res_emb_gain is not None:
+                # HT = AR(...) + i * emb, the RAW embedding. No norm of any kind.
+                # Both normed ht arms lost (radial 0.6672, and the radial is what unit-norm
+                # collapses to) while the only emb arm that ever won -- mlp-site d*emb at
+                # 0.6572 -- was unnormed, so the NORM is the suspect, not the site. The
+                # MoE-output-norm round says the same thing from the other direction: RMS-norming
+                # an addend into the residual stream cost -0.010 bpb in all 3 variants.
+                # Scale note: that winning arm peaked at d = 1.32, i.e. it injected rms ~0.05,
+                # not ~1. Loud was plausibly the bug, so raw is the regime that already works.
+                # Same fused kernel as the carry -- this is exactly a second stream on the add.
+                _emb = block_residual[:, 0].reshape(batch_size, seq_len, hidden_size)
+                if _HAS_FUSED_RES_ADD and hidden_states.is_cuda:
+                    hidden_states = _fused_res_add(
+                        hidden_states, self.attn_res_emb_gain, _emb, modes=("none",))
+                else:
+                    # must round exactly where the kernel does: scalar to the stream dtype,
+                    # product in the stream dtype, accumulate in the output dtype
+                    _g = self.attn_res_emb_gain.float().to(_emb.dtype)
+                    hidden_states = hidden_states + (_g * _emb).to(hidden_states.dtype)
+            elif self.attn_res_emb_theta is not None and self.attn_res_emb_site == "ht":
+                # retired: radial, emb * r^(p-1) with p = sigmoid(theta). Kept so the arms
+                # already on disk still load. It measured itself down to r^p -> 1, i.e. to a
+                # plain unit-norm skip, and lost.
                 _emb = block_residual[:, 0].reshape(batch_size, seq_len, hidden_size).float()
                 _ms = _emb.square().mean(-1, keepdim=True).add(self.attn_res_emb_eps)
-                if self.attn_res_emb_gain is not None:
-                    # i * rms_norm(emb). ONE scalar. No radial term -- rsqrt is plain RMSNorm
-                    # without the learnable per-channel weight, which would cost hidden_size
-                    # params per layer and is exactly what this arm is NOT asking for.
-                    # i is folded into the (B,T,1) factor, NOT applied outside. Written as
-                    # i * (_emb * _ms.rsqrt()) eager materializes the full (B,T,H) tensor and
-                    # reads it back for a second broadcast multiply -- 134MB r+w per layer per
-                    # forward, x9 layers, x backward, to save a pow() on 65k elements.
-                    _skip = _emb * (_ms.rsqrt() * self.attn_res_emb_gain.float())
-                else:
-                    # retired: radial, emb * r^(p-1) with p = sigmoid(theta). Kept so the arms
-                    # already on disk still load; it measured itself down to r^p -> 1, i.e. to
-                    # the unit-norm branch above.
-                    _p = torch.sigmoid(self.attn_res_emb_theta.float())
-                    _skip = _emb * _ms.sqrt().pow(_p - 1.0)
-                hidden_states = hidden_states + _skip.to(hidden_states.dtype)
+                _p = torch.sigmoid(self.attn_res_emb_theta.float())
+                hidden_states = hidden_states + (
+                    _emb * _ms.sqrt().pow(_p - 1.0)).to(hidden_states.dtype)
         # K3's site-1 read, unchanged. Kept for the carry variant: the mix computed at the END of
         # layer l-1 from (S, B) is the SAME tensor as this one -- S and B do not change across the
         # layer boundary -- so "defer the mix to the end of the layer" and "keep K3's site-1 mix"

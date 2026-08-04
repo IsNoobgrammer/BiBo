@@ -291,10 +291,12 @@ def main():
     # p = sigmoid(theta) in (0,1), theta init -4 so it starts near UNIT NORM. At "ht" the skip
     # also reaches ATTENTION, since input_layernorm(HT) feeds self_attn -- the mlp site never did.
     ap.add_argument("--attn_res_emb_site", choices=["mlp", "ht"], default="mlp")
-    # REPLACE the radial exponent with a flat gain: the ht skip becomes i * rms_norm(emb), one
-    # scalar per layer, and theta is not created. The radial version measured itself out: theta
-    # ran -4 -> [-4.55,-5.55] in 1250 steps to move r^p from 0.944 to 0.98, a 4% range, i.e. it
-    # was asymptoting to r^p == 1 = plain unit norm. i inits 0 (strict generalization). ht only.
+    # REPLACE the radial exponent with a flat gain on the RAW embedding: HT = AR(...) + i * emb.
+    # One scalar per layer, no norm of any kind, theta is not created, and the add goes through
+    # the fused residual kernel as a second stream. Both normed ht arms lost (radial 0.6672 vs
+    # 0.6579 c-only) while the only emb arm that ever won -- mlp-site d*emb, 0.6572 -- was
+    # unnormed, and the MoE-output-norm round measured "norm the addend" at -0.010 bpb in all 3
+    # variants. i inits 0 (strict generalization). ht site only.
     ap.add_argument("--attn_res_emb_gain", type=_bool, default=False)
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
