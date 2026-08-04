@@ -239,6 +239,7 @@ class BiBoDecoderLayer(nn.Module):
         if _es not in ("mlp", "ht"):
             raise ValueError(f"attn_res_emb_site must be mlp or ht, got {_es!r}")
         self.attn_res_emb_site = _es
+        self.attn_res_emb_eps = config.rms_norm_eps
         _need_carry = self.attn_res_carry or _es == "ht"
         self.attn_res_emb_theta = (
             nn.Parameter(torch.full((1,), -4.0 if _es == "ht" else 0.0))
