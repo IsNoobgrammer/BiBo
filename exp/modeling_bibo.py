@@ -229,10 +229,21 @@ class BiBoDecoderLayer(nn.Module):
         if _es not in ("none", "sigmoid", "2sigmoid", "tanh", "2tanh"):
             raise ValueError(f"attn_res_emb_scale must be none/sigmoid/2sigmoid/tanh/2tanh, got {_es!r}")
         self.attn_res_emb_scale = _es
+        # site="ht": d is a RADIAL gain on the depth-mix output, emb * r^(p-1) with r = rms(emb)
+        # per token and p = sigmoid(theta) in (0,1). p=1 is the raw embedding (rms 0.04), p=0 is
+        # unit-norm (rms 1). Same trick as radial_theta on the activation, and it exists because the
+        # raw embedding is 500-10000x smaller than everything it is added to, so an unnormalised
+        # skip cannot matter. Init theta=-4 -> p=0.018 -> rms ~1, i.e. NEAR UNIT NORM.
+        # site="mlp" is the retired path: d*emb added to the carry write, theta init 0, no norm.
+        _es = str(getattr(config, "attn_res_emb_site", "mlp"))
+        if _es not in ("mlp", "ht"):
+            raise ValueError(f"attn_res_emb_site must be mlp or ht, got {_es!r}")
+        self.attn_res_emb_site = _es
+        _need_carry = self.attn_res_carry or _es == "ht"
         self.attn_res_emb_theta = (
-            nn.Parameter(torch.zeros(1))
+            nn.Parameter(torch.full((1,), -4.0 if _es == "ht" else 0.0))
             if (getattr(config, "attn_res_emb_term", False) and self.use_attn_residuals
-                and self.attn_res_carry and layer_idx > 0) else None)
+                and _need_carry and layer_idx > 0) else None)
         # Non-persistent so it never enters the state_dict: an extra key would break every existing
         # checkpoint load and the exp(control) == src equality that gates this whole family.
         if self.use_attn_residuals and self.attn_res_carry:
@@ -317,6 +328,11 @@ class BiBoDecoderLayer(nn.Module):
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
             ).reshape(batch_size, seq_len, hidden_size)
+            if self.attn_res_emb_theta is not None and self.attn_res_emb_site == "ht":
+                _e = block_residual[:, 0].reshape(batch_size, seq_len, hidden_size).float()
+                _r = _e.square().mean(-1, keepdim=True).add(self.attn_res_emb_eps).sqrt()
+                _p = torch.sigmoid(self.attn_res_emb_theta.float())
+                hidden_states = hidden_states + (_e * _r.pow(_p - 1.0)).to(hidden_states.dtype)
         # K3's site-1 read, unchanged. Kept for the carry variant: the mix computed at the END of
         # layer l-1 from (S, B) is the SAME tensor as this one -- S and B do not change across the
         # layer boundary -- so "defer the mix to the end of the layer" and "keep K3's site-1 mix"
@@ -363,7 +379,8 @@ class BiBoDecoderLayer(nn.Module):
             # block_residual[:, 0] IS the embedding, always: layer 0 is a block boundary for every
             # block size (0 % n == 0), so the untransformed embedding is what gets archived there.
             # Reusing it costs no new plumbing through the layer signature.
-            _has_emb = self.attn_res_emb_theta is not None and block_residual.shape[1] > 0
+            _has_emb = (self.attn_res_emb_theta is not None and block_residual.shape[1] > 0
+                    and self.attn_res_emb_site == "mlp")
             _emb = (block_residual[:, 0].reshape(batch_size, seq_len, hidden_size)
                     if _has_emb else None)
             if _HAS_FUSED_RES_ADD and attn_read.is_cuda:

@@ -286,6 +286,11 @@ def main():
     # spans (0,2) and covers it.
     ap.add_argument("--attn_res_emb_scale",
                     choices=["none", "sigmoid", "2sigmoid", "tanh", "2tanh"], default="none")
+    # WHERE the embedding skip is applied. "mlp" = the retired path, d*emb on the carry write.
+    # "ht" = a RADIAL gain on the depth-mix output: emb * r^(p-1), r = rms(emb) per token,
+    # p = sigmoid(theta) in (0,1), theta init -4 so it starts near UNIT NORM. At "ht" the skip
+    # also reaches ATTENTION, since input_layernorm(HT) feeds self_attn -- the mlp site never did.
+    ap.add_argument("--attn_res_emb_site", choices=["mlp", "ht"], default="mlp")
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
     # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
@@ -476,6 +481,7 @@ def main():
                            attn_res_carry_scale=args.attn_res_carry_scale,
                            attn_res_emb_term=args.attn_res_emb_term,
                            attn_res_emb_scale=args.attn_res_emb_scale,
+                           attn_res_emb_site=args.attn_res_emb_site,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
@@ -570,6 +576,7 @@ def main():
                 + ("emb" if args.attn_res != "off" and args.attn_res_emb_term else "")
                 + (args.attn_res_emb_scale if args.attn_res_emb_term
                    and args.attn_res_emb_scale != "none" else "")
+                + ("ht" if args.attn_res_emb_term and args.attn_res_emb_site == "ht" else "")
                 # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
