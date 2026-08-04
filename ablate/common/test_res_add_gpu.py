@@ -105,7 +105,82 @@ def main():
         assert ok, f"{tag}: kernel and eager disagree inside the model"
         del model
         torch.cuda.empty_cache()
+    gate_emb_gain()
     print("PASS")
+
+
+def gate_emb_gain():
+    """HT = AR(...) + i*emb through the fused kernel. BIT IDENTITY, not a tolerance.
+
+    The cases above grade on a relative tolerance, which is the gate that let the "more accurate"
+    kernel ship and cost real bpb. This one is the contract from the kernel-bit-identity rule:
+    max|fused - eager| == 0 on the layout the model actually trains in (fp32 stream, bf16 autocast),
+    forward AND backward, plus ZERO router top-k flips. The flip count is the one that matters in
+    an MoE -- a 2.5e-03 perturbation once flipped 3.9% of picks and produced 37% hidden divergence
+    from an otherwise correct kernel, so agreement on the hidden state alone proves nothing.
+    """
+    from src.modeling.ffn.router import BiBoMoERouter
+    pat = swa_block_pattern(SHARED["num_hidden_layers"])
+    ids = torch.randint(0, SHARED["vocab_size"], (4, 512), device="cuda")
+    torch.manual_seed(42069)
+    model, _ = build_arm("bibo_min", device="cuda", dtype=torch.float32,
+                         num_experts=64, top_k=6, special_pairs=0, use_xsa=True,
+                         hybrid_layer_pattern=pat, sliding_window=128,
+                         attn_res="3", attn_res_sites=1, attn_res_carry=True,
+                         attn_res_fp32_stream=True, attn_res_carry_scale="unbounded",
+                         attn_res_emb_term=True, attn_res_emb_site="ht",
+                         attn_res_emb_gain=True)
+    model.train()
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            if "attn_res_carry_theta" in n:
+                p.fill_(0.6)
+            if "attn_res_emb_gain" in n:
+                p.fill_(0.37)     # not 0 -- at i=0 the whole term vanishes and the gate is vacuous
+    picks = []
+    hooks = [m.register_forward_hook(lambda _m, _i, o: picks.append(o[0].detach().clone()))
+             for m in model.modules() if isinstance(m, BiBoMoERouter)]
+    assert hooks, "no routers found -- the flip count would be vacuously zero"
+    snap = {n: b.detach().clone() for n, b in model.named_buffers()}
+
+    def run():
+        picks.clear()
+        with torch.no_grad():
+            for n, b in model.named_buffers():
+                b.copy_(snap[n])
+        for p in model.parameters():
+            p.grad = None
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = model.model(input_ids=ids, use_cache=False)
+            h = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+        h.float().square().mean().backward()
+        return (h.detach().float(), list(picks),
+                {n: p.grad.detach().float().clone()
+                 for n, p in model.named_parameters() if p.grad is not None})
+
+    E._HAS_FUSED_RES_ADD = True
+    h_k, p_k, g_k = run()
+    E._HAS_FUSED_RES_ADD = False
+    h_e, p_e, g_e = run()
+    E._HAS_FUSED_RES_ADD = True
+    for h in hooks:
+        h.remove()
+
+    flips = sum((a != b).sum().item() for a, b in zip(p_k, p_e))
+    total = sum(a.numel() for a in p_k)
+    d_out = (h_k - h_e).abs().max().item()
+    worst, wname = 0.0, ""
+    for n in g_e:
+        d = (g_k[n] - g_e[n]).abs().max().item()
+        if d > worst:
+            worst, wname = d, n
+    print(f"{'emb gain i*emb':<22} hidden {d_out:.2e} | grad {worst:.2e} ({wname[:38]}) "
+          f"| router flips {flips}/{total}")
+    assert flips == 0, f"{flips}/{total} router top-k picks flipped -- the kernel changes routing"
+    assert d_out == 0.0, f"forward is not bit-identical to eager ({d_out:.2e})"
+    assert worst == 0.0, f"backward is not bit-identical to eager ({worst:.2e} on {wname})"
+    del model
+    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
