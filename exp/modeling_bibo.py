@@ -345,12 +345,19 @@ class BiBoDecoderLayer(nn.Module):
             ).reshape(batch_size, seq_len, hidden_size)
             if self.attn_res_emb_site == "ht" and (self.attn_res_emb_gain is not None
                                                    or self.attn_res_emb_theta is not None):
-                _e = block_residual[:, 0].reshape(batch_size, seq_len, hidden_size).float()
-                _r = _e.square().mean(-1, keepdim=True).add(self.attn_res_emb_eps).sqrt()
+                _emb = block_residual[:, 0].reshape(batch_size, seq_len, hidden_size).float()
+                _ms = _emb.square().mean(-1, keepdim=True).add(self.attn_res_emb_eps)
                 if self.attn_res_emb_gain is not None:
-                    _skip = (_e / _r) * self.attn_res_emb_gain.float()
+                    # i * rms_norm(emb). ONE scalar. No radial term -- rsqrt is plain RMSNorm
+                    # without the learnable per-channel weight, which would cost hidden_size
+                    # params per layer and is exactly what this arm is NOT asking for.
+                    _skip = self.attn_res_emb_gain.float() * (_emb * _ms.rsqrt())
                 else:
-                    _skip = _e * _r.pow(torch.sigmoid(self.attn_res_emb_theta.float()) - 1.0)
+                    # retired: radial, emb * r^(p-1) with p = sigmoid(theta). Kept so the arms
+                    # already on disk still load; it measured itself down to r^p -> 1, i.e. to
+                    # the unit-norm branch above.
+                    _p = torch.sigmoid(self.attn_res_emb_theta.float())
+                    _skip = _emb * _ms.sqrt().pow(_p - 1.0)
                 hidden_states = hidden_states + _skip.to(hidden_states.dtype)
         # K3's site-1 read, unchanged. Kept for the carry variant: the mix computed at the END of
         # layer l-1 from (S, B) is the SAME tensor as this one -- S and B do not change across the
