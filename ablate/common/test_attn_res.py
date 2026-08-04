@@ -231,9 +231,10 @@ def main():
     assert not any("attn_res_emb_gain" in n for n, _ in mh.named_parameters()), \
         "attn_res_emb_gain=False must create no parameter"
     assert all(p.item() == 0.0 for _, p in gs), "i must init to exactly 0"
-    _tg = [p.item() for n, p in mg.named_parameters() if "attn_res_emb_theta" in n]
+    assert not any("attn_res_emb_theta" in n for n, _ in mg.named_parameters()), (
+        "the gain REPLACES the radial exponent -- theta must not be created at all, or the arm "
+        "is two coupled scalars again instead of one")
     _th4 = [p.item() for n, p in mh.named_parameters() if "attn_res_emb_theta" in n]
-    assert all(t == 0.0 for t in _tg), f"with i present theta must start neutral at 0, got {_tg}"
     assert all(t == -4.0 for t in _th4), f"the gainless ht arm must keep theta=-4, got {_th4}"
     with torch.no_grad():
         y_g0 = mg(input_ids=ids).logits

@@ -241,26 +241,24 @@ class BiBoDecoderLayer(nn.Module):
         self.attn_res_emb_site = _es
         self.attn_res_emb_eps = config.rms_norm_eps
         _need_carry = self.attn_res_carry or _es == "ht"
+        _emb_on = (getattr(config, "attn_res_emb_term", False) and self.use_attn_residuals
+                   and _need_carry and layer_idx > 0)
+        # attn_res_emb_gain REPLACES the radial exponent with a flat gain: i * rms_norm(emb),
+        # ONE scalar, and theta is not created at all. The radial version measured itself out of
+        # existence -- every layer drove theta from -4 down to [-4.55, -5.55] over 1250 steps, and
+        # all that travel moved the actual magnitude r^p from 0.944 to 0.98. A 4% range. p was
+        # asymptoting to the corner where r^p == 1, i.e. asking for the plain unit-norm embedding,
+        # so the radial machinery had already collapsed to the identity and only i is left doing
+        # work. Different job, too: p coupled the skip to the token's OWN magnitude, i just scales.
+        # Init EXACTLY 0 so the arm is bit-identical to plain carry at step 0 and is a strict
+        # generalization -- same discipline as c and d. dL/di is nonzero there (gate 8 asserts it),
+        # so it can leave. With pure unit norm, i IS the rms of the injected embedding: read the
+        # logged profile directly, no r^p factor to undo.
         _gain_on = bool(getattr(config, "attn_res_emb_gain", False)) and _es == "ht"
-        # theta init: -4 (p=0.018, rms ~1) only for the GAINLESS ht arm, where theta is the only
-        # magnitude knob and the raw embedding is 500-10000x too small to matter. With i present,
-        # i owns the magnitude, so theta starts NEUTRAL at 0 -> p = sigmoid(0) = 0.5.
         self.attn_res_emb_theta = (
-            nn.Parameter(torch.full((1,), -4.0 if (_es == "ht" and not _gain_on) else 0.0))
-            if (getattr(config, "attn_res_emb_term", False) and self.use_attn_residuals
-                and _need_carry and layer_idx > 0) else None)
-        # i: a flat learnable gain on the ht skip -- i * r^p * rms_norm(emb). Init EXACTLY 0, so the
-        # arm is bit-identical to plain carry at step 0 and is a STRICT GENERALIZATION -- the same
-        # discipline as d and c. The model has to ask for the skip and picks its own ramp-in rate.
-        # Note the coupling this creates: dL/dtheta is exactly 0 while i == 0 (theta only enters
-        # through the product), so i moves first and theta only starts learning once i is off zero.
-        # dL/di is NOT zero at init, so the arm can leave the inert point -- gate (8) asserts it.
-        # i and p are NOT redundant but they are only weakly identifiable: p is pinned solely by
-        # per-token variation in r = rms(emb); if r were constant, i would absorb r^p entirely.
-        # Read them as "how much" (i) and "how much of the token's own magnitude" (p).
-        self.attn_res_emb_gain = (
-            nn.Parameter(torch.zeros(1))
-            if (_gain_on and self.attn_res_emb_theta is not None) else None)
+            nn.Parameter(torch.full((1,), -4.0 if _es == "ht" else 0.0))
+            if (_emb_on and not _gain_on) else None)
+        self.attn_res_emb_gain = nn.Parameter(torch.zeros(1)) if (_emb_on and _gain_on) else None
         # Non-persistent so it never enters the state_dict: an extra key would break every existing
         # checkpoint load and the exp(control) == src equality that gates this whole family.
         if self.use_attn_residuals and self.attn_res_carry:
@@ -345,13 +343,14 @@ class BiBoDecoderLayer(nn.Module):
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
             ).reshape(batch_size, seq_len, hidden_size)
-            if self.attn_res_emb_theta is not None and self.attn_res_emb_site == "ht":
+            if self.attn_res_emb_site == "ht" and (self.attn_res_emb_gain is not None
+                                                   or self.attn_res_emb_theta is not None):
                 _e = block_residual[:, 0].reshape(batch_size, seq_len, hidden_size).float()
                 _r = _e.square().mean(-1, keepdim=True).add(self.attn_res_emb_eps).sqrt()
-                _p = torch.sigmoid(self.attn_res_emb_theta.float())
-                _skip = _e * _r.pow(_p - 1.0)
                 if self.attn_res_emb_gain is not None:
-                    _skip = _skip * self.attn_res_emb_gain.float()
+                    _skip = (_e / _r) * self.attn_res_emb_gain.float()
+                else:
+                    _skip = _e * _r.pow(torch.sigmoid(self.attn_res_emb_theta.float()) - 1.0)
                 hidden_states = hidden_states + _skip.to(hidden_states.dtype)
         # K3's site-1 read, unchanged. Kept for the carry variant: the mix computed at the END of
         # layer l-1 from (S, B) is the SAME tensor as this one -- S and B do not change across the

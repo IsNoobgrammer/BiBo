@@ -291,8 +291,10 @@ def main():
     # p = sigmoid(theta) in (0,1), theta init -4 so it starts near UNIT NORM. At "ht" the skip
     # also reaches ATTENTION, since input_layernorm(HT) feeds self_attn -- the mlp site never did.
     ap.add_argument("--attn_res_emb_site", choices=["mlp", "ht"], default="mlp")
-    # a learnable flat gain i on the ht skip: i * r^sigmoid(theta) * rms_norm(emb). Init 1.0, so
-    # step 0 is bit-identical to plain --attn_res_emb_site ht. ht only.
+    # REPLACE the radial exponent with a flat gain: the ht skip becomes i * rms_norm(emb), one
+    # scalar per layer, and theta is not created. The radial version measured itself out: theta
+    # ran -4 -> [-4.55,-5.55] in 1250 steps to move r^p from 0.944 to 0.98, a 4% range, i.e. it
+    # was asymptoting to r^p == 1 = plain unit norm. i inits 0 (strict generalization). ht only.
     ap.add_argument("--attn_res_emb_gain", type=_bool, default=False)
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
@@ -790,31 +792,29 @@ def main():
                         f"[{_c.min().item():.2f},{_c.max().item():.2f}]")
                 aS_s = xa_s + cs_s        # covers the no-radial case; the radial block below
                                           # rebuilds from xa_s + cs_s so neither clobbers the other
-            # d = the off-simplex embedding gain, PER LAYER. The whole arm is a depth-profile
-            # question -- "does layer 1 alone want a token-identity channel?" -- so a mean would
-            # answer nothing. Note d does not exist at layer 0, so L index here is layer_idx-1.
+            # d = the embedding-skip knob, PER LAYER. The whole arm is a depth-profile question --
+            # "does layer 1 alone want a token-identity channel?" -- so a mean would answer nothing.
+            # Note d does not exist at layer 0, so L index here is layer_idx-1.
+            # attn_res_emb_gain (the unit-norm i) logs under the SAME attn_res_d/* keys on purpose:
+            # it is the same axis re-parameterized, and sharing the keys keeps one wandb panel
+            # across arms. They are mutually exclusive by construction -- the gain REPLACES theta --
+            # so there is never a collision. Read the console tag (d= vs i=) for which one it is;
+            # the units differ (theta is a logit, i is directly the injected rms).
             _de = [m.attn_res_emb_theta for m in model.modules()
                    if getattr(m, "attn_res_emb_theta", None) is not None]
+            _dtag = "d"
+            if not _de:
+                _de = [m.attn_res_emb_gain for m in model.modules()
+                       if getattr(m, "attn_res_emb_gain", None) is not None]
+                _dtag = "i"
             if _de:
                 _d = torch.cat([t.detach().float().flatten() for t in _de])
                 rt.update({"train/attn_res_d_mean": _d.mean().item(),
                            "train/attn_res_d_min": _d.min().item(),
                            "train/attn_res_d_max": _d.max().item()})
                 rt.update({f"train/attn_res_d/L{i + 1}": v for i, v in enumerate(_d.tolist())})
-                cs_s += (f" d={_d.mean().item():.3f}"
+                cs_s += (f" {_dtag}={_d.mean().item():.3f}"
                          f"[{_d.min().item():.2f},{_d.max().item():.2f}]")
-                aS_s = xa_s + cs_s
-            # i = the flat gain on the ht skip, PER LAYER for the same depth-profile reason as d.
-            _ge = [m.attn_res_emb_gain for m in model.modules()
-                   if getattr(m, "attn_res_emb_gain", None) is not None]
-            if _ge:
-                _g = torch.cat([t.detach().float().flatten() for t in _ge])
-                rt.update({"train/attn_res_i_mean": _g.mean().item(),
-                           "train/attn_res_i_min": _g.min().item(),
-                           "train/attn_res_i_max": _g.max().item()})
-                rt.update({f"train/attn_res_i/L{i + 1}": v for i, v in enumerate(_g.tolist())})
-                cs_s += (f" i={_g.mean().item():.3f}"
-                         f"[{_g.min().item():.2f},{_g.max().item():.2f}]")
                 aS_s = xa_s + cs_s
             _th = [m.radial_theta for m in model.modules() if hasattr(m, "radial_theta")]
             if _th:
