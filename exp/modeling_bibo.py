@@ -351,7 +351,11 @@ class BiBoDecoderLayer(nn.Module):
                     # i * rms_norm(emb). ONE scalar. No radial term -- rsqrt is plain RMSNorm
                     # without the learnable per-channel weight, which would cost hidden_size
                     # params per layer and is exactly what this arm is NOT asking for.
-                    _skip = self.attn_res_emb_gain.float() * (_emb * _ms.rsqrt())
+                    # i is folded into the (B,T,1) factor, NOT applied outside. Written as
+                    # i * (_emb * _ms.rsqrt()) eager materializes the full (B,T,H) tensor and
+                    # reads it back for a second broadcast multiply -- 134MB r+w per layer per
+                    # forward, x9 layers, x backward, to save a pow() on 65k elements.
+                    _skip = _emb * (_ms.rsqrt() * self.attn_res_emb_gain.float())
                 else:
                     # retired: radial, emb * r^(p-1) with p = sigmoid(theta). Kept so the arms
                     # already on disk still load; it measured itself down to r^p -> 1, i.e. to
