@@ -208,6 +208,46 @@ def main():
     assert dl1 > 1e-2, f"layer-1 d alone changed nothing ({dl1:.2e}) -- d is not per-layer"
     print(f"  [7] emb term: {len(ds)} d (no L0); d=0 identical ({dz:.1e}), d=0.3 moves "
           f"{dl:.3f}, L1-only moves {dl1:.3f}")
+
+    # (8) the ht skip's flat gain i. Init 1.0 must be BIT-identical to the plain ht arm (a
+    #     multiply by exactly 1.0), and i must be live and per-layer -- the same dead-plumbing
+    #     gate as (7). Both arms are built from the same seed and share ms's weights, so the
+    #     only difference is the gain parameter.
+    _ht = dict(attn_res="3", attn_res_sites=1, attn_res_carry=True,
+               attn_res_carry_scale="unbounded", attn_res_emb_term=True,
+               attn_res_emb_site="ht", num_experts=6, special_pairs=0, use_xsa=True,
+               hybrid_layer_pattern=pattern, sliding_window=128, device="cpu",
+               dtype=torch.float32)
+    torch.manual_seed(0)
+    mh, _ = build_arm("bibo_min", **_ht)
+    torch.manual_seed(0)
+    mg, _ = build_arm("bibo_min", attn_res_emb_gain=True, **_ht)
+    mh.eval(); mg.eval()
+    mh.load_state_dict(ms.state_dict(), strict=False)
+    mg.load_state_dict(ms.state_dict(), strict=False)
+    gs = [(n, p) for n, p in mg.named_parameters() if "attn_res_emb_gain" in n]
+    assert len(gs) == NL - 1, f"expected one i per layer EXCEPT layer 0, got {len(gs)}"
+    assert not any("attn_res_emb_gain" in n for n, _ in mh.named_parameters()), \
+        "attn_res_emb_gain=False must create no parameter"
+    with torch.no_grad():
+        y_h, y_g0 = mh(input_ids=ids).logits, mg(input_ids=ids).logits
+    gz = (y_g0 - y_h).abs().max().item()
+    assert gz == 0.0, f"i=1.0 is not bit-identical to the plain ht skip ({gz:.2e})"
+    with torch.no_grad():
+        for _, p in gs:
+            p.fill_(3.0)
+        y_g1 = mg(input_ids=ids).logits
+    gl = (y_g1 - y_g0).abs().max().item()
+    assert gl > 1e-2, f"setting i changed nothing ({gl:.2e}) -- the gain is dead plumbing"
+    with torch.no_grad():
+        for _, p in gs:
+            p.fill_(1.0)
+        dict(mg.named_parameters())["model.layers.1.attn_res_emb_gain"].fill_(3.0)
+        y_gl1 = mg(input_ids=ids).logits
+    gl1 = (y_gl1 - y_g0).abs().max().item()
+    assert gl1 > 1e-2, f"layer-1 i alone changed nothing ({gl1:.2e}) -- i is not per-layer"
+    print(f"  [8] ht gain: {len(gs)} i (no L0); i=1 identical ({gz:.1e}), i=3 moves "
+          f"{gl:.3f}, L1-only moves {gl1:.3f}")
     print("PASS")
 
 

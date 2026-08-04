@@ -130,7 +130,7 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          attn_res_carry=False, attn_res_fp32_stream=False,
                          attn_res_carry_scale="none",
                          attn_res_emb_term=False, attn_res_emb_scale="none",
-                         attn_res_emb_site="mlp"):
+                         attn_res_emb_site="mlp", attn_res_emb_gain=False):
     # attn_res: "off" = stable src model. Anything else routes to exp/ (Kimi K3 Attention
     # Residuals): "control" builds exp's model with residuals DISABLED, an int is the block size
     # in decoder layers (1 = per-layer / Full AttnRes, 3 = one block per [G,S,S]).
@@ -146,7 +146,8 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                  "attn_res_carry_scale": attn_res_carry_scale,
                  "attn_res_emb_term": attn_res_emb_term,
                  "attn_res_emb_scale": attn_res_emb_scale,
-                 "attn_res_emb_site": attn_res_emb_site}
+                 "attn_res_emb_site": attn_res_emb_site,
+                 "attn_res_emb_gain": attn_res_emb_gain}
     return BiBoConfig(
         **extra,
         bias_update_threshold=bias_update_threshold,

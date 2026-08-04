@@ -245,6 +245,16 @@ class BiBoDecoderLayer(nn.Module):
             nn.Parameter(torch.full((1,), -4.0 if _es == "ht" else 0.0))
             if (getattr(config, "attn_res_emb_term", False) and self.use_attn_residuals
                 and _need_carry and layer_idx > 0) else None)
+        # i: a flat learnable gain on the ht skip -- i * r^p * rms_norm(emb). Init EXACTLY 1.0, so
+        # at step 0 the arm is bit-identical to the plain ht skip and any drift is the model asking.
+        # i and p are NOT redundant but they are only weakly identifiable: p is pinned solely by
+        # per-token variation in r = rms(emb); if r were constant, i would absorb r^p entirely.
+        # Read them as "how much" (i) and "how much of the token's own magnitude" (p).
+        self.attn_res_emb_gain = (
+            nn.Parameter(torch.ones(1))
+            if (getattr(config, "attn_res_emb_gain", False)
+                and self.attn_res_emb_theta is not None
+                and self.attn_res_emb_site == "ht") else None)
         # Non-persistent so it never enters the state_dict: an extra key would break every existing
         # checkpoint load and the exp(control) == src equality that gates this whole family.
         if self.use_attn_residuals and self.attn_res_carry:
@@ -333,7 +343,10 @@ class BiBoDecoderLayer(nn.Module):
                 _e = block_residual[:, 0].reshape(batch_size, seq_len, hidden_size).float()
                 _r = _e.square().mean(-1, keepdim=True).add(self.attn_res_emb_eps).sqrt()
                 _p = torch.sigmoid(self.attn_res_emb_theta.float())
-                hidden_states = hidden_states + (_e * _r.pow(_p - 1.0)).to(hidden_states.dtype)
+                _skip = _e * _r.pow(_p - 1.0)
+                if self.attn_res_emb_gain is not None:
+                    _skip = _skip * self.attn_res_emb_gain.float()
+                hidden_states = hidden_states + _skip.to(hidden_states.dtype)
         # K3's site-1 read, unchanged. Kept for the carry variant: the mix computed at the END of
         # layer l-1 from (S, B) is the SAME tensor as this one -- S and B do not change across the
         # layer boundary -- so "defer the mix to the end of the layer" and "keep K3's site-1 mix"
