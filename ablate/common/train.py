@@ -843,9 +843,15 @@ def main():
                     _sd = torch.stack([v.std() for v in _cl])
                     rt["train/attn_res_s_std_mean"] = _sd.mean().item()
                     rt["train/attn_res_s_std_max"] = _sd.max().item()
-                    cs_s += f" sd={_sd.mean().item():.3f}"
+                    _sd_tag = f" sd={_sd.mean().item():.3f}"
+                else:
+                    _sd_tag = ""
+                # AFTER the assignment below, never before it: cs_s is reset here every log step
+                # (it starts as "" up at the top), so appending first put the tag on a string that
+                # was then thrown away. W&B still got the keys -- they go into rt -- so this was
+                # only ever a missing console tag, not lost data.
                 cs_s = (f" s={_c.mean().item():.3f}"
-                        f"[{_c.min().item():.2f},{_c.max().item():.2f}]")
+                        f"[{_c.min().item():.2f},{_c.max().item():.2f}]" + _sd_tag)
                 aS_s = xa_s + cs_s        # covers the no-radial case; the radial block below
                                           # rebuilds from xa_s + cs_s so neither clobbers the other
             # d = the embedding-skip knob, PER LAYER. The whole arm is a depth-profile question --
