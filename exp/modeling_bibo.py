@@ -354,15 +354,12 @@ class BiBoDecoderLayer(nn.Module):
                 # Scale note: that winning arm peaked at d = 1.32, i.e. it injected rms ~0.05,
                 # not ~1. Loud was plausibly the bug, so raw is the regime that already works.
                 # Same fused kernel as the carry -- this is exactly a second stream on the add.
+                # ALWAYS eager, never the kernel: this stream is FP32 under --attn_res_fp32_stream
+                # and the kernel's FP32 path is 1 ULP off eager (FMA contraction), which is enough
+                # to flip MoE top-k. Only the BF16 attention stream is bit-exact through the kernel.
                 _emb = block_residual[:, 0].reshape(batch_size, seq_len, hidden_size)
-                if _HAS_FUSED_RES_ADD and hidden_states.is_cuda:
-                    hidden_states = _fused_res_add(
-                        hidden_states, self.attn_res_emb_gain, _emb, modes=("none",))
-                else:
-                    # must round exactly where the kernel does: scalar to the stream dtype,
-                    # product in the stream dtype, accumulate in the output dtype
-                    _g = self.attn_res_emb_gain.float().to(_emb.dtype)
-                    hidden_states = hidden_states + (_g * _emb).to(hidden_states.dtype)
+                _g = self.attn_res_emb_gain.float().to(_emb.dtype)
+                hidden_states = hidden_states + (_g * _emb).to(hidden_states.dtype)
             elif self.attn_res_emb_theta is not None and self.attn_res_emb_site == "ht":
                 # retired: radial, emb * r^(p-1) with p = sigmoid(theta). Kept so the arms
                 # already on disk still load. It measured itself down to r^p -> 1, i.e. to a
@@ -422,33 +419,35 @@ class BiBoDecoderLayer(nn.Module):
                     and self.attn_res_emb_site == "mlp")
             _emb = (block_residual[:, 0].reshape(batch_size, seq_len, hidden_size)
                     if _has_emb else None)
+            # THE ATTENTION STREAM ONLY goes through the kernel, and it is deliberately the only
+            # thing that ever will. The kernel is bit-exact against eager for a BF16 stream, which
+            # attn_output is under autocast, but 1 ULP off for an FP32 one because Triton contracts
+            # `acc + c*s` into an FMA and the BF16 rounding of the product is what blocks that.
+            # The embedding stream is FP32 (--attn_res_fp32_stream), so it would take the inexact
+            # path, and 1 ULP flips MoE top-k. It is added EAGER below, on both branches.
             if _HAS_FUSED_RES_ADD and attn_read.is_cuda:
                 # attn_res_carry_one is a non-persistent ones buffer, so carry_scale="none"
                 # (a hard c = 1.0) goes down the same fused path instead of forking the formula.
                 _m = self.attn_res_carry_theta
-                _pairs = [_m if _m is not None else self.attn_res_carry_one, attn_output]
-                _modes = [_CARRY_MODE[self.attn_res_carry_scale] if _m is not None else "none"]
-                if _has_emb:
-                    _pairs += [self.attn_res_emb_theta, _emb]
-                    _modes.append(self.attn_res_emb_scale)
-                hidden_states = _fused_res_add(attn_read, *_pairs, modes=tuple(_modes))
+                hidden_states = _fused_res_add(
+                    attn_read, _m if _m is not None else self.attn_res_carry_one, attn_output,
+                    modes=(_CARRY_MODE[self.attn_res_carry_scale] if _m is not None else "none",))
+            elif self.attn_res_carry_theta is not None:
+                _t = self.attn_res_carry_theta.float()
+                _c = (_t if self.attn_res_carry_scale == "unbounded"
+                      else 2.0 * torch.sigmoid(_t) if self.attn_res_carry_scale == "sigmoid"
+                      else 2.0 * torch.tanh(_t))
+                hidden_states = attn_read + _c.to(attn_output.dtype) * attn_output
             else:
-                if self.attn_res_carry_theta is not None:
-                    _t = self.attn_res_carry_theta.float()
-                    _c = (_t if self.attn_res_carry_scale == "unbounded"
-                          else 2.0 * torch.sigmoid(_t) if self.attn_res_carry_scale == "sigmoid"
-                          else 2.0 * torch.tanh(_t))
-                    hidden_states = attn_read + _c.to(attn_output.dtype) * attn_output
-                else:
-                    hidden_states = attn_read + attn_output
-                if _has_emb:
-                    _d = self.attn_res_emb_theta.float()
-                    _d = ({"none": lambda x: x, "sigmoid": torch.sigmoid,
-                           "2sigmoid": lambda x: 2.0 * torch.sigmoid(x),
-                           "tanh": torch.tanh, "2tanh": lambda x: 2.0 * torch.tanh(x)}
-                          [self.attn_res_emb_scale](_d))
-                    hidden_states = hidden_states + (
-                        _d.to(hidden_states.dtype) * _emb.to(hidden_states.dtype))
+                hidden_states = attn_read + attn_output
+            if _has_emb:
+                _d = self.attn_res_emb_theta.float()
+                _d = ({"none": lambda x: x, "sigmoid": torch.sigmoid,
+                       "2sigmoid": lambda x: 2.0 * torch.sigmoid(x),
+                       "tanh": torch.tanh, "2tanh": lambda x: 2.0 * torch.tanh(x)}
+                      [self.attn_res_emb_scale](_d))
+                hidden_states = hidden_states + (
+                    _d.to(hidden_states.dtype) * _emb.to(hidden_states.dtype))
         else:
             # ONE mix per layer, PREFIX: the MLP reads the raw within-block sum. Measured and lost.
             hidden_states = prefix_sum
