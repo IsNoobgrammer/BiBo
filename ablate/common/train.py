@@ -820,10 +820,30 @@ def main():
                 # destroy the very depth panel this block exists for. The within-layer spread is
                 # its own series, because "which layer wants a SHAPED c" is the new question and
                 # a mean hides it exactly the way the global mean hid the depth ramp.
+                # MEAN, not rms. c is unbounded so channels can go NEGATIVE (the ht-site i already
+                # did), and rms discards the sign; it also conflates magnitude with spread, since
+                # rms^2 = mean^2 + var, so a layer centred on 0 with a wide spread would read as a
+                # large rms. The mean is additionally the quantity that compares directly to the
+                # scalar arm, because a scalar IS a uniform vector.
                 rt.update({f"train/attn_res_s/L{i}": v.mean().item() for i, v in enumerate(_cl)})
                 if _cl[0].numel() > 1:
-                    rt.update({f"train/attn_res_s_spread/L{i}": (v.max() - v.min()).item()
+                    # THE NUMBER THIS ARM TURNS ON. If std stays near 0 the vector has collapsed
+                    # back to a scalar, per-dim bought nothing, and any bpb delta is noise -- that
+                    # verdict is not visible in the mean. std rather than max-min because one
+                    # runaway lane out of 512 would otherwise define the range and hide the
+                    # other 511.
+                    rt.update({f"train/attn_res_s_std/L{i}": v.std().item()
                                for i, v in enumerate(_cl)})
+                    # Per-channel AND unbounded is the first configuration where an individual
+                    # channel can flip sign, i.e. the MLP sees that attention channel negated
+                    # while the residual stream still gets it unnegated. Cheap to count, and it
+                    # is the thing a scalar c could never express.
+                    rt.update({f"train/attn_res_s_negfrac/L{i}": (v < 0).float().mean().item()
+                               for i, v in enumerate(_cl)})
+                    _sd = torch.stack([v.std() for v in _cl])
+                    rt["train/attn_res_s_std_mean"] = _sd.mean().item()
+                    rt["train/attn_res_s_std_max"] = _sd.max().item()
+                    cs_s += f" sd={_sd.mean().item():.3f}"
                 cs_s = (f" s={_c.mean().item():.3f}"
                         f"[{_c.min().item():.2f},{_c.max().item():.2f}]")
                 aS_s = xa_s + cs_s        # covers the no-radial case; the radial block below
