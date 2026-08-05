@@ -298,6 +298,11 @@ def main():
     # unnormed, and the MoE-output-norm round measured "norm the addend" at -0.010 bpb in all 3
     # variants. i inits 0 (strict generalization). ht site only.
     ap.add_argument("--attn_res_emb_gain", type=_bool, default=False)
+    # Depth-score -> weight map. BOTH are convex combinations (weights sum to 1), so this does
+    # not change whether the read is a weighted average -- only how scores land on the simplex.
+    # softmax is shift-invariant (N-1 usable dof); signorm = sigmoid(x_i)/sum_j sigmoid(x_j) is
+    # shift-sensitive (all N live) and saturates toward uniform at large positive scores.
+    ap.add_argument("--attn_res_score", choices=["softmax", "signorm"], default="softmax")
     # BF16 RESIDUAL STREAM (src/ baseline only). The stream is fp32 by default -- not by
     # choice, but because weights are fp32 master and nn.Embedding is not autocast, so
     # inputs_embeds is fp32 and every residual add promotes back up. modded-nanogpt runs
@@ -497,6 +502,7 @@ def main():
                            attn_res_emb_scale=args.attn_res_emb_scale,
                            attn_res_emb_site=args.attn_res_emb_site,
                            attn_res_emb_gain=args.attn_res_emb_gain,
+                           attn_res_score=args.attn_res_score,
                            bf16_residual_stream=args.bf16_residual_stream,
                            bf16_moe_out=args.bf16_moe_out,
                            pos_identity_expert=args.pos_identity_expert,
@@ -593,6 +599,8 @@ def main():
                 + ("emb" if args.attn_res != "off" and args.attn_res_emb_term else "")
                 + (args.attn_res_emb_scale if args.attn_res_emb_term
                    and args.attn_res_emb_scale != "none" else "")
+                + ("_signorm" if args.attn_res != "off" and args.attn_res_score == "signorm"
+                   else "")
                 + ("_bf16stream" if args.bf16_residual_stream else "")
                 + ("_bf16moeout" if args.bf16_moe_out else "")
                 + ("ht" if args.attn_res_emb_term and args.attn_res_emb_site == "ht" else "")

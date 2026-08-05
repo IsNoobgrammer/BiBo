@@ -63,6 +63,10 @@ except Exception:
 # attn_res_carry_scale -> the kernel's transform code for the attn_out multiplier. "none" has no
 # theta at all (c is a hard 1.0) and is handled by the caller, not here.
 _CARRY_MODE = {"unbounded": "none", "sigmoid": "2sigmoid", "tanh": "2tanh"}
+# How the depth scores become weights. BOTH are convex combinations -- the weights sum to 1
+# either way, so this does not change whether the read is a weighted average, only the map onto
+# the simplex. See apply_attention_residual for what signorm buys (the shift dimension).
+_SCORE_MODE = {"softmax": 0, "signorm": 1}
 
 logger = logging.get_logger(__name__)
 
@@ -80,6 +84,7 @@ def apply_attention_residual(
     block_residual: torch.Tensor,
     projection: nn.Linear,
     norm: BiBoRMSNorm,
+    score_mode: int = 0,
 ) -> torch.Tensor:
     """Mix completed blocks and the current prefix across model depth.
 
@@ -90,6 +95,13 @@ def apply_attention_residual(
         projection: Learned pseudo-query represented as a bias-free ``hidden -> 1``
             projection.
         norm: Gain-bearing RMSNorm applied independently to every candidate key.
+        score_mode: 0 = softmax (K3, and every arm before Aug 5 2026). 1 = sigmoid/sum,
+            ``sigmoid(x_i) / sum_j sigmoid(x_j)``. Mode 1 is STILL a convex combination -- the
+            depth weights sum to 1 either way, so the read stays a weighted average and cannot
+            grow with the candidate count. What it buys is the shift dimension: softmax sees only
+            score DIFFERENCES, so N scores carry N-1 usable degrees of freedom, while sigmoid/sum
+            responds to the absolute level and uses all N. It also saturates toward uniform once
+            every score is large and positive, which softmax does not.
 
     Returns:
         The depth-attended state with shape ``(tokens, hidden)`` and the same
@@ -124,7 +136,8 @@ def apply_attention_residual(
     score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
 
     if _HAS_FUSED_AR and prefix_sum.is_cuda:
-        return _fused_ar(block_residual, prefix_sum, score_weight, norm.variance_epsilon)
+        return _fused_ar(block_residual, prefix_sum, score_weight, norm.variance_epsilon,
+                         score_mode)
 
     # AUTOCAST MUST BE OFF HERE. Under torch.autocast(bf16) `torch.matmul` is autocast-eligible,
     # so the two matmuls below get their fp32 inputs silently cast back to bf16 and the whole
@@ -150,8 +163,15 @@ def apply_attention_residual(
         sq_sum = torch.linalg.vector_norm(values_float, dim=-1).square()
         inv_rms = torch.rsqrt(sq_sum / values_float.shape[-1] + norm.variance_epsilon)
         scores = torch.matmul(values_float, score_weight) * inv_rms
-        probabilities = scores.softmax(dim=-1).unsqueeze(1)
-        mixed = torch.matmul(probabilities, values_float).squeeze(1)
+        if score_mode == 0:
+            probabilities = scores.softmax(dim=-1)
+        else:
+            # clamp_min matches the kernel's 1e-30 floor exactly. If every candidate saturates
+            # sigmoid to 0 this is 0/0, and the two paths must agree at that tail rather than one
+            # returning NaN and the other a number.
+            _sp = torch.sigmoid(scores)
+            probabilities = _sp / _sp.sum(dim=-1, keepdim=True).clamp_min(1e-30)
+        mixed = torch.matmul(probabilities.unsqueeze(1), values_float).squeeze(1)
     return mixed.to(values.dtype)
 
 
@@ -164,6 +184,8 @@ class BiBoDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.use_attn_residuals = config.attn_res_block_size is not None
         self.attn_res_block_size = config.attn_res_block_size
+        # 0 = softmax, 1 = sigmoid/sum. Int, not a string, because it reaches a Triton constexpr.
+        self.attn_res_score_mode = _SCORE_MODE[getattr(config, "attn_res_score", "softmax")]
 
         self.self_attn = BiBoAttention(config=config, layer_idx=layer_idx)
         self.is_moe_layer = layer_idx not in config.mlp_only_layers
@@ -343,6 +365,7 @@ class BiBoDecoderLayer(nn.Module):
                 block_residual,
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
+                self.attn_res_score_mode,
             ).reshape(batch_size, seq_len, hidden_size)
             if self.attn_res_emb_gain is not None:
                 # HT = AR(...) + i * emb, the RAW embedding. No norm of any kind.
@@ -406,6 +429,7 @@ class BiBoDecoderLayer(nn.Module):
                 block_residual,
                 self.mlp_res_proj,
                 self.mlp_res_norm,
+                self.attn_res_score_mode,
             ).reshape(batch_size, seq_len, hidden_size)
         elif self.attn_res_carry:
             # ONE mix per layer, CARRY: the MLP reads the site-1 mix plus this layer's attention
@@ -519,6 +543,7 @@ class BiBoModel(BiBoPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.use_attn_residuals = config.attn_res_block_size is not None
+        self.attn_res_score_mode = _SCORE_MODE[getattr(config, "attn_res_score", "softmax")]
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
@@ -561,6 +586,7 @@ class BiBoModel(BiBoPreTrainedModel):
             block_residual,
             self.output_attn_res_proj,
             self.output_attn_res_norm,
+            self.attn_res_score_mode,
         ).reshape(batch_size, seq_len, hidden_size)
 
     def forward(

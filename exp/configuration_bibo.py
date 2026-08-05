@@ -23,7 +23,8 @@ class BiBoConfig(_StableBiBoConfig):
     def __init__(self, attn_res_block_size=12, attn_res_sites=2, attn_res_carry=False,
                  attn_res_fp32_stream=False, attn_res_carry_scale="none",
                  attn_res_emb_term=False, attn_res_emb_scale="none",
-                 attn_res_emb_site="mlp", attn_res_emb_gain=False, **kwargs):
+                 attn_res_emb_site="mlp", attn_res_emb_gain=False,
+                 attn_res_score="softmax", **kwargs):
         if attn_res_sites not in (1, 2):
             raise ValueError(
                 f"attn_res_sites must be 2 (K3 faithful: a depth-mix before the attention "
@@ -52,6 +53,19 @@ class BiBoConfig(_StableBiBoConfig):
         self.attn_res_emb_scale = str(attn_res_emb_scale)
         self.attn_res_emb_site = str(attn_res_emb_site)
         self.attn_res_emb_gain = bool(attn_res_emb_gain)
+        # HOW the depth scores become weights. Both options are CONVEX COMBINATIONS -- the depth
+        # weights sum to 1 either way, so the read stays a weighted average and the residual
+        # stream cannot grow with the candidate count. That constraint is deliberate.
+        #   softmax  x_i -> exp(x_i)/sum exp(x_j).  SHIFT-INVARIANT: only score differences
+        #            matter, so N candidates carry N-1 usable degrees of freedom.
+        #   signorm  x_i -> sigmoid(x_i)/sum sigmoid(x_j). Shift-SENSITIVE, so all N are live,
+        #            and it saturates toward uniform once every score is large and positive.
+        # Note what this does NOT do: it does not free the model from the simplex, so it is not
+        # a substitute for c/d/i, which exist precisely because weighting one candidate costs
+        # another its weight one for one. Those stay.
+        if attn_res_score not in ("softmax", "signorm"):
+            raise ValueError(f"attn_res_score must be softmax or signorm, got {attn_res_score!r}")
+        self.attn_res_score = str(attn_res_score)
         # bf16_residual_stream is deliberately NOT a named parameter here. It is owned by the
         # PARENT (src BiBoConfig) and reaches it through **kwargs. Naming it here silently broke
         # the flag: this __init__ set the attribute, then super().__init__(**kwargs) ran the
