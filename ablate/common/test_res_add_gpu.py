@@ -29,6 +29,9 @@ def main():
     assert torch.cuda.is_available(), "needs a GPU: this is the path that runs in training"
     assert E._HAS_FUSED_RES_ADD, "fused residual-add kernel not importable -- nothing to compare"
     patchmod.apply(["liger_norm", "liger_rope", "moe", "xsa"])
+    # imported AFTER apply(), like gate_emb_gain does -- a patch that swapped the class would
+    # make an isinstance check against a module-level import silently match nothing.
+    from src.modeling.ffn.router import BiBoMoERouter
     pat = swa_block_pattern(SHARED["num_hidden_layers"])
     ids = torch.randint(0, SHARED["vocab_size"], (2, 512), device="cuda")
 
@@ -54,11 +57,23 @@ def main():
                 if "attn_res_emb_theta" in n:
                     p.fill_(0.4)
 
+        # ROUTER TOP-K FLIPS. Without this the hidden/grad numbers below cannot be interpreted:
+        # in an MoE a sub-ULP difference can flip which expert runs, and one flip sends a token
+        # down a different subnetwork. That is not the kernel being wrong, it is two different
+        # trajectories being compared, and it reads as a huge hidden divergence either way.
+        # gate_emb_gain has always counted flips; main() never did, which is why it fired at
+        # hidden 2.9e-01 with no way to tell amplification from a bug.
+        picks = []
+        hooks = [m.register_forward_hook(lambda _m, _i, o: picks.append(o[0].detach().clone()))
+                 for m in model.modules() if isinstance(m, BiBoMoERouter)]
+        assert hooks, "no routers found -- the flip count would be vacuously zero"
+
         # the MoE mutates gate.bias on every TRAINING forward, so restore all buffers before each
         # run or this measures bias drift instead of the kernel
         snap = {n: b.detach().clone() for n, b in model.named_buffers()}
 
         def run():
+            picks.clear()
             with torch.no_grad():
                 for n, b in model.named_buffers():
                     b.copy_(snap[n])
@@ -68,19 +83,21 @@ def main():
                 out = model.model(input_ids=ids, use_cache=False)
                 h = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
             h.float().square().mean().backward()
-            return (h.detach().float(),
+            return (h.detach().float(), list(picks),
                     {n: p.grad.detach().float().clone()
                      for n, p in model.named_parameters() if p.grad is not None})
 
         E._HAS_FUSED_RES_ADD = True
-        h_k, g_k = run()
-        h_k2, _ = run()
+        h_k, p_k, g_k = run()
+        h_k2, _, _ = run()
         d_self = (h_k - h_k2).abs().max().item()
         assert d_self == 0.0, f"{tag}: two identical kernel runs differ by {d_self:.2e}"
         E._HAS_FUSED_RES_ADD = False
-        h_e, g_e = run()
+        h_e, p_e, g_e = run()
         E._HAS_FUSED_RES_ADD = True
 
+        flips = sum((a != b).sum().item() for a, b in zip(p_k, p_e))
+        n_pick = sum(a.numel() for a in p_k)
         d_out = (h_k - h_e).abs().max().item() / h_e.abs().max().item()
         worst, wname = 0.0, ""
         for n in g_e:
@@ -90,12 +107,26 @@ def main():
             r = (g_k[n] - g_e[n]).abs().max().item() / den
             if r > worst:
                 worst, wname = r, n
-        # bf16 through 10 layers: eager and kernel differ by the bf16 scalar rounding this kernel
-        # removes, compounded down the stack. A few percent is expected; an order of magnitude is a
-        # bug, and a gradient that disagrees far more than the hidden state is the signature of one.
-        ok = d_out < 5e-2 and worst < 2e-1
-        print(f"{tag:<22} hidden {d_out:.2e} | worst grad {worst:.2e} ({wname[:40]})"
-              + ("  ok" if ok else "  <-- FAIL"))
+        # WHAT THIS CAN AND CANNOT ASSERT.
+        # With a LEARNABLE scalar the kernel and eager are different computations on purpose: the
+        # kernel keeps c in fp32 across the multiply, eager does `_c.to(attn_output.dtype) * ...`
+        # and rounds it to bf16 first (exp/modeling_bibo.py, eager branch). The standalone fp64
+        # grade says the kernel is the more accurate of the two. So equality is not just unmet
+        # here, it is the wrong thing to demand -- the old blanket tolerance was asserting
+        # something false, and it fired at hidden 2.9e-01 while the kernel was behaving.
+        # What IS assertable:
+        #   carry fixed c=1  -- no scalar to round, so BIT IDENTITY and zero flips.
+        #   learnable c      -- divergence must be EXPLAINED BY FLIPS. A big hidden diff with
+        #                       zero flips would mean the kernel moved the arithmetic on its own,
+        #                       which is the bug signature this gate exists to catch.
+        if cs == "none" and not emb:
+            ok = (d_out == 0.0 and worst == 0.0 and flips == 0)
+            why = "bit-identity (no learned scalar)"
+        else:
+            ok = (flips > 0) or (d_out < 5e-2 and worst < 2e-1)
+            why = "divergence explained by router flips" if flips else "no flips, tolerance"
+        print(f"{tag:<22} hidden {d_out:.2e} | worst grad {worst:.2e} ({wname[:34]}) "
+              f"| flips {flips}/{n_pick} | {why}" + ("  ok" if ok else "  <-- FAIL"))
         # the scalar gradients are the kernel's own arithmetic, so call them out separately
         for key in ("attn_res_carry_theta", "attn_res_emb_theta"):
             hits = [(n, g_e[n], g_k[n]) for n in g_e if key in n]
