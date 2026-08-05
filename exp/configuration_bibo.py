@@ -24,7 +24,7 @@ class BiBoConfig(_StableBiBoConfig):
                  attn_res_fp32_stream=False, attn_res_carry_scale="none",
                  attn_res_emb_term=False, attn_res_emb_scale="none",
                  attn_res_emb_site="mlp", attn_res_emb_gain=False,
-                 attn_res_score="softmax", **kwargs):
+                 attn_res_score="softmax", attn_res_carry_per_dim=False, **kwargs):
         if attn_res_sites not in (1, 2):
             raise ValueError(
                 f"attn_res_sites must be 2 (K3 faithful: a depth-mix before the attention "
@@ -66,6 +66,16 @@ class BiBoConfig(_StableBiBoConfig):
         if attn_res_score not in ("softmax", "signorm"):
             raise ValueError(f"attn_res_score must be softmax or signorm, got {attn_res_score!r}")
         self.attn_res_score = str(attn_res_score)
+        # c as an (hidden,) vector instead of one scalar per layer. Strict generalization:
+        # every entry inits to the scalar's init, so step 0 is bit-identical. Only meaningful
+        # with a learnable carry scale -- at attn_res_carry_scale=none there is no parameter.
+        if attn_res_carry_per_dim and not attn_res_carry:
+            raise ValueError("attn_res_carry_per_dim needs attn_res_carry=True")
+        if attn_res_carry_per_dim and _csm == "none":
+            raise ValueError(
+                "attn_res_carry_per_dim needs a learnable attn_res_carry_scale; at 'none' the "
+                "carry is a fixed ones buffer and the flag would be silently inert.")
+        self.attn_res_carry_per_dim = bool(attn_res_carry_per_dim)
         # bf16_residual_stream is deliberately NOT a named parameter here. It is owned by the
         # PARENT (src BiBoConfig) and reaches it through **kwargs. Naming it here silently broke
         # the flag: this __init__ set the attribute, then super().__init__(**kwargs) ran the

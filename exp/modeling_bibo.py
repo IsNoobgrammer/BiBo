@@ -233,8 +233,16 @@ class BiBoDecoderLayer(nn.Module):
         _cs_mode = "none" if _cs_mode in (False, None) else str(_cs_mode)
         self.attn_res_carry_scale = _cs_mode
         _init = {"unbounded": 1.0, "sigmoid": 0.0, "tanh": math.atanh(0.5)}.get(_cs_mode)
+        # PER-CHANNEL c. Shape (hidden,) instead of (1,), every entry at the same init, so it is a
+        # strict generalization of the scalar and step 0 is bit-identical to it.
+        # It is real capacity, not a reparameterization: attn_output feeds TWO consumers -- the
+        # prefix-sum stream and the MLP input -- and c scales only the MLP-facing copy, so a
+        # diagonal scale here cannot be absorbed into o_proj without changing what the stream
+        # carries. 512 params/layer, 5120 total, 0.0008% of the model.
+        self.attn_res_carry_per_dim = bool(getattr(config, "attn_res_carry_per_dim", False))
+        _cshape = (config.hidden_size,) if self.attn_res_carry_per_dim else (1,)
         self.attn_res_carry_theta = (
-            nn.Parameter(torch.full((1,), float(_init)))
+            nn.Parameter(torch.full(_cshape, float(_init)))
             if (_init is not None and self.use_attn_residuals and self.attn_res_carry) else None)
         # d: off-simplex embedding gain on the carry write. Init EXACTLY 0 so the arm is a strict
         # generalization -- at step 0 it is bit-identical to plain carry, and any nonzero final

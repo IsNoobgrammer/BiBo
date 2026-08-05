@@ -303,6 +303,10 @@ def main():
     # softmax is shift-invariant (N-1 usable dof); signorm = sigmoid(x_i)/sum_j sigmoid(x_j) is
     # shift-sensitive (all N live) and saturates toward uniform at large positive scores.
     ap.add_argument("--attn_res_score", choices=["softmax", "signorm"], default="softmax")
+    # c per HIDDEN CHANNEL instead of one scalar per layer: M_in = attn_read + c (*) attn_out.
+    # 512 params/layer. Real capacity, not a reparameterization -- attn_output also feeds the
+    # prefix-sum stream, so a diagonal scale on the MLP-facing copy cannot fold into o_proj.
+    ap.add_argument("--attn_res_carry_per_dim", type=_bool, default=False)
     # BF16 RESIDUAL STREAM (src/ baseline only). The stream is fp32 by default -- not by
     # choice, but because weights are fp32 master and nn.Embedding is not autocast, so
     # inputs_embeds is fp32 and every residual add promotes back up. modded-nanogpt runs
@@ -503,6 +507,7 @@ def main():
                            attn_res_emb_site=args.attn_res_emb_site,
                            attn_res_emb_gain=args.attn_res_emb_gain,
                            attn_res_score=args.attn_res_score,
+                           attn_res_carry_per_dim=args.attn_res_carry_per_dim,
                            bf16_residual_stream=args.bf16_residual_stream,
                            bf16_moe_out=args.bf16_moe_out,
                            pos_identity_expert=args.pos_identity_expert,
@@ -600,6 +605,8 @@ def main():
                 + (args.attn_res_emb_scale if args.attn_res_emb_term
                    and args.attn_res_emb_scale != "none" else "")
                 + ("_signorm" if args.attn_res != "off" and args.attn_res_score == "signorm"
+                   else "")
+                + ("_cperdim" if args.attn_res != "off" and args.attn_res_carry_per_dim
                    else "")
                 + ("_bf16stream" if args.bf16_residual_stream else "")
                 + ("_bf16moeout" if args.bf16_moe_out else "")
@@ -796,10 +803,11 @@ def main():
                    if getattr(m, "attn_res_carry_theta", None) is not None]
             if _cs:
                 _mode = getattr(model.config, "attn_res_carry_scale", "none")
-                _tt = torch.cat([t.detach().float().flatten() for t in _cs])
-                _c = (_tt if _mode == "unbounded"
-                      else 2.0 * torch.sigmoid(_tt) if _mode == "sigmoid"
-                      else 2.0 * torch.tanh(_tt))
+                _xf = (lambda x: x) if _mode == "unbounded" else (
+                    (lambda x: 2.0 * torch.sigmoid(x)) if _mode == "sigmoid"
+                    else (lambda x: 2.0 * torch.tanh(x)))
+                _cl = [_xf(t.detach().float().flatten()) for t in _cs]   # one entry per LAYER
+                _c = torch.cat(_cl)
                 rt.update({"train/attn_res_s_mean": _c.mean().item(),
                            "train/attn_res_s_min": _c.min().item(),
                            "train/attn_res_s_max": _c.max().item()})
@@ -807,8 +815,15 @@ def main():
                 # arm exists for -- "do early layers want the depth mix and late layers their
                 # own attention?" needs to know WHICH layer, the same way radial p's depth ramp
                 # was only visible per layer and its global mean actively misled.
-                rt.update({f"train/attn_res_s/L{i}": v
-                           for i, v in enumerate(_c.tolist())})
+                # With per-dim c each layer holds (hidden,) values, so L{i} carries that layer's
+                # MEAN -- enumerating the flat cat would emit 5120 keys named L0..L5119 and
+                # destroy the very depth panel this block exists for. The within-layer spread is
+                # its own series, because "which layer wants a SHAPED c" is the new question and
+                # a mean hides it exactly the way the global mean hid the depth ramp.
+                rt.update({f"train/attn_res_s/L{i}": v.mean().item() for i, v in enumerate(_cl)})
+                if _cl[0].numel() > 1:
+                    rt.update({f"train/attn_res_s_spread/L{i}": (v.max() - v.min()).item()
+                               for i, v in enumerate(_cl)})
                 cs_s = (f" s={_c.mean().item():.3f}"
                         f"[{_c.min().item():.2f},{_c.max().item():.2f}]")
                 aS_s = xa_s + cs_s        # covers the no-radial case; the radial block below
