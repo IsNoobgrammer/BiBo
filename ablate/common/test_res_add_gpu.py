@@ -35,16 +35,21 @@ def main():
     pat = swa_block_pattern(SHARED["num_hidden_layers"])
     ids = torch.randint(0, SHARED["vocab_size"], (2, 512), device="cuda")
 
-    # (carry_scale, emb_term, emb_scale, fill) -- `fill` is the value every learned scalar takes.
-    # fill=1.0 makes the multiply EXACT, which is the only way bit-identity is reachable (see the
-    # contract note below). Those cases are the hard gate; the rest are the amplification cases.
-    for tag, (cs, emb, es, fill) in (
-            ("carry c=1.0 learned", ("unbounded", False, "none", 1.0)),
-            ("carry+emb both 1.0", ("unbounded", True, "none", 1.0)),
-            ("carry unbounded", ("unbounded", False, "none", 0.625)),
-            ("carry+emb raw", ("unbounded", True, "none", 0.625)),
-            ("carry+emb 2sigmoid", ("sigmoid", True, "2sigmoid", 0.625)),
-            ("carry fixed c=1", ("none", False, "none", 0.625))):
+    # (carry_scale, emb_term, emb_scale, (carry_fill, emb_fill)).
+    # c=1.0 makes the multiply exact; d=0.0 makes eager's SECOND add exact (h + 0 == h in any
+    # dtype), which collapses the two-stream case to one effective rounding on both sides. Those
+    # two together are the only way bit-identity is reachable -- see the contract note below.
+    # "carry+emb d=0" is the load-bearing one: it is the two-stream fused path with every
+    # arithmetic difference removed, so if IT diverges the two-stream plumbing is broken, and no
+    # amount of "the kernel is more accurate" explains it away.
+    for tag, (cs, emb, es, (fill_c, fill_d)) in (
+            ("carry c=1.0 learned", ("unbounded", False, "none", (1.0, 0.0))),
+            ("carry+emb d=0", ("unbounded", True, "none", (1.0, 0.0))),
+            ("carry+emb both 1.0", ("unbounded", True, "none", (1.0, 1.0))),
+            ("carry unbounded", ("unbounded", False, "none", (0.625, 0.0))),
+            ("carry+emb raw", ("unbounded", True, "none", (0.625, 0.375))),
+            ("carry+emb 2sigmoid", ("sigmoid", True, "2sigmoid", (0.625, 0.375))),
+            ("carry fixed c=1", ("none", False, "none", (0.625, 0.0)))):
         torch.manual_seed(42069)
         model, _ = build_arm("bibo_min", device="cuda", dtype=torch.float32,
                              num_experts=8, top_k=2, special_pairs=0, use_xsa=True,
@@ -59,8 +64,10 @@ def main():
         # confound -- though measurement says that is NOT what drives the divergence (see below).
         with torch.no_grad():
             for n, p in model.named_parameters():
-                if "attn_res_carry_theta" in n or "attn_res_emb_theta" in n:
-                    p.fill_(fill)
+                if "attn_res_carry_theta" in n:
+                    p.fill_(fill_c)
+                if "attn_res_emb_theta" in n:
+                    p.fill_(fill_d)
 
         # ROUTER TOP-K FLIPS. Without this the hidden/grad numbers below cannot be interpreted:
         # in an MoE a sub-ULP difference can flip which expert runs, and one flip sends a token
@@ -141,12 +148,15 @@ def main():
         #                       ZERO flips would mean the kernel moved the arithmetic on its own,
         #                       which is the bug signature this gate exists to catch.
         # Every gradient claim is made against g_floor, never against zero.
-        # exact_mul: the multiply introduces no rounding, so nothing is left to differ on.
-        #   cs="none"                      -> no scalar at all (ones buffer)
-        #   cs="unbounded" and fill == 1.0 -> c is the raw theta, so c is exactly 1.0
+        # exact: nothing is left for the two paths to differ on -- every multiply is exact AND
+        # eager performs a single effective rounding, same as the kernel's one fp32 accumulation.
+        #   cs="none"                        -> no scalar at all (ones buffer)
+        #   cs="unbounded", es raw, c == 1.0 -> c is the raw theta, so the multiply is exact
+        #   plus: no emb stream, or d == 0.0 -> eager's second add is `h + 0`, exact in any dtype
         # A transformed mode never qualifies: 2*sigmoid(1.0) is not 1.0.
-        exact_mul = cs == "none" or (cs == "unbounded" and es == "none" and fill == 1.0)
-        if exact_mul:
+        exact_scalar = cs == "none" or (cs == "unbounded" and es == "none" and fill_c == 1.0)
+        one_rounding = (not emb) or fill_d == 0.0
+        if exact_scalar and one_rounding:
             ok = (d_out == 0.0 and flips == 0 and worst <= max(g_floor, 1e-12) * 4)
             why = "BIT-IDENTITY (exact multiply), grad within run-to-run floor"
         else:
