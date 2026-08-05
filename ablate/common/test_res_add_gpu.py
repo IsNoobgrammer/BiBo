@@ -48,14 +48,20 @@ def main():
                              attn_res_carry_scale=cs,
                              attn_res_emb_term=emb, attn_res_emb_scale=es)
         model.train()
-        # give the scalars non-trivial values -- at theta=0 the carry is exactly 1.0 and d is 0 or
-        # 1, which is the one setting where a scale bug cannot show up.
+        # Non-trivial values, because at theta=0 the carry is exactly 1.0 and d is 0 or 1 -- the
+        # one setting where a scale bug cannot show up. But BF16-EXACT ones: 0.625 = 1.25*2^-1 and
+        # 0.375 = 1.5*2^-2 both fit bf16's 8 mantissa bits, so `c.to(bf16)` is a no-op and eager's
+        # rounding of the scalar -- the ONLY thing the kernel deliberately does differently --
+        # stops existing. That makes bit-identity attainable for the RAW modes, which turns this
+        # from a tolerance into a real contract. The old 0.6/0.4 are not representable, so every
+        # raw-mode case was forced through the weaker flips-explained branch for no reason.
+        # Transformed modes (sigmoid/2sigmoid/tanh) still cannot be exact: f(theta) is not.
         with torch.no_grad():
             for n, p in model.named_parameters():
                 if "attn_res_carry_theta" in n:
-                    p.fill_(0.6)
+                    p.fill_(0.625)
                 if "attn_res_emb_theta" in n:
-                    p.fill_(0.4)
+                    p.fill_(0.375)
 
         # ROUTER TOP-K FLIPS. Without this the hidden/grad numbers below cannot be interpreted:
         # in an MoE a sub-ULP difference can flip which expert runs, and one flip sends a token
@@ -131,9 +137,13 @@ def main():
         #                       zero flips would mean the kernel moved the arithmetic on its own,
         #                       which is the bug signature this gate exists to catch.
         # Every gradient claim is made against g_floor, never against zero.
-        if cs == "none" and not emb:
+        # RAW modes with bf16-exact scalars have nothing left to differ on -> hard bit-identity.
+        # Transformed modes compute f(theta), which is not bf16-exact, so they keep the weaker
+        # divergence-must-be-explained-by-flips contract.
+        raw = cs in ("none", "unbounded") and es == "none"
+        if raw:
             ok = (d_out == 0.0 and flips == 0 and worst <= max(g_floor, 1e-12) * 4)
-            why = "bit-identity fwd, grad within run-to-run floor"
+            why = "BIT-IDENTITY (bf16-exact scalars), grad within run-to-run floor"
         else:
             ok = (flips > 0) or (d_out < 5e-2 and worst < max(2e-1, g_floor * 4))
             why = "divergence explained by router flips" if flips else "no flips, tolerance"
@@ -181,8 +191,12 @@ def gate_emb_gain():
         for n, p in model.named_parameters():
             if "attn_res_carry_theta" in n:
                 p.fill_(0.6)
+            # not 0 -- at i=0 the whole term vanishes and the gate is vacuous. 0.375 = 1.5*2^-2 is
+            # BF16-EXACT, so eager's `i.to(bf16)` is a no-op and bit-identity is attainable under
+            # the bf16 stream. 0.37 is not representable, and under bf16 it made eager and the
+            # kernel different computations by construction -- 9735/98304 router flips.
             if "attn_res_emb_gain" in n:
-                p.fill_(0.37)     # not 0 -- at i=0 the whole term vanishes and the gate is vacuous
+                p.fill_(0.375)
     picks = []
     hooks = [m.register_forward_hook(lambda _m, _i, o: picks.append(o[0].detach().clone()))
              for m in model.modules() if isinstance(m, BiBoMoERouter)]
