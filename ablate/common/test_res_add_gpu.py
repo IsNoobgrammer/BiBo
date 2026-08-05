@@ -89,24 +89,35 @@ def main():
 
         E._HAS_FUSED_RES_ADD = True
         h_k, p_k, g_k = run()
-        h_k2, _, _ = run()
+        h_k2, _, g_k2 = run()
         d_self = (h_k - h_k2).abs().max().item()
         assert d_self == 0.0, f"{tag}: two identical kernel runs differ by {d_self:.2e}"
         E._HAS_FUSED_RES_ADD = False
         h_e, p_e, g_e = run()
         E._HAS_FUSED_RES_ADD = True
 
+        def worst_grad(ga, gb):
+            """Worst RELATIVE gradient disagreement between two runs, and where."""
+            w, wn = 0.0, ""
+            for n in gb:
+                den = gb[n].abs().max().item()
+                if den < 1e-12 or n not in ga:
+                    continue
+                r = (ga[n] - gb[n]).abs().max().item() / den
+                if r > w:
+                    w, wn = r, n
+            return w, wn
+
+        # THE CONTROL. The same kernel run twice, gradients compared. attn_res's backward reduces
+        # with atomic_add, whose summation order is not fixed, so gradients are nondeterministic
+        # run to run even with a bit-identical forward. Without this floor a kernel-vs-eager
+        # gradient number means nothing -- the fixed-c case reads 2.1e-02 with an EXACT forward
+        # and ZERO router flips, which cannot be a kernel-vs-eager difference at all.
+        g_floor, g_floor_n = worst_grad(g_k, g_k2)
         flips = sum((a != b).sum().item() for a, b in zip(p_k, p_e))
         n_pick = sum(a.numel() for a in p_k)
         d_out = (h_k - h_e).abs().max().item() / h_e.abs().max().item()
-        worst, wname = 0.0, ""
-        for n in g_e:
-            den = g_e[n].abs().max().item()
-            if den < 1e-12:
-                continue
-            r = (g_k[n] - g_e[n]).abs().max().item() / den
-            if r > worst:
-                worst, wname = r, n
+        worst, wname = worst_grad(g_k, g_e)
         # WHAT THIS CAN AND CANNOT ASSERT.
         # With a LEARNABLE scalar the kernel and eager are different computations on purpose: the
         # kernel keeps c in fp32 across the multiply, eager does `_c.to(attn_output.dtype) * ...`
@@ -119,13 +130,15 @@ def main():
         #   learnable c      -- divergence must be EXPLAINED BY FLIPS. A big hidden diff with
         #                       zero flips would mean the kernel moved the arithmetic on its own,
         #                       which is the bug signature this gate exists to catch.
+        # Every gradient claim is made against g_floor, never against zero.
         if cs == "none" and not emb:
-            ok = (d_out == 0.0 and worst == 0.0 and flips == 0)
-            why = "bit-identity (no learned scalar)"
+            ok = (d_out == 0.0 and flips == 0 and worst <= max(g_floor, 1e-12) * 4)
+            why = "bit-identity fwd, grad within run-to-run floor"
         else:
-            ok = (flips > 0) or (d_out < 5e-2 and worst < 2e-1)
+            ok = (flips > 0) or (d_out < 5e-2 and worst < max(2e-1, g_floor * 4))
             why = "divergence explained by router flips" if flips else "no flips, tolerance"
-        print(f"{tag:<22} hidden {d_out:.2e} | worst grad {worst:.2e} ({wname[:34]}) "
+        print(f"{tag:<22} hidden {d_out:.2e} | grad {worst:.2e} ({wname[:30]}) "
+              f"| kernel-vs-self grad floor {g_floor:.2e} ({g_floor_n[:30]}) "
               f"| flips {flips}/{n_pick} | {why}" + ("  ok" if ok else "  <-- FAIL"))
         # the scalar gradients are the kernel's own arithmetic, so call them out separately
         for key in ("attn_res_carry_theta", "attn_res_emb_theta"):
