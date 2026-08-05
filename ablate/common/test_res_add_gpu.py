@@ -41,7 +41,8 @@ def main():
                              num_experts=8, top_k=2, special_pairs=0, use_xsa=True,
                              hybrid_layer_pattern=pat, sliding_window=128,
                              attn_res="3", attn_res_sites=1, attn_res_carry=True,
-                             attn_res_fp32_stream=True, attn_res_carry_scale=cs,
+                             attn_res_fp32_stream=False, bf16_residual_stream=True,
+                             attn_res_carry_scale=cs,
                              attn_res_emb_term=emb, attn_res_emb_scale=es)
         model.train()
         # give the scalars non-trivial values -- at theta=0 the carry is exactly 1.0 and d is 0 or
@@ -114,8 +115,8 @@ def gate_emb_gain():
 
     The cases above grade on a relative tolerance, which is the gate that let the "more accurate"
     kernel ship and cost real bpb. This one is the contract from the kernel-bit-identity rule:
-    max|fused - eager| == 0 on the layout the model actually trains in (fp32 stream, bf16 autocast),
-    forward AND backward, plus ZERO router top-k flips. The flip count is the one that matters in
+    max|fused - eager| == 0 on the layout the model actually trains in (BF16 STREAM end to end,
+    bf16 autocast), forward AND backward, plus ZERO router top-k flips. The flip count is the one that matters in
     an MoE -- a 2.5e-03 perturbation once flipped 3.9% of picks and produced 37% hidden divergence
     from an otherwise correct kernel, so agreement on the hidden state alone proves nothing.
     """
@@ -127,7 +128,8 @@ def gate_emb_gain():
                          num_experts=64, top_k=6, special_pairs=0, use_xsa=True,
                          hybrid_layer_pattern=pat, sliding_window=128,
                          attn_res="3", attn_res_sites=1, attn_res_carry=True,
-                         attn_res_fp32_stream=True, attn_res_carry_scale="unbounded",
+                         attn_res_fp32_stream=False, bf16_residual_stream=True,
+                         attn_res_carry_scale="unbounded",
                          attn_res_emb_term=True, attn_res_emb_site="ht",
                          attn_res_emb_gain=True)
     model.train()
