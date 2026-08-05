@@ -131,14 +131,15 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          attn_res_carry_scale="none",
                          attn_res_emb_term=False, attn_res_emb_scale="none",
                          attn_res_emb_site="mlp", attn_res_emb_gain=False,
-                         bf16_residual_stream=False):
+                         bf16_residual_stream=False, bf16_moe_out=False):
     # attn_res: "off" = stable src model. Anything else routes to exp/ (Kimi K3 Attention
     # Residuals): "control" builds exp's model with residuals DISABLED, an int is the block size
     # in decoder layers (1 = per-layer / Full AttnRes, 3 = one block per [G,S,S]).
     if attn_res == "off":
         from src.configuration_bibo import BiBoConfig
-        extra = {"bf16_residual_stream": bf16_residual_stream}
-    elif bf16_residual_stream:
+        extra = {"bf16_residual_stream": bf16_residual_stream,
+                 "bf16_moe_out": bf16_moe_out}
+    elif bf16_residual_stream or bf16_moe_out:
         raise NotImplementedError(
             "bf16_residual_stream is implemented in src/ only. The exp/ AttnRes model "
             "keeps its own stream (see --attn_res_fp32_stream), so silently ignoring "

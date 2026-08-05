@@ -26,6 +26,15 @@ class BiBoDecoderLayer(nn.Module):
         # the embedding cast, layer 1 saw bf16 and layers 3 and 9 saw fp32 again. So the
         # cast has to happen at every residual add.
         self._bf16_stream = bool(getattr(config, 'bf16_residual_stream', False))
+        # Round the SUBLAYER CONTRIBUTION to bf16 before it enters the fp32 stream, so the MoE
+        # and attention enter on equal terms. Measured asymmetry without this: attn_out is bf16
+        # (autocast) but mlp_out is fp32 at every MoE layer, because the router emits fp32
+        # weights and the expert combine inherits them. Nobody chose that; it is a side effect.
+        # Router weights and the combine stay FP32 -- this rounds the OUTPUT only, which is the
+        # storage/contribution, not the gating precision DeepSeek keeps high. Applied at the mlp
+        # call site rather than inside the MoE so the Triton-patched MoE is covered too; on a
+        # dense layer it is a no-op because that output is already bf16.
+        self._bf16_moe_out = bool(getattr(config, 'bf16_moe_out', False))
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
@@ -50,6 +59,8 @@ class BiBoDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if self._bf16_moe_out:
+            hidden_states = hidden_states.to(torch.bfloat16)
         hidden_states = residual + hidden_states
         if self._bf16_stream:
             hidden_states = hidden_states.to(torch.bfloat16)

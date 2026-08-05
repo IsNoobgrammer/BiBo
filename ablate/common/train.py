@@ -303,6 +303,8 @@ def main():
     # inputs_embeds is fp32 and every residual add promotes back up. modded-nanogpt runs
     # the whole stream in bf16. Master weights and optimizer state are unaffected.
     ap.add_argument("--bf16_residual_stream", type=_bool, default=False)
+    # Round the sublayer OUTPUT to bf16 before the residual add, stream stays fp32.
+    ap.add_argument("--bf16_moe_out", type=_bool, default=False)
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
     # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
@@ -496,6 +498,7 @@ def main():
                            attn_res_emb_site=args.attn_res_emb_site,
                            attn_res_emb_gain=args.attn_res_emb_gain,
                            bf16_residual_stream=args.bf16_residual_stream,
+                           bf16_moe_out=args.bf16_moe_out,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
@@ -591,6 +594,7 @@ def main():
                 + (args.attn_res_emb_scale if args.attn_res_emb_term
                    and args.attn_res_emb_scale != "none" else "")
                 + ("_bf16stream" if args.bf16_residual_stream else "")
+                + ("_bf16moeout" if args.bf16_moe_out else "")
                 + ("ht" if args.attn_res_emb_term and args.attn_res_emb_site == "ht" else "")
                 + ("i" if args.attn_res_emb_term and args.attn_res_emb_site == "ht"
                    and args.attn_res_emb_gain else "")
