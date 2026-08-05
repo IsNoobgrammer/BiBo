@@ -514,6 +514,7 @@ class BiBoModel(BiBoPreTrainedModel):
     """Experimental BiBo transformer trunk."""
 
     def __init__(self, config: BiBoConfig):
+        self.bf16_stream = bool(getattr(config, 'bf16_residual_stream', False))
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -639,6 +640,21 @@ class BiBoModel(BiBoPreTrainedModel):
         hidden_states = inputs_embeds
         if self.embed_norm is not None:
             hidden_states = self.embed_norm(hidden_states)
+        # BF16 STREAM. nn.Embedding is NOT an autocast op, so embed_tokens returns the WEIGHT's
+        # dtype -- fp32, because we keep fp32 master weights. That single un-autocast lookup is
+        # the only place fp32 enters: it becomes hidden_states, becomes prefix_sum at layer 0,
+        # and gets archived as block_residual[0], where it stays fp32 for the entire forward and
+        # promotes every depth mix that reads it (out = promote(fp32, bf16) = fp32).
+        # --attn_res_fp32_stream false does NOT fix this: that flag only stops attn_output being
+        # UP-cast, it never touches what the embedding injects. Measured before this cast:
+        #   AR in: ps=bfloat16  br=float32  -> out=float32
+        # block_residual is the largest tensor in the AttnRes path -- (T, N-1, H), 402 MB fp32 vs
+        # 201 MB bf16 at N=4 -- and it is re-read by every mix, so leaving it fp32 cost most of
+        # the bf16 throughput win (Kimi b3s2 gained 2.6% where the AttnRes-free baseline gained
+        # 8.8%). DeepSeek does not hit this because their weights ARE bf16, so the lookup returns
+        # bf16 with no cast needed.
+        if self.bf16_stream:
+            hidden_states = hidden_states.to(torch.bfloat16)
 
         position_embeddings = self.rotary_emb(
             hidden_states,

@@ -23,7 +23,7 @@ class BiBoConfig(_StableBiBoConfig):
     def __init__(self, attn_res_block_size=12, attn_res_sites=2, attn_res_carry=False,
                  attn_res_fp32_stream=False, attn_res_carry_scale="none",
                  attn_res_emb_term=False, attn_res_emb_scale="none",
-                 attn_res_emb_site="mlp", attn_res_emb_gain=False, **kwargs):
+                 attn_res_emb_site="mlp", attn_res_emb_gain=False, bf16_residual_stream=False, **kwargs):
         if attn_res_sites not in (1, 2):
             raise ValueError(
                 f"attn_res_sites must be 2 (K3 faithful: a depth-mix before the attention "
@@ -52,6 +52,7 @@ class BiBoConfig(_StableBiBoConfig):
         self.attn_res_emb_scale = str(attn_res_emb_scale)
         self.attn_res_emb_site = str(attn_res_emb_site)
         self.attn_res_emb_gain = bool(attn_res_emb_gain)
+        self.bf16_residual_stream = bool(bf16_residual_stream)
         if attn_res_block_size is not None and (
             isinstance(attn_res_block_size, bool)
             or not isinstance(attn_res_block_size, int)

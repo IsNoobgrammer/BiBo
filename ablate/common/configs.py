@@ -139,11 +139,11 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
         from src.configuration_bibo import BiBoConfig
         extra = {"bf16_residual_stream": bf16_residual_stream,
                  "bf16_moe_out": bf16_moe_out}
-    elif bf16_residual_stream or bf16_moe_out:
+    elif bf16_moe_out:
         raise NotImplementedError(
-            "bf16_residual_stream is implemented in src/ only. The exp/ AttnRes model "
-            "keeps its own stream (see --attn_res_fp32_stream), so silently ignoring "
-            "this flag there would produce an arm that is not what its name says.")
+            "bf16_moe_out is src/ only. The exp/ MoE output is already bf16 via the Triton "
+            "patch, so the flag would be inert there rather than wrong -- but silent inertness "
+            "is how an arm ends up not being what its name says.")
     else:
         from exp.configuration_bibo import BiBoConfig
         extra = {"attn_res_block_size": None if attn_res == "control" else int(attn_res),
@@ -154,7 +154,8 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                  "attn_res_emb_term": attn_res_emb_term,
                  "attn_res_emb_scale": attn_res_emb_scale,
                  "attn_res_emb_site": attn_res_emb_site,
-                 "attn_res_emb_gain": attn_res_emb_gain}
+                 "attn_res_emb_gain": attn_res_emb_gain,
+                 "bf16_residual_stream": bf16_residual_stream}
     return BiBoConfig(
         **extra,
         bias_update_threshold=bias_update_threshold,
