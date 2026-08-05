@@ -238,25 +238,43 @@ def gate_emb_gain():
 
     E._HAS_FUSED_RES_ADD = True
     h_k, p_k, g_k = run()
+    h_k2, _, g_k2 = run()          # the kernel against ITSELF -- the nondeterminism floor
     E._HAS_FUSED_RES_ADD = False
     h_e, p_e, g_e = run()
     E._HAS_FUSED_RES_ADD = True
     for h in hooks:
         h.remove()
 
+    def worst_abs(ga, gb):
+        w, wn = 0.0, ""
+        for n in gb:
+            if n not in ga:
+                continue
+            d = (ga[n] - gb[n]).abs().max().item()
+            if d > w:
+                w, wn = d, n
+        return w, wn
+
     flips = sum((a != b).sum().item() for a, b in zip(p_k, p_e))
     total = sum(a.numel() for a in p_k)
     d_out = (h_k - h_e).abs().max().item()
-    worst, wname = 0.0, ""
-    for n in g_e:
-        d = (g_k[n] - g_e[n]).abs().max().item()
-        if d > worst:
-            worst, wname = d, n
-    print(f"{'emb gain i*emb':<22} hidden {d_out:.2e} | grad {worst:.2e} ({wname[:38]}) "
+    d_self = (h_k - h_k2).abs().max().item()
+    g_floor, g_floor_n = worst_abs(g_k, g_k2)
+    worst, wname = worst_abs(g_k, g_e)
+    print(f"{'emb gain i*emb':<22} hidden {d_out:.2e} | grad {worst:.2e} ({wname[:30]}) "
+          f"| kernel-vs-self grad floor {g_floor:.2e} ({g_floor_n[:30]}) "
           f"| router flips {flips}/{total}")
     assert flips == 0, f"{flips}/{total} router top-k picks flipped -- the kernel changes routing"
+    assert d_self == 0.0, f"two identical kernel runs differ in the forward ({d_self:.2e})"
     assert d_out == 0.0, f"forward is not bit-identical to eager ({d_out:.2e})"
-    assert worst == 0.0, f"backward is not bit-identical to eager ({worst:.2e} on {wname})"
+    # The FORWARD is held to exact zero -- it is deterministic, and it is. The backward is not:
+    # attn_res reduces with atomic_add, so the same kernel run twice already disagrees by g_floor
+    # (measured ~1e-2 relative elsewhere in this file). Demanding exact 0 here asserted that
+    # atomic_add is order-stable, which it is not, and it failed at 4.77e-07 on embed_tokens while
+    # the forward was bit-perfect with zero router flips.
+    assert worst <= max(g_floor, 1e-12) * 4, (
+        f"backward differs from eager by {worst:.2e} on {wname}, beyond the {g_floor:.2e} "
+        f"run-to-run floor -- that is the kernel, not atomic nondeterminism")
     del model
     torch.cuda.empty_cache()
 
