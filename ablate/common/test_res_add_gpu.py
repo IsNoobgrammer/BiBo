@@ -101,35 +101,60 @@ def main():
 
         E._HAS_FUSED_RES_ADD = True
         h_k, p_k, g_k = run()
-        h_k2, _, g_k2 = run()
-        d_self = (h_k - h_k2).abs().max().item()
-        assert d_self == 0.0, f"{tag}: two identical kernel runs differ by {d_self:.2e}"
+        # THREE kernel runs, not two. The atomic_add floor is itself a random draw, so estimating
+        # it from a single pair makes the gate flaky in exactly the direction that wastes GPU: the
+        # c=1.0 case passed twice and then failed at grad 8.31e-02 against a floor that happened
+        # to draw 1.33e-02, with a bit-identical forward and zero router flips. Both numbers came
+        # from the same distribution. Max over pairs biases the estimate UP, which is the safe
+        # direction for a floor.
+        selfs = [run() for _ in range(2)]
+        for h_s, _, _ in selfs:
+            d_self = (h_k - h_s).abs().max().item()
+            assert d_self == 0.0, f"{tag}: two identical kernel runs differ by {d_self:.2e}"
         E._HAS_FUSED_RES_ADD = False
         h_e, p_e, g_e = run()
         E._HAS_FUSED_RES_ADD = True
 
-        def worst_grad(ga, gb):
-            """Worst RELATIVE gradient disagreement between two runs, and where."""
-            w, wn = 0.0, ""
-            for n in gb:
-                den = gb[n].abs().max().item()
-                if den < 1e-12 or n not in ga:
+        def per_param(ga, gb, scale):
+            """{param: relative gradient disagreement}, each normalised by its own magnitude."""
+            out = {}
+            for n in scale:
+                den = scale[n].abs().max().item()
+                if den < 1e-12 or n not in ga or n not in gb:
                     continue
-                r = (ga[n] - gb[n]).abs().max().item() / den
-                if r > w:
-                    w, wn = r, n
-            return w, wn
+                out[n] = (ga[n] - gb[n]).abs().max().item() / den
+            return out
 
-        # THE CONTROL. The same kernel run twice, gradients compared. attn_res's backward reduces
-        # with atomic_add, whose summation order is not fixed, so gradients are nondeterministic
-        # run to run even with a bit-identical forward. Without this floor a kernel-vs-eager
-        # gradient number means nothing -- the fixed-c case reads 2.1e-02 with an EXACT forward
-        # and ZERO router flips, which cannot be a kernel-vs-eager difference at all.
-        g_floor, g_floor_n = worst_grad(g_k, g_k2)
+        def worst_grad(ga, gb):
+            d = per_param(ga, gb, gb)
+            return (max(d.values()), max(d, key=d.get)) if d else (0.0, "")
+
+        # THE CONTROL. attn_res's backward reduces with atomic_add, whose summation order is not
+        # fixed, so gradients disagree run to run even with a bit-identical forward. Without this
+        # floor a kernel-vs-eager gradient number means nothing -- the fixed-c case reads 2.1e-02
+        # with an EXACT forward and ZERO router flips, which cannot be kernel-vs-eager at all.
+        #
+        # PER PARAMETER, not a global max. The worst-disagreeing parameter is itself random: one
+        # failure had kernel-vs-eager worst on layers.7.attn_res_carry_theta and the floor on
+        # layers.3 -- two unrelated parameters, so the ratio between them measured nothing. Each
+        # parameter is now compared against ITS OWN floor, maxed over the kernel-vs-kernel pairs.
+        floors = {}
+        for g_s in [g[2] for g in selfs] + [selfs[0][2]]:
+            for n, v in per_param(g_k, g_s, g_e).items():
+                floors[n] = max(floors.get(n, 0.0), v)
+        for n, v in per_param(selfs[0][2], selfs[1][2], g_e).items():
+            floors[n] = max(floors.get(n, 0.0), v)
+        g_floor = max(floors.values()) if floors else 0.0
+        g_floor_n = max(floors, key=floors.get) if floors else ""
         flips = sum((a != b).sum().item() for a, b in zip(p_k, p_e))
         n_pick = sum(a.numel() for a in p_k)
         d_out = (h_k - h_e).abs().max().item() / h_e.abs().max().item()
-        worst, wname = worst_grad(g_k, g_e)
+        # worst EXCESS over each parameter's own floor -- this is the number the gate acts on.
+        ke = per_param(g_k, g_e, g_e)
+        excess = {n: v / max(floors.get(n, 0.0), 1e-6) for n, v in ke.items()}
+        worst_x = max(excess.values()) if excess else 0.0
+        wname = max(excess, key=excess.get) if excess else ""
+        worst = ke.get(wname, 0.0)
         # WHAT THIS CAN AND CANNOT ASSERT.
         # Under a bf16 stream eager computes `c.to(bf16) * attn_output` IN BF16 -- it rounds the
         # PRODUCT -- then rounds again on the add. The kernel forms the product in fp32 and rounds
@@ -147,7 +172,7 @@ def main():
         #   any other scalar -- divergence must be EXPLAINED BY FLIPS. A big hidden diff with
         #                       ZERO flips would mean the kernel moved the arithmetic on its own,
         #                       which is the bug signature this gate exists to catch.
-        # Every gradient claim is made against g_floor, never against zero.
+        # Every gradient claim is made against that parameter's own floor, never against zero.
         # exact: nothing is left for the two paths to differ on -- every multiply is exact AND
         # eager performs a single effective rounding, same as the kernel's one fp32 accumulation.
         #   cs="none"                        -> no scalar at all (ones buffer)
@@ -156,15 +181,20 @@ def main():
         # A transformed mode never qualifies: 2*sigmoid(1.0) is not 1.0.
         exact_scalar = cs == "none" or (cs == "unbounded" and es == "none" and fill_c == 1.0)
         one_rounding = (not emb) or fill_d == 0.0
+        # SLACK is on the EXCESS RATIO, so it is scale-free: 4x means "this parameter disagrees
+        # with eager more than 4x as much as the kernel disagrees with itself on that same
+        # parameter". Noise-vs-noise lands near 1x; a real arithmetic change does not.
+        SLACK = 4.0
         if exact_scalar and one_rounding:
-            ok = (d_out == 0.0 and flips == 0 and worst <= max(g_floor, 1e-12) * 4)
-            why = "BIT-IDENTITY (exact multiply), grad within run-to-run floor"
+            ok = (d_out == 0.0 and flips == 0 and worst_x <= SLACK)
+            why = "BIT-IDENTITY (exact multiply), grad within per-param floor"
         else:
-            ok = (flips > 0) or (d_out < 5e-2 and worst < max(2e-1, g_floor * 4))
+            ok = (flips > 0) or (d_out < 5e-2 and worst_x <= SLACK)
             why = "divergence explained by router flips" if flips else "no flips, tolerance"
-        print(f"{tag:<22} hidden {d_out:.2e} | grad {worst:.2e} ({wname[:30]}) "
-              f"| kernel-vs-self grad floor {g_floor:.2e} ({g_floor_n[:30]}) "
-              f"| flips {flips}/{n_pick} | {why}" + ("  ok" if ok else "  <-- FAIL"))
+        print(f"{tag:<22} hidden {d_out:.2e} | grad {worst:.2e} vs own floor "
+              f"{floors.get(wname, 0.0):.2e} = {worst_x:.2f}x ({wname[:28]}) "
+              f"| max floor {g_floor:.2e} | flips {flips}/{n_pick} | {why}"
+              + ("  ok" if ok else "  <-- FAIL"))
         # the scalar gradients are the kernel's own arithmetic, so call them out separately
         for key in ("attn_res_carry_theta", "attn_res_emb_theta"):
             hits = [(n, g_e[n], g_k[n]) for n in g_e if key in n]
@@ -238,32 +268,34 @@ def gate_emb_gain():
 
     E._HAS_FUSED_RES_ADD = True
     h_k, p_k, g_k = run()
-    h_k2, _, g_k2 = run()          # the kernel against ITSELF -- the nondeterminism floor
+    selfs = [run() for _ in range(2)]      # the kernel against ITSELF, twice
     E._HAS_FUSED_RES_ADD = False
     h_e, p_e, g_e = run()
     E._HAS_FUSED_RES_ADD = True
     for h in hooks:
         h.remove()
 
-    def worst_abs(ga, gb):
-        w, wn = 0.0, ""
-        for n in gb:
-            if n not in ga:
-                continue
-            d = (ga[n] - gb[n]).abs().max().item()
-            if d > w:
-                w, wn = d, n
-        return w, wn
+    def abs_pp(ga, gb):
+        return {n: (ga[n] - gb[n]).abs().max().item() for n in gb if n in ga}
 
     flips = sum((a != b).sum().item() for a, b in zip(p_k, p_e))
     total = sum(a.numel() for a in p_k)
     d_out = (h_k - h_e).abs().max().item()
-    d_self = (h_k - h_k2).abs().max().item()
-    g_floor, g_floor_n = worst_abs(g_k, g_k2)
-    worst, wname = worst_abs(g_k, g_e)
-    print(f"{'emb gain i*emb':<22} hidden {d_out:.2e} | grad {worst:.2e} ({wname[:30]}) "
-          f"| kernel-vs-self grad floor {g_floor:.2e} ({g_floor_n[:30]}) "
-          f"| router flips {flips}/{total}")
+    d_self = max((h_k - h_s).abs().max().item() for h_s, _, _ in selfs)
+    # Per-parameter floor, maxed over every kernel-vs-kernel pair -- same reasoning as main():
+    # one draw of a random quantity is not a floor, and the worst parameter moves between runs.
+    floors = {}
+    for ga, gb in ((g_k, selfs[0][2]), (g_k, selfs[1][2]), (selfs[0][2], selfs[1][2])):
+        for n, v in abs_pp(ga, gb).items():
+            floors[n] = max(floors.get(n, 0.0), v)
+    ke = abs_pp(g_k, g_e)
+    excess = {n: v / max(floors.get(n, 0.0), 1e-30) for n, v in ke.items() if v > 0}
+    worst_x = max(excess.values()) if excess else 0.0
+    wname = max(excess, key=excess.get) if excess else ""
+    worst = ke.get(wname, 0.0)
+    g_floor = floors.get(wname, 0.0)
+    print(f"{'emb gain i*emb':<22} hidden {d_out:.2e} | grad {worst:.2e} vs own floor "
+          f"{g_floor:.2e} = {worst_x:.2f}x ({wname[:28]}) | router flips {flips}/{total}")
     assert flips == 0, f"{flips}/{total} router top-k picks flipped -- the kernel changes routing"
     assert d_self == 0.0, f"two identical kernel runs differ in the forward ({d_self:.2e})"
     assert d_out == 0.0, f"forward is not bit-identical to eager ({d_out:.2e})"
@@ -272,9 +304,9 @@ def gate_emb_gain():
     # (measured ~1e-2 relative elsewhere in this file). Demanding exact 0 here asserted that
     # atomic_add is order-stable, which it is not, and it failed at 4.77e-07 on embed_tokens while
     # the forward was bit-perfect with zero router flips.
-    assert worst <= max(g_floor, 1e-12) * 4, (
-        f"backward differs from eager by {worst:.2e} on {wname}, beyond the {g_floor:.2e} "
-        f"run-to-run floor -- that is the kernel, not atomic nondeterminism")
+    assert worst_x <= 4.0, (
+        f"backward differs from eager by {worst:.2e} on {wname}, {worst_x:.1f}x that parameter's "
+        f"own {g_floor:.2e} run-to-run floor -- that is the kernel, not atomic nondeterminism")
     del model
     torch.cuda.empty_cache()
 
