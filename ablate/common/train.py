@@ -298,6 +298,11 @@ def main():
     # unnormed, and the MoE-output-norm round measured "norm the addend" at -0.010 bpb in all 3
     # variants. i inits 0 (strict generalization). ht site only.
     ap.add_argument("--attn_res_emb_gain", type=_bool, default=False)
+    # BF16 RESIDUAL STREAM (src/ baseline only). The stream is fp32 by default -- not by
+    # choice, but because weights are fp32 master and nn.Embedding is not autocast, so
+    # inputs_embeds is fp32 and every residual add promotes back up. modded-nanogpt runs
+    # the whole stream in bf16. Master weights and optimizer state are unaffected.
+    ap.add_argument("--bf16_residual_stream", type=_bool, default=False)
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
     # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
@@ -490,6 +495,7 @@ def main():
                            attn_res_emb_scale=args.attn_res_emb_scale,
                            attn_res_emb_site=args.attn_res_emb_site,
                            attn_res_emb_gain=args.attn_res_emb_gain,
+                           bf16_residual_stream=args.bf16_residual_stream,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
@@ -584,6 +590,7 @@ def main():
                 + ("emb" if args.attn_res != "off" and args.attn_res_emb_term else "")
                 + (args.attn_res_emb_scale if args.attn_res_emb_term
                    and args.attn_res_emb_scale != "none" else "")
+                + ("_bf16stream" if args.bf16_residual_stream else "")
                 + ("ht" if args.attn_res_emb_term and args.attn_res_emb_site == "ht" else "")
                 + ("i" if args.attn_res_emb_term and args.attn_res_emb_site == "ht"
                    and args.attn_res_emb_gain else "")

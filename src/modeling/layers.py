@@ -20,6 +20,12 @@ class BiBoDecoderLayer(nn.Module):
         layer_idx: Layer index
     """
     def __init__(self, config: BiBoConfig, layer_idx: int):
+        # BF16 residual stream. Casting once at the embedding is NOT enough: the MoE
+        # combine returns fp32 (the router weights are fp32), so `residual + mlp_out`
+        # promotes the stream straight back at the first MoE layer. Measured: with only
+        # the embedding cast, layer 1 saw bf16 and layers 3 and 9 saw fp32 again. So the
+        # cast has to happen at every residual add.
+        self._bf16_stream = bool(getattr(config, 'bf16_residual_stream', False))
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
@@ -45,6 +51,8 @@ class BiBoDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+        if self._bf16_stream:
+            hidden_states = hidden_states.to(torch.bfloat16)
         return hidden_states
 
     def forward(
@@ -71,6 +79,8 @@ class BiBoDecoderLayer(nn.Module):
             output_attentions=output_attentions,
         )
         hidden_states = residual + attn_output
+        if self._bf16_stream:
+            hidden_states = hidden_states.to(torch.bfloat16)
 
         # FFN with selective checkpointing
         if self.use_selective_checkpointing and self.training:

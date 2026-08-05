@@ -166,6 +166,13 @@ class BiBoModel(BiBoPreTrainedModel):
         hidden_states = inputs_embeds
         if self.embed_norm is not None:
             hidden_states = self.embed_norm(hidden_states)
+        # BF16 RESIDUAL STREAM. Without this the stream is fp32 for a subtle reason: weights
+        # are fp32 master and nn.Embedding is NOT autocast, so inputs_embeds arrives fp32 and
+        # every `residual + attn_out` promotes the bf16 sublayer output back up. One cast here
+        # keeps the whole stream bf16, which is what modded-nanogpt does. Master weights and
+        # optimizer state are untouched.
+        if getattr(self.config, 'bf16_residual_stream', False):
+            hidden_states = hidden_states.to(torch.bfloat16)
 
         # seq_len as a host int keeps the dynamic-NTK path free of a per-step GPU sync / graph break.
         position_embeddings = self.rotary_emb(

@@ -51,8 +51,14 @@ class BiBoConfig(PretrainedConfig):
         norm_topk_prob="sum",
         bias_update_factor=None,
         bias_update_threshold=8000,
+        bf16_residual_stream=False,
         **kwargs,
     ):
+        # Cast the residual stream to BF16 at the embedding, so every `residual + sublayer`
+        # add downstream stays bf16 instead of promoting back to fp32. Master weights and
+        # optimizer state are UNCHANGED (still fp32) -- this is the stream only, which is
+        # what modded-nanogpt runs and what halves residual traffic.
+        self.bf16_residual_stream = bool(bf16_residual_stream)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
