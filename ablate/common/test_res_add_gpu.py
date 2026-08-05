@@ -35,10 +35,16 @@ def main():
     pat = swa_block_pattern(SHARED["num_hidden_layers"])
     ids = torch.randint(0, SHARED["vocab_size"], (2, 512), device="cuda")
 
-    for tag, (cs, emb, es) in (("carry unbounded", ("unbounded", False, "none")),
-                               ("carry+emb raw", ("unbounded", True, "none")),
-                               ("carry+emb 2sigmoid", ("sigmoid", True, "2sigmoid")),
-                               ("carry fixed c=1", ("none", False, "none"))):
+    # (carry_scale, emb_term, emb_scale, fill) -- `fill` is the value every learned scalar takes.
+    # fill=1.0 makes the multiply EXACT, which is the only way bit-identity is reachable (see the
+    # contract note below). Those cases are the hard gate; the rest are the amplification cases.
+    for tag, (cs, emb, es, fill) in (
+            ("carry c=1.0 learned", ("unbounded", False, "none", 1.0)),
+            ("carry+emb both 1.0", ("unbounded", True, "none", 1.0)),
+            ("carry unbounded", ("unbounded", False, "none", 0.625)),
+            ("carry+emb raw", ("unbounded", True, "none", 0.625)),
+            ("carry+emb 2sigmoid", ("sigmoid", True, "2sigmoid", 0.625)),
+            ("carry fixed c=1", ("none", False, "none", 0.625))):
         torch.manual_seed(42069)
         model, _ = build_arm("bibo_min", device="cuda", dtype=torch.float32,
                              num_experts=8, top_k=2, special_pairs=0, use_xsa=True,
@@ -48,20 +54,13 @@ def main():
                              attn_res_carry_scale=cs,
                              attn_res_emb_term=emb, attn_res_emb_scale=es)
         model.train()
-        # Non-trivial values, because at theta=0 the carry is exactly 1.0 and d is 0 or 1 -- the
-        # one setting where a scale bug cannot show up. But BF16-EXACT ones: 0.625 = 1.25*2^-1 and
-        # 0.375 = 1.5*2^-2 both fit bf16's 8 mantissa bits, so `c.to(bf16)` is a no-op and eager's
-        # rounding of the scalar -- the ONLY thing the kernel deliberately does differently --
-        # stops existing. That makes bit-identity attainable for the RAW modes, which turns this
-        # from a tolerance into a real contract. The old 0.6/0.4 are not representable, so every
-        # raw-mode case was forced through the weaker flips-explained branch for no reason.
-        # Transformed modes (sigmoid/2sigmoid/tanh) still cannot be exact: f(theta) is not.
+        # Never 0: at theta=0 the carry is exactly 1.0 and d is 0, the one setting where a scale
+        # bug cannot show up. 0.625 = 1.25*2^-1 is bf16-exact, which removes scalar-rounding as a
+        # confound -- though measurement says that is NOT what drives the divergence (see below).
         with torch.no_grad():
             for n, p in model.named_parameters():
-                if "attn_res_carry_theta" in n:
-                    p.fill_(0.625)
-                if "attn_res_emb_theta" in n:
-                    p.fill_(0.375)
+                if "attn_res_carry_theta" in n or "attn_res_emb_theta" in n:
+                    p.fill_(fill)
 
         # ROUTER TOP-K FLIPS. Without this the hidden/grad numbers below cannot be interpreted:
         # in an MoE a sub-ULP difference can flip which expert runs, and one flip sends a token
@@ -125,25 +124,31 @@ def main():
         d_out = (h_k - h_e).abs().max().item() / h_e.abs().max().item()
         worst, wname = worst_grad(g_k, g_e)
         # WHAT THIS CAN AND CANNOT ASSERT.
-        # With a LEARNABLE scalar the kernel and eager are different computations on purpose: the
-        # kernel keeps c in fp32 across the multiply, eager does `_c.to(attn_output.dtype) * ...`
-        # and rounds it to bf16 first (exp/modeling_bibo.py, eager branch). The standalone fp64
-        # grade says the kernel is the more accurate of the two. So equality is not just unmet
-        # here, it is the wrong thing to demand -- the old blanket tolerance was asserting
-        # something false, and it fired at hidden 2.9e-01 while the kernel was behaving.
+        # Under a bf16 stream eager computes `c.to(bf16) * attn_output` IN BF16 -- it rounds the
+        # PRODUCT -- then rounds again on the add. The kernel forms the product in fp32 and rounds
+        # once, at the store. That is the whole difference, and the fp64 grade says the kernel is
+        # the more accurate of the two. So equality is not merely unmet for c != 1, it is the
+        # wrong thing to demand, and the old blanket tolerance fired at hidden 2.9e-01 while the
+        # kernel was behaving perfectly.
+        # Making c bf16-EXACT does not rescue it: measured at c = 0.625 (exactly representable)
+        # the two still diverge at hidden 4.0e-01 over 517 flips, because it is the product that
+        # rounds, not the scalar. Only c == 1.0 removes the multiply's rounding entirely.
         # What IS assertable:
-        #   carry fixed c=1  -- no scalar to round, so BIT IDENTITY and zero flips.
-        #   learnable c      -- divergence must be EXPLAINED BY FLIPS. A big hidden diff with
-        #                       zero flips would mean the kernel moved the arithmetic on its own,
+        #   scalar == 1.0    -- product is exact, so BIT IDENTITY and zero flips. Non-vacuous:
+        #                       the Parameter exists and takes gradients, unlike the i=0 case.
+        #   carry fixed c=1  -- same, via the ones buffer instead of a Parameter.
+        #   any other scalar -- divergence must be EXPLAINED BY FLIPS. A big hidden diff with
+        #                       ZERO flips would mean the kernel moved the arithmetic on its own,
         #                       which is the bug signature this gate exists to catch.
         # Every gradient claim is made against g_floor, never against zero.
-        # RAW modes with bf16-exact scalars have nothing left to differ on -> hard bit-identity.
-        # Transformed modes compute f(theta), which is not bf16-exact, so they keep the weaker
-        # divergence-must-be-explained-by-flips contract.
-        raw = cs in ("none", "unbounded") and es == "none"
-        if raw:
+        # exact_mul: the multiply introduces no rounding, so nothing is left to differ on.
+        #   cs="none"                      -> no scalar at all (ones buffer)
+        #   cs="unbounded" and fill == 1.0 -> c is the raw theta, so c is exactly 1.0
+        # A transformed mode never qualifies: 2*sigmoid(1.0) is not 1.0.
+        exact_mul = cs == "none" or (cs == "unbounded" and es == "none" and fill == 1.0)
+        if exact_mul:
             ok = (d_out == 0.0 and flips == 0 and worst <= max(g_floor, 1e-12) * 4)
-            why = "BIT-IDENTITY (bf16-exact scalars), grad within run-to-run floor"
+            why = "BIT-IDENTITY (exact multiply), grad within run-to-run floor"
         else:
             ok = (flips > 0) or (d_out < 5e-2 and worst < max(2e-1, g_floor * 4))
             why = "divergence explained by router flips" if flips else "no flips, tolerance"
@@ -190,13 +195,16 @@ def gate_emb_gain():
     with torch.no_grad():
         for n, p in model.named_parameters():
             if "attn_res_carry_theta" in n:
-                p.fill_(0.6)
-            # not 0 -- at i=0 the whole term vanishes and the gate is vacuous. 0.375 = 1.5*2^-2 is
-            # BF16-EXACT, so eager's `i.to(bf16)` is a no-op and bit-identity is attainable under
-            # the bf16 stream. 0.37 is not representable, and under bf16 it made eager and the
-            # kernel different computations by construction -- 9735/98304 router flips.
+                p.fill_(1.0)      # exact multiply, same reason as the gain below
+            # Not 0 -- at i=0 the whole term vanishes and the gate is vacuous. Exactly 1.0 --
+            # under a bf16 stream eager rounds the PRODUCT i*emb to bf16 while the kernel forms it
+            # in fp32, so any i != 1 makes the two different computations by construction and
+            # bit-identity is unreachable (0.37 measured 9735/98304 flips once the stream went
+            # bf16; 0.375, though bf16-exact, does not help -- it is the product that rounds).
+            # At i = 1.0 the multiply is exact, the Parameter still exists and still takes a
+            # gradient, and BIT IDENTITY is a contract the kernel can actually be held to.
             if "attn_res_emb_gain" in n:
-                p.fill_(0.375)
+                p.fill_(1.0)
     picks = []
     hooks = [m.register_forward_hook(lambda _m, _i, o: picks.append(o[0].detach().clone()))
              for m in model.modules() if isinstance(m, BiBoMoERouter)]
