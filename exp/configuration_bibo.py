@@ -25,7 +25,7 @@ class BiBoConfig(_StableBiBoConfig):
                  attn_res_emb_term=False, attn_res_emb_scale="none",
                  attn_res_emb_site="mlp", attn_res_emb_gain=False,
                  attn_res_score="softmax", attn_res_carry_per_dim=False,
-                 attn_res_carry_gate="none", **kwargs):
+                 attn_res_carry_gate="none", attn_res_emb_per_dim=False, **kwargs):
         if attn_res_sites not in (1, 2):
             raise ValueError(
                 f"attn_res_sites must be 2 (K3 faithful: a depth-mix before the attention "
@@ -98,6 +98,16 @@ class BiBoConfig(_StableBiBoConfig):
                     f"attn_res_carry_gate produces the whole coefficient, so "
                     f"attn_res_carry_scale must be none, got {_csm!r}")
         self.attn_res_carry_gate = _g
+        # d as an (hidden,) vector, the same widening per-dim c got. Needs the emb term to
+        # exist, and is meaningless on the ht gain path where theta is not created at all.
+        if attn_res_emb_per_dim:
+            if not attn_res_emb_term:
+                raise ValueError("attn_res_emb_per_dim needs attn_res_emb_term=True")
+            if attn_res_emb_gain:
+                raise ValueError(
+                    "attn_res_emb_per_dim is for the theta-based emb term; the ht gain path "
+                    "replaces theta with i and would ignore it")
+        self.attn_res_emb_per_dim = bool(attn_res_emb_per_dim)
         # bf16_residual_stream is deliberately NOT a named parameter here. It is owned by the
         # PARENT (src BiBoConfig) and reaches it through **kwargs. Naming it here silently broke
         # the flag: this __init__ set the attribute, then super().__init__(**kwargs) ran the

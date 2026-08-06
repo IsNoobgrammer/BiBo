@@ -17,6 +17,7 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
               attn_res_carry_scale="none", attn_res_emb_term=False, attn_res_emb_scale="none",
               attn_res_emb_site="mlp", attn_res_emb_gain=False, attn_res_score="softmax",
               attn_res_carry_per_dim=False, attn_res_carry_gate="none",
+              attn_res_emb_per_dim=False,
               bf16_residual_stream=False, bf16_moe_out=False):
     """arm in {'qwen','bibo_min'} -> (model, config). Params in `dtype` (fp32 master; bf16 via autocast).
     Balancing, each native: BiBo router-bias updates; Qwen Switch aux loss (aux_coef).
@@ -63,6 +64,7 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
                                    attn_res_score=attn_res_score,
                                    attn_res_carry_per_dim=attn_res_carry_per_dim,
                                    attn_res_carry_gate=attn_res_carry_gate,
+                                   attn_res_emb_per_dim=attn_res_emb_per_dim,
                                    bf16_residual_stream=bf16_residual_stream,
                                    bf16_moe_out=bf16_moe_out)
         model = BiBoForCausalLM(cfg)

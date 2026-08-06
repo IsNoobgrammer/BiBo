@@ -321,8 +321,15 @@ class BiBoDecoderLayer(nn.Module):
         # generalization -- same discipline as c and d. dL/di is nonzero there (gate 8 asserts it),
         # so it can leave.
         _gain_on = bool(getattr(config, "attn_res_emb_gain", False)) and _es == "ht"
+        # PER-DIM d, same axis as per-dim c. c per-channel beat scalar c by -0.0011 for free,
+        # so the question is whether shaping the EMBEDDING contribution per channel does the same.
+        # Worth asking despite d and c measuring as substitutes (d on scalar c was worth -0.0016,
+        # on per-dim c only -0.0001): that showed a SCALAR d adds nothing once c is shaped, not
+        # that a shaped d adds nothing. Init is unchanged, so it stays a strict generalization.
+        self.attn_res_emb_per_dim = bool(getattr(config, "attn_res_emb_per_dim", False))
+        _dshape = (config.hidden_size,) if self.attn_res_emb_per_dim else (1,)
         self.attn_res_emb_theta = (
-            nn.Parameter(torch.full((1,), -4.0 if _es == "ht" else 0.0))
+            nn.Parameter(torch.full(_dshape, -4.0 if _es == "ht" else 0.0))
             if (_emb_on and not _gain_on) else None)
         self.attn_res_emb_gain = nn.Parameter(torch.zeros(1)) if (_emb_on and _gain_on) else None
         # Non-persistent so it never enters the state_dict: an extra key would break every existing
