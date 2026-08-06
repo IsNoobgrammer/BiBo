@@ -67,6 +67,7 @@ def _arch_kwargs(c):
         attn_res_emb_site=c.get("attn_res_emb_site", "mlp"),
         attn_res_emb_gain=c.get("attn_res_emb_gain", False),
         attn_res_score=c.get("attn_res_score", "softmax"),
+        attn_res_topk=c.get("attn_res_topk", 0),
         attn_res_carry_per_dim=c.get("attn_res_carry_per_dim", False),
         attn_res_carry_gate=c.get("attn_res_carry_gate", "none") or "none",
         attn_res_emb_per_dim=c.get("attn_res_emb_per_dim", False),

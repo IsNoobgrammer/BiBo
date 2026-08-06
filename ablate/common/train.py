@@ -303,6 +303,11 @@ def main():
     # softmax is shift-invariant (N-1 usable dof); signorm = sigmoid(x_i)/sum_j sigmoid(x_j) is
     # shift-sensitive (all N live) and saturates toward uniform at large positive scores.
     ap.add_argument("--attn_res_score", choices=["softmax", "signorm"], default="softmax")
+    # Sparse depth mix: keep only the k highest-scoring candidates, prefix_sum always among
+    # them, renormalize over the survivors. 0 = dense. Inert wherever the pool is <= k, so at
+    # --attn_res 1 it first binds at layer k-1 and at --attn_res 3 (pool never exceeds 5) any
+    # k >= 5 does nothing at all.
+    ap.add_argument("--attn_res_topk", type=int, default=0)
     # c per HIDDEN CHANNEL instead of one scalar per layer: M_in = attn_read + c (*) attn_out.
     # 512 params/layer. Real capacity, not a reparameterization -- attn_output also feeds the
     # prefix-sum stream, so a diagonal scale on the MLP-facing copy cannot fold into o_proj.
@@ -513,6 +518,7 @@ def main():
                            attn_res_emb_site=args.attn_res_emb_site,
                            attn_res_emb_gain=args.attn_res_emb_gain,
                            attn_res_score=args.attn_res_score,
+                           attn_res_topk=args.attn_res_topk,
                            attn_res_carry_per_dim=args.attn_res_carry_per_dim,
                            attn_res_carry_gate=args.attn_res_carry_gate,
                            attn_res_emb_per_dim=args.attn_res_emb_per_dim,
@@ -613,6 +619,8 @@ def main():
                 + (args.attn_res_emb_scale if args.attn_res_emb_term
                    and args.attn_res_emb_scale != "none" else "")
                 + ("_signorm" if args.attn_res != "off" and args.attn_res_score == "signorm"
+                   else "")
+                + (f"_top{args.attn_res_topk}" if args.attn_res != "off" and args.attn_res_topk
                    else "")
                 + ("_cperdim" if args.attn_res != "off" and args.attn_res_carry_per_dim
                    else "")

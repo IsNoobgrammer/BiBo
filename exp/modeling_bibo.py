@@ -85,6 +85,7 @@ def apply_attention_residual(
     projection: nn.Linear,
     norm: BiBoRMSNorm,
     score_mode: int = 0,
+    topk: int = 0,
 ) -> torch.Tensor:
     """Mix completed blocks and the current prefix across model depth.
 
@@ -102,6 +103,18 @@ def apply_attention_residual(
             score DIFFERENCES, so N scores carry N-1 usable degrees of freedom, while sigmoid/sum
             responds to the absolute level and uses all N. It also saturates toward uniform once
             every score is large and positive, which softmax does not.
+        topk: 0 = dense, mix over every candidate. k > 0 = SPARSE DEPTH: score all candidates,
+            keep only the k highest, renormalize over those. Still a convex combination -- the
+            surviving weights sum to 1 -- just on a k-face of the simplex instead of its interior.
+            ``prefix_sum`` is FORCED into the selection and consumes one of the k slots, so k=4
+            means the live stream plus the 3 best committed blocks. It is forced because it is the
+            only candidate carrying THIS layer's attention output: dropping it would not
+            down-weight attention, it would disconnect the layer from the depth read entirely and
+            zero its gradient through this path for that token.
+            A no-op wherever k >= candidate count, which is what makes k a depth threshold. At
+            block_size=1 the pool is 2,3,...,11 across the 20 mix sites, so k first binds at
+            layer k-1's second site and sparsifies everything below it; at block_size=3 the pool
+            never exceeds 5, so any k >= 5 does nothing at all.
 
     Returns:
         The depth-attended state with shape ``(tokens, hidden)`` and the same
@@ -137,7 +150,7 @@ def apply_attention_residual(
 
     if _HAS_FUSED_AR and prefix_sum.is_cuda:
         return _fused_ar(block_residual, prefix_sum, score_weight, norm.variance_epsilon,
-                         score_mode)
+                         score_mode, topk)
 
     # AUTOCAST MUST BE OFF HERE. Under torch.autocast(bf16) `torch.matmul` is autocast-eligible,
     # so the two matmuls below get their fp32 inputs silently cast back to bf16 and the whole
@@ -163,6 +176,13 @@ def apply_attention_residual(
         sq_sum = torch.linalg.vector_norm(values_float, dim=-1).square()
         inv_rms = torch.rsqrt(sq_sum / values_float.shape[-1] + norm.variance_epsilon)
         scores = torch.matmul(values_float, score_weight) * inv_rms
+        if topk and topk < scores.shape[-1]:
+            # Same rule as the kernel's `_topk_sel`: last column (the prefix sum) forced in via
+            # +inf, and `<` rather than `<=` so exact ties keep every tied candidate.
+            _key = scores.clone()
+            _key[..., -1] = float("inf")
+            _kth = _key.topk(topk, dim=-1).values[..., -1:]
+            scores = scores.masked_fill(_key < _kth, float("-inf"))
         if score_mode == 0:
             probabilities = scores.softmax(dim=-1)
         else:
@@ -186,6 +206,7 @@ class BiBoDecoderLayer(nn.Module):
         self.attn_res_block_size = config.attn_res_block_size
         # 0 = softmax, 1 = sigmoid/sum. Int, not a string, because it reaches a Triton constexpr.
         self.attn_res_score_mode = _SCORE_MODE[getattr(config, "attn_res_score", "softmax")]
+        self.attn_res_topk = int(getattr(config, "attn_res_topk", 0) or 0)
 
         self.self_attn = BiBoAttention(config=config, layer_idx=layer_idx)
         self.is_moe_layer = layer_idx not in config.mlp_only_layers
@@ -416,6 +437,7 @@ class BiBoDecoderLayer(nn.Module):
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
                 self.attn_res_score_mode,
+                self.attn_res_topk,
             ).reshape(batch_size, seq_len, hidden_size)
             if self.attn_res_emb_gain is not None:
                 # HT = AR(...) + i * emb, the RAW embedding. No norm of any kind.
@@ -480,6 +502,7 @@ class BiBoDecoderLayer(nn.Module):
                 self.mlp_res_proj,
                 self.mlp_res_norm,
                 self.attn_res_score_mode,
+                self.attn_res_topk,
             ).reshape(batch_size, seq_len, hidden_size)
         elif self.attn_res_carry:
             # ONE mix per layer, CARRY: the MLP reads the site-1 mix plus this layer's attention
@@ -633,6 +656,7 @@ class BiBoModel(BiBoPreTrainedModel):
         self.vocab_size = config.vocab_size
         self.use_attn_residuals = config.attn_res_block_size is not None
         self.attn_res_score_mode = _SCORE_MODE[getattr(config, "attn_res_score", "softmax")]
+        self.attn_res_topk = int(getattr(config, "attn_res_topk", 0) or 0)
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
@@ -676,6 +700,7 @@ class BiBoModel(BiBoPreTrainedModel):
             self.output_attn_res_proj,
             self.output_attn_res_norm,
             self.attn_res_score_mode,
+            self.attn_res_topk,
         ).reshape(batch_size, seq_len, hidden_size)
 
     def forward(

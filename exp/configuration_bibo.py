@@ -24,7 +24,7 @@ class BiBoConfig(_StableBiBoConfig):
                  attn_res_fp32_stream=False, attn_res_carry_scale="none",
                  attn_res_emb_term=False, attn_res_emb_scale="none",
                  attn_res_emb_site="mlp", attn_res_emb_gain=False,
-                 attn_res_score="softmax", attn_res_carry_per_dim=False,
+                 attn_res_score="softmax", attn_res_topk=0, attn_res_carry_per_dim=False,
                  attn_res_carry_gate="none", attn_res_emb_per_dim=False, **kwargs):
         if attn_res_sites not in (1, 2):
             raise ValueError(
@@ -67,6 +67,15 @@ class BiBoConfig(_StableBiBoConfig):
         if attn_res_score not in ("softmax", "signorm"):
             raise ValueError(f"attn_res_score must be softmax or signorm, got {attn_res_score!r}")
         self.attn_res_score = str(attn_res_score)
+        # SPARSE DEPTH. 0 = dense. k > 0 mixes only the k best-scoring candidates, prefix_sum
+        # forced in. k is effectively a DEPTH THRESHOLD, not a width: it is inert wherever the
+        # candidate pool is <= k, and the pool grows with depth. k=1 would select the prefix sum
+        # alone at every site, deleting the depth mix entirely, so it is rejected rather than
+        # silently building a model with no AttnRes in it.
+        attn_res_topk = int(attn_res_topk or 0)
+        if attn_res_topk < 0 or attn_res_topk == 1:
+            raise ValueError(f"attn_res_topk must be 0 (dense) or >= 2, got {attn_res_topk!r}")
+        self.attn_res_topk = attn_res_topk
         # c as an (hidden,) vector instead of one scalar per layer. Strict generalization:
         # every entry inits to the scalar's init, so step 0 is bit-identical. Only meaningful
         # with a learnable carry scale -- at attn_res_carry_scale=none there is no parameter.

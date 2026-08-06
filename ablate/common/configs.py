@@ -131,13 +131,18 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          attn_res_carry_scale="none",
                          attn_res_emb_term=False, attn_res_emb_scale="none",
                          attn_res_emb_site="mlp", attn_res_emb_gain=False,
-                         attn_res_score="softmax", attn_res_carry_per_dim=False,
+                         attn_res_score="softmax", attn_res_topk=0,
+                         attn_res_carry_per_dim=False,
                          attn_res_carry_gate="none", attn_res_emb_per_dim=False,
                          bf16_residual_stream=False, bf16_moe_out=False):
     # attn_res: "off" = stable src model. Anything else routes to exp/ (Kimi K3 Attention
     # Residuals): "control" builds exp's model with residuals DISABLED, an int is the block size
     # in decoder layers (1 = per-layer / Full AttnRes, 3 = one block per [G,S,S]).
     if attn_res == "off":
+        if attn_res_topk:
+            raise NotImplementedError(
+                "attn_res_topk only exists inside the AttnRes depth mix, so with --attn_res off "
+                "it would be silently inert.")
         if attn_res_score != "softmax":
             raise NotImplementedError(
                 "attn_res_score only exists inside the AttnRes depth mix, so with --attn_res off "
@@ -162,6 +167,7 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                  "attn_res_emb_site": attn_res_emb_site,
                  "attn_res_emb_gain": attn_res_emb_gain,
                  "attn_res_score": attn_res_score,
+                 "attn_res_topk": attn_res_topk,
                  "attn_res_carry_per_dim": attn_res_carry_per_dim,
                  "attn_res_carry_gate": attn_res_carry_gate,
                  "attn_res_emb_per_dim": attn_res_emb_per_dim,
