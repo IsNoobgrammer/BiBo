@@ -336,7 +336,11 @@ def main():
     # Motivated by measurement: CV(rms(gate)) across tokens is 28% at MoE layer 0 but only ~4% from
     # layer 2 on, so NormSiLU's per-token norm earns its keep early and is nearly a constant divide
     # later -- where a per-expert scalar reproduces it and skips the RMS pre-pass.
-    ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free special experts, per-type count
+    ap.add_argument("--special_pairs", type=int, default=0)
+    # ASYMMETRIC identity counts. --special_pairs is per-type and applies to BOTH signs, so it
+    # cannot express e.g. 6 +Identity with 2 -Identity. These override it independently.
+    ap.add_argument("--pos_identity_n", type=int, default=None)
+    ap.add_argument("--neg_identity_n", type=int, default=None)                       # BiBo param-free special experts, per-type count
     ap.add_argument("--no_pos_identity", dest="pos_identity_expert", action="store_false")  # drop +Identity (code 3); test -Identity alone
     ap.add_argument("--no_neg_identity", dest="neg_identity_expert", action="store_false")  # drop -Identity (code 4); test +Identity alone
     ap.add_argument("--norm_topk_prob", type=int, default=1)  # 1 = normalize top-k weights to sum to 1 (BiBo model default). 0 = raw scores as weights (old ablate behavior)
@@ -519,6 +523,8 @@ def main():
                            attn_res_emb_gain=args.attn_res_emb_gain,
                            attn_res_score=args.attn_res_score,
                            attn_res_topk=args.attn_res_topk,
+                           num_pos_identity_experts=args.pos_identity_n,
+                           num_neg_identity_experts=args.neg_identity_n,
                            attn_res_carry_per_dim=args.attn_res_carry_per_dim,
                            attn_res_carry_gate=args.attn_res_carry_gate,
                            attn_res_emb_per_dim=args.attn_res_emb_per_dim,
@@ -642,6 +648,8 @@ def main():
                    if args.optim == "manas" else "")
                 + (f"_e{n_total}" if n_total != SHARED["num_experts"] else "")
                 + (f"_se{args.special_pairs}" if args.special_pairs else "")
+                + (f"_id{args.pos_identity_n}p{args.neg_identity_n or 0}n"
+                   if args.pos_identity_n is not None else "")
                 + (("_posonly" if not args.neg_identity_expert else "") if args.special_pairs else "")
                 + (("_negonly" if not args.pos_identity_expert else "") if args.special_pairs else "")
                 # bias_update_factor MUST be in the tag: it is a first-class ablation axis (it sets

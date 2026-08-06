@@ -44,6 +44,14 @@ class BiBoConfig(PretrainedConfig):
         special_expert_pairs=1,
         pos_identity_expert=True,
         neg_identity_expert=True,
+        # ASYMMETRIC override. `special_expert_pairs` is a per-type count applied to BOTH signs,
+        # so it can only express n(+Identity) == n(-Identity). These let the two differ -- e.g.
+        # 6 positive and 2 negative, to test whether signed pass-through needs as much subtractive
+        # capacity as additive. Both the eager MoE and the Triton act-code path already build
+        # their expert ranges from the two counts independently, so nothing downstream changes.
+        # None = derive from special_expert_pairs as before.
+        num_pos_identity_experts=None,
+        num_neg_identity_experts=None,
         use_shared_expert=False,
         shared_expert_type="mlp",
         num_shared_experts=1,
@@ -101,8 +109,15 @@ class BiBoConfig(PretrainedConfig):
         self.special_expert_pairs = special_expert_pairs
         self.pos_identity_expert = pos_identity_expert
         self.neg_identity_expert = neg_identity_expert
-        self.num_pos_identity_experts = special_expert_pairs if pos_identity_expert else 0
-        self.num_neg_identity_experts = special_expert_pairs if neg_identity_expert else 0
+        self.num_pos_identity_experts = (
+            int(num_pos_identity_experts) if num_pos_identity_experts is not None
+            else (special_expert_pairs if pos_identity_expert else 0))
+        self.num_neg_identity_experts = (
+            int(num_neg_identity_experts) if num_neg_identity_experts is not None
+            else (special_expert_pairs if neg_identity_expert else 0))
+        if self.num_pos_identity_experts < 0 or self.num_neg_identity_experts < 0:
+            raise ValueError("identity expert counts must be >= 0, got "
+                             f"+{self.num_pos_identity_experts} / -{self.num_neg_identity_experts}")
         self.num_glu_experts = (num_routed_experts - self.num_pos_identity_experts
                                 - self.num_neg_identity_experts)
 

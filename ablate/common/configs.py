@@ -123,6 +123,7 @@ def resolve_swa(swa_pattern, sliding_window, n_layers):
 def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          num_experts=None, special_pairs=0,
                          use_xsa=False, xsa_alpha_init=0.0,
+                         num_pos_identity_experts=None, num_neg_identity_experts=None,
                          pos_identity_expert=True, neg_identity_expert=True,
                          top_k=None, moe_intermediate_size=None, num_shared_experts=0,
                          hybrid_layer_pattern=None, sliding_window=128,
@@ -172,6 +173,10 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                  "attn_res_carry_gate": attn_res_carry_gate,
                  "attn_res_emb_per_dim": attn_res_emb_per_dim,
                  "bf16_residual_stream": bf16_residual_stream}
+    if num_pos_identity_experts is not None:
+        extra['num_pos_identity_experts'] = num_pos_identity_experts
+    if num_neg_identity_experts is not None:
+        extra['num_neg_identity_experts'] = num_neg_identity_experts
     return BiBoConfig(
         **extra,
         bias_update_threshold=bias_update_threshold,
