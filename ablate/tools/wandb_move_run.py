@@ -72,8 +72,11 @@ def main():
 
     # VERIFY. The mutation returns only a clientMutationId, so a silent no-op is indistinguishable
     # from success without re-reading both sides.
-    still = {r.id for r in api.runs(f"{args.entity}/{args.src}")} & set(ids)
-    landed = {r.id for r in api.runs(f"{args.entity}/{args.dst}")} & set(ids)
+    # A FRESH Api: wandb.Api() memoizes run listings per project, so reusing `api` here reports the
+    # pre-move state and turns a successful move into a false FAILED. Cost me one confused report.
+    fresh = wandb.Api()
+    still = {r.id for r in fresh.runs(f"{args.entity}/{args.src}")} & set(ids)
+    landed = {r.id for r in fresh.runs(f"{args.entity}/{args.dst}")} & set(ids)
     print(f"\nmoved  : {sorted(landed)}")
     print(f"stuck  : {sorted(still)}")
     if still or landed != set(ids):
