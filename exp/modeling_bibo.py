@@ -239,18 +239,41 @@ class BiBoDecoderLayer(nn.Module):
         # prefix-sum stream and the MLP input -- and c scales only the MLP-facing copy, so a
         # diagonal scale here cannot be absorbed into o_proj without changing what the stream
         # carries. 512 params/layer, 5120 total, 0.0008% of the model.
-        # INPUT-DEPENDENT GATE: c becomes SiLU(W @ attn_read), per token AND per channel, where
-        # the static per-dim c was per channel only. BIAS-FREE like every other projection in this
-        # model -- attention_bias=False and the router's balancing bias is the sole exception in
-        # the architecture, so a gate bias would have been the only other one.
-        # It subsumes both the scalar and the per-dim carry, so it is refused alongside either:
-        # stacking them would mean c_static * c_gate, two knobs on one coefficient.
+        # SELF-GATED CARRY:  c = 2*sigmoid(G(attn_out)),  ht = attn_read + c * attn_out
+        #
+        # Three properties, each forced by a measured failure of the first attempt
+        # (SiLU(W @ attn_read), which ran the coefficient to 7936 by step 400):
+        #   SELF-GATED  G reads attn_out, the tensor it multiplies. Reading attn_read instead let
+        #               the model inflate the gate and shrink o_proj at no cost, because the two
+        #               were independent. Gating what you multiply couples them: shrinking
+        #               attn_out by k shrinks the product by k^2.
+        #   STARTS AT 1 G is ZERO-INITIALISED and 2*sigmoid(0) = 1 exactly, so the arm begins as
+        #               plain carry. SiLU(0)=0 instead began with attention BLOCKED from the MLP,
+        #               so the weights had to grow just to open the path and nothing said stop.
+        #               d/dG of 2*sigmoid(G a)*a is 0.5*a^2 at G=0 -- inert but not stuck.
+        #   BOUNDED     (0, 2) brackets the measured static range [0.18, 2.13]; the bound comes
+        #               from the per-dim arm, not from taste. SiLU is unbounded above and that is
+        #               what let 7936 happen at all.
+        # NO BIAS anywhere: the router's balancing bias stays the only one in the architecture.
+        #
+        # Note what this is: 2*sigmoid(W x)*x with W = I is exactly 2*SiLU(x). The matrix buys
+        # CROSS-CHANNEL gating and nothing else, which is why "diag" exists as the control -- if
+        # a per-channel temperature captures the gain, the (H,H) matrix was never needed.
+        #   "diag"  w: (H,)   512 params/layer, elementwise, no matmul
+        #   "full"  W: (H,H)  262k params/layer, cross-channel
+        # nn.Parameter, not nn.Linear, so post_init()'s _init_weights cannot silently overwrite
+        # the zero init -- that would restore the exact failure this design exists to avoid.
+        _gm = str(getattr(config, "attn_res_carry_gate", "none") or "none")
+        if _gm is True or _gm == "True":       # tolerate the old bool flag
+            _gm = "full"
+        self.attn_res_carry_gate_mode = _gm
         self.attn_res_carry_gate = None
-        if getattr(config, "attn_res_carry_gate", False):
+        if _gm != "none":
             if not (self.use_attn_residuals and self.attn_res_carry):
                 raise ValueError("attn_res_carry_gate needs attn_res_carry=True on an AttnRes arm")
-            self.attn_res_carry_gate = nn.Linear(config.hidden_size, config.hidden_size,
-                                                 bias=False)
+            _shape = ((config.hidden_size,) if _gm == "diag"
+                      else (config.hidden_size, config.hidden_size))
+            self.attn_res_carry_gate = nn.Parameter(torch.zeros(*_shape))
         self.attn_res_carry_per_dim = bool(getattr(config, "attn_res_carry_per_dim", False))
         _cshape = (config.hidden_size,) if self.attn_res_carry_per_dim else (1,)
         self.attn_res_carry_theta = (
@@ -475,7 +498,9 @@ class BiBoDecoderLayer(nn.Module):
             # init washes out, and what is being tested is the RANGE the gate can express.
             _ao = attn_output
             if self.attn_res_carry_gate is not None:
-                _g = torch.nn.functional.silu(self.attn_res_carry_gate(attn_read))
+                _w = self.attn_res_carry_gate
+                _z = (_w * attn_output) if _w.ndim == 1 else (attn_output @ _w.t())
+                _g = 2.0 * torch.sigmoid(_z)
                 _ao = _g * attn_output
                 # The gate output IS c -- the same carry coefficient the scalar and per-dim arms
                 # learn, just computed per token instead of stored. So it logs under the SAME

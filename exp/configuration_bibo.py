@@ -25,7 +25,7 @@ class BiBoConfig(_StableBiBoConfig):
                  attn_res_emb_term=False, attn_res_emb_scale="none",
                  attn_res_emb_site="mlp", attn_res_emb_gain=False,
                  attn_res_score="softmax", attn_res_carry_per_dim=False,
-                 attn_res_carry_gate=False, **kwargs):
+                 attn_res_carry_gate="none", **kwargs):
         if attn_res_sites not in (1, 2):
             raise ValueError(
                 f"attn_res_sites must be 2 (K3 faithful: a depth-mix before the attention "
@@ -83,7 +83,12 @@ class BiBoConfig(_StableBiBoConfig):
         # 2.133, which a sigmoid gate cannot represent at all.
         # Refused with per_dim or a learnable carry_scale: the gate already produces the whole
         # coefficient, so either would put two knobs on one number.
-        if attn_res_carry_gate:
+        _g = "none" if attn_res_carry_gate in (False, None) else str(attn_res_carry_gate)
+        if _g == "True":
+            _g = "full"
+        if _g not in ("none", "diag", "full"):
+            raise ValueError(f"attn_res_carry_gate must be none/diag/full, got {_g!r}")
+        if _g != "none":
             if not attn_res_carry:
                 raise ValueError("attn_res_carry_gate needs attn_res_carry=True")
             if attn_res_carry_per_dim:
@@ -92,7 +97,7 @@ class BiBoConfig(_StableBiBoConfig):
                 raise ValueError(
                     f"attn_res_carry_gate produces the whole coefficient, so "
                     f"attn_res_carry_scale must be none, got {_csm!r}")
-        self.attn_res_carry_gate = bool(attn_res_carry_gate)
+        self.attn_res_carry_gate = _g
         # bf16_residual_stream is deliberately NOT a named parameter here. It is owned by the
         # PARENT (src BiBoConfig) and reaches it through **kwargs. Naming it here silently broke
         # the flag: this __init__ set the attribute, then super().__init__(**kwargs) ran the

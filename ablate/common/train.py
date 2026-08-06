@@ -310,7 +310,7 @@ def main():
     # c = SiLU(W @ attn_read), input-dependent, bias-free. Subsumes per_dim and carry_scale.
     # W is (hidden, hidden) per layer -- at H=512 that is 2.6M params (+1.9%); at the 7168 both
     # Kimi K3 and DeepSeek-V3 use it would be 51.4M/layer, i.e. one extra attention projection.
-    ap.add_argument("--attn_res_carry_gate", type=_bool, default=False)
+    ap.add_argument("--attn_res_carry_gate", choices=["none", "diag", "full"], default="none")
     # BF16 RESIDUAL STREAM (src/ baseline only). The stream is fp32 by default -- not by
     # choice, but because weights are fp32 master and nn.Embedding is not autocast, so
     # inputs_embeds is fp32 and every residual add promotes back up. modded-nanogpt runs
@@ -613,7 +613,8 @@ def main():
                    else "")
                 + ("_cperdim" if args.attn_res != "off" and args.attn_res_carry_per_dim
                    else "")
-                + ("_cgate" if args.attn_res != "off" and args.attn_res_carry_gate else "")
+                + (f"_cgate{args.attn_res_carry_gate}" if args.attn_res != "off"
+                   and args.attn_res_carry_gate != "none" else "")
                 + ("_bf16stream" if args.bf16_residual_stream else "")
                 + ("_bf16moeout" if args.bf16_moe_out else "")
                 + ("ht" if args.attn_res_emb_term and args.attn_res_emb_site == "ht" else "")
@@ -895,7 +896,7 @@ def main():
                 # so it keeps its own key rather than polluting the s axis it is 25x below.
                 # It answers "is the input-dependence being used at all": standard init is
                 # ~1/sqrt(H)=0.044, and a flat trace means the gate is behaving as a constant.
-                _r = torch.stack([m.attn_res_carry_gate.weight.detach().float().pow(2).mean().sqrt()
+                _r = torch.stack([m.attn_res_carry_gate.detach().float().pow(2).mean().sqrt()
                                   for m in _gm])
                 rt.update({f"train/attn_res_gate_w/L{i}": v for i, v in enumerate(_r.tolist())})
                 rt["train/attn_res_gate_w_mean"] = _r.mean().item()
