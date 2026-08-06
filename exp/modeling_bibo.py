@@ -501,7 +501,13 @@ class BiBoDecoderLayer(nn.Module):
                 _w = self.attn_res_carry_gate
                 _z = (_w * attn_output) if _w.ndim == 1 else (attn_output @ _w.t())
                 _g = 2.0 * torch.sigmoid(_z)
-                _ao = _g * attn_output
+                # CAST BACK. The gate is an fp32 Parameter and attn_output is bf16, so the product
+                # promotes to fp32 -- and _fused_res_add then promotes the whole residual stream
+                # with it, silently turning a bf16-stream arm into an fp32-stream one. Caught by
+                # the init test: with the gate at zero this arm must be bit-identical to plain
+                # carry, and it read 3.703 instead of 0 for exactly this reason. The gate ITSELF
+                # stays fp32 (sigmoid is worth computing there); only the product rejoins bf16.
+                _ao = (_g * attn_output).to(attn_output.dtype)
                 # The gate output IS c -- the same carry coefficient the scalar and per-dim arms
                 # learn, just computed per token instead of stored. So it logs under the SAME
                 # attn_res_s/* keys and lands in the existing panel, exactly as the emb gain i
