@@ -482,9 +482,24 @@ def main():
         print("[router] warning: norm_topk_prob=0 -> NO top-k normalization; raw sigmoid scores are "
               "the combine weights and they will NOT sum to 1.", flush=True)
     n_total = args.experts or SHARED["num_experts"]
-    n_glu = glu_count(n_total, args.special_pairs, args.pos_identity_expert, args.neg_identity_expert)
-    print(f"[experts] {n_total} routed = {n_glu} GLU ({args.act}) + {n_total - n_glu} +/-Identity "
-          f"(special_pairs={args.special_pairs})", flush=True)
+    # --pos_identity_n / --neg_identity_n override special_pairs, so glu_count() alone would print
+    # a GLU count the model does not have. A wrong expert-layout line in the log is exactly the
+    # kind of thing that gets believed later.
+    if args.pos_identity_n is not None or args.neg_identity_n is not None:
+        _npos = args.pos_identity_n if args.pos_identity_n is not None else (
+            args.special_pairs if args.pos_identity_expert else 0)
+        _nneg = args.neg_identity_n if args.neg_identity_n is not None else (
+            args.special_pairs if args.neg_identity_expert else 0)
+        n_glu = n_total - _npos - _nneg
+        _how = f"pos_identity_n={_npos}, neg_identity_n={_nneg}"
+    else:
+        n_glu = glu_count(n_total, args.special_pairs, args.pos_identity_expert,
+                          args.neg_identity_expert)
+        _npos = args.special_pairs if args.pos_identity_expert else 0
+        _nneg = args.special_pairs if args.neg_identity_expert else 0
+        _how = f"special_pairs={args.special_pairs}"
+    print(f"[experts] {n_total} routed = {n_glu} GLU ({args.act}) + {_npos} +Identity "
+          f"+ {_nneg} -Identity  ({_how})", flush=True)
     assert "moe" in patch_list, "the fused-moe patch is required: eager experts are ~3x slower"
     patchmod.RADIAL_P = args.radial_p
     patchmod.EXPERT_ACT = args.act
