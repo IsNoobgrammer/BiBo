@@ -932,6 +932,14 @@ def main():
                     rt.update({f"train/attn_res_d_std/L{i + 1}": v
                                for i, v in enumerate(_dsd.tolist())})
                     rt["train/attn_res_d_std_mean"] = _dsd.mean().item()
+                    rt["train/attn_res_d_std_max"] = _dsd.max().item()
+                    # Symmetric with per-dim c. Both per-dim c arms measured negfrac = 0 at every
+                    # layer -- no attention channel ever wanted to be negated. d is a different
+                    # question: it weights the EMBEDDING, and a channel wanting the token identity
+                    # subtracted is not obviously absurd the way a negated attention channel was.
+                    rt.update({f"train/attn_res_d_negfrac/L{i + 1}":
+                               (t.detach() < 0).float().mean().item()
+                               for i, t in enumerate(_de)})
                 cs_s += (f" {_dtag}={_d.mean().item():.3f}"
                          f"[{_d.min().item():.2f},{_d.max().item():.2f}]"
                          + (f" dsd={_dsd.mean().item():.3f}" if _dsd is not None else ""))
