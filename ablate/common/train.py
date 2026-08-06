@@ -995,8 +995,26 @@ def main():
             print(f"  [eval @{step}] {summarize(flat)}", flush=True)
         if do_eval and sample_every > 0 and step > 0 and step % sample_every == 0:   # samples on their own cadence (default = eval_every)
             with _eager(model):
-                for s in generate_samples(model, tok, device=DEV, dtype=dt):
-                    print(f"    [sample {s['lang']}] {s['prompt']} -> {s['completion']}", flush=True)
+                _sm = generate_samples(model, tok, device=DEV, dtype=dt)
+            for s in _sm:
+                print(f"    [sample {s['lang']}] ent={s['entropy']:.2f} top1={s['top1']:.2f} "
+                      f"rep4={s['rep4']:.2f} | {s['prompt']} -> {s['completion']}", flush=True)
+            # LOGGED, not just printed. bpb ranked three checkpoints in the exact REVERSE order of
+            # generation quality -- the best bpb (per-dim c+d) produced punctuation salad at
+            # entropy 4.9, the worst (b1s2 softmax) wrote the only coherent text at 2.26. These
+            # are the metrics that see it, and having them per eval means it is visible at step
+            # 1000 instead of after a checkpoint autopsy.
+            _sagg = {}
+            for _k in ("entropy", "top1", "rep4"):
+                _sagg[f"eval/sample_{_k}"] = sum(x[_k] for x in _sm) / max(len(_sm), 1)
+                for _lg in ("en", "hi"):
+                    _v = [x[_k] for x in _sm if x["lang"] == _lg]
+                    if _v:
+                        _sagg[f"eval/sample_{_k}_{_lg}"] = sum(_v) / len(_v)
+            if wb is not None:
+                wb.log(_sagg, step=step)
+            print(f"    [sample agg] " + " ".join(f"{k.split('/')[-1]}={v:.3f}"
+                                                  for k, v in sorted(_sagg.items())), flush=True)
         if args.ckpt_every and step > 0 and step % args.ckpt_every == 0:
             if hf_api is not None:
                 _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_step{step}"))
@@ -1021,8 +1039,14 @@ def main():
             if wb:
                 wb.log(full_flat, step=total_steps)
             print(f"  [final eval] {summarize(full_flat)}", flush=True)
-            for s in final_eval.get("samples", []):
-                print(f"    [sample {s['lang']}] {s['prompt']} -> {s['completion']}", flush=True)
+            _fs = final_eval.get("samples", [])
+            for s in _fs:
+                print(f"    [sample {s['lang']}] ent={s.get('entropy', float('nan')):.2f} "
+                      f"top1={s.get('top1', float('nan')):.2f} rep4={s.get('rep4', float('nan')):.2f} "
+                      f"| {s['prompt']} -> {s['completion']}", flush=True)
+            if wb is not None and _fs and "entropy" in _fs[0]:
+                wb.log({f"eval/sample_{k}": sum(x[k] for x in _fs) / len(_fs)
+                        for k in ("entropy", "top1", "rep4")}, step=total_steps)
         except Exception as e:
             print(f"  [final eval] FAILED: {type(e).__name__}: {str(e)[:200]} (checkpoints already pushed)",
                   flush=True)
