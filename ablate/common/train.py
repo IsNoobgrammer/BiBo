@@ -307,6 +307,10 @@ def main():
     # 512 params/layer. Real capacity, not a reparameterization -- attn_output also feeds the
     # prefix-sum stream, so a diagonal scale on the MLP-facing copy cannot fold into o_proj.
     ap.add_argument("--attn_res_carry_per_dim", type=_bool, default=False)
+    # c = SiLU(W @ attn_read), input-dependent, bias-free. Subsumes per_dim and carry_scale.
+    # W is (hidden, hidden) per layer -- at H=512 that is 2.6M params (+1.9%); at the 7168 both
+    # Kimi K3 and DeepSeek-V3 use it would be 51.4M/layer, i.e. one extra attention projection.
+    ap.add_argument("--attn_res_carry_gate", type=_bool, default=False)
     # BF16 RESIDUAL STREAM (src/ baseline only). The stream is fp32 by default -- not by
     # choice, but because weights are fp32 master and nn.Embedding is not autocast, so
     # inputs_embeds is fp32 and every residual add promotes back up. modded-nanogpt runs
@@ -508,6 +512,7 @@ def main():
                            attn_res_emb_gain=args.attn_res_emb_gain,
                            attn_res_score=args.attn_res_score,
                            attn_res_carry_per_dim=args.attn_res_carry_per_dim,
+                           attn_res_carry_gate=args.attn_res_carry_gate,
                            bf16_residual_stream=args.bf16_residual_stream,
                            bf16_moe_out=args.bf16_moe_out,
                            pos_identity_expert=args.pos_identity_expert,
@@ -608,6 +613,7 @@ def main():
                    else "")
                 + ("_cperdim" if args.attn_res != "off" and args.attn_res_carry_per_dim
                    else "")
+                + ("_cgate" if args.attn_res != "off" and args.attn_res_carry_gate else "")
                 + ("_bf16stream" if args.bf16_residual_stream else "")
                 + ("_bf16moeout" if args.bf16_moe_out else "")
                 + ("ht" if args.attn_res_emb_term and args.attn_res_emb_site == "ht" else "")
@@ -862,6 +868,22 @@ def main():
             # across arms. They are mutually exclusive by construction -- the gain REPLACES theta --
             # so there is never a collision. Read the console tag (d= vs i=) for which one it is;
             # the units differ (theta is a logit, i is directly the injected rms).
+            # GATE. There is no bias, so there is no static component to report -- the whole
+            # coefficient is SiLU(W @ attn_read) and W is the only parameter. Its RMS is the
+            # "is input-dependence actually being used" signal, the analogue of s_std for the
+            # static per-dim arm: standard init puts it near 1/sqrt(H) = 0.044, so growth means
+            # the gate is learning to discriminate and a flat trace means it is not.
+            # The gate OUTPUT distribution is what we really want, but reading it needs a hook in
+            # the forward and a sync every step; it is recoverable from the checkpoint afterwards.
+            _gw = [m.attn_res_carry_gate.weight for m in model.modules()
+                   if getattr(m, "attn_res_carry_gate", None) is not None]
+            if _gw:
+                _r = torch.stack([w.detach().float().pow(2).mean().sqrt() for w in _gw])
+                rt.update({f"train/attn_res_gate_w/L{i}": v for i, v in enumerate(_r.tolist())})
+                rt["train/attn_res_gate_w_mean"] = _r.mean().item()
+                rt["train/attn_res_gate_w_max"] = _r.max().item()
+                cs_s += f" gw={_r.mean().item():.4f}"
+                aS_s = xa_s + cs_s
             _de = [m.attn_res_emb_theta for m in model.modules()
                    if getattr(m, "attn_res_emb_theta", None) is not None]
             _dtag = "d"

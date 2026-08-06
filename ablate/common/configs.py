@@ -132,6 +132,7 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          attn_res_emb_term=False, attn_res_emb_scale="none",
                          attn_res_emb_site="mlp", attn_res_emb_gain=False,
                          attn_res_score="softmax", attn_res_carry_per_dim=False,
+                         attn_res_carry_gate=False,
                          bf16_residual_stream=False, bf16_moe_out=False):
     # attn_res: "off" = stable src model. Anything else routes to exp/ (Kimi K3 Attention
     # Residuals): "control" builds exp's model with residuals DISABLED, an int is the block size
@@ -162,6 +163,7 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                  "attn_res_emb_gain": attn_res_emb_gain,
                  "attn_res_score": attn_res_score,
                  "attn_res_carry_per_dim": attn_res_carry_per_dim,
+                 "attn_res_carry_gate": attn_res_carry_gate,
                  "bf16_residual_stream": bf16_residual_stream}
     return BiBoConfig(
         **extra,

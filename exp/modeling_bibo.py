@@ -239,6 +239,18 @@ class BiBoDecoderLayer(nn.Module):
         # prefix-sum stream and the MLP input -- and c scales only the MLP-facing copy, so a
         # diagonal scale here cannot be absorbed into o_proj without changing what the stream
         # carries. 512 params/layer, 5120 total, 0.0008% of the model.
+        # INPUT-DEPENDENT GATE: c becomes SiLU(W @ attn_read), per token AND per channel, where
+        # the static per-dim c was per channel only. BIAS-FREE like every other projection in this
+        # model -- attention_bias=False and the router's balancing bias is the sole exception in
+        # the architecture, so a gate bias would have been the only other one.
+        # It subsumes both the scalar and the per-dim carry, so it is refused alongside either:
+        # stacking them would mean c_static * c_gate, two knobs on one coefficient.
+        self.attn_res_carry_gate = None
+        if getattr(config, "attn_res_carry_gate", False):
+            if not (self.use_attn_residuals and self.attn_res_carry):
+                raise ValueError("attn_res_carry_gate needs attn_res_carry=True on an AttnRes arm")
+            self.attn_res_carry_gate = nn.Linear(config.hidden_size, config.hidden_size,
+                                                 bias=False)
         self.attn_res_carry_per_dim = bool(getattr(config, "attn_res_carry_per_dim", False))
         _cshape = (config.hidden_size,) if self.attn_res_carry_per_dim else (1,)
         self.attn_res_carry_theta = (
@@ -447,6 +459,23 @@ class BiBoDecoderLayer(nn.Module):
             # block_residual[:, 0] IS the embedding, always: layer 0 is a block boundary for every
             # block size (0 % n == 0), so the untransformed embedding is what gets archived there.
             # Reusing it costs no new plumbing through the layer signature.
+            # INPUT-DEPENDENT GATE on the MLP-facing copy of attention:
+            #     ht = attn_read + SiLU(W @ attn_read) * attn_out
+            # SiLU, not sigmoid, because the coefficient it replaces is not bounded by 1: the
+            # static per-dim c reached 2.133 with per-layer means up to 1.66, so a sigmoid gate
+            # could not represent what the static version already learned. Qwen's G1 uses sigmoid,
+            # but it gates a raw attention output whose scale is absorbed downstream; here the
+            # coefficient goes straight into a residual add where its magnitude is the point.
+            # NO BIAS, matching the rest of the model -- q/k/v/o are bias-free via
+            # attention_bias=False and the router's balancing bias is the only one in the
+            # architecture. Consequence, stated rather than hidden: SiLU(0) = 0, so with a
+            # standard-init W the gate starts near zero and attention reaches the MLP only
+            # weakly at step 0, then has to grow. That is a real handicap for the first few
+            # hundred steps and it is accepted deliberately -- over 500M tokens at this LR the
+            # init washes out, and what is being tested is the RANGE the gate can express.
+            _ao = attn_output
+            if self.attn_res_carry_gate is not None:
+                _ao = torch.nn.functional.silu(self.attn_res_carry_gate(attn_read)) * attn_output
             _has_emb = (self.attn_res_emb_theta is not None and block_residual.shape[1] > 0
                     and self.attn_res_emb_site == "mlp")
             _emb = (block_residual[:, 0].reshape(batch_size, seq_len, hidden_size)
@@ -462,7 +491,7 @@ class BiBoDecoderLayer(nn.Module):
                 # attn_res_carry_one is a non-persistent ones buffer, so carry_scale="none"
                 # (a hard c = 1.0) goes down the same fused path instead of forking the formula.
                 _m = self.attn_res_carry_theta
-                _pairs = [_m if _m is not None else self.attn_res_carry_one, attn_output]
+                _pairs = [_m if _m is not None else self.attn_res_carry_one, _ao]
                 _modes = [_CARRY_MODE[self.attn_res_carry_scale] if _m is not None else "none"]
                 if _has_emb:
                     _pairs += [self.attn_res_emb_theta, _emb]
@@ -474,9 +503,9 @@ class BiBoDecoderLayer(nn.Module):
                     _c = (_t if self.attn_res_carry_scale == "unbounded"
                           else 2.0 * torch.sigmoid(_t) if self.attn_res_carry_scale == "sigmoid"
                           else 2.0 * torch.tanh(_t))
-                    hidden_states = attn_read + _c.to(attn_output.dtype) * attn_output
+                    hidden_states = attn_read + _c.to(_ao.dtype) * _ao
                 else:
-                    hidden_states = attn_read + attn_output
+                    hidden_states = attn_read + _ao
                 if _has_emb:
                     _d = self.attn_res_emb_theta.float()
                     _d = ({"none": lambda x: x, "sigmoid": torch.sigmoid,

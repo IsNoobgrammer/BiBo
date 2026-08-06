@@ -24,7 +24,8 @@ class BiBoConfig(_StableBiBoConfig):
                  attn_res_fp32_stream=False, attn_res_carry_scale="none",
                  attn_res_emb_term=False, attn_res_emb_scale="none",
                  attn_res_emb_site="mlp", attn_res_emb_gain=False,
-                 attn_res_score="softmax", attn_res_carry_per_dim=False, **kwargs):
+                 attn_res_score="softmax", attn_res_carry_per_dim=False,
+                 attn_res_carry_gate=False, **kwargs):
         if attn_res_sites not in (1, 2):
             raise ValueError(
                 f"attn_res_sites must be 2 (K3 faithful: a depth-mix before the attention "
@@ -76,6 +77,22 @@ class BiBoConfig(_StableBiBoConfig):
                 "attn_res_carry_per_dim needs a learnable attn_res_carry_scale; at 'none' the "
                 "carry is a fixed ones buffer and the flag would be silently inert.")
         self.attn_res_carry_per_dim = bool(attn_res_carry_per_dim)
+        # c = SiLU(W @ attn_read): per token AND per channel, where per_dim is per channel only.
+        # No bias -- the router's balancing bias is the only one in this architecture and it
+        # stays that way. SiLU rather than sigmoid because the static c it replaces reached
+        # 2.133, which a sigmoid gate cannot represent at all.
+        # Refused with per_dim or a learnable carry_scale: the gate already produces the whole
+        # coefficient, so either would put two knobs on one number.
+        if attn_res_carry_gate:
+            if not attn_res_carry:
+                raise ValueError("attn_res_carry_gate needs attn_res_carry=True")
+            if attn_res_carry_per_dim:
+                raise ValueError("attn_res_carry_gate subsumes attn_res_carry_per_dim; pick one")
+            if _csm != "none":
+                raise ValueError(
+                    f"attn_res_carry_gate produces the whole coefficient, so "
+                    f"attn_res_carry_scale must be none, got {_csm!r}")
+        self.attn_res_carry_gate = bool(attn_res_carry_gate)
         # bf16_residual_stream is deliberately NOT a named parameter here. It is owned by the
         # PARENT (src BiBoConfig) and reaches it through **kwargs. Naming it here silently broke
         # the flag: this __init__ set the attribute, then super().__init__(**kwargs) ran the
