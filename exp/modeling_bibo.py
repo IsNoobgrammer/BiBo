@@ -475,7 +475,21 @@ class BiBoDecoderLayer(nn.Module):
             # init washes out, and what is being tested is the RANGE the gate can express.
             _ao = attn_output
             if self.attn_res_carry_gate is not None:
-                _ao = torch.nn.functional.silu(self.attn_res_carry_gate(attn_read)) * attn_output
+                _g = torch.nn.functional.silu(self.attn_res_carry_gate(attn_read))
+                _ao = _g * attn_output
+                # The gate output IS c -- the same carry coefficient the scalar and per-dim arms
+                # learn, just computed per token instead of stored. So it logs under the SAME
+                # attn_res_s/* keys and lands in the existing panel, exactly as the emb gain i
+                # shares d's keys. They cannot collide: the gate requires carry_scale=none, so
+                # attn_res_carry_theta does not exist whenever these are populated.
+                # Strided over tokens: this is a diagnostic on 33M values per layer per step, and
+                # every 16th token is far more than enough for a mean and a std while costing
+                # 1/16th of the traffic. Detached 0-dim tensors, .item() deferred to the logger,
+                # so there is no GPU sync in the training step.
+                with torch.no_grad():
+                    _gs = _g[:, ::16].float()
+                    self._gate_mean, self._gate_std = _gs.mean(), _gs.std()
+                    self._gate_min, self._gate_max = _gs.min(), _gs.max()
             _has_emb = (self.attn_res_emb_theta is not None and block_residual.shape[1] > 0
                     and self.attn_res_emb_site == "mlp")
             _emb = (block_residual[:, 0].reshape(batch_size, seq_len, hidden_size)

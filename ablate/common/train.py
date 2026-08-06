@@ -875,14 +875,34 @@ def main():
             # the gate is learning to discriminate and a flat trace means it is not.
             # The gate OUTPUT distribution is what we really want, but reading it needs a hook in
             # the forward and a sync every step; it is recoverable from the checkpoint afterwards.
-            _gw = [m.attn_res_carry_gate.weight for m in model.modules()
-                   if getattr(m, "attn_res_carry_gate", None) is not None]
-            if _gw:
-                _r = torch.stack([w.detach().float().pow(2).mean().sqrt() for w in _gw])
+            _gm = [m for m in model.modules() if getattr(m, "_gate_mean", None) is not None]
+            if _gm:
+                # SAME PANEL as the scalar and per-dim arms. The gate output is c, so it goes to
+                # attn_res_s/* and attn_res_s_std/*, not to keys of its own -- the depth profile
+                # is only readable if every parameterization of c plots on one axis. No collision
+                # is possible: the gate requires carry_scale=none, so the theta-based block above
+                # found nothing and left these keys free.
+                _mu = torch.stack([m._gate_mean for m in _gm])
+                _sd = torch.stack([m._gate_std for m in _gm])
+                rt.update({f"train/attn_res_s/L{i}": v for i, v in enumerate(_mu.tolist())})
+                rt.update({f"train/attn_res_s_std/L{i}": v for i, v in enumerate(_sd.tolist())})
+                rt.update({"train/attn_res_s_mean": _mu.mean().item(),
+                           "train/attn_res_s_min": min(m._gate_min.item() for m in _gm),
+                           "train/attn_res_s_max": max(m._gate_max.item() for m in _gm),
+                           "train/attn_res_s_std_mean": _sd.mean().item(),
+                           "train/attn_res_s_std_max": _sd.max().item()})
+                # W's RMS is a DIFFERENT quantity -- a parameter norm, not a coefficient value --
+                # so it keeps its own key rather than polluting the s axis it is 25x below.
+                # It answers "is the input-dependence being used at all": standard init is
+                # ~1/sqrt(H)=0.044, and a flat trace means the gate is behaving as a constant.
+                _r = torch.stack([m.attn_res_carry_gate.weight.detach().float().pow(2).mean().sqrt()
+                                  for m in _gm])
                 rt.update({f"train/attn_res_gate_w/L{i}": v for i, v in enumerate(_r.tolist())})
                 rt["train/attn_res_gate_w_mean"] = _r.mean().item()
-                rt["train/attn_res_gate_w_max"] = _r.max().item()
-                cs_s += f" gw={_r.mean().item():.4f}"
+                cs_s += (f" s={_mu.mean().item():.3f}"
+                         f"[{min(m._gate_min.item() for m in _gm):.2f},"
+                         f"{max(m._gate_max.item() for m in _gm):.2f}]"
+                         f" sd={_sd.mean().item():.3f} gw={_r.mean().item():.4f}")
                 aS_s = xa_s + cs_s
             _de = [m.attn_res_emb_theta for m in model.modules()
                    if getattr(m, "attn_res_emb_theta", None) is not None]
