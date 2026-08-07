@@ -762,7 +762,8 @@ def main():
           flush=True)
 
     gen = token_batches(args.batch, args.seq_len, DEV, dataset=args.dataset,
-                        synthetic=(args.data == "synthetic"), vocab=cfg.vocab_size, seed=args.seed)
+                        synthetic=(args.data == "synthetic"), vocab=cfg.vocab_size, seed=args.seed,
+                        pad_id=0 if args.pad_id is None else int(args.pad_id))
     # MFU denominator: measured achievable GEMM peak, or --peak_tflops (theoretical). FLOPs/token = 6N + attn.
     measured_peak = _measure_peak_tflops(DEV, dt)
     peak_tflops = args.peak_tflops if args.peak_tflops > 0 else measured_peak
