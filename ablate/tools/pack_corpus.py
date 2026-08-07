@@ -53,6 +53,7 @@ def main():
 
     buf, rows, total_rows, shard_i, t0 = [], [], 0, 0, time.time()
     n_docs = 0
+    n_stripped = 0
     dropped_tail = 0
 
     def flush_shard():
@@ -80,6 +81,13 @@ def main():
                 continue
             n_docs += len(texts)
             for ids in tk.encode_batch_list(texts):
+                # A web-crawl document can literally contain the string "<|endoftext|>", which the
+                # tokenizer parses into id 0 -- measured once in 8.209B FineWeb-EDU tokens. One
+                # token is numerically nothing, but it breaks the guarantee that masking id 0 is a
+                # no-op, and that guarantee is what makes --pad_id safe on this corpus. Drop it.
+                if 0 in ids:
+                    ids = [t for t in ids if t != 0]
+                    n_stripped += 1
                 buf.extend(ids)
                 buf.append(a.sep)
                 while len(buf) >= a.seq:
@@ -100,12 +108,13 @@ def main():
 
     meta = {"src": a.src, "seq": a.seq, "sep": a.sep, "rows": total_rows, "docs": n_docs,
             "tokens": total_rows * a.seq, "shards": shard_i,
-            "dropped_tail_tokens": dropped_tail, "wall_s": round(time.time() - t0, 1)}
+            "dropped_tail_tokens": dropped_tail, "docs_with_id0_stripped": n_stripped,
+            "wall_s": round(time.time() - t0, 1)}
     with open(os.path.join(a.out, "pack_meta.json"), "w") as fh:
         json.dump(meta, fh, indent=2)
     print(f"[pack] DONE rows={total_rows} ({total_rows*a.seq/1e9:.3f}B tokens) from {n_docs} docs "
           f"in {shard_i} shards | dropped final partial buffer of {dropped_tail} tokens "
-          f"| {time.time()-t0:.0f}s", flush=True)
+          f"| {n_stripped} docs had a literal id 0 stripped | {time.time()-t0:.0f}s", flush=True)
 
 
 if __name__ == "__main__":
