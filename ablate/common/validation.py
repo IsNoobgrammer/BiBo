@@ -110,19 +110,27 @@ def build_holdout(dataset, seq_len, n_seqs, device, field="input_ids"):
     since no disjointness guarantee is possible there.
     """
     import pyarrow as pa
+    import pyarrow.parquet as pq
     _train, held = split_shards(dataset)
     if not held:
         return None
     n = seq_len + 1
     rows = []
     for f in held:
-        with pa.memory_map(f, "rb") as s:
-            col = pa.ipc.open_stream(s).read_all().column(field)
-            for r in col.slice(0, max(n_seqs * 4, 64)).to_pylist():
-                if len(r) >= n:
-                    rows.append(r[:n])            # same truncation rule the training loader uses
-                if len(rows) >= n_seqs:
-                    break
+        # BOTH layouts: bip2 ships arrow IPC, the packed FineWeb corpora ship parquet with the
+        # column named `label`. Reading a parquet file as an IPC stream fails with a confusing
+        # "expected to read N metadata bytes" rather than a format error.
+        if f.endswith(".parquet"):
+            t = pq.ParquetFile(f).read_row_group(0)
+        else:
+            with pa.memory_map(f, "rb") as h:
+                t = pa.ipc.open_stream(h).read_all()
+        col = t.column(field) if field in t.column_names else t.column("label")
+        for r in col.slice(0, max(n_seqs * 4, 64)).to_pylist():
+            if len(r) >= n:
+                rows.append(r[:n])                # the holdout is a fixed probe, not training data
+            if len(rows) >= n_seqs:
+                break
         if len(rows) >= n_seqs:
             break
     assert len(rows) == n_seqs, (f"holdout shard {held} yielded {len(rows)} usable rows of >= {n} "
