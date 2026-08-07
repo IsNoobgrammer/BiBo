@@ -110,7 +110,13 @@ def main():
         ids = tbl.column("input_ids").to_pylist()
         cols = {"label": pa.array(ids, type=pa.list_(pa.int32()))}
         if dec is not None:
-            cols["raw_label"] = pa.array([dec.decode(r) for r in ids], type=pa.string())
+            # gigatoken.decode returns BYTES, not str. errors="replace" because a row boundary cuts
+            # at a token boundary, which for a byte-level BPE can land mid-UTF-8-character -- one
+            # replacement char at the seam is correct, and raw_label is for eyeballing anyway.
+            # `label` is unaffected: the token ids are exact regardless of how they render.
+            cols["raw_label"] = pa.array(
+                [(d.decode("utf-8", errors="replace") if isinstance(d, (bytes, bytearray)) else d)
+                 for d in (dec.decode(r) for r in ids)], type=pa.string())
         out = os.path.join(a.stage, f"train-{i:05d}.parquet")
         pq.write_table(pa.table(cols), out, compression="zstd")
         api.upload_file(path_or_fileobj=out, path_in_repo=f"data/train-{i:05d}.parquet",
