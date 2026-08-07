@@ -22,11 +22,38 @@ import glob
 import json
 import os
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+# Xet high-performance transfer. Must be set BEFORE huggingface_hub is imported anywhere.
+os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+
 TOKENIZER_JSON = "/tmp/qtk_patched.json"
+
+
+def _convert(job):
+    """Worker: one packed .arrow shard -> one zstd parquet. Returns (path, rows, bytes)."""
+    src, out, tok_json, no_raw = job
+    with pa.memory_map(src, "rb") as h:
+        tbl = pa.ipc.open_stream(h).read_all()
+    # Pass the ListArray STRAIGHT through -- it is already list<int32>, the output schema. The old
+    # path did to_pylist() and rebuilt it with pa.array(), materializing 410M Python ints per shard
+    # twice: 117s of the ~213s per shard, i.e. more than the upload it was blamed on.
+    arr = tbl.column("input_ids").combine_chunks()
+    cols = {"label": arr}
+    if not no_raw:
+        import gigatoken as gt
+        dec = gt.Tokenizer(tok_json)
+        # gigatoken.decode returns BYTES. errors="replace" because a row boundary cuts at a token
+        # boundary, which for a byte-level BPE can land mid-UTF-8-character; one replacement char
+        # at the seam is fine since raw_label is for inspection. `label` is exact regardless.
+        cols["raw_label"] = pa.array(
+            [(d.decode("utf-8", errors="replace") if isinstance(d, (bytes, bytearray)) else d)
+             for d in (dec.decode(r) for r in arr.to_pylist())], type=pa.string())
+    pq.write_table(pa.table(cols), out, compression="zstd")
+    return out, len(arr), os.path.getsize(out)
 
 CARD = """---
 license: apache-2.0
@@ -81,6 +108,9 @@ def main():
     ap.add_argument("--tokenizer_json", default=TOKENIZER_JSON)
     ap.add_argument("--stage", default="/home/marimo/work/data/_stage")
     ap.add_argument("--langs", default="- hi")
+    # capped by MEMORY, not cores: each worker holds a shard's decoded text (~4 GB for Hindi)
+    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--upload_workers", type=int, default=8)
     a = ap.parse_args()
 
     tok_env = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -90,10 +120,7 @@ def main():
     api = HfApi(token=tok_env)
     api.create_repo(a.repo, repo_type="dataset", private=a.private, exist_ok=True)
 
-    dec = None
-    if not a.no_raw:
-        import gigatoken as gt
-        dec = gt.Tokenizer(a.tokenizer_json)
+    # the tokenizer is loaded per worker inside _convert, not here -- it does not pickle
 
     shards = sorted(glob.glob(os.path.join(a.src, "*.arrow")))
     assert shards, f"no .arrow shards under {a.src}"
@@ -103,39 +130,40 @@ def main():
     if os.path.exists(mp):
         meta = json.load(open(mp))
 
-    t0, total = time.time(), 0
-    for i, s in enumerate(shards):
-        with pa.memory_map(s, "rb") as h:
-            tbl = pa.ipc.open_stream(h).read_all()
-        ids = tbl.column("input_ids").to_pylist()
-        cols = {"label": pa.array(ids, type=pa.list_(pa.int32()))}
-        if dec is not None:
-            # gigatoken.decode returns BYTES, not str. errors="replace" because a row boundary cuts
-            # at a token boundary, which for a byte-level BPE can land mid-UTF-8-character -- one
-            # replacement char at the seam is correct, and raw_label is for eyeballing anyway.
-            # `label` is unaffected: the token ids are exact regardless of how they render.
-            cols["raw_label"] = pa.array(
-                [(d.decode("utf-8", errors="replace") if isinstance(d, (bytes, bytearray)) else d)
-                 for d in (dec.decode(r) for r in ids)], type=pa.string())
-        out = os.path.join(a.stage, f"train-{i:05d}.parquet")
-        pq.write_table(pa.table(cols), out, compression="zstd")
-        api.upload_file(path_or_fileobj=out, path_in_repo=f"data/train-{i:05d}.parquet",
-                        repo_id=a.repo, repo_type="dataset")
-        total += len(ids)
-        print(f"[push] {i+1}/{len(shards)} rows={len(ids)} total={total} "
-              f"{os.path.getsize(out)/1e9:.2f}GB {time.time()-t0:.0f}s", flush=True)
-        os.remove(out)
-        del tbl, ids, cols
+    t0 = time.time()
+    # PHASE 1 -- convert every shard to parquet, in parallel across cores. Workers are capped well
+    # below nproc because each holds a whole shard's decoded text (~4 GB for Hindi), not because
+    # of CPU.
+    jobs = [(s, os.path.join(a.stage, f"train-{i:05d}.parquet"), a.tokenizer_json, a.no_raw)
+            for i, s in enumerate(shards)]
+    total = 0
+    with ProcessPoolExecutor(max_workers=a.workers) as ex:
+        futs = {ex.submit(_convert, j): j for j in jobs}
+        for k, fut in enumerate(as_completed(futs)):
+            out, rows, nbytes = fut.result()
+            total += rows
+            print(f"[push] converted {k+1}/{len(jobs)} {os.path.basename(out)} rows={rows} "
+                  f"{nbytes/1e9:.2f}GB  {time.time()-t0:.0f}s", flush=True)
+    t_conv = time.time() - t0
+    print(f"[push] conversion done in {t_conv:.0f}s, {total:,} rows staged", flush=True)
 
     seq = meta.get("seq", 4096)
     card = CARD.format(repo=a.repo, rows=total, seq=seq, btok=total * seq / 1e9,
                        sep=meta.get("sep", 81914), src=meta.get("src", a.src), langs=a.langs)
-    cp = os.path.join(a.stage, "README.md")
-    open(cp, "w", encoding="utf-8").write(card)
-    api.upload_file(path_or_fileobj=cp, path_in_repo="README.md",
-                    repo_id=a.repo, repo_type="dataset")
+    open(os.path.join(a.stage, "README.md"), "w", encoding="utf-8").write(card)
+
+    # PHASE 2 -- one parallel, resumable upload of the whole folder. upload_file per shard was
+    # strictly sequential AND never overlapped with the conversion above; upload_large_folder
+    # runs many transfers at once and skips whatever already landed if it is re-run.
+    t1 = time.time()
+    try:
+        api.upload_large_folder(repo_id=a.repo, folder_path=a.stage, repo_type="dataset",
+                                num_workers=a.upload_workers)
+    except AttributeError:                       # older hub: fall back to the folder uploader
+        api.upload_folder(repo_id=a.repo, folder_path=a.stage, repo_type="dataset")
     print(f"[push] DONE {total:,} rows -> https://huggingface.co/datasets/{a.repo} "
-          f"({time.time()-t0:.0f}s)", flush=True)
+          f"| convert {t_conv:.0f}s + upload {time.time()-t1:.0f}s = {time.time()-t0:.0f}s",
+          flush=True)
 
 
 if __name__ == "__main__":
