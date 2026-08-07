@@ -25,6 +25,7 @@ from .data import token_batches, TRAIN_DATASET
 # Kept because the HF checkpoint push still needs a tokenizer to save alongside the weights.
 TOKENIZER = "fhai50032/QTK-81K"
 from .router_trace import RouterTrace   # training-stream router diagnostic; survived the purge
+from . import validation as _val        # frozen small batch, CE logged on the training log line
 from kernels.sm120.cross_entropy import fused_linear_cross_entropy   # sm120 (Blackwell); CE byte-identical to sm75
 
 DEV = "cuda"
@@ -467,6 +468,10 @@ def main():
     for _dead in ("--eval_extrap", "--final_extrap"):
         ap.add_argument(_dead, default="", help="IGNORED: eval removed")
     ap.add_argument("--no_eval_icl", action="store_true", help="IGNORED: eval removed")
+    # per-step validation on a FROZEN small batch (2 en + 2 hi instruction-following sources).
+    # Logged on the training log line. 0 = follow --log_every, -1 = off.
+    ap.add_argument("--val_every", type=int, default=0)
+    ap.add_argument("--val_seqs", type=int, default=2)            # sequences per source
     ap.add_argument("--out", default=None)
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_project", default="polyglu-ablations")
@@ -718,9 +723,21 @@ def main():
         print(f"[{run_name}] HF push -> {args.hf_repo} every {args.ckpt_every} steps (async, non-blocking); "
               f"periodic -> step<N>/, final -> repo root", flush=True)
 
+    # FROZEN validation batch, built once. Failure is FATAL by design: a silently-skipped source
+    # would leave the run logging a val number that means something different from every other run.
+    val_batches = None
+    val_every = args.log_every if args.val_every == 0 else args.val_every
+    if args.val_every >= 0 and args.data == "real":
+        from transformers import AutoTokenizer
+        _vt = AutoTokenizer.from_pretrained(TOKENIZER)
+        val_batches = _val.build(_vt, args.seq_len, args.val_seqs, DEV,
+                                 eos_id=_vt.eos_token_id if _vt.eos_token_id is not None else 0)
+        print(f"[val] {len(val_batches)} sources x {args.val_seqs} seqs "
+              f"({', '.join(f'{n}/{l}' for n, l, _ in val_batches)}) every {val_every} steps", flush=True)
+
     print(f"[{run_name}] params total={total/1e6:.2f}M active={active/1e6:.2f}M | steps={total_steps} "
           f"tok/step={tok_per_step} patches={patch_list} {args.precision} attn={args.attn} "
-          f"muon_mats={n_mat} eval=REMOVED", flush=True)
+          f"muon_mats={n_mat} eval=REMOVED val={'on' if val_batches else 'off'}", flush=True)
 
     gen = token_batches(args.batch, args.seq_len, DEV, dataset=args.dataset,
                         synthetic=(args.data == "synthetic"), vocab=cfg.vocab_size, seed=args.seed,
@@ -994,9 +1011,17 @@ def main():
                 aS_s = (xa_s + cs_s + f" p={rt['train/radial_p_mean']:.3f}"
                         f"[{rt['train/radial_p_min']:.2f},{rt['train/radial_p_max']:.2f}]"
                         f" th={rt['train/act_alpha_mean']:+.3f}")
+            # VALIDATION on the frozen batch. Unlike train loss this is the same text every step and
+            # every arm, so it is the only number here that can rank two runs.
+            val_s, val_flat = "", {}
+            if val_batches is not None and (step % val_every == 0 or step == total_steps - 1):
+                _vo, val_flat = _val.losses(model, val_batches, fused_linear_cross_entropy, amp)
+                val_s = (f" val={_vo:.4f}"
+                         f"[en={val_flat.get('val/loss_en', float('nan')):.3f},"
+                         f"hi={val_flat.get('val/loss_hi', float('nan')):.3f}]")
             print(f"  step {step}/{total_steps} loss={lv:.4f} run{len(_loss_hist)}={lv_run:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
-                  f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{rt_s}{aS_s}"
+                  f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{val_s}{rt_s}{aS_s}"
                   f"{f' wd={cur_wd:.4f}' if wd_sched is not None else ''}"
                   # clean = loss at RESTORED theta; probe = how much of `loss` is the probe sitting
                   # downhill. Under muon probe is ~0 by construction (nothing to restore).
@@ -1011,7 +1036,7 @@ def main():
                         **({"train/loss_clean": loss_clean, "train/probe_gap": loss_clean - lv}
                            if loss_clean is not None else {}),
                         **({"train/probe_gamma": _mns.probe_gamma} if _mns is not None else {}),
-                        "tokens": toks, **rt}, step=step)
+                        "tokens": toks, **rt, **val_flat}, step=step)
         if args.ckpt_every and step > 0 and step % args.ckpt_every == 0:
             if hf_api is not None:
                 _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_step{step}"))

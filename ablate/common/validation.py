@@ -1,0 +1,176 @@
+"""Per-step VALIDATION loss on a small fixed batch of instruction-following text.
+
+This is not the deleted eval. It is one no-grad forward over a FROZEN batch, built once at startup
+and reused unchanged for the whole run, logged on the normal training log line. Because the batch
+never changes, val loss is directly comparable across steps and across arms.
+
+Sources are instruction-following text scored as WHOLE-SEQUENCE cross-entropy -- not answer-only,
+not multiple-choice. Two English, two Hindi:
+
+    no_robots        en   human-written instruction + response
+    winogrande       en   pronoun-resolution sentences (short; both options appended as text)
+    alpaca_hi        hi   instruction + input + output, Devanagari
+    evol_instruct_hi hi   multi-turn conversations, Devanagari
+
+Cost: `--val_seqs` sequences per source (default 2) => 8 sequences of seq_len+1, ~8k tokens, one
+forward, no backward. Against a 262k-token training step that is noise.
+
+Run the self-check (downloads the four sources, no GPU):
+    python -m ablate.common.validation
+"""
+from . import _paths  # noqa: F401
+import torch
+
+TOKENIZER = "fhai50032/QTK-81K"
+
+
+# ─────────────────────────── source extractors ───────────────────────────
+# Each returns list[str] of whole texts. These are per-source ON PURPOSE: a generic
+# "join every string column" helper silently produced EMPTY text for the two sources whose content
+# lives in a list column, which then reads as a working validation set scoring nothing. The
+# build-time asserts below exist to catch exactly that.
+
+def _no_robots(n):
+    from datasets import load_dataset
+    ds = load_dataset("HuggingFaceH4/no_robots", split="train")
+    out = []
+    for ex in ds:
+        turns = ex.get("messages") or []
+        t = "\n".join(m.get("content", "") for m in turns if isinstance(m, dict))
+        if t.strip():
+            out.append(t)
+        if len(out) >= n:
+            break
+    return out
+
+
+def _winogrande(n):
+    from datasets import load_dataset
+    ds = load_dataset("allenai/winogrande", "winogrande_xl", split="train")
+    out = []
+    for ex in ds:
+        t = f"{ex['sentence']}\n{ex['option1']}\n{ex['option2']}"
+        if t.strip():
+            out.append(t)
+        if len(out) >= n:
+            break
+    return out
+
+
+def _alpaca_hi(n):
+    from datasets import load_dataset
+    ds = load_dataset("iamshnoo/alpaca-cleaned-hindi", split="train")
+    out = []
+    for ex in ds:
+        t = "\n".join(x for x in (ex.get("instruction"), ex.get("input"), ex.get("output")) if x)
+        if t.strip():
+            out.append(t)
+        if len(out) >= n:
+            break
+    return out
+
+
+def _evol_hi(n):
+    from datasets import load_dataset
+    ds = load_dataset("FreedomIntelligence/evol-instruct-hindi", split="train")
+    out = []
+    for ex in ds:
+        turns = ex.get("conversations") or []
+        t = "\n".join(m.get("value", "") for m in turns if isinstance(m, dict))
+        if t.strip():
+            out.append(t)
+        if len(out) >= n:
+            break
+    return out
+
+
+SOURCES = [("no_robots", "en", _no_robots), ("winogrande", "en", _winogrande),
+           ("alpaca_hi", "hi", _alpaca_hi), ("evol_instruct_hi", "hi", _evol_hi)]
+
+_DEVANAGARI = ("ऀ", "ॿ")
+
+
+def _devanagari_frac(text):
+    if not text:
+        return 0.0
+    return sum(1 for ch in text if _DEVANAGARI[0] <= ch <= _DEVANAGARI[1]) / len(text)
+
+
+def build(tokenizer, seq_len, seqs_per_source=2, device="cuda", eos_id=0):
+    """Freeze the validation batch. Returns [(name, lang, LongTensor[K, seq_len+1])].
+
+    Texts are concatenated with an EOS between documents and cut into seq_len+1 chunks, so every
+    position is real text -- no padding, and nothing is masked. Deterministic: fixed sources, fixed
+    order, no shuffle, so two runs build a byte-identical batch and their val losses are comparable.
+    """
+    n_needed = seqs_per_source * seq_len
+    out = []
+    for name, lang, loader in SOURCES:
+        # pull enough documents to fill the chunks; these sets average 29-155 tokens/doc
+        texts = loader(max(64, n_needed // 8))
+        assert texts, f"validation source {name} returned no text"
+        joined = "\n".join(texts)
+        if lang == "hi":
+            frac = _devanagari_frac(joined)
+            assert frac > 0.30, (
+                f"validation source {name} is tagged hi but only {100*frac:.1f}% Devanagari -- the "
+                f"extractor is probably reading the wrong column and scoring empty or English text")
+        ids = []
+        for t in texts:
+            ids.extend(tokenizer.encode(t, add_special_tokens=False))
+            ids.append(eos_id)
+            if len(ids) >= n_needed + seqs_per_source:
+                break
+        n = seq_len + 1
+        chunks = [ids[i * seq_len:i * seq_len + n] for i in range(seqs_per_source)]
+        chunks = [c for c in chunks if len(c) == n]
+        assert chunks, (f"validation source {name}: only {len(ids)} tokens, need "
+                        f"{n_needed + seqs_per_source} for {seqs_per_source}x{n}")
+        out.append((name, lang, torch.tensor(chunks, dtype=torch.long, device=device)))
+    return out
+
+
+@torch.no_grad()
+def losses(model, batches, ce_fn, amp):
+    """Per-source / per-language / overall validation CE. Restores training mode on exit."""
+    was_training = model.training
+    model.eval()                      # so the MoE balancer bias update stays off (gated on .training)
+    per_source, by_lang = {}, {}
+    try:
+        for name, lang, ids in batches:
+            inp, tgt = ids[:, :-1], ids[:, 1:].reshape(-1)
+            with amp:
+                h = model.model(input_ids=inp, use_cache=False)
+                h = h.last_hidden_state if hasattr(h, "last_hidden_state") else h[0]
+                # ignore_index -100 ALWAYS -- never --pad_id. The validation number must mean the
+                # same thing regardless of how the training corpus is masked.
+                loss = float(ce_fn(h.reshape(-1, h.shape[-1]), model.lm_head.weight, tgt,
+                                   ignore_index=-100))
+            per_source[name] = loss
+            by_lang.setdefault(lang, []).append(loss)
+    finally:
+        if was_training:
+            model.train()
+    flat = {f"val/loss_{k}": v for k, v in per_source.items()}
+    flat.update({f"val/loss_{lg}": sum(v) / len(v) for lg, v in by_lang.items()})
+    overall = sum(per_source.values()) / max(len(per_source), 1)
+    flat["val/loss"] = overall
+    flat["val/ppl"] = float(torch.exp(torch.tensor(overall)))
+    return overall, flat
+
+
+if __name__ == "__main__":
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(TOKENIZER)
+    b = build(tok, seq_len=1024, seqs_per_source=2, device="cpu",
+              eos_id=tok.eos_token_id if tok.eos_token_id is not None else 0)
+    assert len(b) == len(SOURCES), f"expected {len(SOURCES)} sources, built {len(b)}"
+    assert {lang for _, lang, _ in b} == {"en", "hi"}, "both languages must be present"
+    for name, lang, ids in b:
+        assert ids.shape == (2, 1025), f"{name}: got {tuple(ids.shape)}, expected (2, 1025)"
+        print(f"  {name:18s} {lang}  {tuple(ids.shape)}  first ids {ids[0, :6].tolist()}")
+    # determinism: a second build must be bit-identical, else val loss is not comparable step to step
+    b2 = build(tok, seq_len=1024, seqs_per_source=2, device="cpu",
+               eos_id=tok.eos_token_id if tok.eos_token_id is not None else 0)
+    assert all(torch.equal(a[2], c[2]) for a, c in zip(b, b2)), "validation batch is NOT deterministic"
+    print("[validation self-check] 4 sources, 2 en + 2 hi, deterministic, Devanagari asserted  OK")
