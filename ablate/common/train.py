@@ -231,6 +231,10 @@ def main():
     ap.add_argument("--attn", choices=["sdpa", "flash_attention_4"], default="sdpa")
     # Token id excluded from the CE. None = nothing masked, correct for a PACKED corpus. Set it
     # only when rows are actually padded. See _ce for the pad/eos collision this has to respect.
+    # Free-text suffix on the W&B run name. The auto-name is built from ARCHITECTURE flags only,
+    # so a sweep over a non-architecture knob (lr, wd, seed) produces N runs with ONE name and is
+    # unreadable in the UI. Use this to tag the swept value, e.g. --run_tag mlr1e-2.
+    ap.add_argument("--run_tag", default="")
     ap.add_argument("--pad_id", type=int, default=None)
     ap.add_argument("--aux_coef", type=float, default=0.001)                      # Qwen aux load-balancing loss coef (0=off; paper 0.001)
     ap.add_argument("--experts", type=int, default=0)   # TOTAL routed experts (GLU + specials); 0 = SHARED (6). GLU count = experts - 2*special_pairs -- see configs.glu_count
@@ -712,7 +716,8 @@ def main():
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + ("" if args.norm_topk_prob else "_nontp")   # normalization is the default; mark when OFF
                 + ("_radamw" if args.router_optim == "adamw" else "")
-                + ("_cos" if args.scheduler == "cosine" else ""))
+                + ("_cos" if args.scheduler == "cosine" else "")
+                + (f"_{args.run_tag}" if args.run_tag else ""))
     out_dir = args.out or os.path.join(os.path.dirname(__file__), "..", "runs")
     os.makedirs(out_dir, exist_ok=True)
 
