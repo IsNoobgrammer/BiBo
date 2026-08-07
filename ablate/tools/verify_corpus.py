@@ -48,19 +48,20 @@ def main():
     for i, s in enumerate(shards):
         with pa.memory_map(s, "rb") as h:
             tbl = pa.ipc.open_stream(h).read_all()
-        col = tbl.column("input_ids")
-        lens = np.asarray(col.value_lengths() if hasattr(col, "value_lengths")
-                          else [len(r) for r in col.to_pylist()])
+        # combine_chunks FIRST: a ChunkedArray has no .value_lengths, and the old fallback went via
+        # to_pylist(), materializing 410M Python ints per shard (~8 min/shard instead of seconds).
+        arr = tbl.column("input_ids").combine_chunks()
+        lens = np.asarray(arr.value_lengths())
         if (lens != a.seq).any():
             bad_len.append((s, int(lens.min()), int(lens.max())))
-        flat = np.asarray(col.combine_chunks().flatten())
+        flat = np.asarray(arr.values)          # zero-copy view of the flat child array
         rows += len(lens)
         seps += int((flat == a.sep).sum())
         zeros += int((flat == 0).sum())
         lo, hi = min(lo, int(flat.min())), max(hi, int(flat.max()))
         print(f"  shard {i+1}/{len(shards)}  rows={len(lens)}  ids[{flat.min()},{flat.max()}]  "
               f"sep={(flat == a.sep).sum()}  zeros={(flat == 0).sum()}", flush=True)
-        del tbl, col, flat
+        del tbl, arr, flat
 
     print(f"\ntotal rows={rows:,}  tokens={rows*a.seq:,} ({rows*a.seq/1e9:.3f}B)  "
           f"id range [{lo},{hi}]  separators={seps:,}  zeros={zeros:,}")
