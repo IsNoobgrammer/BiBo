@@ -138,12 +138,19 @@ def _devanagari_frac(text):
     return sum(1 for ch in text if _DEVANAGARI[0] <= ch <= _DEVANAGARI[1]) / len(text)
 
 
-def build(tokenizer, seq_len, seqs_per_source=2, device="cuda", eos_id=0):
-    """Freeze the validation batch. Returns [(name, lang, LongTensor[K, seq_len+1])].
+SEP_ID = 81914          # <|im_end|>, NOT <|endoftext|> (0)
 
-    Texts are concatenated with an EOS between documents and cut into seq_len+1 chunks, so every
-    position is real text -- no padding, and nothing is masked. Deterministic: fixed sources, fixed
-    order, no shuffle, so two runs build a byte-identical batch and their val losses are comparable.
+
+def build(tokenizer, seq_len, seqs_per_source=2, device="cuda", sep_id=SEP_ID):
+    """Freeze the external validation batches. Returns [(name, lang, LongTensor[K, seq_len+1])].
+
+    Documents are joined with `<|im_end|>` (81914) rather than `<|endoftext|>` (0) ON PURPOSE: the
+    CE below masks the pad id, and in QTK-81K pad_token_id == eos_token_id == 0, so an EOS separator
+    would be silently deleted from the loss along with the padding. 81914 is never masked, so every
+    separator is scored and the boundary is real supervision.
+
+    Deterministic: fixed sources, fixed order, no shuffle, so two runs build a byte-identical batch
+    and their losses are comparable.
     """
     n_needed = seqs_per_source * seq_len
     out = []
@@ -160,7 +167,7 @@ def build(tokenizer, seq_len, seqs_per_source=2, device="cuda", eos_id=0):
         ids = []
         for t in texts:
             ids.extend(tokenizer.encode(t, add_special_tokens=False))
-            ids.append(eos_id)
+            ids.append(sep_id)
             if len(ids) >= n_needed + seqs_per_source:
                 break
         n = seq_len + 1
@@ -173,9 +180,16 @@ def build(tokenizer, seq_len, seqs_per_source=2, device="cuda", eos_id=0):
 
 
 @torch.no_grad()
-def losses(model, holdout, batches, ce_fn, amp):
+def losses(model, holdout, batches, ce_fn, amp, pad_id=0):
     """Returns (headline, flat). `headline` is the held-out-corpus CE and is the ONLY ranking number;
-    the external sources land under val/ext/* and are never averaged into it. Restores train mode."""
+    the external sources land under val/ext/* and are never averaged into it. Restores train mode.
+
+    `pad_id` is ALWAYS masked, independently of the training --pad_id flag. Padding is trivially
+    predictable, so scoring it would drag val/loss down in proportion to how much padding a corpus
+    happens to carry -- an arm on a 16%-padded corpus would look better than an identical arm on a
+    packed one. Fixed here so the number means one thing across every corpus. The external batches
+    use <|im_end|> as their separator precisely so this mask cannot eat their document boundaries.
+    """
     was_training = model.training
     model.eval()                      # so the MoE balancer bias update stays off (gated on .training)
 
@@ -184,10 +198,8 @@ def losses(model, holdout, batches, ce_fn, amp):
         with amp:
             h = model.model(input_ids=inp, use_cache=False)
             h = h.last_hidden_state if hasattr(h, "last_hidden_state") else h[0]
-            # ignore_index -100 ALWAYS -- never --pad_id. The number must mean the same thing
-            # regardless of how the training corpus happens to be masked.
             return float(ce_fn(h.reshape(-1, h.shape[-1]), model.lm_head.weight, tgt,
-                               ignore_index=-100))
+                               ignore_index=int(pad_id)))
 
     flat, by_lang, headline = {}, {}, None
     try:
@@ -210,16 +222,20 @@ if __name__ == "__main__":
     import sys
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(TOKENIZER)
-    _eos = tok.eos_token_id if tok.eos_token_id is not None else 0
-    b = build(tok, seq_len=1024, seqs_per_source=2, device="cpu", eos_id=_eos)
+    b = build(tok, seq_len=1024, seqs_per_source=2, device="cpu")
     assert len(b) == len(SOURCES), f"expected {len(SOURCES)} sources, built {len(b)}"
     assert {lang for _, lang, _ in b} == {"en", "hi"}, "both languages must be present"
     for name, lang, ids in b:
         assert ids.shape == (2, 1025), f"{name}: got {tuple(ids.shape)}, expected (2, 1025)"
         print(f"  val/ext/{name:16s} {lang}  {tuple(ids.shape)}  first ids {ids[0, :6].tolist()}")
     # determinism: a second build must be bit-identical, else val loss is not comparable step to step
-    b2 = build(tok, seq_len=1024, seqs_per_source=2, device="cpu", eos_id=_eos)
+    b2 = build(tok, seq_len=1024, seqs_per_source=2, device="cpu")
     assert all(torch.equal(a[2], c[2]) for a, c in zip(b, b2)), "external batch is NOT deterministic"
+    # the masked pad id must not appear in the external batches, or the mask would delete real
+    # supervision rather than padding -- this is the check that makes SEP_ID=81914 load-bearing
+    for name, _lang, ids in b:
+        assert (ids == 0).sum() == 0, (f"{name} contains pad id 0; the val CE masks it, so those "
+                                       f"targets would vanish from the loss")
 
     # holdout tier, if a corpus path was given: python -m ablate.common.validation <dataset_dir>
     if len(sys.argv) > 1:

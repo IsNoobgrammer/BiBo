@@ -1023,7 +1023,8 @@ def main():
             val_s, val_flat = "", {}
             if (val_holdout is not None or val_batches) and (step % val_every == 0 or step == total_steps - 1):
                 _vo, val_flat = _val.losses(model, val_holdout, val_batches,
-                                            fused_linear_cross_entropy, amp)
+                                            fused_linear_cross_entropy, amp,
+                                            pad_id=0 if args.pad_id is None else int(args.pad_id))
                 # headline first and on its own; the external sources follow, tagged, so the two
                 # tiers can never be misread as one aggregate.
                 val_s = ("" if _vo is None else f" val={_vo:.4f}") + (
