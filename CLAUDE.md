@@ -69,3 +69,45 @@ comparability with the whole board.
 
 **When building a new corpus**: pack it (concatenate with an `<|im_end|>` separator, cut at the row
 length, no padding). Then `--pad_id` is unnecessary and no batch compute is wasted.
+
+## Tokenization: use gigatoken, not HF tokenizers (Aug 7 2026)
+
+`gigatoken` (PyPI, Rust BPE with Python bindings) is a drop-in replacement for the HF fast
+tokenizer and is **10.1x faster** on our corpus. Adopt it for any bulk tokenization.
+
+```python
+import gigatoken as gt
+tk  = gt.Tokenizer("/path/to/qtk_patched.json")   # see the byte_fallback note below
+ids = tk.encode_batch_list(list_of_strings)       # native API, fastest
+hfc = tk.as_hf()                                  # HF-compatible __call__ if you need the shim
+```
+
+Measured on 4000 English fineweb-edu docs, single process:
+
+| | throughput | speedup |
+|---|---|---|
+| HF fast tokenizer | 13.0 MB/s | 1x |
+| gigatoken `as_hf()` | 89.6 MB/s | 6.9x |
+| gigatoken native `encode_batch_list` | 131.5 MB/s | **10.1x** |
+
+The advertised 989x is their native file-reading path on a different tokenizer; ours is 10x. At
+131 MB/s a ~33 GB corpus tokenizes in about 4 minutes single-process, so **tokenization is no longer
+the bottleneck and `datasets.map(num_proc=...)` is not needed** — a plain `batched=True` map, or
+just reading parquet directly, is enough.
+
+**QTK-81K needs one patch.** `fhai50032/QTK-81K` declares `model.byte_fallback: true` but ships no
+`<0xHH>` byte tokens, so gigatoken refuses to load it:
+
+    RuntimeError: byte_fallback is set but the vocab has no <0xHH> byte tokens
+
+Clearing the flag is safe **because the vocab has no byte tokens for it to ever fall back to**:
+
+```python
+d = json.loads(hf.backend_tokenizer.to_str())
+d["model"]["byte_fallback"] = False
+```
+
+That argument is not what licenses the change — the parity check is. Gate any tokenizer swap on
+**exact token-id equality against the HF tokenizer**, on real corpus text, sampled from several
+positions. Ours: **0 mismatches / 3200 docs** (Hindi and English, at start/quarter/middle/late of
+the corpus). Same rule as kernels: bit identity or it does not ship.
