@@ -53,15 +53,30 @@ class _QwenAuxCollector:
         self.logits = []
 
 
-def _ce(model, ids, use_fused, aux=None, aux_coef=0.0, num_experts=6, top_k=2):
+def _ce(model, ids, use_fused, aux=None, aux_coef=0.0, num_experts=6, top_k=2, pad_id=None):
+    """CE over next-token targets, with `pad_id` (from --pad_id) excluded from the loss.
+
+    Default None = nothing is masked, which is correct for a PACKED corpus: it contains no padding,
+    so masking any id would only delete real tokens. Set --pad_id only for a corpus that pads rows.
+
+    Both branches take ignore_index explicitly. They used to take neither, so the kernel's default
+    of -100 applied and a padded corpus would have trained ON its padding -- pad ids are
+    non-negative and never matched -100.
+
+    In QTK-81K pad_token_id == eos_token_id == 0 (<|endoftext|>), so masking id 0 also masks every
+    end-of-text target. That is safe ONLY while documents are delimited by something else --
+    <|im_end|> (81914) in this corpus. If a future corpus separates documents with <|endoftext|>,
+    masking it would stop the model ever learning to terminate. main() warns on this.
+    """
     inp, tgt = ids[:, :-1], ids[:, 1:].reshape(-1)
     if aux is not None:
         aux.reset()
     out = model.model(input_ids=inp, use_cache=False)
     h = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
     sh = h.reshape(-1, h.shape[-1])
-    loss = (fused_linear_cross_entropy(sh, model.lm_head.weight, tgt) if use_fused
-            else torch.nn.functional.cross_entropy(model.lm_head(sh), tgt))
+    _ign = -100 if pad_id is None else int(pad_id)
+    loss = (fused_linear_cross_entropy(sh, model.lm_head.weight, tgt, ignore_index=_ign) if use_fused
+            else torch.nn.functional.cross_entropy(model.lm_head(sh), tgt, ignore_index=_ign))
     if aux is not None and aux_coef > 0 and aux.logits:      # Qwen aux load-balancing loss
         from baseline.qwen3moe.modeling import load_balancing_loss_func
         loss = loss + aux_coef * load_balancing_loss_func(tuple(aux.logits), num_experts, top_k)
@@ -214,6 +229,9 @@ def main():
     ap.add_argument("--eval_seq_len", type=int, default=0)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")  # NEVER fp16
     ap.add_argument("--attn", choices=["sdpa", "flash_attention_4"], default="sdpa")
+    # Token id excluded from the CE. None = nothing masked, correct for a PACKED corpus. Set it
+    # only when rows are actually padded. See _ce for the pad/eos collision this has to respect.
+    ap.add_argument("--pad_id", type=int, default=None)
     ap.add_argument("--aux_coef", type=float, default=0.001)                      # Qwen aux load-balancing loss coef (0=off; paper 0.001)
     ap.add_argument("--experts", type=int, default=0)   # TOTAL routed experts (GLU + specials); 0 = SHARED (6). GLU count = experts - 2*special_pairs -- see configs.glu_count
     # PolyGLU expert activation. THE ACTIVATION AXIS IS CLOSED (Jul 26 2026): the six on/off switches
@@ -481,6 +499,20 @@ def main():
     if not args.norm_topk_prob:
         print("[router] warning: norm_topk_prob=0 -> NO top-k normalization; raw sigmoid scores are "
               "the combine weights and they will NOT sum to 1.", flush=True)
+    if args.pad_id is not None:
+        # Warn, do not block: masking id 0 is CORRECT for a corpus delimited by <|im_end|> (81914),
+        # and wrong for one delimited by <|endoftext|>. Only the corpus knows which, so state the
+        # assumption loudly rather than guess -- the failure is silent (the model never learns to
+        # stop) and would read as a mysterious degeneration rather than a bug.
+        from transformers import AutoTokenizer
+        from .evaluate import TOKENIZER
+        _eos = AutoTokenizer.from_pretrained(TOKENIZER).eos_token_id
+        print(f"[loss] pad_id={args.pad_id} excluded from CE", flush=True)
+        if _eos is not None and int(args.pad_id) == int(_eos):
+            print(f"[loss] WARNING: pad_id == eos_token_id ({_eos}). Every end-of-text target is "
+                  f"now masked. This is safe ONLY if documents are separated by <|im_end|> "
+                  f"(81914); if they are separated by <|endoftext|>, the model will never learn "
+                  f"to terminate.", flush=True)
     n_total = args.experts or SHARED["num_experts"]
     # --pos_identity_n / --neg_identity_n override special_pairs, so glu_count() alone would print
     # a GLU count the model does not have. A wrong expert-layout line in the log is exactly the
@@ -767,7 +799,8 @@ def main():
             with _probe():
                 with amp:
                     loss = _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
-                               getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok) / args.grad_accum
+                               getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok,
+                               pad_id=args.pad_id) / args.grad_accum
                 loss.backward()
             _vote()
             loss_val += loss.item()
