@@ -733,8 +733,9 @@ def main():
         # TIER 1 -- val/loss, the ranking number: held-out shard of THIS corpus, in-distribution.
         val_holdout = _val.build_holdout(args.dataset, args.seq_len, args.val_seqs, DEV)
         # TIER 2 -- val/ext/*, external instruction sources. Watched, never averaged into val/loss.
-        val_batches = _val.build(_vt, args.seq_len, args.val_seqs, DEV,
-                                 eos_id=_vt.eos_token_id if _vt.eos_token_id is not None else 0)
+        # Separator is <|im_end|> (validation.SEP_ID), NOT eos: the val CE masks the pad id and
+        # pad == eos == 0 here, so an eos separator would be deleted from the loss.
+        val_batches = _val.build(_vt, args.seq_len, args.val_seqs, DEV)
         if val_holdout is None:
             print("[val] WARNING: no held-out shard (Hub-streamed dataset) -- val/loss is ABSENT "
                   "and only val/ext/* is logged. Nothing in-distribution ranks these arms.", flush=True)
