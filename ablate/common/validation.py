@@ -1,25 +1,38 @@
-"""Per-step VALIDATION loss on a small fixed batch of instruction-following text.
+"""Per-step VALIDATION loss on FROZEN batches, built once at startup and reused unchanged.
 
-This is not the deleted eval. It is one no-grad forward over a FROZEN batch, built once at startup
-and reused unchanged for the whole run, logged on the normal training log line. Because the batch
-never changes, val loss is directly comparable across steps and across arms.
+This is not the deleted eval. It is one no-grad forward per source, logged on the normal training
+log line. Because the batches never change, these numbers are comparable across steps AND arms --
+which train loss is not, since train loss moves with whatever the loader happens to feed.
 
-Sources are instruction-following text scored as WHOLE-SEQUENCE cross-entropy -- not answer-only,
-not multiple-choice. Two English, two Hindi:
+TWO TIERS, logged separately and never averaged together:
 
-    no_robots        en   human-written instruction + response
-    winogrande       en   pronoun-resolution sentences (short; both options appended as text)
-    alpaca_hi        hi   instruction + input + output, Devanagari
-    evol_instruct_hi hi   multi-turn conversations, Devanagari
+  `val/loss`  -- THE NUMBER. A held-out slice of the ACTUAL TRAINING CORPUS (the last shard, which
+                 data.split_shards keeps training away from). In-distribution, so it moves for the
+                 same reasons train loss does and is the only thing here that can catch a broken
+                 data pipeline. Rank arms on this.
 
-Cost: `--val_seqs` sequences per source (default 2) => 8 sequences of seq_len+1, ~8k tokens, one
-forward, no backward. Against a 262k-token training step that is noise.
+  `val/ext/*` -- four EXTERNAL instruction-following sources, watched but never folded into the
+                 headline. Scored as WHOLE-SEQUENCE cross-entropy: not answer-only, not
+                 multiple-choice. GSM8K and Belebele are deliberately excluded (single-answer).
 
-Run the self-check (downloads the four sources, no GPU):
+                     no_robots        en   human-written instruction + response
+                     winogrande       en   pronoun-resolution sentences, both options as text
+                     alpaca_hi        hi   instruction + input + output, Devanagari
+                     evol_instruct_hi hi   multi-turn conversations, Devanagari
+
+Mixing the two tiers into one average would be the mistake that hid the loader regression: an
+in-distribution number and an out-of-distribution number moving in OPPOSITE directions is the
+signal, and averaging them destroys exactly that.
+
+Cost: `--val_seqs` sequences per source (default 2), 10 sequences of seq_len+1 total, one forward
+each, no backward. Against a 262k-token training step that is noise.
+
+Run the self-check (downloads the four external sources, no GPU):
     python -m ablate.common.validation
 """
 from . import _paths  # noqa: F401
 import torch
+from .data import split_shards
 
 TOKENIZER = "fhai50032/QTK-81K"
 
@@ -87,6 +100,35 @@ def _evol_hi(n):
 SOURCES = [("no_robots", "en", _no_robots), ("winogrande", "en", _winogrande),
            ("alpaca_hi", "hi", _alpaca_hi), ("evol_instruct_hi", "hi", _evol_hi)]
 
+
+def build_holdout(dataset, seq_len, n_seqs, device, field="input_ids"):
+    """THE headline batch: rows from the held-out shard, already tokenized by the corpus builder.
+
+    Read straight from the shard's `input_ids` -- no tokenizer, no re-encoding -- so this is byte
+    for byte the same kind of input the training loader produces, and any divergence in the number
+    is the MODEL, not a preprocessing difference. Returns None when the dataset is Hub-streamed,
+    since no disjointness guarantee is possible there.
+    """
+    import pyarrow as pa
+    _train, held = split_shards(dataset)
+    if not held:
+        return None
+    n = seq_len + 1
+    rows = []
+    for f in held:
+        with pa.memory_map(f, "rb") as s:
+            col = pa.ipc.open_stream(s).read_all().column(field)
+            for r in col.slice(0, max(n_seqs * 4, 64)).to_pylist():
+                if len(r) >= n:
+                    rows.append(r[:n])            # same truncation rule the training loader uses
+                if len(rows) >= n_seqs:
+                    break
+        if len(rows) >= n_seqs:
+            break
+    assert len(rows) == n_seqs, (f"holdout shard {held} yielded {len(rows)} usable rows of >= {n} "
+                                 f"tokens, need {n_seqs}")
+    return torch.tensor(rows, dtype=torch.long, device=device)
+
 _DEVANAGARI = ("ऀ", "ॿ")
 
 
@@ -131,46 +173,64 @@ def build(tokenizer, seq_len, seqs_per_source=2, device="cuda", eos_id=0):
 
 
 @torch.no_grad()
-def losses(model, batches, ce_fn, amp):
-    """Per-source / per-language / overall validation CE. Restores training mode on exit."""
+def losses(model, holdout, batches, ce_fn, amp):
+    """Returns (headline, flat). `headline` is the held-out-corpus CE and is the ONLY ranking number;
+    the external sources land under val/ext/* and are never averaged into it. Restores train mode."""
     was_training = model.training
     model.eval()                      # so the MoE balancer bias update stays off (gated on .training)
-    per_source, by_lang = {}, {}
+
+    def _ce(ids):
+        inp, tgt = ids[:, :-1], ids[:, 1:].reshape(-1)
+        with amp:
+            h = model.model(input_ids=inp, use_cache=False)
+            h = h.last_hidden_state if hasattr(h, "last_hidden_state") else h[0]
+            # ignore_index -100 ALWAYS -- never --pad_id. The number must mean the same thing
+            # regardless of how the training corpus happens to be masked.
+            return float(ce_fn(h.reshape(-1, h.shape[-1]), model.lm_head.weight, tgt,
+                               ignore_index=-100))
+
+    flat, by_lang, headline = {}, {}, None
     try:
-        for name, lang, ids in batches:
-            inp, tgt = ids[:, :-1], ids[:, 1:].reshape(-1)
-            with amp:
-                h = model.model(input_ids=inp, use_cache=False)
-                h = h.last_hidden_state if hasattr(h, "last_hidden_state") else h[0]
-                # ignore_index -100 ALWAYS -- never --pad_id. The validation number must mean the
-                # same thing regardless of how the training corpus is masked.
-                loss = float(ce_fn(h.reshape(-1, h.shape[-1]), model.lm_head.weight, tgt,
-                                   ignore_index=-100))
-            per_source[name] = loss
+        if holdout is not None:
+            headline = _ce(holdout)
+            flat["val/loss"] = headline
+            flat["val/ppl"] = float(torch.exp(torch.tensor(headline)))
+        for name, lang, ids in (batches or []):
+            loss = _ce(ids)
+            flat[f"val/ext/{name}"] = loss
             by_lang.setdefault(lang, []).append(loss)
     finally:
         if was_training:
             model.train()
-    flat = {f"val/loss_{k}": v for k, v in per_source.items()}
-    flat.update({f"val/loss_{lg}": sum(v) / len(v) for lg, v in by_lang.items()})
-    overall = sum(per_source.values()) / max(len(per_source), 1)
-    flat["val/loss"] = overall
-    flat["val/ppl"] = float(torch.exp(torch.tensor(overall)))
-    return overall, flat
+    flat.update({f"val/ext/{lg}": sum(v) / len(v) for lg, v in by_lang.items()})
+    return headline, flat
 
 
 if __name__ == "__main__":
+    import sys
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(TOKENIZER)
-    b = build(tok, seq_len=1024, seqs_per_source=2, device="cpu",
-              eos_id=tok.eos_token_id if tok.eos_token_id is not None else 0)
+    _eos = tok.eos_token_id if tok.eos_token_id is not None else 0
+    b = build(tok, seq_len=1024, seqs_per_source=2, device="cpu", eos_id=_eos)
     assert len(b) == len(SOURCES), f"expected {len(SOURCES)} sources, built {len(b)}"
     assert {lang for _, lang, _ in b} == {"en", "hi"}, "both languages must be present"
     for name, lang, ids in b:
         assert ids.shape == (2, 1025), f"{name}: got {tuple(ids.shape)}, expected (2, 1025)"
-        print(f"  {name:18s} {lang}  {tuple(ids.shape)}  first ids {ids[0, :6].tolist()}")
+        print(f"  val/ext/{name:16s} {lang}  {tuple(ids.shape)}  first ids {ids[0, :6].tolist()}")
     # determinism: a second build must be bit-identical, else val loss is not comparable step to step
-    b2 = build(tok, seq_len=1024, seqs_per_source=2, device="cpu",
-               eos_id=tok.eos_token_id if tok.eos_token_id is not None else 0)
-    assert all(torch.equal(a[2], c[2]) for a, c in zip(b, b2)), "validation batch is NOT deterministic"
-    print("[validation self-check] 4 sources, 2 en + 2 hi, deterministic, Devanagari asserted  OK")
+    b2 = build(tok, seq_len=1024, seqs_per_source=2, device="cpu", eos_id=_eos)
+    assert all(torch.equal(a[2], c[2]) for a, c in zip(b, b2)), "external batch is NOT deterministic"
+
+    # holdout tier, if a corpus path was given: python -m ablate.common.validation <dataset_dir>
+    if len(sys.argv) > 1:
+        tr, held = split_shards(sys.argv[1])
+        h = build_holdout(sys.argv[1], 1024, 2, "cpu")
+        assert h.shape == (2, 1025), f"holdout: got {tuple(h.shape)}"
+        assert set(tr).isdisjoint(held), "holdout shard is also a training shard -- LEAKAGE"
+        print(f"  val/loss (holdout)      {tuple(h.shape)}  from {len(held)} shard(s), "
+              f"{len(tr)} train shards, disjoint")
+        assert torch.equal(h, build_holdout(sys.argv[1], 1024, 2, "cpu")), "holdout NOT deterministic"
+    else:
+        print("  val/loss (holdout)      skipped -- pass a dataset dir to check it")
+    print("[validation self-check] 4 external sources (2 en + 2 hi), deterministic, "
+          "Devanagari asserted; holdout disjoint from train  OK")

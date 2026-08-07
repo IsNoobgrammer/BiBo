@@ -723,17 +723,24 @@ def main():
         print(f"[{run_name}] HF push -> {args.hf_repo} every {args.ckpt_every} steps (async, non-blocking); "
               f"periodic -> step<N>/, final -> repo root", flush=True)
 
-    # FROZEN validation batch, built once. Failure is FATAL by design: a silently-skipped source
+    # FROZEN validation batches, built once. Failure is FATAL by design: a silently-skipped source
     # would leave the run logging a val number that means something different from every other run.
-    val_batches = None
+    val_batches = val_holdout = None
     val_every = args.log_every if args.val_every == 0 else args.val_every
     if args.val_every >= 0 and args.data == "real":
         from transformers import AutoTokenizer
         _vt = AutoTokenizer.from_pretrained(TOKENIZER)
+        # TIER 1 -- val/loss, the ranking number: held-out shard of THIS corpus, in-distribution.
+        val_holdout = _val.build_holdout(args.dataset, args.seq_len, args.val_seqs, DEV)
+        # TIER 2 -- val/ext/*, external instruction sources. Watched, never averaged into val/loss.
         val_batches = _val.build(_vt, args.seq_len, args.val_seqs, DEV,
                                  eos_id=_vt.eos_token_id if _vt.eos_token_id is not None else 0)
-        print(f"[val] {len(val_batches)} sources x {args.val_seqs} seqs "
-              f"({', '.join(f'{n}/{l}' for n, l, _ in val_batches)}) every {val_every} steps", flush=True)
+        if val_holdout is None:
+            print("[val] WARNING: no held-out shard (Hub-streamed dataset) -- val/loss is ABSENT "
+                  "and only val/ext/* is logged. Nothing in-distribution ranks these arms.", flush=True)
+        print(f"[val] every {val_every} steps | val/loss=holdout"
+              f"{'' if val_holdout is None else f' {tuple(val_holdout.shape)}'} | "
+              f"val/ext: {', '.join(f'{n}/{l}' for n, l, _ in val_batches)}", flush=True)
 
     print(f"[{run_name}] params total={total/1e6:.2f}M active={active/1e6:.2f}M | steps={total_steps} "
           f"tok/step={tok_per_step} patches={patch_list} {args.precision} attn={args.attn} "
@@ -1014,11 +1021,16 @@ def main():
             # VALIDATION on the frozen batch. Unlike train loss this is the same text every step and
             # every arm, so it is the only number here that can rank two runs.
             val_s, val_flat = "", {}
-            if val_batches is not None and (step % val_every == 0 or step == total_steps - 1):
-                _vo, val_flat = _val.losses(model, val_batches, fused_linear_cross_entropy, amp)
-                val_s = (f" val={_vo:.4f}"
-                         f"[en={val_flat.get('val/loss_en', float('nan')):.3f},"
-                         f"hi={val_flat.get('val/loss_hi', float('nan')):.3f}]")
+            if (val_holdout is not None or val_batches) and (step % val_every == 0 or step == total_steps - 1):
+                _vo, val_flat = _val.losses(model, val_holdout, val_batches,
+                                            fused_linear_cross_entropy, amp)
+                # headline first and on its own; the external sources follow, tagged, so the two
+                # tiers can never be misread as one aggregate.
+                val_s = ("" if _vo is None else f" val={_vo:.4f}") + (
+                    " ext[" + " ".join(f"{k.rsplit('/', 1)[1][:2]}={v:.2f}"
+                                       for k, v in val_flat.items()
+                                       if k.startswith("val/ext/") and k.rsplit("/", 1)[1]
+                                       not in ("en", "hi")) + "]" if val_batches else "")
             print(f"  step {step}/{total_steps} loss={lv:.4f} run{len(_loss_hist)}={lv_run:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
                   f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{val_s}{rt_s}{aS_s}"

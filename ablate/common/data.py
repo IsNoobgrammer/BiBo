@@ -9,6 +9,29 @@ import torch
 TRAIN_DATASET = "tinycompany/Better-Instruct-packed-2"
 
 
+HOLDOUT_SHARDS = 1     # reserved for validation; training never sees them
+
+
+def _shards(dataset):
+    """Sorted .arrow shards if `dataset` is a local dir, else None (Hub streaming)."""
+    import os, glob
+    return (sorted(glob.glob(os.path.join(dataset, "**", "*.arrow"), recursive=True))
+            if os.path.isdir(dataset) else None)
+
+
+def split_shards(dataset):
+    """(train_shards, holdout_shards). The LAST shard is held out so validation is measured on text
+    training provably never reached -- shard granularity rather than a row count because the loader
+    streams and would otherwise have to know the corpus length up front. Returns (None, None) for a
+    Hub-streamed dataset, where no such guarantee is possible."""
+    fs = _shards(dataset)
+    if not fs:
+        return None, None
+    if len(fs) <= HOLDOUT_SHARDS:
+        raise ValueError(f"{dataset} has {len(fs)} shard(s); need > {HOLDOUT_SHARDS} to hold one out")
+    return fs[:-HOLDOUT_SHARDS], fs[-HOLDOUT_SHARDS:]
+
+
 def _fit(ids, n, pad_id):
     """One row -> exactly n tokens: truncate if long, trailing-pad if short."""
     return ids[:n] if len(ids) >= n else list(ids) + [pad_id] * (n - len(ids))
@@ -38,11 +61,10 @@ def token_batches(batch, seq_len, device, dataset=TRAIN_DATASET, synthetic=False
             yield torch.randint(0, vocab, (batch, seq_len + 1), generator=gen, device=device)
         return
     from datasets import load_dataset
-    import os, glob
     # if `dataset` is a local dir of pre-downloaded .arrow shards, stream from DISK (robust — no HTTP
     # range reads that time out; download them with hf_transfer/xet first). Else stream from the Hub.
-    local_files = sorted(glob.glob(os.path.join(dataset, "**", "*.arrow"), recursive=True)) \
-        if os.path.isdir(dataset) else None
+    # The LAST shard is excluded: it is the validation holdout (see split_shards).
+    local_files, _held = split_shards(dataset)
     while True:                                    # loop the stream for multi-epoch token budgets
         ds = (load_dataset("arrow", data_files=local_files, split="train", streaming=True)
               if local_files else load_dataset(dataset, split="train", streaming=True))
