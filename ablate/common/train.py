@@ -20,9 +20,11 @@ from . import patches as patchmod
 from .optim import build_optimizers
 from .schedule import make_scheduler, make_wd_schedule
 from .data import token_batches, TRAIN_DATASET
-from .evaluate import evaluate, Tok, summarize
-from .eval.interp import RouterTrace
-from .eval.sample import generate_samples
+# EVAL REMOVED Aug 7 2026. The whole ablate/common/eval package and evaluate.py are gone; runs log
+# train loss, grad norm and throughput only. Nothing here is comparable to any previous board.
+# Kept because the HF checkpoint push still needs a tokenizer to save alongside the weights.
+TOKENIZER = "fhai50032/QTK-81K"
+from .router_trace import RouterTrace   # training-stream router diagnostic; survived the purge
 from kernels.sm120.cross_entropy import fused_linear_cross_entropy   # sm120 (Blackwell); CE byte-identical to sm75
 
 DEV = "cuda"
@@ -194,21 +196,9 @@ def _push_hf_async(api, repo, local_dir, path_in_repo, tag):
     return fut
 
 
-@contextlib.contextmanager
-def _eager(model):
-    """Run eval / sampling on the UN-compiled module. torch.compile chokes on the eval and generation
-    shapes: recompile-limit churn, and an inductor crash ('SymFloat' has no attribute 'size') on the long
-    length-extrap sequences. Eval isn't perf-critical, so swap compiled -> orig for the duration and restore
-    after. No-op when compile is off (orig is None)."""
-    compiled = getattr(model, "model", None)
-    orig = getattr(compiled, "_orig_mod", None)
-    if orig is not None:
-        model.model = orig
-    try:
-        yield
-    finally:
-        if orig is not None:
-            model.model = compiled
+# _eager() lived here: it swapped the compiled module for the eager one around eval/generation,
+# because torch.compile choked on the eval shapes. Deleted Aug 7 2026 with the eval -- its only
+# callers were the eval and sampling call sites. Restore from git history if sampling comes back.
 
 
 def main():
@@ -222,11 +212,6 @@ def main():
     ap.add_argument("--batch", type=int, default=64)             # per micro-step
     ap.add_argument("--grad_accum", type=int, default=2)          # global batch = batch * grad_accum
     ap.add_argument("--seq_len", type=int, default=1024)
-    # Eval context is PINNED separately from training context. bpb depends strongly on how much
-    # context the model gets, so a --seq_len 2048 run evaluated at 2048 is not comparable to the
-    # board, which is all 1024 -- the number would move for a reason that has nothing to do with
-    # the arm. 0 = follow --seq_len (old behaviour).
-    ap.add_argument("--eval_seq_len", type=int, default=0)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")  # NEVER fp16
     ap.add_argument("--attn", choices=["sdpa", "flash_attention_4"], default="sdpa")
     # Token id excluded from the CE. None = nothing masked, correct for a PACKED corpus. Set it
@@ -474,21 +459,14 @@ def main():
     ap.add_argument("--hf_repo", default="")     # if set, push model+tokenizer to this HF repo every --ckpt_every steps (async, non-blocking)
     ap.add_argument("--hf_token", default="")    # HF WRITE token; falls back to $HF_TOKEN / $HUGGING_FACE_HUB_TOKEN
     ap.add_argument("--hf_private", action="store_true")  # create the repo private
-    # in-training eval -> W&B curves (this is the point; not a post-hoc-only eval)
-    # 0 = FINAL EVAL ONLY (the default). Periodic evals cost ~2.4 min each and only exist to draw
-    # W&B curves; the number every comparison actually uses is the final one. >0 re-enables them.
-    #  -1 = NO EVAL AT ALL (use for short diagnostic/throughput runs -- a full eval is ~2.5 min
-    #       and dwarfs a 100-step run; it is also where runs have hung in teardown)
-    #   0 = FINAL EVAL ONLY (default)   >0 = periodic evals on top
-    ap.add_argument("--eval_every", type=int, default=0)
-    ap.add_argument("--sample_every", type=int, default=0)       # 0 = same as eval_every; steps between 2en+2hi samples
-    ap.add_argument("--eval_mcq_n", type=int, default=200)       # cheap periodic MCQ sample
-    ap.add_argument("--eval_bpb_n", type=int, default=200)       # cheap periodic bpb sample/source
-    ap.add_argument("--eval_extrap", default="")                 # periodic length-extrap (default off; e.g. 1024,2048,4096)
-    ap.add_argument("--final_mcq_n", type=int, default=500)      # full final eval
-    ap.add_argument("--final_extrap", default="1024,2048,4096")
-    ap.add_argument("--no_eval_icl", action="store_true")        # ICL-slope metric is ON by default (periodic + final)
-    ap.add_argument("--eval_icl_n", type=int, default=50)        # periodic ICL items/lang/shot (final uses 100)
+    # EVAL REMOVED Aug 7 2026 -- these are accepted and IGNORED so existing launch scripts and
+    # queue files keep running instead of dying on an unknown flag. Nothing reads them.
+    for _dead in ("--eval_every", "--sample_every", "--eval_mcq_n", "--eval_bpb_n",
+                  "--final_mcq_n", "--eval_icl_n", "--eval_seq_len"):
+        ap.add_argument(_dead, type=int, default=0, help="IGNORED: eval removed")
+    for _dead in ("--eval_extrap", "--final_extrap"):
+        ap.add_argument(_dead, default="", help="IGNORED: eval removed")
+    ap.add_argument("--no_eval_icl", action="store_true", help="IGNORED: eval removed")
     ap.add_argument("--out", default=None)
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_project", default="polyglu-ablations")
@@ -509,7 +487,6 @@ def main():
         # assumption loudly rather than guess -- the failure is silent (the model never learns to
         # stop) and would read as a mysterious degeneration rather than a bug.
         from transformers import AutoTokenizer
-        from .evaluate import TOKENIZER
         _eos = AutoTokenizer.from_pretrained(TOKENIZER).eos_token_id
         print(f"[loss] pad_id={args.pad_id} excluded from CE", flush=True)
         if _eos is not None and int(args.pad_id) == int(_eos):
@@ -728,38 +705,22 @@ def main():
                         config={**vars(args), "total_steps": total_steps,
                                 "params_total": total, "params_active": active})
 
-    # in-training eval (needs the real corpus/tokenizer + benchmark datasets)
-    # do_eval gates the FINAL eval (the number every comparison uses); --eval_every only adds
-    # periodic ones on top. They were one flag, so --eval_every 0 silently suppressed the final
-    # eval as well -- which is why "final only" was previously spelled --eval_every 100000.
-    do_eval = args.data == "real" and args.eval_every >= 0
-    tok = Tok() if do_eval else None
-    if args.eval_every < 0:
-        print("[eval] disabled entirely (--eval_every -1)", flush=True)
-    elif not do_eval:
-        print("[eval] disabled: --data synthetic (benchmark eval needs the real corpus + downloads)", flush=True)
-    ev_extrap = tuple(int(x) for x in args.eval_extrap.split(",") if x.strip()) or None
-    sample_every = args.sample_every if args.sample_every > 0 else args.eval_every   # default: sample when we eval
-
     # async HF checkpoint push: save_pretrained locally (main thread), then upload_folder in the background.
     hf_api = hf_tok = None
     hf_futures = []
     if args.hf_repo:
         from huggingface_hub import HfApi
         from transformers import AutoTokenizer
-        from .evaluate import TOKENIZER
         _hf_token = args.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
         hf_api = HfApi(token=_hf_token)
         hf_api.create_repo(args.hf_repo, private=args.hf_private, exist_ok=True)
-        hf_tok = tok._t if tok is not None else AutoTokenizer.from_pretrained(TOKENIZER)   # reuse the eval tokenizer
+        hf_tok = AutoTokenizer.from_pretrained(TOKENIZER)   # saved next to the weights so from_pretrained works
         print(f"[{run_name}] HF push -> {args.hf_repo} every {args.ckpt_every} steps (async, non-blocking); "
               f"periodic -> step<N>/, final -> repo root", flush=True)
 
     print(f"[{run_name}] params total={total/1e6:.2f}M active={active/1e6:.2f}M | steps={total_steps} "
           f"tok/step={tok_per_step} patches={patch_list} {args.precision} attn={args.attn} "
-          f"muon_mats={n_mat} eval="
-          f"{'off' if not do_eval else (f'every {args.eval_every}' if args.eval_every > 0 else 'final only')}",
-          flush=True)
+          f"muon_mats={n_mat} eval=REMOVED", flush=True)
 
     gen = token_batches(args.batch, args.seq_len, DEV, dataset=args.dataset,
                         synthetic=(args.data == "synthetic"), vocab=cfg.vocab_size, seed=args.seed,
@@ -1051,40 +1012,6 @@ def main():
                            if loss_clean is not None else {}),
                         **({"train/probe_gamma": _mns.probe_gamma} if _mns is not None else {}),
                         "tokens": toks, **rt}, step=step)
-        # `step > 0`: step 0 evaluates a RANDOM-INIT model, so the numbers are noise (measured
-        # bpb hi=2.04 en=4.19 vs 0.74/1.64 at the end) while costing a full eval pass -- ~2.4 min
-        # of a 12.5 min 500-step arm, i.e. ~19%. The final eval still runs, and any --eval_every
-        # multiple after 0 still runs, so curves are unaffected.
-        if do_eval and args.eval_every > 0 and step > 0 and step % args.eval_every == 0:   # periodic eval -> W&B curves
-            with _eager(model):                                # eval on the un-compiled module (see _eager)
-                _, flat = evaluate(model, tok, seq_len=(args.eval_seq_len or args.seq_len), mcq_n=args.eval_mcq_n, bpb_n=args.eval_bpb_n,
-                                   extrap_lengths=ev_extrap, do_samples=False,
-                                   do_icl=not args.no_eval_icl, icl_n=args.eval_icl_n, device=DEV, dtype=dt)
-            if wb:
-                wb.log(flat, step=step)
-            print(f"  [eval @{step}] {summarize(flat)}", flush=True)
-        if do_eval and sample_every > 0 and step > 0 and step % sample_every == 0:   # samples on their own cadence (default = eval_every)
-            with _eager(model):
-                _sm = generate_samples(model, tok, device=DEV, dtype=dt)
-            for s in _sm:
-                print(f"    [sample {s['lang']}] ent={s['entropy']:.2f} top1={s['top1']:.2f} "
-                      f"rep4={s['rep4']:.2f} | {s['prompt']} -> {s['completion']}", flush=True)
-            # LOGGED, not just printed. bpb ranked three checkpoints in the exact REVERSE order of
-            # generation quality -- the best bpb (per-dim c+d) produced punctuation salad at
-            # entropy 4.9, the worst (b1s2 softmax) wrote the only coherent text at 2.26. These
-            # are the metrics that see it, and having them per eval means it is visible at step
-            # 1000 instead of after a checkpoint autopsy.
-            _sagg = {}
-            for _k in ("entropy", "top1", "rep4"):
-                _sagg[f"eval/sample_{_k}"] = sum(x[_k] for x in _sm) / max(len(_sm), 1)
-                for _lg in ("en", "hi"):
-                    _v = [x[_k] for x in _sm if x["lang"] == _lg]
-                    if _v:
-                        _sagg[f"eval/sample_{_k}_{_lg}"] = sum(_v) / len(_v)
-            if wb is not None:
-                wb.log(_sagg, step=step)
-            print(f"    [sample agg] " + " ".join(f"{k.split('/')[-1]}={v:.3f}"
-                                                  for k, v in sorted(_sagg.items())), flush=True)
         if args.ckpt_every and step > 0 and step % args.ckpt_every == 0:
             if hf_api is not None:
                 _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_step{step}"))
@@ -1098,31 +1025,9 @@ def main():
     if hf_api is not None:                                  # final -> repo root so `from_pretrained(repo)` just works
         _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_final"))
         hf_futures.append(_push_hf_async(hf_api, args.hf_repo, _dir, "final", f"{run_name} final"))
-    final_eval = None
-    if do_eval:
-        try:                                                   # best-effort: a final-eval failure must NOT
-            fe = tuple(int(x) for x in args.final_extrap.split(",") if x.strip()) or None   # abort the HF
-            with _eager(model):                                # drain / result.json / wb.finish below
-                final_eval, full_flat = evaluate(model, tok, seq_len=(args.eval_seq_len or args.seq_len), mcq_n=args.final_mcq_n,
-                                                 extrap_lengths=fe, do_icl=not args.no_eval_icl, icl_n=100,
-                                                 device=DEV, dtype=dt)
-            if wb:
-                wb.log(full_flat, step=total_steps)
-            print(f"  [final eval] {summarize(full_flat)}", flush=True)
-            _fs = final_eval.get("samples", [])
-            for s in _fs:
-                print(f"    [sample {s['lang']}] ent={s.get('entropy', float('nan')):.2f} "
-                      f"top1={s.get('top1', float('nan')):.2f} rep4={s.get('rep4', float('nan')):.2f} "
-                      f"| {s['prompt']} -> {s['completion']}", flush=True)
-            if wb is not None and _fs and "entropy" in _fs[0]:
-                wb.log({f"eval/sample_{k}": sum(x[k] for x in _fs) / len(_fs)
-                        for k in ("entropy", "top1", "rep4")}, step=total_steps)
-        except Exception as e:
-            print(f"  [final eval] FAILED: {type(e).__name__}: {str(e)[:200]} (checkpoints already pushed)",
-                  flush=True)
     res = {"arm": args.arm, "seed": args.seed, "steps": total_steps, "tokens": total_steps * tok_per_step,
            "final_loss": loss_val, "final_loss_running": sum(_loss_hist) / len(_loss_hist), "params_total": total, "params_active": active,
-           "ckpt": ckpt, "wall_s": time.time() - t0, "eval": final_eval, "config": vars(args)}
+           "ckpt": ckpt, "wall_s": time.time() - t0, "eval": None, "config": vars(args)}
     with open(os.path.join(out_dir, f"{run_name}_result.json"), "w") as f:
         json.dump(res, f, indent=2)
     if hf_futures:                                         # drain: block until every background upload lands,

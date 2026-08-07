@@ -1,9 +1,11 @@
-"""Interpretability metrics collected DURING eval forwards (hooks on the MoE experts of BOTH arms):
-  - expert utilization: per-expert load, balance-entropy (1=perfectly balanced), coeff-of-variation, max/min.
-  - router confidence: mean top-1 gate weight, mean routing entropy over the top-k, frac(top1>0.5).
-Zero training cost (only active inside the `collect` context around eval). Works for BiBoFusedExperts and
-Qwen3MoeExperts (both take (hidden, top_k_index, top_k_weights))."""
-from .. import _paths  # noqa: F401
+"""Router mechanics traced on the TRAINING stream (top-1 weight, entropy, balance, boundary gap).
+
+Lifted out of the deleted ablate/common/eval package on Aug 7 2026. This is a TRAINING diagnostic,
+not an eval -- it reads the router during normal training forwards and feeds the per-step log
+line. It never scores the model against held-out data, which is why it survived the eval purge.
+
+The eval-time `collect` context manager did NOT survive: it piggybacked on the bpb forwards."""
+from . import _paths  # noqa: F401
 import math
 import torch
 
@@ -166,14 +168,3 @@ class RouterTrace:
         self._handles = []
 
 
-class collect:
-    """Context manager: `with collect(model, num_experts) as c: <eval forwards>; stats = c.result()`."""
-    def __init__(self, model, num_experts):
-        self._stats = MoEStats(model, num_experts)
-
-    def __enter__(self):
-        return self._stats
-
-    def __exit__(self, *exc):
-        self._stats.close()
-        return False
