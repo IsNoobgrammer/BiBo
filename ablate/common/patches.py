@@ -193,6 +193,10 @@ def patch_megakernel():
 
     This SUPERSEDES 'moe' on MoE layers: the fused block calls moe_per_expert itself, so a run with
     both patches simply leaves BiBoFusedExperts.forward patched and never calls it.
+
+    KNOWN GAP: the `gap=` field (router boundary gap) goes dark on this path. It needs the (k+1)-th
+    score, and the fused kernel does the top-k internally and returns only the k selected. top1w /
+    rent / bal are all preserved by replaying the MoEStats hooks below.
     """
     from kernels.sm120.megakernel.moe.block import megakernel_block
     from src.modeling.layers import BiBoDecoderLayer
@@ -220,11 +224,17 @@ def patch_megakernel():
              "rw": moe.gate.gate_proj.weight.t().contiguous(),
              "bias": moe.gate.bias,
              "gu": moe.experts.gate_up_proj, "dn": moe.experts.down_proj}
-        out, idx = megakernel_block(
-            hidden_states.reshape(b * s, h), w,
-            _expert_codes(moe.experts, hidden_states.device, hidden_states.dtype),
+        flat = hidden_states.reshape(b * s, h)
+        out, idx, wgt = megakernel_block(
+            flat, w, _expert_codes(moe.experts, hidden_states.device, hidden_states.dtype),
             top_k=moe.gate.top_k, eps=self.post_attention_layernorm.variance_epsilon,
-            act_params=_act_params(moe.experts), return_idx=True)
+            act_params=_act_params(moe.experts), return_routing=True)
+        # MoEStats instruments the router with a forward PRE-hook on BiBoFusedExperts, and this path
+        # never calls that module -- so top1w / rent / bal silently vanished from the log line while
+        # the model itself was fine. `bal` is how expert collapse gets noticed, so replay the hooks
+        # with the arguments they expect: (hidden, top_k_index, top_k_weights).
+        for _h in moe.experts._forward_pre_hooks.values():
+            _h(moe.experts, (flat, idx.long(), wgt))
         # the balancing bias is driven from these indices and mutated by .add_() outside the
         # optimizer; it must fire exactly once per forward, exactly as BiBoMoELayer.forward does it
         if moe.training and moe.bias_update_factor > 0:
