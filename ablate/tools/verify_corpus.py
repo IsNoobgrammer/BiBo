@@ -99,8 +99,14 @@ def main():
     if meta:
         assert meta["rows"] == rows, f"pack_meta says {meta['rows']} rows, shards hold {rows}"
         assert meta["seq"] == a.seq, f"pack_meta seq={meta['seq']} vs --seq {a.seq}"
-        print(f"pack_meta.json agrees: {meta['rows']:,} rows, seq {meta['seq']}, "
-              f"{meta['docs']:,} docs, {meta['dropped_tail_tokens']} tokens dropped")
+        # keys differ by producer: pack_corpus writes docs/dropped_tail_tokens, mix_corpus writes
+        # ratio/consumed/holdout_rows. Report whatever is present rather than KeyError after every
+        # real check has already passed.
+        extra = " ".join(f"{k}={meta[k]}" for k in
+                         ("docs", "dropped_tail_tokens", "docs_with_id0_stripped",
+                          "ratio", "consumed", "train_rows", "holdout_rows", "seed")
+                         if k in meta)
+        print(f"pack_meta.json agrees: {meta['rows']:,} rows, seq {meta['seq']}  {extra}")
     print("\nVERIFY OK")
 
 
