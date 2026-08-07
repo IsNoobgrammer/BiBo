@@ -17,10 +17,18 @@ HOLDOUT_SHARDS = 1     # reserved for validation; training never sees them
 
 
 def _shards(dataset):
-    """Sorted .arrow shards if `dataset` is a local dir, else None (Hub streaming)."""
+    """Sorted shard paths if `dataset` is a local dir, else None (Hub streaming).
+
+    Handles BOTH layouts: bip2 ships .arrow, the packed FineWeb corpora ship .parquet.
+    """
     import os, glob
-    return (sorted(glob.glob(os.path.join(dataset, "**", "*.arrow"), recursive=True))
-            if os.path.isdir(dataset) else None)
+    if not os.path.isdir(dataset):
+        return None
+    for ext in ("*.arrow", "*.parquet"):
+        fs = sorted(glob.glob(os.path.join(dataset, "**", ext), recursive=True))
+        if fs:
+            return fs
+    return []
 
 
 def split_shards(dataset):
@@ -86,8 +94,11 @@ def token_batches(batch, seq_len, device, dataset=TRAIN_DATASET, synthetic=False
     # The LAST shard is excluded: it is the validation holdout (see split_shards).
     local_files, _held = split_shards(dataset)
     while True:                                    # loop the stream for multi-epoch token budgets
-        ds = (load_dataset("arrow", data_files=local_files, split="train", streaming=True)
-              if local_files else load_dataset(dataset, split="train", streaming=True))
+        if local_files:
+            fmt = "parquet" if local_files[0].endswith(".parquet") else "arrow"
+            ds = load_dataset(fmt, data_files=local_files, split="train", streaming=True)
+        else:
+            ds = load_dataset(dataset, split="train", streaming=True)
         rows = []
         for ex in ds:
             # the packed FineWeb corpora name the column `label`; bip2 names it `input_ids`
