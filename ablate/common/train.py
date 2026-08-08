@@ -725,7 +725,12 @@ def main():
     wb = None
     if args.wandb:
         import wandb
+        # console="wrap": capture stdout into the run's Logs tab. The end-of-run report prints every
+        # greedy AND sampled generation there on purpose -- W&B renders long text poorly in a table,
+        # and the log is the readable place for it. Default "auto" can decline to capture when
+        # stdout is already redirected, which is exactly how these runs are launched (nohup > log).
         wb = wandb.init(project=args.wandb_project, name=run_name,
+                        settings=wandb.Settings(console="wrap"),
                         config={**vars(args), "total_steps": total_steps,
                                 "params_total": total, "params_active": active})
 

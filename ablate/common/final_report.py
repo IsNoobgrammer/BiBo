@@ -204,23 +204,40 @@ def run(model, tok, dataset, ce_fn, amp, device="cuda", wb=None, max_new=96, n_s
     """Everything above, printed and (if wb) logged. Never raises into the training script: a
     reporting bug must not destroy a finished run's checkpoint and result.json."""
     flat, rows = {}, []
+    # Everything below is PRINTED as well as logged. W&B renders long text badly in a table, so the
+    # run's Logs tab is where these are actually readable -- and the W&B run is still open here, so
+    # console capture picks all of it up. Both decoding modes are printed in full, not just greedy.
+    bar = "=" * 78
     try:
+        print(f"\n{bar}\nGENERATION SAMPLES -- {len(PROMPTS)} prompts x (greedy, sampled) "
+              f"= {2 * len(PROMPTS)} completions, {max_new} tokens each\n{bar}", flush=True)
+        n = 0
         for lang, p in PROMPTS:
             for mode, temp in (("greedy", 0.0), ("sampled", 0.8)):
                 txt, ids = generate(model, tok, p, max_new=max_new, temperature=temp,
                                     device=device, amp=amp)
                 m = degen_metrics(ids)
+                n += 1
                 rows.append([lang, mode, p, txt, m["rep@1"], m["rep@4"], m["distinct1"], m["distinct3"]])
                 if mode == "greedy":       # degen headline from greedy only: sampling hides loops
                     for k, v in m.items():
                         flat[f"degen/{lang}/{k}"] = v
-                print(f"\n--- [{lang}/{mode}] {p}\n{txt}\n    rep@1={m['rep@1']:.3f} "
-                      f"rep@4={m['rep@4']:.3f} distinct1={m['distinct1']:.3f} "
-                      f"distinct3={m['distinct3']:.3f}", flush=True)
+                print(f"\n[{n}/{2 * len(PROMPTS)}] lang={lang}  mode={mode}  temp={temp}\n"
+                      f"  PROMPT : {p}\n"
+                      f"  OUTPUT : {txt}\n"
+                      f"  METRICS: rep@1={m['rep@1']:.3f}  rep@4={m['rep@4']:.3f}  "
+                      f"distinct1={m['distinct1']:.3f}  distinct3={m['distinct3']:.3f}\n"
+                      + "-" * 78, flush=True)
         for k in ("rep@1", "rep@4", "distinct1", "distinct3"):
             vals = [v for kk, v in flat.items() if kk.endswith("/" + k)]
             if vals:
                 flat[f"degen/{k}"] = sum(vals) / len(vals)
+        # compact scoreboard, so the numbers are scannable without re-reading every completion
+        print(f"\n{'lang/mode':<16}{'rep@1':>9}{'rep@4':>9}{'distinct1':>12}{'distinct3':>12}",
+              flush=True)
+        for lang, mode, _p, _t, r1, r4, d1, d3 in rows:
+            print(f"{lang + '/' + mode:<16}{r1:>9.3f}{r4:>9.3f}{d1:>12.3f}{d3:>12.3f}", flush=True)
+        print(bar, flush=True)
     except Exception as e:
         print(f"[final_report] sampling FAILED: {type(e).__name__}: {e}", flush=True)
 

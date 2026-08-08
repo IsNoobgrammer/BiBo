@@ -99,13 +99,16 @@ def main():
         with open(a.result_json) as f:
             _res = json.load(f)
         rid = a.wandb_id or _res.get("wandb_id")
+        # console="wrap" so the generations print into the run's Logs tab, where long text is
+        # actually readable -- W&B's table view is not
+        _st = wandb.Settings(console="wrap")
         if rid:
             # RESUME the training run. A report in its own run sits next to the curves it describes
             # instead of on them, and cannot be compared -- which is the whole reason to log it.
-            wb = wandb.init(project=a.wandb_project, id=rid, resume="must")
+            wb = wandb.init(project=a.wandb_project, id=rid, resume="must", settings=_st)
             print(f"[report_ckpt] resumed W&B run {rid}", flush=True)
         else:
-            wb = wandb.init(project=a.wandb_project,
+            wb = wandb.init(project=a.wandb_project, settings=_st,
                             name=(a.run_tag or os.path.basename(a.result_json).replace("_result.json", "")) + "-report",
                             config=vars(c))
             print("[report_ckpt] WARNING: no wandb_id in the result json (run predates it) -- "
