@@ -219,22 +219,28 @@ def patch_megakernel():
 
     _announced = []
 
-    def _ffn(self, hidden_states):
-        if not self.is_moe_layer:
-            return _orig(self, hidden_states)
-        moe = self.mlp
-        why = _unsupported(moe)
-        if why is not None:
-            if not _announced:
-                print(f"[megakernel] DISABLED -- {why}; falling back to the eager norm+router+"
-                      f"experts block", flush=True)
-                _announced.append(True)
-            return _orig(self, hidden_states)
+    def _use_mk(layer):
+        """Can this layer take the fused path? Announces the decision ONCE, either way.
+
+        The caller decides what to fall back TO -- src's layer adds a residual and casts, the
+        AttnRes layer does not, so a fallback inside _mk_mlp would return the wrong thing for one
+        of them."""
+        if not layer.is_moe_layer:
+            return False
+        why = _unsupported(layer.mlp)
         if not _announced:
-            print("[megakernel] ENGAGED on MoE layers (fused norm + router + experts)", flush=True)
             _announced.append(True)
+            print(f"[megakernel] DISABLED -- {why}; falling back to the eager norm+router+experts"
+                  f" block" if why else
+                  "[megakernel] ENGAGED on MoE layers (fused norm + router + experts)", flush=True)
+        return why is None
+
+    def _mk_mlp(self, hidden_states):
+        """norm + router + experts, fused. Returns the MoE output ONLY -- the residual add and any
+        dtype casts belong to the caller, because the stable and AttnRes layers do them
+        differently. Callers must gate on _use_mk() first."""
+        moe = self.mlp
         b, s, h = hidden_states.shape
-        residual = hidden_states
         # gate_proj is nn.Linear(H, E) so .weight is [E,H]; the kernel takes [H,E] and reads it with
         # no stride arguments, so a transposed VIEW would be silently misread -- .contiguous() is
         # load-bearing, not tidiness. 512x64 elements, so the copy is free.
@@ -267,15 +273,49 @@ def patch_megakernel():
             tpe = moe._balance_step(idx.view(b, s, -1).long(), b * s)
             if tpe is not None:
                 moe.update_bias(tpe)
-        out = out.view(b, s, h)
+        return out.view(b, s, h)
+
+    def _ffn(self, hidden_states):
+        """src's stable layer: residual + bf16 casts around the fused block."""
+        if not _use_mk(self):
+            return _orig(self, hidden_states)
+        out = _mk_mlp(self, hidden_states)
         if self._bf16_moe_out:
             out = out.to(torch.bfloat16)
-        hidden_states = residual + out
+        hidden_states = hidden_states + out
         if self._bf16_stream:
             hidden_states = hidden_states.to(torch.bfloat16)
         return hidden_states
 
     BiBoDecoderLayer._ffn_forward = _nc(_ffn)
+
+    # exp/modeling_bibo defines its OWN BiBoDecoderLayer, and build_arm switches to it whenever
+    # attn_res != "off". Patching only src's class meant an AttnRes run silently got the eager
+    # norm+router -- no error, and not even the ENGAGED line, because the method was never called.
+    # That would have made every AttnRes arm non-comparable to a megakernel baseline.
+    try:
+        from exp.modeling_bibo import BiBoDecoderLayer as _ExpLayer
+    except Exception:
+        _ExpLayer = None
+    if _ExpLayer is not None and _ExpLayer is not BiBoDecoderLayer:
+        _exp_std = getattr(_ExpLayer, "_orig_std_ffn", None) or _ExpLayer._standard_ffn_forward
+        _exp_ar = getattr(_ExpLayer, "_orig_ar_mlp", None) or _ExpLayer._attn_res_mlp_forward
+        _ExpLayer._orig_std_ffn = _exp_std
+        _ExpLayer._orig_ar_mlp = _exp_ar
+
+        def _exp_standard(self, hidden_states):
+            if not _use_mk(self):
+                return _exp_std(self, hidden_states)
+            return hidden_states + _mk_mlp(self, hidden_states)
+
+        def _exp_attn_res(self, hidden_states):
+            # NO residual here: the AttnRes path adds its own depth-mixed residual downstream
+            if not _use_mk(self):
+                return _exp_ar(self, hidden_states)
+            return _mk_mlp(self, hidden_states)
+
+        _ExpLayer._standard_ffn_forward = _nc(_exp_standard)
+        _ExpLayer._attn_res_mlp_forward = _nc(_exp_attn_res)
 
 
 # ───────────────────────── fused XSA (BiBo only) ─────────────────────────
