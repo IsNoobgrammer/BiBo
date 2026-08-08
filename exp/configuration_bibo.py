@@ -35,9 +35,9 @@ class BiBoConfig(_StableBiBoConfig):
         self.attn_res_carry = bool(attn_res_carry)
         self.attn_res_fp32_stream = bool(attn_res_fp32_stream)
         _csm = "none" if attn_res_carry_scale in (False, None) else str(attn_res_carry_scale)
-        if _csm not in ("none", "raw", "unbounded", "rms", "sigmoid", "tanh",
-                        "sigmoid_rms", "tanh_rms"):
-            raise ValueError(f"attn_res_carry_scale must be one of none/raw/rms, "
+        _ok = ("none", "raw", "unbounded", "rms", "sigmoid", "tanh", "sigmoid_rms", "tanh_rms")
+        if _csm not in _ok:
+            raise ValueError(f"attn_res_carry_scale must be one of {'/'.join(_ok)}, "
                              f"got {attn_res_carry_scale!r}")
         self.attn_res_carry_scale = _csm
         # A THIRD, OFF-SIMPLEX term on the carry write: h = attn_read + c*attn_out + d*embedding,
