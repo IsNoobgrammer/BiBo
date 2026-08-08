@@ -157,7 +157,7 @@ def extrapolation(model, dataset, ce_fn, amp, device, lens=(1024, 2048, 4096), n
 
 @torch.no_grad()
 def context_ablation(model, dataset, ce_fn, amp, device, target_window=512,
-                     ctxs=(1024, 2048, 4096), n_seqs=4, pad_id=0, row_tokens=4096):
+                     ctxs=(1024, 2048, 4096), n_seqs=32, pad_id=0, row_tokens=4096, chunk=8):
     """THE clean extrapolation test: identical target tokens, only the visible context varies.
 
     Both numbers in `extrapolation()` conflate two things, because a longer sequence means both
@@ -185,14 +185,25 @@ def context_ablation(model, dataset, ce_fn, amp, device, target_window=512,
         for C in ctxs:
             C = min(C, row_tokens - 1)
             a = row_tokens - 1 - C
-            inp = batch[:, a:a + C]                     # C tokens of history+targets
-            tgt = batch[:, a + 1:a + C + 1]             # shifted by one, so the LAST w align
-            with amp:
-                h = model.model(input_ids=inp, use_cache=False)
-                h = h.last_hidden_state if hasattr(h, "last_hidden_state") else h[0]
-                w = min(target_window, h.shape[1])
-                out[C] = float(ce_fn(h[:, -w:].reshape(-1, h.shape[-1]), model.lm_head.weight,
-                                     tgt[:, -w:].reshape(-1), ignore_index=int(pad_id)))
+            tot, cnt = 0.0, 0
+            # MICRO-BATCHED. swa_attention falls back to eager at long S, which materialises a dense
+            # [B,H,S,S] softmax -- 32 GB at S=4095 with 128 rows, and it OOMed exactly there. The
+            # sample size for this metric should be set by where the estimate converges, not by what
+            # happens to fit in one forward.
+            for i in range(0, batch.shape[0], chunk):
+                b = batch[i:i + chunk]
+                inp, tgt = b[:, a:a + C], b[:, a + 1:a + C + 1]   # shifted so the LAST w align
+                with amp:
+                    h = model.model(input_ids=inp, use_cache=False)
+                    h = h.last_hidden_state if hasattr(h, "last_hidden_state") else h[0]
+                    w = min(target_window, h.shape[1])
+                    loss = float(ce_fn(h[:, -w:].reshape(-1, h.shape[-1]), model.lm_head.weight,
+                                       tgt[:, -w:].reshape(-1), ignore_index=int(pad_id)))
+                # weight by token count so chunking is exactly equivalent to one big forward
+                tot += loss * b.shape[0] * w
+                cnt += b.shape[0] * w
+                del h
+            out[C] = tot / max(cnt, 1)
     finally:
         if was_training:
             model.train()
@@ -267,12 +278,12 @@ def run(model, tok, dataset, ce_fn, amp, device="cuda", wb=None, max_new=96, n_s
         print(f"[final_report] extrapolation FAILED: {type(e).__name__}: {e}", flush=True)
 
     try:
-        # More rows than the other metrics on purpose: this is the number that decides whether a
-        # model should be served at long context, and n_seqs (2-4, sized for the per-step val) is
-        # too small a sample to rank runs on. One 4096-token forward over 16 rows costs a fraction
-        # of a training step.
+        # 32 rows, not n_seqs (2-4, sized for the per-step val): this number decides whether a model
+        # should be served at long context, so it is sized by where the estimate CONVERGES. Measured
+        # on the 2000-step baseline, the 4x delta reads +0.1196 / +0.0776 / +0.0870 / +0.0869 at
+        # 4 / 16 / 32 / 64 rows -- flat from 32 on, and a 4-row sample is off by 37%.
         ca = context_ablation(model, dataset, ce_fn, amp, device, ctxs=lens,
-                              n_seqs=max(n_seqs, 16))
+                              n_seqs=max(n_seqs, 32))
         if ca:
             c0 = min(ca)
             for C, v in ca.items():
