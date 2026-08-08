@@ -155,6 +155,50 @@ def extrapolation(model, dataset, ce_fn, amp, device, lens=(1024, 2048, 4096), n
     return out
 
 
+@torch.no_grad()
+def context_ablation(model, dataset, ce_fn, amp, device, target_window=512,
+                     ctxs=(1024, 2048, 4096), n_seqs=4, pad_id=0, row_tokens=4096):
+    """THE clean extrapolation test: identical target tokens, only the visible context varies.
+
+    Both numbers in `extrapolation()` conflate two things, because a longer sequence means both
+    "further past the trained length" AND "more context available", and its late positions are
+    easier for the second reason regardless of the first. No arrangement of that measurement
+    separates them.
+
+    Here every context budget C scores the SAME final `target_window` tokens of the SAME rows. Only
+    the history differs: C=1024 feeds the 1024 tokens immediately before them (so those targets land
+    at RoPE positions ~512-1023, in-distribution), C=4096 feeds the whole document (the same targets
+    now sit at RoPE positions ~3584-4095, 4x beyond training). Identical targets, identical text --
+    the delta is attributable to context length alone.
+
+    Read it as: does context past the trained length HELP or HURT?
+        ctx4096 < ctx1024  -> long context is a real win; serve at 4096
+        ctx4096 > ctx1024  -> the model would do better truncating its own history
+    """
+    batch = _holdout_rows(dataset, row_tokens, n_seqs, device)
+    if batch is None:
+        return {}
+    was_training = model.training
+    model.eval()
+    out = {}
+    try:
+        for C in ctxs:
+            C = min(C, row_tokens - 1)
+            a = row_tokens - 1 - C
+            inp = batch[:, a:a + C]                     # C tokens of history+targets
+            tgt = batch[:, a + 1:a + C + 1]             # shifted by one, so the LAST w align
+            with amp:
+                h = model.model(input_ids=inp, use_cache=False)
+                h = h.last_hidden_state if hasattr(h, "last_hidden_state") else h[0]
+                w = min(target_window, h.shape[1])
+                out[C] = float(ce_fn(h[:, -w:].reshape(-1, h.shape[-1]), model.lm_head.weight,
+                                     tgt[:, -w:].reshape(-1), ignore_index=int(pad_id)))
+    finally:
+        if was_training:
+            model.train()
+    return out
+
+
 def run(model, tok, dataset, ce_fn, amp, device="cuda", wb=None, max_new=96, n_seqs=4,
         lens=(1024, 2048, 4096)):
     """Everything above, printed and (if wb) logged. Never raises into the training script: a
@@ -205,6 +249,22 @@ def run(model, tok, dataset, ce_fn, amp, device="cuda", wb=None, max_new=96, n_s
     except Exception as e:
         print(f"[final_report] extrapolation FAILED: {type(e).__name__}: {e}", flush=True)
 
+    try:
+        ca = context_ablation(model, dataset, ce_fn, amp, device, ctxs=lens, n_seqs=n_seqs)
+        if ca:
+            c0 = min(ca)
+            for C, v in ca.items():
+                flat[f"ctxabl/ctx{C}"] = v
+                if C != c0:
+                    # NEGATIVE = the extra context genuinely helps on identical targets
+                    flat[f"ctxabl/delta_ctx{C}"] = v - ca[c0]
+            print("\n[context ablation] SAME targets, varying context: " + "  ".join(
+                f"ctx{C}={v:.4f}" for C, v in sorted(ca.items())), flush=True)
+            print(f"[context ablation] delta vs ctx{c0} (neg = longer context HELPS): " + "  ".join(
+                f"ctx{C}={v - ca[c0]:+.4f}" for C, v in sorted(ca.items()) if C != c0), flush=True)
+    except Exception as e:
+        print(f"[final_report] context ablation FAILED: {type(e).__name__}: {e}", flush=True)
+
     if wb is not None and (flat or rows):
         try:
             import wandb
@@ -231,5 +291,17 @@ if __name__ == "__main__":
     # a half-repeating sample must land strictly between the two extremes
     mixed = degen_metrics(list(range(20)) + [99] * 20)
     assert 0.0 < mixed["rep@1"] < 1.0 and 0.0 < mixed["rep@4"] < 1.0, mixed
+    # context_ablation is only meaningful if every context budget scores the SAME target tokens.
+    # That is pure index arithmetic, so check it here rather than discovering a silent misalignment
+    # as a "result" -- an off-by-C slice would compare different text and still print clean numbers.
+    row_tokens, W, spans = 4096, 512, []
+    for C in (1024, 2048, 4096):
+        C = min(C, row_tokens - 1)
+        a = row_tokens - 1 - C
+        tgt_end = a + C + 1                      # tgt = batch[:, a+1 : a+C+1]
+        spans.append((tgt_end - W, tgt_end))     # the last W of it is what gets scored
+    assert len(set(spans)) == 1, f"context budgets score DIFFERENT targets: {spans}"
+    assert spans[0] == (row_tokens - W, row_tokens), spans
     print(f"final_report self-check OK -- {len(PROMPTS)} prompts (2 en, 2 hi); "
-          f"degen metrics separate a loop (rep@1=1.000) from varied text (rep@1=0.000)")
+          f"degen metrics separate a loop (rep@1=1.000) from varied text (rep@1=0.000); "
+          f"context ablation scores identical targets {spans[0]} at every context budget")
