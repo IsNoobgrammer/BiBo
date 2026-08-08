@@ -483,6 +483,14 @@ def main():
     # run actually spends its life in. Purely cosmetic -- the number at step 0 is not informative,
     # it is log(vocab). Set 0 to log from the start.
     ap.add_argument("--val_start", type=int, default=100)
+    # END-OF-RUN report on the final weights: 4 fixed prompts (2 en + 2 hi) + degeneration metrics
+    # + val CE at each --extrap_lens. Runs after the checkpoint is written, once, so it costs
+    # nothing during training and cannot lose the weights if it fails.
+    ap.add_argument("--final_report", type=lambda s: str(s).lower() not in ("0", "false", "no"),
+                    default=True)
+    ap.add_argument("--sample_tokens", type=int, default=96)     # tokens generated per prompt
+    # 1024 is the TRAINED length; 2048/4096 are beyond anything RoPE saw. Logged one panel each.
+    ap.add_argument("--extrap_lens", default="1024,2048,4096")
     ap.add_argument("--out", default=None)
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_project", default="polyglu-ablations")
@@ -1073,6 +1081,24 @@ def main():
 
     ckpt = os.path.join(out_dir, f"{run_name}_final.pt")
     torch.save(model.state_dict(), ckpt)
+
+    # ---- END-OF-RUN REPORT on the FINAL weights: samples + degeneration + length extrapolation.
+    # After the checkpoint is written, never before: a bug in reporting must not cost the run its
+    # weights. final_report swallows its own exceptions for the same reason.
+    final_flat = {}
+    if args.final_report and args.data == "real":
+        from . import final_report as _fr
+        from transformers import AutoTokenizer as _AT
+        print(f"\n[{run_name}] final report: {len(_fr.PROMPTS)} prompts + extrapolation "
+              f"at {args.extrap_lens}", flush=True)
+        try:
+            _rt = _AT.from_pretrained(TOKENIZER)
+            _lens = tuple(int(x) for x in str(args.extrap_lens).split(",") if x.strip())
+            final_flat = _fr.run(model, _rt, args.dataset, fused_linear_cross_entropy, amp,
+                                 device=DEV, wb=wb, max_new=args.sample_tokens,
+                                 n_seqs=args.val_seqs, lens=_lens)
+        except Exception as _e:
+            print(f"[{run_name}] final report FAILED: {type(_e).__name__}: {_e}", flush=True)
     if hf_api is not None:                                  # final -> repo root so `from_pretrained(repo)` just works
         _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_final"))
         hf_futures.append(_push_hf_async(hf_api, args.hf_repo, _dir, "final", f"{run_name} final"))
