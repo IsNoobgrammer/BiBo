@@ -203,17 +203,36 @@ def patch_megakernel():
     _orig = getattr(BiBoDecoderLayer, "_orig_ffn_forward", None) or BiBoDecoderLayer._ffn_forward
     BiBoDecoderLayer._orig_ffn_forward = _orig
 
+    def _unsupported(moe):
+        """Why this layer cannot take the fused path, or None. Checked per layer because the
+        megakernel is now the DEFAULT patch: a config it cannot express must fall back to the
+        original block, not crash the run. The fallback is ANNOUNCED, never silent -- a quietly
+        disabled kernel is how a 'speedup' gets attributed to the wrong thing."""
+        if moe.use_shared_expert:
+            # a shared expert consumes the NORMED hidden, which the fused block computes
+            # internally and never returns
+            return "shared experts"
+        if not moe.gate.norm_topk_prob or moe.gate.norm_topk_prob == "softmax":
+            # the fused router hardcodes sum-norm; softmax would be silently renormalised
+            return f"norm_topk_prob={moe.gate.norm_topk_prob!r} (fused router is sum-norm only)"
+        return None
+
+    _announced = []
+
     def _ffn(self, hidden_states):
         if not self.is_moe_layer:
             return _orig(self, hidden_states)
         moe = self.mlp
-        # A shared expert consumes the NORMED hidden, which the fused block computes internally and
-        # never returns. Failing loudly beats silently dropping it and reading the result as
-        # "the megakernel costs quality".
-        assert not moe.use_shared_expert, "megakernel patch does not support shared experts"
-        # the fused router hardcodes sum-norm; a softmax arm would be silently renormalised
-        assert moe.gate.norm_topk_prob and moe.gate.norm_topk_prob != "softmax", \
-            f"megakernel router is sum-norm only, got norm_topk_prob={moe.gate.norm_topk_prob!r}"
+        why = _unsupported(moe)
+        if why is not None:
+            if not _announced:
+                print(f"[megakernel] DISABLED -- {why}; falling back to the eager norm+router+"
+                      f"experts block", flush=True)
+                _announced.append(True)
+            return _orig(self, hidden_states)
+        if not _announced:
+            print("[megakernel] ENGAGED on MoE layers (fused norm + router + experts)", flush=True)
+            _announced.append(True)
         b, s, h = hidden_states.shape
         residual = hidden_states
         # gate_proj is nn.Linear(H, E) so .weight is [E,H]; the kernel takes [H,E] and reads it with

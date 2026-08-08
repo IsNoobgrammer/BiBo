@@ -386,7 +386,10 @@ def main():
     ap.add_argument("--compile", action="store_true")           # torch.compile the transformer body
     ap.add_argument("--peak_tflops", type=float, default=0.0)   # MFU denominator: 0=auto-measure achievable GEMM;
     #                                                             else theoretical, e.g. 480 (dense bf16) / 960 (sparse)
-    ap.add_argument("--patches", default="liger_norm,liger_rope,ce,moe")
+    # 'megakernel' is DEFAULT: it fuses post_attention_layernorm + router + experts into one block
+    # and supersedes 'moe' on MoE layers. 'moe' stays in the list because the dense mlp_only_layers
+    # and the Qwen arm still route through BiBoFusedExperts.forward.
+    ap.add_argument("--patches", default="liger_norm,liger_rope,ce,moe,megakernel")
     ap.add_argument("--muon_scale_mode", choices=["polar", "normuon", "aurora", "aurora_ema", "aurora_ema_v2"],
                     default="aurora")  # post-NS row scaling; EMA variants: normuon / aurora_ema / aurora_ema_v2
     ap.add_argument("--xorth_post", type=float, default=0.0)       # cross-expert whitening MAX strength (0=off), scoped to MoE expert stacks
