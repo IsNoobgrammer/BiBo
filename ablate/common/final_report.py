@@ -214,7 +214,7 @@ def run(model, tok, dataset, ce_fn, amp, device="cuda", wb=None, max_new=96, n_s
         lens=(1024, 2048, 4096)):
     """Everything above, printed and (if wb) logged. Never raises into the training script: a
     reporting bug must not destroy a finished run's checkpoint and result.json."""
-    flat, rows = {}, []
+    flat, rows, per_lang = {}, [], {}
     # Everything below is PRINTED as well as logged. W&B renders long text badly in a table, so the
     # run's Logs tab is where these are actually readable -- and the W&B run is still open here, so
     # console capture picks all of it up. Both decoding modes are printed in full, not just greedy.
@@ -231,18 +231,24 @@ def run(model, tok, dataset, ce_fn, amp, device="cuda", wb=None, max_new=96, n_s
                 n += 1
                 rows.append([lang, mode, p, txt, m["rep@1"], m["rep@4"], m["distinct1"], m["distinct3"]])
                 if mode == "greedy":       # degen headline from greedy only: sampling hides loops
-                    for k, v in m.items():
-                        flat[f"degen/{lang}/{k}"] = v
+                    per_lang.setdefault(lang, []).append(m)
                 print(f"\n[{n}/{2 * len(PROMPTS)}] lang={lang}  mode={mode}  temp={temp}\n"
                       f"  PROMPT : {p}\n"
                       f"  OUTPUT : {txt}\n"
                       f"  METRICS: rep@1={m['rep@1']:.3f}  rep@4={m['rep@4']:.3f}  "
                       f"distinct1={m['distinct1']:.3f}  distinct3={m['distinct3']:.3f}\n"
                       + "-" * 78, flush=True)
-        for k in ("rep@1", "rep@4", "distinct1", "distinct3"):
-            vals = [v for kk, v in flat.items() if kk.endswith("/" + k)]
-            if vals:
-                flat[f"degen/{k}"] = sum(vals) / len(vals)
+        # W&B gets rep@4 + distinct3 per language and nothing else. Deliberately narrow:
+        #  - AVERAGED over that language's prompts. Assigning per prompt silently kept only the
+        #    LAST one, since both en prompts write the same key.
+        #  - no en/hi average: the two differ materially (rep@4 0.85 vs 0.69 on the 2000-step
+        #    baseline) and averaging them destroys the only interesting comparison.
+        #  - rep@1 and distinct1 are dropped from the CHARTS, not from the run: rep@4 catches
+        #    everything rep@1 does, distinct3 is the standard form, and all four still print in
+        #    the scoreboard below where they are readable.
+        for lang, ms in per_lang.items():
+            for k in ("rep@4", "distinct3"):
+                flat[f"degen/{lang}/{k}"] = sum(d[k] for d in ms) / len(ms)
         # compact scoreboard, so the numbers are scannable without re-reading every completion
         print(f"\n{'lang/mode':<16}{'rep@1':>9}{'rep@4':>9}{'distinct1':>12}{'distinct3':>12}",
               flush=True)
@@ -254,17 +260,10 @@ def run(model, tok, dataset, ce_fn, amp, device="cuda", wb=None, max_new=96, n_s
 
     try:
         ex = extrapolation(model, dataset, ce_fn, amp, device, lens=lens, n_seqs=n_seqs)
-        for L, v in ex.items():                              # one W&B panel per length, never averaged
-            flat[f"extrap/seq{L}"] = v["all"]
-            flat[f"extrap/tail_seq{L}"] = v["tail"]
-        base = ex.get(min(ex)) if ex else None               # the trained length is the reference
-        if base:
-            L0 = min(ex)
-            for L, v in ex.items():
-                if L != L0:
-                    # + = WORSE than at the trained length. The tail delta is the real signal.
-                    flat[f"extrap/delta_seq{L}"] = v["all"] - base["all"]
-                    flat[f"extrap/delta_tail_seq{L}"] = v["tail"] - base["tail"]
+        # PRINTED ONLY -- deliberately not logged to W&B. Both of these conflate "past the trained
+        # length" with "more context available", and on the 2000-step baseline they said 4096 was
+        # 0.52 BETTER while the controlled test said it was 0.087 worse. A misleading number given
+        # its own panel gets read as a result; kept in the log as a diagnostic, nothing more.
         print("\n[extrapolation] all-positions:  " + "  ".join(
             f"seq{L}={v['all']:.4f}" for L, v in sorted(ex.items())), flush=True)
         print("[extrapolation] last-512 (RANK ON THIS): " + "  ".join(
