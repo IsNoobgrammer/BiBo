@@ -65,7 +65,9 @@ except Exception:
 # The kernel's mode set is now {none, rms}; the bounded transforms are gone. "raw" keeps c as the
 # unconstrained parameter; "rms" additionally normalises the stream c multiplies, which is what
 # removes the need for a cage on c at all.
-_CARRY_MODE = {"raw": "none", "rms": "rms"}
+# "unbounded" is the original name for "raw" -- same math, c = theta with no
+# transform. Both accepted so older configs and launch scripts keep working.
+_CARRY_MODE = {"raw": "none", "unbounded": "none", "rms": "rms"}
 # How the depth scores become weights. BOTH are convex combinations -- the weights sum to 1
 # either way, so this does not change whether the read is a weighted average, only the map onto
 # the simplex. See apply_attention_residual for what signorm buys (the shift dimension).
@@ -258,7 +260,7 @@ class BiBoDecoderLayer(nn.Module):
         self.attn_res_carry_scale = _cs_mode
         # both surviving modes start c at EXACTLY 1.0, so each is a strict generalization of
         # plain carry and step 0 is bit-identical to it
-        _init = {"raw": 1.0, "rms": 1.0}.get(_cs_mode)
+        _init = {"raw": 1.0, "unbounded": 1.0, "rms": 1.0}.get(_cs_mode)
         # PER-CHANNEL c. Shape (hidden,) instead of (1,), every entry at the same init, so it is a
         # strict generalization of the scalar and step 0 is bit-identical to it.
         # It is real capacity, not a reparameterization: attn_output feeds TWO consumers -- the

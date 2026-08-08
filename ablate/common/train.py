@@ -281,7 +281,7 @@ def main():
     # the stream it multiplies is RMS-normalised, which is what removes the need to bound c: the
     # bounded transforms existed only to stop an unbounded c running away (7936 by step 400).
     ap.add_argument("--attn_res_carry_scale",
-                    choices=["none", "raw", "rms"], default="none")
+                    choices=["none", "raw", "unbounded", "rms"], default="none")
     # Third, OFF-SIMPLEX term on the carry write: h = attn_read + c*attn_out + d*embedding.
     # d is per-layer, learnable, init 0 -> strict generalization of plain carry. Tests whether
     # layer 1's negative XSA alpha is a workaround for a missing token-identity channel.
@@ -902,7 +902,7 @@ def main():
                 # set changed to {none, raw, rms} the new names fell through to it and the log
                 # reported 2*tanh(1.0) = 1.523 for a c that was exactly 1.0. Keyed explicitly now,
                 # and it RAISES on an unknown mode rather than silently transforming.
-                assert _mode in ("none", "raw", "rms"), (
+                assert _mode in ("none", "raw", "unbounded", "rms"), (
                     f"attn_res_carry_scale={_mode!r} has no logging transform; add one rather "
                     f"than let s= report a value the model never used")
                 _xf = lambda x: x
