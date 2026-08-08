@@ -112,8 +112,18 @@ def _holdout_rows(dataset, n_tokens, n_seqs, device, field="input_ids"):
 
 
 @torch.no_grad()
-def extrapolation(model, dataset, ce_fn, amp, device, lens=(1024, 2048, 4096), n_seqs=4, pad_id=0):
-    """Val CE at each context length. Returns {length: loss}, skipping lengths the corpus cannot fill.
+def extrapolation(model, dataset, ce_fn, amp, device, lens=(1024, 2048, 4096), n_seqs=4, pad_id=0,
+                  tail=512):
+    """Val CE at each context length. Returns {length: {"all": x, "tail": y}}.
+
+    TWO numbers per length, because the obvious one is confounded. `all` averages every predicted
+    position, so a longer context necessarily includes more LATE positions, which are easier simply
+    because more context precedes them. That makes `all` fall with length even for a model whose
+    extrapolation is mediocre -- it is measuring position-in-document, not length generalisation.
+
+    `tail` averages only the final `tail` positions, so each length is scored where it is actually
+    extrapolating: at L=1024 that is in-distribution, at L=4096 it is 4x beyond anything RoPE saw.
+    A model whose positional scheme breaks shows it as tail RISING with length. Rank on `tail`.
 
     A 4096-token row yields 4095 predicted positions at length 4096 (the last token has no target),
     so `lens` is capped by the row length rather than silently wrapping into the next document --
@@ -128,12 +138,17 @@ def extrapolation(model, dataset, ce_fn, amp, device, lens=(1024, 2048, 4096), n
             batch = _holdout_rows(dataset, min(L + 1, 4096), n_seqs, device)
             if batch is None:
                 continue
-            inp, tgt = batch[:, :-1], batch[:, 1:].reshape(-1)
+            inp, tgt = batch[:, :-1], batch[:, 1:]
             with amp:
                 h = model.model(input_ids=inp, use_cache=False)
                 h = h.last_hidden_state if hasattr(h, "last_hidden_state") else h[0]
-                out[L] = float(ce_fn(h.reshape(-1, h.shape[-1]), model.lm_head.weight, tgt,
-                                     ignore_index=int(pad_id)))
+                w = model.lm_head.weight
+                rec = {"all": float(ce_fn(h.reshape(-1, h.shape[-1]), w, tgt.reshape(-1),
+                                          ignore_index=int(pad_id)))}
+                t = min(tail, h.shape[1])
+                rec["tail"] = float(ce_fn(h[:, -t:].reshape(-1, h.shape[-1]), w,
+                                          tgt[:, -t:].reshape(-1), ignore_index=int(pad_id)))
+            out[L] = rec
     finally:
         if was_training:
             model.train()
@@ -167,18 +182,26 @@ def run(model, tok, dataset, ce_fn, amp, device="cuda", wb=None, max_new=96, n_s
 
     try:
         ex = extrapolation(model, dataset, ce_fn, amp, device, lens=lens, n_seqs=n_seqs)
-        for L, v in ex.items():
-            flat[f"extrap/seq{L}"] = v                       # one W&B panel per length, never averaged
-        base = ex.get(1024)
+        for L, v in ex.items():                              # one W&B panel per length, never averaged
+            flat[f"extrap/seq{L}"] = v["all"]
+            flat[f"extrap/tail_seq{L}"] = v["tail"]
+        base = ex.get(min(ex)) if ex else None               # the trained length is the reference
         if base:
+            L0 = min(ex)
             for L, v in ex.items():
-                if L != 1024:
-                    flat[f"extrap/delta_seq{L}"] = v - base  # + = worse than at trained length
-        print("\n[extrapolation] " + "  ".join(f"seq{L}={v:.4f}" for L, v in sorted(ex.items())),
-              flush=True)
+                if L != L0:
+                    # + = WORSE than at the trained length. The tail delta is the real signal.
+                    flat[f"extrap/delta_seq{L}"] = v["all"] - base["all"]
+                    flat[f"extrap/delta_tail_seq{L}"] = v["tail"] - base["tail"]
+        print("\n[extrapolation] all-positions:  " + "  ".join(
+            f"seq{L}={v['all']:.4f}" for L, v in sorted(ex.items())), flush=True)
+        print("[extrapolation] last-512 (RANK ON THIS): " + "  ".join(
+            f"seq{L}={v['tail']:.4f}" for L, v in sorted(ex.items())), flush=True)
         if base and len(ex) > 1:
-            print("[extrapolation] delta vs trained 1024: " + "  ".join(
-                f"seq{L}={v - base:+.4f}" for L, v in sorted(ex.items()) if L != 1024), flush=True)
+            L0 = min(ex)
+            print(f"[extrapolation] tail delta vs trained {L0}: " + "  ".join(
+                f"seq{L}={v['tail'] - base['tail']:+.4f}"
+                for L, v in sorted(ex.items()) if L != L0), flush=True)
     except Exception as e:
         print(f"[final_report] extrapolation FAILED: {type(e).__name__}: {e}", flush=True)
 

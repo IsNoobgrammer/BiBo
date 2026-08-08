@@ -80,6 +80,9 @@ def main():
     ap.add_argument("result_json")
     ap.add_argument("--wandb_project", default="")
     ap.add_argument("--run_tag", default="")
+    # attach to an EXISTING run; taken from result.json when present, this is the override for
+    # checkpoints trained before the id was recorded
+    ap.add_argument("--wandb_id", default="")
     ap.add_argument("--sample_tokens", type=int, default=96)
     ap.add_argument("--extrap_lens", default="1024,2048,4096")
     ap.add_argument("--n_seqs", type=int, default=4)
@@ -93,9 +96,21 @@ def main():
     wb = None
     if a.wandb_project:
         import wandb
-        wb = wandb.init(project=a.wandb_project,
-                        name=(a.run_tag or os.path.basename(a.result_json).replace("_result.json", "")) + "-report",
-                        config=vars(c))
+        with open(a.result_json) as f:
+            _res = json.load(f)
+        rid = a.wandb_id or _res.get("wandb_id")
+        if rid:
+            # RESUME the training run. A report in its own run sits next to the curves it describes
+            # instead of on them, and cannot be compared -- which is the whole reason to log it.
+            wb = wandb.init(project=a.wandb_project, id=rid, resume="must")
+            print(f"[report_ckpt] resumed W&B run {rid}", flush=True)
+        else:
+            wb = wandb.init(project=a.wandb_project,
+                            name=(a.run_tag or os.path.basename(a.result_json).replace("_result.json", "")) + "-report",
+                            config=vars(c))
+            print("[report_ckpt] WARNING: no wandb_id in the result json (run predates it) -- "
+                  "logging to a NEW run. Pass --wandb_id <id> to attach to the training run.",
+                  flush=True)
     amp = torch.autocast("cuda", torch.bfloat16)
     lens = tuple(int(x) for x in a.extrap_lens.split(",") if x.strip())
     flat = fr.run(model, tok, c.dataset, fused_linear_cross_entropy, amp, device=DEV, wb=wb,

@@ -1104,7 +1104,14 @@ def main():
         hf_futures.append(_push_hf_async(hf_api, args.hf_repo, _dir, "final", f"{run_name} final"))
     res = {"arm": args.arm, "seed": args.seed, "steps": total_steps, "tokens": total_steps * tok_per_step,
            "final_loss": loss_val, "final_loss_running": sum(_loss_hist) / len(_loss_hist), "params_total": total, "params_active": active,
-           "ckpt": ckpt, "wall_s": time.time() - t0, "eval": None, "config": vars(args)}
+           "ckpt": ckpt, "wall_s": time.time() - t0, "eval": None,
+           # the W&B run id, so report_ckpt.py can RESUME this run rather than opening a second one.
+           # A report logged to its own run cannot be compared against the training curves it
+           # describes, which is the entire point of logging it.
+           "wandb_id": (getattr(wb, "id", None) if wb else None),
+           "wandb_project": (args.wandb_project if wb else None),
+           "final_report": final_flat,
+           "config": vars(args)}
     with open(os.path.join(out_dir, f"{run_name}_result.json"), "w") as f:
         json.dump(res, f, indent=2)
     if hf_futures:                                         # drain: block until every background upload lands,
