@@ -897,9 +897,15 @@ def main():
                    if getattr(m, "attn_res_carry_theta", None) is not None]
             if _cs:
                 _mode = getattr(model.config, "attn_res_carry_scale", "none")
-                _xf = (lambda x: x) if _mode == "unbounded" else (
-                    (lambda x: 2.0 * torch.sigmoid(x)) if _mode == "sigmoid"
-                    else (lambda x: 2.0 * torch.tanh(x)))
+                # c is the RAW parameter in every surviving mode -- "rms" normalises the STREAM,
+                # not c. This chain used to end in an unguarded `else 2*tanh`, so when the mode
+                # set changed to {none, raw, rms} the new names fell through to it and the log
+                # reported 2*tanh(1.0) = 1.523 for a c that was exactly 1.0. Keyed explicitly now,
+                # and it RAISES on an unknown mode rather than silently transforming.
+                assert _mode in ("none", "raw", "rms"), (
+                    f"attn_res_carry_scale={_mode!r} has no logging transform; add one rather "
+                    f"than let s= report a value the model never used")
+                _xf = lambda x: x
                 _cl = [_xf(t.detach().float().flatten()) for t in _cs]   # one entry per LAYER
                 _c = torch.cat(_cl)
                 rt.update({"train/attn_res_s_mean": _c.mean().item(),
