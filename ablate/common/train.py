@@ -281,7 +281,8 @@ def main():
     # the stream it multiplies is RMS-normalised, which is what removes the need to bound c: the
     # bounded transforms existed only to stop an unbounded c running away (7936 by step 400).
     ap.add_argument("--attn_res_carry_scale",
-                    choices=["none", "raw", "unbounded", "rms"], default="none")
+                    choices=["none", "raw", "unbounded", "rms", "sigmoid", "tanh",
+                             "sigmoid_rms", "tanh_rms"], default="none")
     # Third, OFF-SIMPLEX term on the carry write: h = attn_read + c*attn_out + d*embedding.
     # d is per-layer, learnable, init 0 -> strict generalization of plain carry. Tests whether
     # layer 1's negative XSA alpha is a workaround for a missing token-identity channel.
@@ -897,15 +898,16 @@ def main():
                    if getattr(m, "attn_res_carry_theta", None) is not None]
             if _cs:
                 _mode = getattr(model.config, "attn_res_carry_scale", "none")
-                # c is the RAW parameter in every surviving mode -- "rms" normalises the STREAM,
-                # not c. This chain used to end in an unguarded `else 2*tanh`, so when the mode
-                # set changed to {none, raw, rms} the new names fell through to it and the log
-                # reported 2*tanh(1.0) = 1.523 for a c that was exactly 1.0. Keyed explicitly now,
-                # and it RAISES on an unknown mode rather than silently transforming.
-                assert _mode in ("none", "raw", "unbounded", "rms"), (
-                    f"attn_res_carry_scale={_mode!r} has no logging transform; add one rather "
-                    f"than let s= report a value the model never used")
-                _xf = lambda x: x
+                # THE SAME map the model uses, imported rather than re-spelled. This chain was
+                # once a hand-written if/elif ending in an unguarded `else 2*tanh`; when the mode
+                # names changed, the new ones fell through to it and s= reported 2*tanh(1.0)=1.523
+                # for a c that was exactly 1.0. A second copy of a transform is a second chance to
+                # display a number the model never computed.
+                from exp.modeling_bibo import _CARRY_C
+                assert _mode in _CARRY_C, (
+                    f"attn_res_carry_scale={_mode!r} is not in _CARRY_C; s= would report a value "
+                    f"the model never used")
+                _xf = _CARRY_C[_mode]
                 _cl = [_xf(t.detach().float().flatten()) for t in _cs]   # one entry per LAYER
                 _c = torch.cat(_cl)
                 rt.update({"train/attn_res_s_mean": _c.mean().item(),

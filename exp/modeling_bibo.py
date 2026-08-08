@@ -65,9 +65,29 @@ except Exception:
 # The kernel's mode set is now {none, rms}; the bounded transforms are gone. "raw" keeps c as the
 # unconstrained parameter; "rms" additionally normalises the stream c multiplies, which is what
 # removes the need for a cage on c at all.
-# "unbounded" is the original name for "raw" -- same math, c = theta with no
-# transform. Both accepted so older configs and launch scripts keep working.
-_CARRY_MODE = {"raw": "none", "unbounded": "none", "rms": "rms"}
+# TWO ORTHOGONAL AXES, not one mode list.
+#
+#   _CARRY_C      how c is parameterised from theta.   Applied in TORCH, on the (H,) vector.
+#   _CARRY_STREAM whether the stream c multiplies is RMS-normalised. Applied in the KERNEL.
+#
+# The transform lives on the torch side ON PURPOSE. It is a function of theta -- 512 values --
+# not of the (T,H) data, so it costs one tiny op per layer. The previous kernel evaluated it
+# INSIDE the loop in fp64: at grid 8192 that is ~4.2M fp64 exp calls per launch to produce 512
+# distinct numbers, which is why "sigmoid" looked expensive when the maths is nearly free.
+# Autograd chains through it for free, so the kernel never needs a d(transform)/d(theta) rule.
+#
+# Splitting them also makes the combinations reachable: sigmoid+rms, tanh+rms, raw+rms.
+_CARRY_C = {
+    "raw": lambda t: t,
+    "unbounded": lambda t: t,                       # original name for raw
+    "rms": lambda t: t,                             # rms constrains the STREAM, not c
+    "sigmoid": lambda t: 2.0 * torch.sigmoid(t),    # (0, 2), init theta=0 -> c=1
+    "tanh": lambda t: 2.0 * torch.tanh(t),          # (-2, 2), init atanh(.5) -> c=1
+    "sigmoid_rms": lambda t: 2.0 * torch.sigmoid(t),
+    "tanh_rms": lambda t: 2.0 * torch.tanh(t),
+}
+_CARRY_STREAM = {"raw": "none", "unbounded": "none", "sigmoid": "none", "tanh": "none",
+                 "rms": "rms", "sigmoid_rms": "rms", "tanh_rms": "rms"}
 # How the depth scores become weights. BOTH are convex combinations -- the weights sum to 1
 # either way, so this does not change whether the read is a weighted average, only the map onto
 # the simplex. See apply_attention_residual for what signorm buys (the shift dimension).
@@ -260,7 +280,10 @@ class BiBoDecoderLayer(nn.Module):
         self.attn_res_carry_scale = _cs_mode
         # both surviving modes start c at EXACTLY 1.0, so each is a strict generalization of
         # plain carry and step 0 is bit-identical to it
-        _init = {"raw": 1.0, "unbounded": 1.0, "rms": 1.0}.get(_cs_mode)
+        # every mode starts c at EXACTLY 1.0, so each is a strict generalization of plain carry
+        _init = {"raw": 1.0, "unbounded": 1.0, "rms": 1.0, "sigmoid": 0.0,
+                 "sigmoid_rms": 0.0, "tanh": math.atanh(0.5),
+                 "tanh_rms": math.atanh(0.5)}.get(_cs_mode)
         # PER-CHANNEL c. Shape (hidden,) instead of (1,), every entry at the same init, so it is a
         # strict generalization of the scalar and step 0 is bit-identical to it.
         # It is real capacity, not a reparameterization: attn_output feeds TWO consumers -- the
@@ -580,15 +603,21 @@ class BiBoDecoderLayer(nn.Module):
                 assert not _has_emb, (
                     "attn_res_emb_term needs --fused_res_add false: the fused residual add is "
                     "single-stream since the embedding term was retired")
-                _mode = _CARRY_MODE[self.attn_res_carry_scale] if _m is not None else "none"
-                hidden_states = _fused_res_add(
-                    attn_read, _m if _m is not None else self.attn_res_carry_one, _ao,
-                    modes=(_mode,))
+                # c = f(theta) in TORCH: cheap on (H,), and autograd chains it without the
+                # kernel needing a derivative rule for the transform.
+                if _m is not None:
+                    _c = _CARRY_C[self.attn_res_carry_scale](_m)
+                    _mode = _CARRY_STREAM[self.attn_res_carry_scale]
+                else:
+                    _c, _mode = self.attn_res_carry_one, "none"
+                hidden_states = _fused_res_add(attn_read, _c, _ao, modes=(_mode,))
             else:
                 if self.attn_res_carry_theta is not None:
-                    _c = self.attn_res_carry_theta.float()      # raw in both modes; no transform
+                    # same two axes as the fused path, so eager and kernel cannot disagree
+                    _c = _CARRY_C[self.attn_res_carry_scale](
+                        self.attn_res_carry_theta.float())
                     _s = _ao
-                    if self.attn_res_carry_scale == "rms":
+                    if _CARRY_STREAM[self.attn_res_carry_scale] == "rms":
                         _s32 = _s.float()
                         _s = (_s32 * torch.rsqrt(_s32.pow(2).mean(-1, keepdim=True)
                                                  + 1e-6)).to(_ao.dtype)
