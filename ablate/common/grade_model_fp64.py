@@ -50,7 +50,7 @@ def main():
     cfg = dict(num_experts=8, top_k=2, special_pairs=0, use_xsa=True,
                hybrid_layer_pattern=pat, sliding_window=128, attn_res="3", attn_res_sites=1,
                attn_res_carry=True, attn_res_fp32_stream=True,
-               attn_res_carry_scale="unbounded", attn_res_emb_term=True)
+               attn_res_carry_scale="raw", attn_res_emb_term=True)
 
     torch.manual_seed(42069)
     m64, _ = build_arm("bibo_min", device="cuda", dtype=torch.float64, **cfg)

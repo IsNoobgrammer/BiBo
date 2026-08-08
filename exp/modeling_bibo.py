@@ -62,7 +62,10 @@ except Exception:
 
 # attn_res_carry_scale -> the kernel's transform code for the attn_out multiplier. "none" has no
 # theta at all (c is a hard 1.0) and is handled by the caller, not here.
-_CARRY_MODE = {"unbounded": "none", "sigmoid": "2sigmoid", "tanh": "2tanh"}
+# The kernel's mode set is now {none, rms}; the bounded transforms are gone. "raw" keeps c as the
+# unconstrained parameter; "rms" additionally normalises the stream c multiplies, which is what
+# removes the need for a cage on c at all.
+_CARRY_MODE = {"raw": "none", "rms": "rms"}
 # How the depth scores become weights. BOTH are convex combinations -- the weights sum to 1
 # either way, so this does not change whether the read is a weighted average, only the map onto
 # the simplex. See apply_attention_residual for what signorm buys (the shift dimension).
@@ -253,7 +256,9 @@ class BiBoDecoderLayer(nn.Module):
         _cs_mode = getattr(config, "attn_res_carry_scale", "none")
         _cs_mode = "none" if _cs_mode in (False, None) else str(_cs_mode)
         self.attn_res_carry_scale = _cs_mode
-        _init = {"unbounded": 1.0, "sigmoid": 0.0, "tanh": math.atanh(0.5)}.get(_cs_mode)
+        # both surviving modes start c at EXACTLY 1.0, so each is a strict generalization of
+        # plain carry and step 0 is bit-identical to it
+        _init = {"raw": 1.0, "rms": 1.0}.get(_cs_mode)
         # PER-CHANNEL c. Shape (hidden,) instead of (1,), every entry at the same init, so it is a
         # strict generalization of the scalar and step 0 is bit-identical to it.
         # It is real capacity, not a reparameterization: attn_output feeds TWO consumers -- the
@@ -566,19 +571,26 @@ class BiBoDecoderLayer(nn.Module):
                 # attn_res_carry_one is a non-persistent ones buffer, so carry_scale="none"
                 # (a hard c = 1.0) goes down the same fused path instead of forking the formula.
                 _m = self.attn_res_carry_theta
-                _pairs = [_m if _m is not None else self.attn_res_carry_one, _ao]
-                _modes = [_CARRY_MODE[self.attn_res_carry_scale] if _m is not None else "none"]
-                if _has_emb:
-                    _pairs += [self.attn_res_emb_theta, _emb]
-                    _modes.append(self.attn_res_emb_scale)
-                hidden_states = _fused_res_add(attn_read, *_pairs, modes=tuple(_modes))
+                # SINGLE STREAM. make_mlp_input now takes exactly one (theta, stream) pair -- the
+                # embedding term was retired along with the multi-stream kernel. An emb arm must
+                # run --fused_res_add false, and the assert below says so instead of letting the
+                # kernel silently drop a term the caller asked for.
+                assert not _has_emb, (
+                    "attn_res_emb_term needs --fused_res_add false: the fused residual add is "
+                    "single-stream since the embedding term was retired")
+                _mode = _CARRY_MODE[self.attn_res_carry_scale] if _m is not None else "none"
+                hidden_states = _fused_res_add(
+                    attn_read, _m if _m is not None else self.attn_res_carry_one, _ao,
+                    modes=(_mode,))
             else:
                 if self.attn_res_carry_theta is not None:
-                    _t = self.attn_res_carry_theta.float()
-                    _c = (_t if self.attn_res_carry_scale == "unbounded"
-                          else 2.0 * torch.sigmoid(_t) if self.attn_res_carry_scale == "sigmoid"
-                          else 2.0 * torch.tanh(_t))
-                    hidden_states = attn_read + _c.to(_ao.dtype) * _ao
+                    _c = self.attn_res_carry_theta.float()      # raw in both modes; no transform
+                    _s = _ao
+                    if self.attn_res_carry_scale == "rms":
+                        _s32 = _s.float()
+                        _s = (_s32 * torch.rsqrt(_s32.pow(2).mean(-1, keepdim=True)
+                                                 + 1e-6)).to(_ao.dtype)
+                    hidden_states = attn_read + _c.to(_s.dtype) * _s
                 else:
                     hidden_states = attn_read + _ao
                 if _has_emb:

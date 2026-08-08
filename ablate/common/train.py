@@ -277,8 +277,11 @@ def main():
     ap.add_argument("--attn_res_fp32_stream", type=_bool, default=False)
     # Learnable per-layer coefficient on the carry term: A_coeff = 2*sigmoid(theta), init 1.0
     # so it is a strict generalization of plain carry. Logged as cs= to get the depth profile.
+    # none = c fixed at 1 (no parameter). raw = c learnable, unconstrained. rms = c learnable AND
+    # the stream it multiplies is RMS-normalised, which is what removes the need to bound c: the
+    # bounded transforms existed only to stop an unbounded c running away (7936 by step 400).
     ap.add_argument("--attn_res_carry_scale",
-                    choices=["none", "unbounded", "sigmoid", "tanh"], default="none")
+                    choices=["none", "raw", "rms"], default="none")
     # Third, OFF-SIMPLEX term on the carry write: h = attn_read + c*attn_out + d*embedding.
     # d is per-layer, learnable, init 0 -> strict generalization of plain carry. Tests whether
     # layer 1's negative XSA alpha is a workaround for a missing token-identity channel.

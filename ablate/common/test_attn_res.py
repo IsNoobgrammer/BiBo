@@ -160,7 +160,7 @@ def main():
     ms, _ = build_arm("bibo_min", device="cpu", dtype=torch.float32, num_experts=6,
                       special_pairs=0, use_xsa=True, hybrid_layer_pattern=pattern,
                       sliding_window=128, attn_res="3", attn_res_sites=1,
-                      attn_res_carry=True, attn_res_carry_scale="unbounded")
+                      attn_res_carry=True, attn_res_carry_scale="raw")
     ms.eval()
     ms.load_state_dict(mc.state_dict(), strict=False)
     n_theta = sum(1 for n, _ in ms.named_parameters() if "attn_res_carry_theta" in n)
@@ -181,7 +181,7 @@ def main():
     me, _ = build_arm("bibo_min", device="cpu", dtype=torch.float32, num_experts=6,
                       special_pairs=0, use_xsa=True, hybrid_layer_pattern=pattern,
                       sliding_window=128, attn_res="3", attn_res_sites=1, attn_res_carry=True,
-                      attn_res_carry_scale="unbounded", attn_res_emb_term=True)
+                      attn_res_carry_scale="raw", attn_res_emb_term=True)
     me.eval()
     me.load_state_dict(ms.state_dict(), strict=False)
     ds = [(n, p) for n, p in me.named_parameters() if "attn_res_emb_theta" in n]
@@ -216,7 +216,7 @@ def main():
     #     live and per-layer, and -- because i=0 zeroes the whole product -- dL/di must be NONZERO
     #     at init, or the arm is pinned at the inert point and every other gate here is vacuous.
     _ht = dict(attn_res="3", attn_res_sites=1, attn_res_carry=True,
-               attn_res_carry_scale="unbounded", attn_res_emb_term=True,
+               attn_res_carry_scale="raw", attn_res_emb_term=True,
                attn_res_emb_site="ht", num_experts=6, special_pairs=0, use_xsa=True,
                hybrid_layer_pattern=pattern, sliding_window=128, device="cpu",
                dtype=torch.float32)

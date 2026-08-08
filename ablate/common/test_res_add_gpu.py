@@ -228,7 +228,7 @@ def gate_emb_gain():
                          hybrid_layer_pattern=pat, sliding_window=128,
                          attn_res="3", attn_res_sites=1, attn_res_carry=True,
                          attn_res_fp32_stream=False, bf16_residual_stream=True,
-                         attn_res_carry_scale="unbounded",
+                         attn_res_carry_scale="raw",
                          attn_res_emb_term=True, attn_res_emb_site="ht",
                          attn_res_emb_gain=True)
     model.train()
