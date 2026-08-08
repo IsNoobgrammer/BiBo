@@ -267,7 +267,12 @@ def run(model, tok, dataset, ce_fn, amp, device="cuda", wb=None, max_new=96, n_s
         print(f"[final_report] extrapolation FAILED: {type(e).__name__}: {e}", flush=True)
 
     try:
-        ca = context_ablation(model, dataset, ce_fn, amp, device, ctxs=lens, n_seqs=n_seqs)
+        # More rows than the other metrics on purpose: this is the number that decides whether a
+        # model should be served at long context, and n_seqs (2-4, sized for the per-step val) is
+        # too small a sample to rank runs on. One 4096-token forward over 16 rows costs a fraction
+        # of a training step.
+        ca = context_ablation(model, dataset, ce_fn, amp, device, ctxs=lens,
+                              n_seqs=max(n_seqs, 16))
         if ca:
             c0 = min(ca)
             for C, v in ca.items():
