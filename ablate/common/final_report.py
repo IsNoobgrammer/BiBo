@@ -268,8 +268,9 @@ def run(model, tok, dataset, ce_fn, amp, device="cuda", wb=None, max_new=96, n_s
             f"seq{L}={v['all']:.4f}" for L, v in sorted(ex.items())), flush=True)
         print("[extrapolation] last-512 (RANK ON THIS): " + "  ".join(
             f"seq{L}={v['tail']:.4f}" for L, v in sorted(ex.items())), flush=True)
-        if base and len(ex) > 1:
+        if len(ex) > 1:
             L0 = min(ex)
+            base = ex[L0]
             print(f"[extrapolation] tail delta vs trained {L0}: " + "  ".join(
                 f"seq{L}={v['tail'] - base['tail']:+.4f}"
                 for L, v in sorted(ex.items()) if L != L0), flush=True)
