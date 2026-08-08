@@ -58,7 +58,7 @@ _KJ, _PIN = (3.4445, -4.7750, 2.0315), (2.0, -1.5, 0.5)
 NS8 = (_KJ,) * 6 + (_PIN,) * 2
 
 
-def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, ns_dtype=torch.bfloat16,
+def build_optimizers(model, muon_lr=1e-2, adam_lr=3e-4, wd=0.1, momentum=0.95, ns_dtype=torch.bfloat16,
                      scale_mode="aurora", xorth_post=0.0, xorth_gate_ref=0.3, xorth_ema=0.95,
                      xorth_warmup_steps=0, xorth_where="post", router_adamw=False,
                      act_scale_lr=None, cautious_decay=False, vec_matrices_adamw=False,

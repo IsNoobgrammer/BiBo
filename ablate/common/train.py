@@ -394,7 +394,10 @@ def main():
     ap.add_argument("--xorth_ema", type=float, default=0.95)       # EMA decay of the persistent per-stack (E,E) gram
     ap.add_argument("--xorth_warmup_steps", type=int, default=0)   # gate xorth OFF until step > this (0 = active from step 1)
     ap.add_argument("--xorth_where", choices=["pre", "post"], default="post")  # whiten momentum PRE-NS or orthogonalized update POST-NS
-    ap.add_argument("--muon_lr", type=float, default=3e-4)
+    # 1e-2 is the BOARD LR. It used to be 3e-4 here while every launch script passed --muon_lr 0.01,
+    # so the default was dead code that read as the real setting -- an argparse default nobody runs
+    # is worse than no default. Anything not passing --muon_lr now gets what the board runs.
+    ap.add_argument("--muon_lr", type=float, default=1e-2)
     ap.add_argument("--adam_lr", type=float, default=3e-4)
     ap.add_argument("--wd", type=float, default=0.1)
     # REVERSE-COSINE wd ramp: --wd is the START, --wd_end the finish, rising while the LR decays.
@@ -472,6 +475,11 @@ def main():
     # Logged on the training log line. 0 = follow --log_every, -1 = off.
     ap.add_argument("--val_every", type=int, default=0)
     ap.add_argument("--val_seqs", type=int, default=2)            # sequences per source
+    # Skip validation until this step. At init the loss is ~11.4 (uniform over an 81920 vocab), and
+    # a single point that high pins every downstream chart's y-axis to it, flattening the range the
+    # run actually spends its life in. Purely cosmetic -- the number at step 0 is not informative,
+    # it is log(vocab). Set 0 to log from the start.
+    ap.add_argument("--val_start", type=int, default=100)
     ap.add_argument("--out", default=None)
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_project", default="polyglu-ablations")
@@ -739,7 +747,7 @@ def main():
         if val_holdout is None:
             print("[val] WARNING: no held-out shard (Hub-streamed dataset) -- val/loss is ABSENT "
                   "and only val/ext/* is logged. Nothing in-distribution ranks these arms.", flush=True)
-        print(f"[val] every {val_every} steps | val/loss=holdout"
+        print(f"[val] every {val_every} steps from step {args.val_start} | val/loss=holdout"
               f"{'' if val_holdout is None else f' {tuple(val_holdout.shape)}'} | "
               f"val/ext: {', '.join(f'{n}/{l}' for n, l, _ in val_batches)}", flush=True)
 
@@ -1022,7 +1030,8 @@ def main():
             # VALIDATION on the frozen batch. Unlike train loss this is the same text every step and
             # every arm, so it is the only number here that can rank two runs.
             val_s, val_flat = "", {}
-            if (val_holdout is not None or val_batches) and (step % val_every == 0 or step == total_steps - 1):
+            if ((val_holdout is not None or val_batches) and step >= args.val_start
+                    and (step % val_every == 0 or step == total_steps - 1)):
                 _vo, val_flat = _val.losses(model, val_holdout, val_batches,
                                             fused_linear_cross_entropy, amp,
                                             pad_id=0 if args.pad_id is None else int(args.pad_id))
