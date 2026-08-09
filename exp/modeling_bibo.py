@@ -282,11 +282,19 @@ class BiBoDecoderLayer(nn.Module):
         #   "sigmoid"    s = 2*sigmoid(theta) init th=0    range (0,2)
         #   "tanh"       s = 2*tanh(theta)    init th=atanh(.5)  range (-2,2)
         #
-        # Unbounded goes first ON PURPOSE and is not meant to ship: it is the only variant that
-        # can tell us WHERE the model wants s to sit, which is what picks the bound. If min/max
-        # settle inside (0,2) then sigmoid is the right cage; if they run past it, a cage at 2
-        # would be clipping the answer and the question changes. Every unbounded scale we have
-        # tried has eventually run away, so this is a measurement, not a candidate.
+        # RAW IS THE DEFAULT (Aug 9 2026), and the paragraph that used to live here was wrong.
+        # It said "every unbounded scale we have tried has eventually run away, so this is a
+        # measurement, not a candidate". Measured over 2000 steps, raw's max c goes
+        # 1.39 -> 3.22 -> 4.29 -> 4.38 -> 4.38 and is FLAT from ~step 1400. It converges.
+        # Meanwhile the bounded modes end pressed against their ceiling -- sigmoid 1.76 of 2.0
+        # (88%), tanh 1.91 of 2.0 (95%) -- so the cage BINDS, and the (0,2) it was set to
+        # "brackets the measured static range [0.18, 2.13]" is wrong by 2x against the 4.38 the
+        # unconstrained run actually wants.
+        # Quality cannot separate them: the one comparison in the round not straddling a kernel
+        # rewrite is raw 3.6055 vs tanh 3.6109 at the same seed -- 0.005, null. The sigmoid arm
+        # that looked like a winner (3.5847) ran on the pre-rewrite kernel and is not comparable;
+        # on current code sigmoid sits at 3.6191. So this is a tie, and raw wins it by being the
+        # one that needs no transform, no bound, and no justification.
         _cs_mode = getattr(config, "attn_res_carry_scale", "none")
         _cs_mode = "none" if _cs_mode in (False, None) else str(_cs_mode)
         self.attn_res_carry_scale = _cs_mode
