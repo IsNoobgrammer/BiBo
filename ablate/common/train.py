@@ -282,7 +282,7 @@ def main():
     # bounded transforms existed only to stop an unbounded c running away (7936 by step 400).
     ap.add_argument("--attn_res_carry_scale",
                     choices=["none", "raw", "unbounded", "rms", "sigmoid", "tanh",
-                             "sigmoid_rms", "tanh_rms"], default="none")
+                             "sigmoid_rms", "tanh_rms", "slope05", "slope15"], default="none")
     # Third, OFF-SIMPLEX term on the carry write: h = attn_read + c*attn_out + d*embedding.
     # d is per-layer, learnable, init 0 -> strict generalization of plain carry. Tests whether
     # layer 1's negative XSA alpha is a workaround for a missing token-identity channel.

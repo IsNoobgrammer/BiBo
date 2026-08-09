@@ -85,9 +85,21 @@ _CARRY_C = {
     "tanh": lambda t: 2.0 * torch.tanh(t),          # (-2, 2), init atanh(.5) -> c=1
     "sigmoid_rms": lambda t: 2.0 * torch.sigmoid(t),
     "tanh_rms": lambda t: 2.0 * torch.tanh(t),
+    # SLOPE FAMILY: c = 1 + s*(theta-1), theta init 1 -> c=1, dc/dtheta = s, UNBOUNDED.
+    # These exist to separate the two things sigmoid/tanh confound. Measured at seed 42069, val
+    # over steps 1575-2000 orders by slope at init, NOT by boundedness:
+    #     2*sigmoid  slope 0.50  3.5847     tanh  slope 1.50  3.6109
+    #     raw        slope 1.00  3.6055     (tanh is bounded like sigmoid and still lost)
+    # theta is AdamW-optimised, and Adam's update is gradient-SCALE invariant: |d_theta| ~ lr
+    # regardless of s. So s does not change how fast theta moves -- it changes how far c moves per
+    # unit of theta, |dc| = s*|d_theta|. That is the effective LR on c, and it is the whole claim.
+    # If slope05 reproduces sigmoid, the bound is decoration. If it reproduces raw, it is not.
+    "slope05": lambda t: 0.5 * t + 0.5,             # slope 0.5, matches sigmoid at c=1
+    "slope15": lambda t: 1.5 * t - 0.5,             # slope 1.5, matches tanh at c=1
 }
 _CARRY_STREAM = {"raw": "none", "unbounded": "none", "sigmoid": "none", "tanh": "none",
-                 "rms": "rms", "sigmoid_rms": "rms", "tanh_rms": "rms"}
+                 "rms": "rms", "sigmoid_rms": "rms", "tanh_rms": "rms",
+                 "slope05": "none", "slope15": "none"}
 # How the depth scores become weights. BOTH are convex combinations -- the weights sum to 1
 # either way, so this does not change whether the read is a weighted average, only the map onto
 # the simplex. See apply_attention_residual for what signorm buys (the shift dimension).
@@ -283,7 +295,8 @@ class BiBoDecoderLayer(nn.Module):
         # every mode starts c at EXACTLY 1.0, so each is a strict generalization of plain carry
         _init = {"raw": 1.0, "unbounded": 1.0, "rms": 1.0, "sigmoid": 0.0,
                  "sigmoid_rms": 0.0, "tanh": math.atanh(0.5),
-                 "tanh_rms": math.atanh(0.5)}.get(_cs_mode)
+                 "tanh_rms": math.atanh(0.5),
+                 "slope05": 1.0, "slope15": 1.0}.get(_cs_mode)
         # PER-CHANNEL c. Shape (hidden,) instead of (1,), every entry at the same init, so it is a
         # strict generalization of the scalar and step 0 is bit-identical to it.
         # It is real capacity, not a reparameterization: attn_output feeds TWO consumers -- the
