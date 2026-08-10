@@ -32,6 +32,8 @@ class BiBoConfig(PretrainedConfig):
         rope_theta=None,
         rope_scaling=None,
         partial_rotary_factor=0.334,
+        swa_rope_theta=None,                 # None -> rope_theta. Sliding-window layers only.
+        swa_partial_rotary_factor=None,      # None -> partial_rotary_factor. 0.0 -> NoPE.
         pad_token_id=None,
         bos_token_id=0,
         eos_token_id=0,
@@ -140,8 +142,16 @@ class BiBoConfig(PretrainedConfig):
 
         self.bias_update_threshold = bias_update_threshold if bias_update_threshold is not None else 8000
 
+        # NTK IS OFF BY DEFAULT (Aug 11 2026). It used to default to {"type": "dynamic"}, with
+        # max_position_embeddings=2048 as the reference length. That is not inert: at eval the
+        # base silently rescaled, e.g. seq 4095 -> scale 4095/2048 = 2.0 -> base 10000 * 2^(42/40)
+        # ~= 20700. So ctxabl's ctx1024/ctx2048 ran at base 10000 and ctx4095 at ~20700 -- the
+        # extrapolation metric was comparing two different models, and the stretch was applied to
+        # the sliding-window layers too, which never see past `sliding_window` tokens and only
+        # lose local resolution for it. Production splits this the other way: Motif 3 extends
+        # only the full-attention layers and leaves the windowed ones on local RoPE.
         if self.rope_scaling is None:
-            self.rope_scaling = {"type": "dynamic", "factor": 1.0}
+            self.rope_scaling = {"type": "none", "factor": 1.0}
 
         self.mlp_only_layers = (
             mlp_only_layers if mlp_only_layers is not None
@@ -159,6 +169,23 @@ class BiBoConfig(PretrainedConfig):
         self.head_dim = self.hidden_size // self.num_attention_heads
         _rope_dim = round(self.partial_rotary_factor * self.head_dim)
         self.rope_dim = _rope_dim - (_rope_dim % 2)
+        # SEPARATE ROPE FOR SLIDING vs FULL LAYERS. A window-W layer only ever resolves relative
+        # distances <= W, a full layer resolves the whole context, so they want different spectra.
+        # Every shipped SWA model splits this: MiMo V2.5 Pro swa_rope_theta 10k / rope_theta 10M at
+        # window 128, Gemma 3 rope_local_base_freq 10k / rope_theta 1M at window 1024, Muse Glimmer
+        # layer_rope_theta 500k on sliding and 0 (NoPE) on full.
+        #   rope_theta / partial_rotary_factor    -> FULL-attention (global) layers
+        #   swa_rope_theta / swa_partial_rotary   -> sliding-window (local) layers
+        # partial_rotary_factor 0.0 means NoPE for that layer type: no rotation at all, the head
+        # passes through whole. Note the factor sets rope_dim, which is also the exponent
+        # denominator in base^(-2i/rope_dim), so it coarsens the SAMPLING of the 2*pi .. 2*pi*base
+        # spectrum rather than truncating its range.
+        self.swa_rope_theta = self.rope_theta if swa_rope_theta is None else float(swa_rope_theta)
+        _swa_prf = (self.partial_rotary_factor if swa_partial_rotary_factor is None
+                    else float(swa_partial_rotary_factor))
+        self.swa_partial_rotary_factor = _swa_prf
+        _swa_rope_dim = round(_swa_prf * self.head_dim)
+        self.swa_rope_dim = _swa_rope_dim - (_swa_rope_dim % 2)
 
         if self.hidden_size % self.num_attention_heads != 0:
             raise ValueError(
@@ -177,10 +204,21 @@ class BiBoConfig(PretrainedConfig):
                 f"leaves {self.num_glu_experts} GLU experts; need at least 1. Raise "
                 f"num_routed_experts or lower special_expert_pairs."
             )
-        if self.rope_dim < 2:
+        # 0 is legal now and MEANS NoPE for that layer type -- Muse Glimmer ships exactly this
+        # (layer_rope_theta 0 on its full-attention layers). Anything in (0, 2) is still an error:
+        # it reads as "a little RoPE" but a single rotary dim is not expressible.
+        for _n, _d, _f in (("", self.rope_dim, self.partial_rotary_factor),
+                           ("swa_", self.swa_rope_dim, self.swa_partial_rotary_factor)):
+            if _d != 0 and _d < 2:
+                raise ValueError(
+                    f"{_n}partial_rotary_factor={_f} gives {_n}rope_dim={_d} "
+                    f"(head_dim={self.head_dim}); need 0 (NoPE) or at least 2 rotary dims."
+                )
+        if self.rope_dim == 0 and self.swa_rope_dim == 0:
             raise ValueError(
-                f"partial_rotary_factor={self.partial_rotary_factor} gives rope_dim={self.rope_dim} "
-                f"(head_dim={self.head_dim}); need at least 2 rotary dims."
+                "both partial_rotary_factor and swa_partial_rotary_factor are 0, so NO layer gets "
+                "any positional signal. That is a fully NoPE model, not a rope ablation -- if you "
+                "mean it, say so explicitly rather than reaching it by setting two factors to 0."
             )
         if self.norm_topk_prob and self.norm_topk_prob not in NORM_TOPK_MODES:
             raise ValueError(

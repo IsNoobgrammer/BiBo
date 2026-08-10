@@ -1,6 +1,6 @@
 """BiBo modeling components"""
 from .norm import BiBoRMSNorm
-from .embed import BiBoRotaryEmbedding, apply_rotary_pos_emb, rotate_half
+from .embed import BiBoRotaryEmbedding, DualRotaryEmbedding, apply_rotary_pos_emb, rotate_half
 from .attn import BiBoAttention, repeat_kv
 from .ffn import (
     BiBoMLP,
@@ -17,6 +17,7 @@ __all__ = [
     'BiBoRMSNorm',
     # Embeddings
     'BiBoRotaryEmbedding',
+    'DualRotaryEmbedding',
     'apply_rotary_pos_emb',
     'rotate_half',
     # Attention

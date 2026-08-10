@@ -4,7 +4,7 @@ from torch import nn
 from typing import Optional
 from transformers.utils.generic import maybe_autocast
 
-__all__ = ['BiBoRotaryEmbedding', 'apply_rotary_pos_emb', 'rotate_half']
+__all__ = ['BiBoRotaryEmbedding', 'DualRotaryEmbedding', 'apply_rotary_pos_emb', 'rotate_half']
 
 
 def rotate_half(x):
@@ -99,3 +99,43 @@ class BiBoRotaryEmbedding(nn.Module):
             sin = emb.sin() * self.attention_scaling
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+class DualRotaryEmbedding(nn.Module):
+    """cos/sin for FULL-attention and SLIDING-window layers, which need different spectra.
+
+    A window-W layer only ever resolves relative distances <= W; a full-attention layer resolves
+    the whole context. Every shipped SWA model splits this (MiMo V2.5 Pro 10k/10M at window 128,
+    Gemma 3 10k/1M at window 1024, Muse Glimmer 500k local and 0 = NoPE global), so the two layer
+    types get their own base AND their own rotary width.
+
+    forward() returns ``(global_pair, local_pair)``; each entry is a ``(cos, sin)`` tuple, or
+    ``None`` when that layer type is NoPE (rope_dim 0). Consumers index with ``is_swa``.
+    The two share one underlying module when base and width match, so the common case costs
+    exactly what a single BiBoRotaryEmbedding cost before.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        rt = config.rope_scaling["type"]
+        sf = config.rope_scaling.get("factor", 1.0)
+        mp = config.max_position_embeddings
+
+        def _mk(dim, base):
+            if dim == 0:                       # NoPE for this layer type
+                return None
+            return BiBoRotaryEmbedding(dim, max_position_embeddings=mp, base=base,
+                                       rope_type=rt, scaling_factor=sf)
+
+        self.glob = _mk(config.rope_dim, config.rope_theta)
+        self._shared = (config.swa_rope_dim == config.rope_dim
+                        and config.swa_rope_theta == config.rope_theta)
+        self.local = None if self._shared else _mk(config.swa_rope_dim, config.swa_rope_theta)
+
+    @torch.no_grad()
+    def forward(self, x, position_ids, seq_len=None):
+        g = None if self.glob is None else self.glob(x, position_ids, seq_len=seq_len)
+        if self._shared:
+            return (g, g)
+        l = None if self.local is None else self.local(x, position_ids, seq_len=seq_len)
+        return (g, l)

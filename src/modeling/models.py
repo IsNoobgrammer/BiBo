@@ -17,7 +17,7 @@ from transformers.utils import logging
 
 from src.configuration_bibo import BiBoConfig
 from .norm import BiBoRMSNorm
-from .embed import BiBoRotaryEmbedding
+from .embed import BiBoRotaryEmbedding, DualRotaryEmbedding
 from .layers import BiBoDecoderLayer
 
 logger = logging.get_logger(__name__)
@@ -81,13 +81,10 @@ class BiBoModel(BiBoPreTrainedModel):
         self.embed_norm = (BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
                            if getattr(config, "exp_post_embed_norm", False) else None)
         # rope_dim, NOT head_dim — cos/sin cover only the rotated slice of each head.
-        self.rotary_emb = BiBoRotaryEmbedding(
-            config.rope_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-            rope_type=config.rope_scaling["type"],
-            scaling_factor=config.rope_scaling.get("factor", 1.0),
-        )
+        # Dual: full-attention layers and sliding-window layers get their own base and rotary
+        # width. Collapses to a single module when the two configs match, so the default costs
+        # nothing extra. Returns (global_pair, local_pair); attention indexes it with is_swa.
+        self.rotary_emb = DualRotaryEmbedding(config)
         self.gradient_checkpointing = False
         self.post_init()
 
