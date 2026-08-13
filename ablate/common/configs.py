@@ -194,8 +194,6 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
         rms_norm_eps=SHARED["rms_norm_eps"],
         rope_theta=(rope_theta if rope_theta is not None else SHARED["rope_theta"]),
         swa_rope_theta=swa_rope_theta,
-        **({} if partial_rotary_factor is None
-           else {"partial_rotary_factor": partial_rotary_factor}),
         swa_partial_rotary_factor=swa_partial_rotary_factor,
         tie_word_embeddings=SHARED["tie_word_embeddings"], norm_topk_prob=SHARED["norm_topk_prob"],
         # --- the ablation delta: radial-NormSiLU experts + partial RoPE ---
@@ -203,7 +201,8 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
         special_expert_pairs=special_pairs,
         pos_identity_expert=pos_identity_expert,
         neg_identity_expert=neg_identity_expert,
-        partial_rotary_factor=PARTIAL_ROPE,
+        partial_rotary_factor=(PARTIAL_ROPE if partial_rotary_factor is None
+                               else partial_rotary_factor),
         # --- everything else stripped to Qwen-equivalence ---
         use_xsa=use_xsa, xsa_alpha_init=xsa_alpha_init,
         hybrid_layer_pattern=hybrid_layer_pattern,
