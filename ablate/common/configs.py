@@ -125,8 +125,7 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          pos_identity_expert=True, neg_identity_expert=True,
                          top_k=None, moe_intermediate_size=None, num_shared_experts=0,
                          hybrid_layer_pattern=None, sliding_window=128,
-                         swa_qk_norm=True, rope_theta=None, swa_rope_theta=None,
-                         partial_rotary_factor=None, swa_partial_rotary_factor=None,
+                         swa_qk_norm=True, rope_theta=None,
                          attn_res="off", attn_res_sites=2,
                          attn_res_carry=False, attn_res_fp32_stream=False,
                          attn_res_carry_scale="none",
@@ -191,19 +190,12 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
         max_position_embeddings=SHARED["max_position_embeddings"], mlp_only_layers=SHARED["mlp_only_layers"],
         rms_norm_eps=SHARED["rms_norm_eps"],
         rope_theta=(rope_theta if rope_theta is not None else SHARED["rope_theta"]),
-        swa_rope_theta=swa_rope_theta,
-        **({} if swa_partial_rotary_factor is None
-           else {"swa_partial_rotary_factor": swa_partial_rotary_factor}),
         tie_word_embeddings=SHARED["tie_word_embeddings"], norm_topk_prob=SHARED["norm_topk_prob"],
         # --- the ablation delta: radial-NormSiLU experts + split RoPE ---
         num_routed_experts=(num_experts or SHARED["num_experts"]),
         special_expert_pairs=special_pairs,
         pos_identity_expert=pos_identity_expert,
         neg_identity_expert=neg_identity_expert,
-        # Rope defaults live in BiBoConfig now (global NoPE / local full RoPE) -- pass through
-        # only when an arm overrides, so there is ONE place the default is written down.
-        **({} if partial_rotary_factor is None
-           else {"partial_rotary_factor": partial_rotary_factor}),
         # --- everything else stripped to Qwen-equivalence ---
         use_xsa=use_xsa, xsa_alpha_init=xsa_alpha_init,
         hybrid_layer_pattern=hybrid_layer_pattern,

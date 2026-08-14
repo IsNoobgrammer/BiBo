@@ -17,7 +17,7 @@ from transformers.utils import logging
 
 from src.configuration_bibo import BiBoConfig
 from .norm import BiBoRMSNorm
-from .embed import BiBoRotaryEmbedding, DualRotaryEmbedding
+from .embed import BiBoRotaryEmbedding
 from .layers import BiBoDecoderLayer
 
 logger = logging.get_logger(__name__)
@@ -80,11 +80,8 @@ class BiBoModel(BiBoPreTrainedModel):
         # unchanged otherwise. self.norm (pre-LM-head) is always present either way.
         self.embed_norm = (BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
                            if getattr(config, "exp_post_embed_norm", False) else None)
-        # rope_dim, NOT head_dim — cos/sin cover only the rotated slice of each head.
-        # Dual: full-attention layers and sliding-window layers get their own base and rotary
-        # width. Collapses to a single module when the two configs match, so the default costs
-        # nothing extra. Returns (global_pair, local_pair); attention indexes it with is_swa.
-        self.rotary_emb = DualRotaryEmbedding(config)
+        # ONE rotary, full head_dim, used by the windowed layers only (global layers are NoPE).
+        self.rotary_emb = BiBoRotaryEmbedding(config.head_dim, base=config.rope_theta)
         self.gradient_checkpointing = False
         self.post_init()
 
@@ -172,8 +169,7 @@ class BiBoModel(BiBoPreTrainedModel):
             hidden_states = hidden_states.to(torch.bfloat16)
 
         # seq_len as a host int keeps the dynamic-NTK path free of a per-step GPU sync / graph break.
-        position_embeddings = self.rotary_emb(
-            hidden_states, position_ids, seq_len=past_seen_tokens + seq_length)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None

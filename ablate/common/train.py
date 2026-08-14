@@ -370,19 +370,9 @@ def main():
     # QK-norm on the WINDOWED layers only (global layers always keep it). False = the arm that
     # asks whether a 128-token span already bounds logits well enough to make it redundant.
     ap.add_argument("--swa_qk_norm", type=_bool, default=True)
-    # RoPE, split by layer type. A window-W layer only resolves relative distances <= W while a
-    # full-attention layer resolves the whole context, so they want different spectra -- every
-    # shipped SWA model splits it (MiMo 10k local / 10M global at window 128, Gemma 3 10k / 1M at
-    # window 1024, Muse Glimmer 500k local and 0 = NoPE global).
-    #   --rope_theta / --partial_rotary      -> FULL-attention (global) layers
-    #   --swa_rope_theta / --swa_partial_rotary -> sliding-window (local) layers
-    # A partial-rotary factor of 0 means NoPE for that layer type. Unset (None) inherits: theta
-    # from --rope_theta, factor from --partial_rotary. NTK is OFF by default now, so these are
-    # the only things that set the rotary spectrum.
+    # Positional encoding is FIXED: NoPE on full-attention layers, full RoPE on windowed ones.
+    # Not a knob -- the rope round settled it. This is only the base for the windowed layers.
     ap.add_argument("--rope_theta", type=float, default=None)
-    ap.add_argument("--swa_rope_theta", type=float, default=None)
-    ap.add_argument("--partial_rotary", type=float, default=None)
-    ap.add_argument("--swa_partial_rotary", type=float, default=None)
     # XSA is part of the default stack now (learnable per-head alpha, init 0). BooleanOptionalAction
     # so the existing `--use_xsa` spelling still parses and `--no-use_xsa` is the ablation.
     ap.add_argument("--use_xsa", action=argparse.BooleanOptionalAction, default=True)
@@ -583,9 +573,6 @@ def main():
                            hybrid_layer_pattern=_swa_pat, sliding_window=_win,
                            swa_qk_norm=args.swa_qk_norm,
                            rope_theta=args.rope_theta,
-                           swa_rope_theta=args.swa_rope_theta,
-                           partial_rotary_factor=args.partial_rotary,
-                           swa_partial_rotary_factor=args.swa_partial_rotary,
                            attn_res=args.attn_res, attn_res_sites=args.attn_res_sites,
                            attn_res_carry=args.attn_res_carry,
                            attn_res_fp32_stream=args.attn_res_fp32_stream,
@@ -683,15 +670,7 @@ def main():
                 + (f"_swa{args.swa_pattern}w{str(args.sliding_window).replace(',', '-')}"
                    if args.swa_pattern != "none" else "")
                 + ("_noqkn" if args.swa_pattern != "none" and not args.swa_qk_norm else "")
-                # rope tag only when a rope knob is set, so every prior run name is unchanged.
-                # "n" = NoPE (factor 0); theta in k so 1e6 reads rt1000k not rt1000000.0
-                + ("".join(
-                    [f"_rt{args.rope_theta/1000:g}k" if args.rope_theta else "",
-                     f"_srt{args.swa_rope_theta/1000:g}k" if args.swa_rope_theta else "",
-                     ("_prn" if args.partial_rotary == 0 else f"_pr{args.partial_rotary:g}")
-                     if args.partial_rotary is not None else "",
-                     ("_sprn" if args.swa_partial_rotary == 0 else f"_spr{args.swa_partial_rotary:g}")
-                     if args.swa_partial_rotary is not None else ""]))
+                + (f"_rt{args.rope_theta/1000:g}k" if args.rope_theta else "")
                 # activation is an axis again; an untagged silu arm would overwrite the radial
                 # control's ckpt/_result.json on the same seed+experts
                 + (f"_act{args.act}" if args.act != "radial" else "")

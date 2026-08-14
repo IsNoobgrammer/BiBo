@@ -29,11 +29,7 @@ class BiBoConfig(PretrainedConfig):
         hybrid_layer_pattern=None,
         sliding_window=128,
         swa_qk_norm=True,
-        rope_theta=None,
-        rope_scaling=None,
-        partial_rotary_factor=0.0,           # FULL-attention layers: 0.0 = NoPE (the default)
-        swa_rope_theta=None,                 # None -> rope_theta. Sliding-window layers only.
-        swa_partial_rotary_factor=1.0,       # sliding-window layers: 1.0 = full RoPE (default)
+        rope_theta=None,                     # base for the WINDOWED layers; global layers are NoPE
         pad_token_id=None,
         bos_token_id=0,
         eos_token_id=0,
@@ -97,8 +93,6 @@ class BiBoConfig(PretrainedConfig):
         # QK-norm anywhere, Gemma 4 applies it on every layer; this flag tests the middle.
         self.swa_qk_norm = swa_qk_norm
 
-        self.rope_scaling = rope_scaling
-        self.partial_rotary_factor = partial_rotary_factor
 
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
@@ -142,17 +136,6 @@ class BiBoConfig(PretrainedConfig):
 
         self.bias_update_threshold = bias_update_threshold if bias_update_threshold is not None else 8000
 
-        # NTK IS OFF BY DEFAULT (Aug 11 2026). It used to default to {"type": "dynamic"}, with
-        # max_position_embeddings=2048 as the reference length. That is not inert: at eval the
-        # base silently rescaled, e.g. seq 4095 -> scale 4095/2048 = 2.0 -> base 10000 * 2^(42/40)
-        # ~= 20700. So ctxabl's ctx1024/ctx2048 ran at base 10000 and ctx4095 at ~20700 -- the
-        # extrapolation metric was comparing two different models, and the stretch was applied to
-        # the sliding-window layers too, which never see past `sliding_window` tokens and only
-        # lose local resolution for it. Production splits this the other way: Motif 3 extends
-        # only the full-attention layers and leaves the windowed ones on local RoPE.
-        if self.rope_scaling is None:
-            self.rope_scaling = {"type": "none", "factor": 1.0}
-
         self.mlp_only_layers = (
             mlp_only_layers if mlp_only_layers is not None
             else sorted({0, num_hidden_layers - 1})
@@ -166,39 +149,13 @@ class BiBoConfig(PretrainedConfig):
             **kwargs,
         )
 
+        # POSITIONAL ENCODING IS FIXED, NOT CONFIGURABLE (Aug 14 2026). Full-attention layers get
+        # NoPE; sliding-window layers get full RoPE over the whole head_dim. There is no partial
+        # rotary fraction, no per-layer-type width, no second base and no NTK scaling -- each of
+        # those was a knob whose value the measurement settled, so it is spelled in the code
+        # instead. See docs/ and the rope round: ctx4095 came out 3.3107 (global NoPE) / 3.3245
+        # (partial) / 3.3805 (full), while local width moved it 0.0037, inside the noise floor.
         self.head_dim = self.hidden_size // self.num_attention_heads
-        _rope_dim = round(self.partial_rotary_factor * self.head_dim)
-        self.rope_dim = _rope_dim - (_rope_dim % 2)
-        # SEPARATE ROPE PER LAYER TYPE. A window-W layer only ever resolves relative distances
-        # <= W, a full-attention layer resolves the whole context, so they want different spectra.
-        # Every shipped SWA model splits this: MiMo V2.5 Pro 10k local / 10M global at window 128,
-        # Gemma 3 10k / 1M at window 1024, Muse Glimmer 500k local and 0 (NoPE) global.
-        #   rope_theta / partial_rotary_factor      -> FULL-attention (global) layers
-        #   swa_rope_theta / swa_partial_rotary_*   -> sliding-window (local) layers
-        # A factor of 0.0 means NoPE for that layer type: no rotation at all, head passes through.
-        #
-        # DEFAULT (Aug 14 2026): NoPE on global, FULL RoPE on local. Measured over 4 arms x 2000
-        # steps: global rotary width is what governs length generalization and local width barely
-        # matters. ctx4095 (identical targets, 4x trained length) came out global-NoPE 3.3107,
-        # global-partial 3.3245, global-full 3.3805 -- monotone, 26 sigma across the ends. With
-        # global NoPE, moving local 42/128 -> 128/128 dims moved ctx4095 by 0.0037, inside the
-        # noise floor. Mechanically right: a window-128 layer only sees distances <= 128, always
-        # in-distribution, so its rotary width cannot affect extrapolation; only global layers see
-        # position deltas past the trained length. Full local rotary is also ~2% FASTER, because
-        # rope_dim == head_dim skips the slice+concat that a partial rotary needs.
-        # TRADE-OFF ON RECORD: this arm is worse on 5 of 6 short-context held-out sets
-        # (winogrande +0.082, alpaca_hi +0.023, hi +0.029) at n=1. Long context and throughput were
-        # bought with short-context quality; the 0.334 partial-rotary default it replaces is the
-        # better model if short-context is what matters.
-        #
-        # NOTE both factors are EXPLICIT -- swa no longer inherits from partial_rotary_factor.
-        # With the global default at 0.0, inheritance would have silently made the local layers
-        # NoPE too, i.e. a fully position-free model reached by touching one knob.
-        self.swa_rope_theta = self.rope_theta if swa_rope_theta is None else float(swa_rope_theta)
-        _swa_prf = float(swa_partial_rotary_factor)
-        self.swa_partial_rotary_factor = _swa_prf
-        _swa_rope_dim = round(_swa_prf * self.head_dim)
-        self.swa_rope_dim = _swa_rope_dim - (_swa_rope_dim % 2)
 
         if self.hidden_size % self.num_attention_heads != 0:
             raise ValueError(
@@ -216,22 +173,6 @@ class BiBoConfig(PretrainedConfig):
                 f"{self.num_pos_identity_experts + self.num_neg_identity_experts} +/-Identity specials "
                 f"leaves {self.num_glu_experts} GLU experts; need at least 1. Raise "
                 f"num_routed_experts or lower special_expert_pairs."
-            )
-        # 0 is legal now and MEANS NoPE for that layer type -- Muse Glimmer ships exactly this
-        # (layer_rope_theta 0 on its full-attention layers). Anything in (0, 2) is still an error:
-        # it reads as "a little RoPE" but a single rotary dim is not expressible.
-        for _n, _d, _f in (("", self.rope_dim, self.partial_rotary_factor),
-                           ("swa_", self.swa_rope_dim, self.swa_partial_rotary_factor)):
-            if _d != 0 and _d < 2:
-                raise ValueError(
-                    f"{_n}partial_rotary_factor={_f} gives {_n}rope_dim={_d} "
-                    f"(head_dim={self.head_dim}); need 0 (NoPE) or at least 2 rotary dims."
-                )
-        if self.rope_dim == 0 and self.swa_rope_dim == 0:
-            raise ValueError(
-                "both partial_rotary_factor and swa_partial_rotary_factor are 0, so NO layer gets "
-                "any positional signal. That is a fully NoPE model, not a rope ablation -- if you "
-                "mean it, say so explicitly rather than reaching it by setting two factors to 0."
             )
         if self.norm_topk_prob and self.norm_topk_prob not in NORM_TOPK_MODES:
             raise ValueError(

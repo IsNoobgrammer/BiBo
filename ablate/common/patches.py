@@ -45,7 +45,7 @@ def patch_liger_rope():
         return LigerRopeFunction.apply(q, k, cos[:1], sin[:1], None, unsqueeze_dim)
     import src.modeling.attn.base as bibo_attn_base
     import baseline.qwen3moe.modeling as qwen_mod
-    bibo_attn_base.apply_rotary_pos_emb = _nc(_liger_rope)   # bibo calls it on the rope_dim slice
+    bibo_attn_base.apply_rotary_pos_emb = _nc(_liger_rope)   # windowed layers only; globals are NoPE
     qwen_mod.apply_rotary_pos_emb = _nc(_liger_rope)          # qwen calls it on full head_dim
 
 

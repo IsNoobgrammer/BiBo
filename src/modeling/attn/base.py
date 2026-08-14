@@ -1,4 +1,4 @@
-"""BiBoAttention — minimal shared shell: projections, QK-norm, partial RoPE, KV cache,
+"""BiBoAttention — minimal shared shell: projections, QK-norm, RoPE, KV cache,
 per-layer dispatch to the SWA or full-attention flavor module, XSA, output projection.
 The attention flavors themselves live in swa.py (flex band + eager reference) and
 full_attention.py (SDPA fast path / mask path)."""
@@ -33,12 +33,7 @@ class BiBoAttention(nn.Module):
         pattern = getattr(config, "hybrid_layer_pattern", None)
         self.is_swa = bool(pattern[layer_idx]) if pattern is not None else False
 
-        # dim-wise partial RoPE: the first rope_dim of each head rotates, the rest passes through.
-        # PER LAYER TYPE -- a window-W layer resolves distances <= W and a full-attention layer
-        # resolves the whole context, so they get separate widths (and separate bases, handled by
-        # DualRotaryEmbedding). 0 means NoPE for this layer: no rotation at all.
-        self.rope_dim = (getattr(config, "swa_rope_dim", config.rope_dim) if self.is_swa
-                         else config.rope_dim)
+
         # Hierarchical SWA reads its per-layer window off `sliding_window_per_layer`; plain
         # `sliding_window` stays scalar because transformers' cache indexes with it directly.
         _per = getattr(config, "sliding_window_per_layer", None)
@@ -85,28 +80,15 @@ class BiBoAttention(nn.Module):
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        # cos/sin are sized rope_dim (built at model level); the tail passes through as NoPE.
-        # DualRotaryEmbedding hands down (global_pair, local_pair), either of which is None when
-        # that layer type is NoPE. A bare (cos, sin) is still accepted so an external caller with
-        # a plain BiBoRotaryEmbedding keeps working -- discriminated on whether entry 0 is a
-        # tensor or a nested pair/None.
-        _pe = position_embeddings
-        _dual = _pe[0] is None or isinstance(_pe[0], (tuple, list))
-        _pair = (_pe[1] if self.is_swa else _pe[0]) if _dual else _pe
-
-        rd = self.rope_dim
-        if _pair is None or rd == 0:
-            cos = sin = None                      # NoPE layer: no rotation, heads pass through
-        elif rd < self.head_dim:
-            cos, sin = _pair
-            q_rot, q_pass = query_states[..., :rd], query_states[..., rd:]
-            k_rot, k_pass = key_states[..., :rd], key_states[..., rd:]
-            q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
-            query_states = torch.cat([q_rot, q_pass], dim=-1)
-            key_states = torch.cat([k_rot, k_pass], dim=-1)
-        else:
-            cos, sin = _pair
+        # FIXED ARCHITECTURE: full RoPE on the sliding-window layers, NoPE on the full-attention
+        # layers. Nothing to configure -- a window-W layer only ever resolves relative distances
+        # <= W and a full-attention layer resolves the whole context, and measurement said the
+        # global width is what governs length generalization while the local width barely moves it.
+        if self.is_swa:
+            cos, sin = position_embeddings
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        else:
+            cos = sin = None
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
