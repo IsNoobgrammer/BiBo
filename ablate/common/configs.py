@@ -1,10 +1,11 @@
 """Arm configs for the BiBo-min vs Qwen ablation -- parameter-matched by construction.
 
 Both arms share identical dims / experts / top_k. Because a GLU expert == SwiGLU in params and
-partial-vs-full RoPE is parameter-free, the two models have the SAME parameter count exactly.
+RoPE width is parameter-free, the two models have the SAME parameter count exactly.
 
   'qwen'     : stock Qwen3MoE (SwiGLU experts, full RoPE, softmax router).
-  'bibo_min' : BiBo stripped to Qwen-equivalence EXCEPT radial-NormSiLU experts + partial RoPE.
+  'bibo_min' : BiBo stripped to Qwen-equivalence EXCEPT radial-NormSiLU experts + the
+               split RoPE (NoPE on full-attention layers, full RoPE on windowed ones).
 
 EXPERT COUNTING CHANGED Aug 1 2026. num_routed_experts is now the TOTAL and the GLU count is
 DERIVED as total - 2*special_pairs. It used to be the other way round (polyglu_mult*3 GLU experts
@@ -32,9 +33,6 @@ SHARED = dict(
     tie_word_embeddings=True,
     norm_topk_prob="sum",         # "sum" (MiMo div-sum) | "softmax" | False
 )
-
-PARTIAL_ROPE = 0.334              # BiBo-min partial rotary; 1.0 == Qwen full RoPE
-
 
 def glu_count(num_experts, special_pairs, pos_identity=True, neg_identity=True):
     """GLU experts left after the param-free specials take their slots. This is the number Qwen has
@@ -194,15 +192,18 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
         rms_norm_eps=SHARED["rms_norm_eps"],
         rope_theta=(rope_theta if rope_theta is not None else SHARED["rope_theta"]),
         swa_rope_theta=swa_rope_theta,
-        swa_partial_rotary_factor=swa_partial_rotary_factor,
+        **({} if swa_partial_rotary_factor is None
+           else {"swa_partial_rotary_factor": swa_partial_rotary_factor}),
         tie_word_embeddings=SHARED["tie_word_embeddings"], norm_topk_prob=SHARED["norm_topk_prob"],
-        # --- the ablation delta: radial-NormSiLU experts + partial RoPE ---
+        # --- the ablation delta: radial-NormSiLU experts + split RoPE ---
         num_routed_experts=(num_experts or SHARED["num_experts"]),
         special_expert_pairs=special_pairs,
         pos_identity_expert=pos_identity_expert,
         neg_identity_expert=neg_identity_expert,
-        partial_rotary_factor=(PARTIAL_ROPE if partial_rotary_factor is None
-                               else partial_rotary_factor),
+        # Rope defaults live in BiBoConfig now (global NoPE / local full RoPE) -- pass through
+        # only when an arm overrides, so there is ONE place the default is written down.
+        **({} if partial_rotary_factor is None
+           else {"partial_rotary_factor": partial_rotary_factor}),
         # --- everything else stripped to Qwen-equivalence ---
         use_xsa=use_xsa, xsa_alpha_init=xsa_alpha_init,
         hybrid_layer_pattern=hybrid_layer_pattern,

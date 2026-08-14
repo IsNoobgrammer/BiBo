@@ -47,8 +47,12 @@ what does not work is what stops it being re-tried.
 - **XSA** — remove the token's own value component from its attention output:
   `Y <- Y - tanh(alpha) * (Y . V_hat) V_hat`, applied **per head, before `o_proj`**, with `alpha`
   a learnable per-head logit **initialised to 0** so XSA starts off and the model switches it on.
-- **Partial RoPE**, `partial_rotary_factor=0.334`. At `head_dim=128` that rotates **42 dimensions**
-  and passes the remaining 86 through as NoPE.
+- **Split RoPE by layer type** (Aug 14 2026). Full-attention layers get **NoPE**
+  (`partial_rotary_factor=0.0`); sliding-window layers get **full RoPE**
+  (`swa_partial_rotary_factor=1.0`). Global rotary width is what governs length
+  generalization -- ctx4095 was 3.3107 NoPE / 3.3245 partial / 3.3805 full -- while
+  local width barely moves it, since a window-128 layer never sees a distance past 128.
+  Replaces the previous uniform `partial_rotary_factor=0.334`.
 - **Tied input/output embeddings.**
 
 ### Residual topology (Kimi K3 Attention Residuals, modified)

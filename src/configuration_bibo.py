@@ -31,9 +31,9 @@ class BiBoConfig(PretrainedConfig):
         swa_qk_norm=True,
         rope_theta=None,
         rope_scaling=None,
-        partial_rotary_factor=0.334,
+        partial_rotary_factor=0.0,           # FULL-attention layers: 0.0 = NoPE (the default)
         swa_rope_theta=None,                 # None -> rope_theta. Sliding-window layers only.
-        swa_partial_rotary_factor=None,      # None -> partial_rotary_factor. 0.0 -> NoPE.
+        swa_partial_rotary_factor=1.0,       # sliding-window layers: 1.0 = full RoPE (default)
         pad_token_id=None,
         bos_token_id=0,
         eos_token_id=0,
@@ -169,20 +169,33 @@ class BiBoConfig(PretrainedConfig):
         self.head_dim = self.hidden_size // self.num_attention_heads
         _rope_dim = round(self.partial_rotary_factor * self.head_dim)
         self.rope_dim = _rope_dim - (_rope_dim % 2)
-        # SEPARATE ROPE FOR SLIDING vs FULL LAYERS. A window-W layer only ever resolves relative
-        # distances <= W, a full layer resolves the whole context, so they want different spectra.
-        # Every shipped SWA model splits this: MiMo V2.5 Pro swa_rope_theta 10k / rope_theta 10M at
-        # window 128, Gemma 3 rope_local_base_freq 10k / rope_theta 1M at window 1024, Muse Glimmer
-        # layer_rope_theta 500k on sliding and 0 (NoPE) on full.
-        #   rope_theta / partial_rotary_factor    -> FULL-attention (global) layers
-        #   swa_rope_theta / swa_partial_rotary   -> sliding-window (local) layers
-        # partial_rotary_factor 0.0 means NoPE for that layer type: no rotation at all, the head
-        # passes through whole. Note the factor sets rope_dim, which is also the exponent
-        # denominator in base^(-2i/rope_dim), so it coarsens the SAMPLING of the 2*pi .. 2*pi*base
-        # spectrum rather than truncating its range.
+        # SEPARATE ROPE PER LAYER TYPE. A window-W layer only ever resolves relative distances
+        # <= W, a full-attention layer resolves the whole context, so they want different spectra.
+        # Every shipped SWA model splits this: MiMo V2.5 Pro 10k local / 10M global at window 128,
+        # Gemma 3 10k / 1M at window 1024, Muse Glimmer 500k local and 0 (NoPE) global.
+        #   rope_theta / partial_rotary_factor      -> FULL-attention (global) layers
+        #   swa_rope_theta / swa_partial_rotary_*   -> sliding-window (local) layers
+        # A factor of 0.0 means NoPE for that layer type: no rotation at all, head passes through.
+        #
+        # DEFAULT (Aug 14 2026): NoPE on global, FULL RoPE on local. Measured over 4 arms x 2000
+        # steps: global rotary width is what governs length generalization and local width barely
+        # matters. ctx4095 (identical targets, 4x trained length) came out global-NoPE 3.3107,
+        # global-partial 3.3245, global-full 3.3805 -- monotone, 26 sigma across the ends. With
+        # global NoPE, moving local 42/128 -> 128/128 dims moved ctx4095 by 0.0037, inside the
+        # noise floor. Mechanically right: a window-128 layer only sees distances <= 128, always
+        # in-distribution, so its rotary width cannot affect extrapolation; only global layers see
+        # position deltas past the trained length. Full local rotary is also ~2% FASTER, because
+        # rope_dim == head_dim skips the slice+concat that a partial rotary needs.
+        # TRADE-OFF ON RECORD: this arm is worse on 5 of 6 short-context held-out sets
+        # (winogrande +0.082, alpaca_hi +0.023, hi +0.029) at n=1. Long context and throughput were
+        # bought with short-context quality; the 0.334 partial-rotary default it replaces is the
+        # better model if short-context is what matters.
+        #
+        # NOTE both factors are EXPLICIT -- swa no longer inherits from partial_rotary_factor.
+        # With the global default at 0.0, inheritance would have silently made the local layers
+        # NoPE too, i.e. a fully position-free model reached by touching one knob.
         self.swa_rope_theta = self.rope_theta if swa_rope_theta is None else float(swa_rope_theta)
-        _swa_prf = (self.partial_rotary_factor if swa_partial_rotary_factor is None
-                    else float(swa_partial_rotary_factor))
+        _swa_prf = float(swa_partial_rotary_factor)
         self.swa_partial_rotary_factor = _swa_prf
         _swa_rope_dim = round(_swa_prf * self.head_dim)
         self.swa_rope_dim = _swa_rope_dim - (_swa_rope_dim % 2)
