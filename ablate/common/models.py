@@ -7,7 +7,7 @@ from . import patches
 
 def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
               bias_update_threshold=10240, bias_update_factor=None, aux_coef=0.001,
-              num_experts=None, special_pairs=0,
+              num_experts=None, special_pairs=0, mlp_only_layers=None,
               use_xsa=False, xsa_alpha_init=0.0,
               pos_identity_expert=True, neg_identity_expert=True,
               top_k=None, moe_intermediate_size=None, num_shared_experts=0,
@@ -34,7 +34,8 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
                          f"{n_glu} GLU experts; raise --experts or lower --special_pairs")
     if arm == "qwen":
         from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
-        cfg = make_qwen_config(eff, aux_coef=aux_coef, num_experts=n_glu)
+        cfg = make_qwen_config(eff, aux_coef=aux_coef, num_experts=n_glu,
+                               mlp_only_layers=mlp_only_layers)
         model = Qwen3MoeForCausalLM(cfg)
     elif arm == "bibo_min":
         # exp/ reimplements only the residual topology (decoder layer + trunk); it imports
@@ -47,6 +48,7 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
             from exp.modeling_bibo import BiBoForCausalLM
         cfg = make_bibo_min_config(bias_update_threshold, bias_update_factor,
                                    num_experts=n_total, special_pairs=special_pairs,
+                                   mlp_only_layers=mlp_only_layers,
                                    rope_theta=rope_theta,
                                    use_xsa=use_xsa,
                                    xsa_alpha_init=xsa_alpha_init,

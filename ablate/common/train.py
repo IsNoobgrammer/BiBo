@@ -373,6 +373,12 @@ def main():
     # Positional encoding is FIXED: NoPE on full-attention layers, full RoPE on windowed ones.
     # Not a knob -- the rope round settled it. This is only the base for the windowed layers.
     ap.add_argument("--rope_theta", type=float, default=None)
+    # Which layers keep a DENSE FFN instead of the MoE block. Default [0, 9] on the board config,
+    # which under swa_pattern block3 are exactly the full-attention layers. "none" = every layer
+    # is MoE. Changing this changes the PARAMETER COUNT -- these arms are not param-matched, and
+    # the comparison is quality per (total, active) params, both of which train.py prints.
+    ap.add_argument("--mlp_only_layers", type=str, default=None,
+                    help='comma list of dense-FFN layer indices, or "none" for all-MoE')
     # XSA is part of the default stack now (learnable per-head alpha, init 0). BooleanOptionalAction
     # so the existing `--use_xsa` spelling still parses and `--no-use_xsa` is the ablation.
     ap.add_argument("--use_xsa", action=argparse.BooleanOptionalAction, default=True)
@@ -561,6 +567,16 @@ def main():
           + f" -> kernel act code {_glu_code}", flush=True)
     # Shared with run_eval.py so a checkpoint's architecture can be reproduced exactly.
     _swa_pat, _win = resolve_swa(args.swa_pattern, args.sliding_window, SHARED["num_hidden_layers"])
+    # None -> SHARED default [0, 9]; "none" -> [] (every layer MoE); else a comma list.
+    _dense = (None if args.mlp_only_layers is None else
+              [] if args.mlp_only_layers.lower() == "none" else
+              [int(v) for v in args.mlp_only_layers.split(",")])
+    if _dense is not None:
+        _bad = [i for i in _dense if not 0 <= i < SHARED["num_hidden_layers"]]
+        if _bad:
+            raise ValueError(f"--mlp_only_layers {_bad} out of range for "
+                             f"{SHARED['num_hidden_layers']} layers")
+        print(f"[ffn] dense layers {_dense or 'NONE - every layer is MoE'}", flush=True)
     if _swa_pat is not None:
         print(f"[swa] pattern {_swa_pat} (1=windowed) window={_win} "
               f"qk_norm={args.swa_qk_norm}", flush=True)
@@ -573,6 +589,7 @@ def main():
                            hybrid_layer_pattern=_swa_pat, sliding_window=_win,
                            swa_qk_norm=args.swa_qk_norm,
                            rope_theta=args.rope_theta,
+                           mlp_only_layers=_dense,
                            attn_res=args.attn_res, attn_res_sites=args.attn_res_sites,
                            attn_res_carry=args.attn_res_carry,
                            attn_res_fp32_stream=args.attn_res_fp32_stream,
@@ -671,6 +688,10 @@ def main():
                    if args.swa_pattern != "none" else "")
                 + ("_noqkn" if args.swa_pattern != "none" and not args.swa_qk_norm else "")
                 + (f"_rt{args.rope_theta/1000:g}k" if args.rope_theta else "")
+                # A different dense/MoE split is a different model with a different param count;
+                # untagged it would overwrite the baseline's ckpt and _result.json on the same seed.
+                + ("" if args.mlp_only_layers is None else
+                   "_allmoe" if _dense == [] else "_dense" + "-".join(map(str, _dense)))
                 # activation is an axis again; an untagged silu arm would overwrite the radial
                 # control's ckpt/_result.json on the same seed+experts
                 + (f"_act{args.act}" if args.act != "radial" else "")

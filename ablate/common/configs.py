@@ -41,7 +41,7 @@ def glu_count(num_experts, special_pairs, pos_identity=True, neg_identity=True):
     return num_experts - n_special
 
 
-def make_qwen_config(attn_impl="sdpa", aux_coef=0.001, num_experts=None):
+def make_qwen_config(attn_impl="sdpa", aux_coef=0.001, num_experts=None, mlp_only_layers=None):
     from baseline.qwen3moe.config import Qwen3MoeConfig
     cfg = Qwen3MoeConfig(
         vocab_size=SHARED["vocab_size"], hidden_size=SHARED["hidden_size"],
@@ -51,7 +51,8 @@ def make_qwen_config(attn_impl="sdpa", aux_coef=0.001, num_experts=None):
         num_experts_per_tok=SHARED["num_experts_per_tok"],
         moe_intermediate_size=SHARED["moe_intermediate_size"],
         norm_topk_prob=bool(SHARED["norm_topk_prob"]),
-        max_position_embeddings=SHARED["max_position_embeddings"], mlp_only_layers=SHARED["mlp_only_layers"],
+        max_position_embeddings=SHARED["max_position_embeddings"],
+        mlp_only_layers=(SHARED["mlp_only_layers"] if mlp_only_layers is None else list(mlp_only_layers)),
         rms_norm_eps=SHARED["rms_norm_eps"], rope_theta=SHARED["rope_theta"],
         tie_word_embeddings=SHARED["tie_word_embeddings"], router_aux_loss_coef=aux_coef,
     )
@@ -119,7 +120,7 @@ def resolve_swa(swa_pattern, sliding_window, n_layers):
 
 
 def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
-                         num_experts=None, special_pairs=0,
+                         num_experts=None, special_pairs=0, mlp_only_layers=None,
                          use_xsa=False, xsa_alpha_init=0.0,
                          num_pos_identity_experts=None, num_neg_identity_experts=None,
                          pos_identity_expert=True, neg_identity_expert=True,
@@ -187,7 +188,8 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
         # same factor -- pass both to hold compute constant.
         moe_intermediate_size=(moe_intermediate_size or SHARED["moe_intermediate_size"]),
         num_experts_per_tok=(top_k or SHARED["num_experts_per_tok"]),
-        max_position_embeddings=SHARED["max_position_embeddings"], mlp_only_layers=SHARED["mlp_only_layers"],
+        max_position_embeddings=SHARED["max_position_embeddings"],
+        mlp_only_layers=(SHARED["mlp_only_layers"] if mlp_only_layers is None else list(mlp_only_layers)),
         rms_norm_eps=SHARED["rms_norm_eps"],
         rope_theta=(rope_theta if rope_theta is not None else SHARED["rope_theta"]),
         tie_word_embeddings=SHARED["tie_word_embeddings"], norm_topk_prob=SHARED["norm_topk_prob"],
