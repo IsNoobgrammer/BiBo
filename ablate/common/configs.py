@@ -121,6 +121,7 @@ def resolve_swa(swa_pattern, sliding_window, n_layers):
 
 def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          num_experts=None, special_pairs=0, mlp_only_layers=None,
+                         intermediate_size=None,
                          use_xsa=False, xsa_alpha_init=0.0,
                          num_pos_identity_experts=None, num_neg_identity_experts=None,
                          pos_identity_expert=True, neg_identity_expert=True,
@@ -182,7 +183,8 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
         bias_update_threshold=bias_update_threshold,
         bias_update_factor=bias_update_factor,      # None -> BiBoConfig default (0.4, proportional)
         vocab_size=SHARED["vocab_size"], hidden_size=SHARED["hidden_size"],
-        intermediate_size=SHARED["intermediate_size"], num_hidden_layers=SHARED["num_hidden_layers"],
+        intermediate_size=(intermediate_size or SHARED["intermediate_size"]),
+        num_hidden_layers=SHARED["num_hidden_layers"],
         num_attention_heads=SHARED["num_attention_heads"], num_key_value_heads=SHARED["num_key_value_heads"],
         # Raising top_k WITHOUT shrinking moe_intermediate_size multiplies active expert FLOPs by the
         # same factor -- pass both to hold compute constant.

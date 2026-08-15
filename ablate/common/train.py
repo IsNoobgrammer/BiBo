@@ -379,6 +379,12 @@ def main():
     # the comparison is quality per (total, active) params, both of which train.py prints.
     ap.add_argument("--mlp_only_layers", type=str, default=None,
                     help='comma list of dense-FFN layer indices, or "none" for all-MoE')
+    # Width of the DENSE FFN on mlp_only_layers. Default 1024 leaves a dense layer far cheaper
+    # than the MoE block it sits next to, so swapping one for the other moves active params by
+    # +5.0% and the arms are not comparable at matched compute. top_k*moe_inter (=4608 on the
+    # board config) makes a dense layer and an MoE layer cost the SAME active params, to within
+    # the router's h*num_experts.
+    ap.add_argument("--dense_inter", type=int, default=None)
     # XSA is part of the default stack now (learnable per-head alpha, init 0). BooleanOptionalAction
     # so the existing `--use_xsa` spelling still parses and `--no-use_xsa` is the ablation.
     ap.add_argument("--use_xsa", action=argparse.BooleanOptionalAction, default=True)
@@ -590,6 +596,7 @@ def main():
                            swa_qk_norm=args.swa_qk_norm,
                            rope_theta=args.rope_theta,
                            mlp_only_layers=_dense,
+                           intermediate_size=args.dense_inter,
                            attn_res=args.attn_res, attn_res_sites=args.attn_res_sites,
                            attn_res_carry=args.attn_res_carry,
                            attn_res_fp32_stream=args.attn_res_fp32_stream,
@@ -690,6 +697,7 @@ def main():
                 + (f"_rt{args.rope_theta/1000:g}k" if args.rope_theta else "")
                 # A different dense/MoE split is a different model with a different param count;
                 # untagged it would overwrite the baseline's ckpt and _result.json on the same seed.
+                + (f"_di{args.dense_inter}" if args.dense_inter else "")
                 + ("" if args.mlp_only_layers is None else
                    "_allmoe" if _dense == [] else "_dense" + "-".join(map(str, _dense)))
                 # activation is an axis again; an untagged silu arm would overwrite the radial
