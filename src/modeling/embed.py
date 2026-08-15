@@ -41,9 +41,14 @@ class BiBoRotaryEmbedding(nn.Module):
         super().__init__()
         self.dim = dim
         self.base = base
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64)
-                                   .to(device=device, dtype=torch.float) / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("inv_freq", self._compute_inv_freq(device), persistent=False)
+
+    def _compute_inv_freq(self, device=None):
+        """Also called by _init_weights: inv_freq is persistent=False, so it is absent from the
+        checkpoint and from_pretrained's meta path would otherwise leave it uninitialized --
+        which silently degrades RoPE to the identity rather than raising."""
+        return 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64)
+                                    .to(device=device, dtype=torch.float) / self.dim))
 
     @torch.no_grad()
     def forward(self, x, position_ids):

@@ -54,14 +54,12 @@ class BiBoPreTrainedModel(PreTrainedModel):
         elif isinstance(module, BiBoRMSNorm):
             hf_init.ones_(module.weight)                 # Qwen3 parity; needed on meta-init
         elif isinstance(module, BiBoRotaryEmbedding):
-            # inv_freq/original_inv_freq are persistent=False, so they are NOT in the checkpoint and
-            # from_pretrained's lazy/meta path never runs __init__'s computation for them. Without
-            # this branch they come back as uninitialized memory — and since dynamic-NTK returns
-            # original_inv_freq in-window, a zeroed buffer means cos=1/sin=0, i.e. RoPE silently
-            # becomes the identity on every loaded checkpoint. (Stock Llama does the same thing.)
-            freqs = module._compute_inv_freq(module.base, module.inv_freq.device)
-            hf_init.copy_(module.inv_freq, freqs)
-            hf_init.copy_(module.original_inv_freq, freqs)
+            # inv_freq is persistent=False, so it is NOT in the checkpoint and from_pretrained's
+            # lazy/meta path never runs __init__'s computation for it. Without this branch it comes
+            # back as uninitialized memory, and a zeroed buffer means cos=1/sin=0, i.e. RoPE
+            # silently becomes the identity on every loaded checkpoint. (Stock Llama does the same.)
+            # `original_inv_freq` is gone with dynamic-NTK; there is one buffer now.
+            hf_init.copy_(module.inv_freq, module._compute_inv_freq(module.inv_freq.device))
 
 
 class BiBoModel(BiBoPreTrainedModel):
