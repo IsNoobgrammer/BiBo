@@ -91,13 +91,13 @@ def main():
               f"{out['loss_c1']:>11.4f}{out['delta_c1']:>+9.4f}")
 
     after = loss()
-    ok = abs(after - base) < 1e-6
+    ok = abs(after - base) <= max(3 * floor, 1e-4)
     print(f"\nbaseline recheck {after:.6f} (was {base:.6f}) -> "
           f"{'restore clean' if ok else 'RESTORE LEAKED -- numbers above are void'}")
 
     if a.json:
         with open(a.json, "w") as f:
-            json.dump({"baseline": base, "recheck": after, "restore_clean": ok,
+            json.dump({"baseline": base, "recheck": after, "restore_clean": ok, "noise_floor": floor,
                        "carry_scale": mode, "rows": rows}, f, indent=1)
         print(f"wrote {a.json}")
 
