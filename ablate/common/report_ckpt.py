@@ -62,7 +62,15 @@ def load_from_result(result_json, device=DEV):
         bf16_residual_stream=c.bf16_residual_stream, bf16_moe_out=c.bf16_moe_out,
         pos_identity_expert=c.pos_identity_expert, neg_identity_expert=c.neg_identity_expert,
         top_k=(c.top_k or None), moe_intermediate_size=(c.moe_inter or None),
-        num_shared_experts=c.n_shared)
+        num_shared_experts=c.n_shared,
+        # The dense/MoE split and the dense width are part of the ARCHITECTURE, so a rebuild that
+        # ignores them silently builds a different model. strict=True then fails with missing
+        # mlp.gate_proj keys against an all-MoE checkpoint -- which is how this was found. Parsed
+        # the same way train.py parses the flag: None -> SHARED default, "none" -> every layer MoE.
+        mlp_only_layers=(None if getattr(c, "mlp_only_layers", None) is None else
+                         [] if str(c.mlp_only_layers).lower() == "none" else
+                         [int(v) for v in str(c.mlp_only_layers).split(",")]),
+        intermediate_size=getattr(c, "dense_inter", None))
 
     sd = torch.load(ckpt, map_location=device)
     # strict=True on purpose: a silently-ignored missing key is a randomly-initialised tensor, and
