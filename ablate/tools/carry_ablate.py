@@ -57,10 +57,17 @@ def main():
     @torch.no_grad()
     def loss():
         out, _flat = _val.losses(model, holdout, None, fused_linear_cross_entropy, amp, pad_id=0)
+        # _val.losses restores TRAIN mode on exit, and in train mode the router's accumulated_tpe
+        # buffer keeps accumulating -- without this the model state drifts between ablations.
+        model.eval()
         return float(out)
 
-    base = loss()
-    print(f"\nbaseline loss {base:.4f}")
+    # Noise floor FIRST: the fused MoE kernel is nondeterministic (measured 1.1e-4 spread over six
+    # identical forwards), so an unmeasured floor turns every small delta below into a story.
+    probe = [loss() for _ in range(4)]
+    floor = max(probe) - min(probe)
+    base = sum(probe) / len(probe)
+    print(f"\nbaseline loss {base:.4f}   (repeat spread {floor:.2e} over {len(probe)} identical evals)")
     # theta such that c == target, inverted per transform; done in theta-space so the forward
     # path is untouched and the ablation cannot diverge from how the model actually computes c.
     mode = getattr(cfg, "attn_res_carry_scale", "raw")
