@@ -1,8 +1,12 @@
 @AGENTS.md
+@ablate/marimo.md
 
 ---
 
 ## Behavior Rules (Always-On — Follow Every Time)
+
+0. **The molab box is driven with `execute-code.sh`, never by taking over the session.** Full rules in @ablate/marimo.md — read it before touching the box. Taking over flips every other client to read-only and locks the user out of their own notebook while you work.
+
 
 1. **TODO first, always.** Before touching anything non-trivial, write a concrete TODO list. Each item must be self-verifiable — "works" is not a goal, "runs without error and returns X" is. Freeze the list once work starts. Never quietly drop or rewrite goals mid-task. If a goal turns out impossible, say so explicitly.
 

@@ -32,8 +32,7 @@ common/            hardware-agnostic, modular, swappable
     bpb.py         tokenizer-independent bits-per-byte, per language/domain
     mcq.py         log-likelihood MCQ (Belebele, XNLI, optional Global-MMLU), per language
   smoke.py         local build+patch+param-match+train verification
-tools/box.py       drive a molab GPU box from the terminal (shell/python on it; list, read, run,
-                   edit, create, delete its notebook cells). See docs/molab_box.md
+marimo.md          how to drive the molab GPU box (execute-code.sh + cm). READ IT FIRST.
 rtx_6000/run.sh    single GPU, global batch 40, 1B tokens, bf16
 t4_x2/run.sh       2x T4, one arm per GPU, micro 10 x accum 4 = same global batch 40
 ```
