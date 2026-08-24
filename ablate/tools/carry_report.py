@@ -107,7 +107,7 @@ def main():
         report["layers"][L] = row
 
     if not carry:
-        print("\nNO attn_res_carry PARAMS FOUND -- key names may have changed; "
+        print("\nNO attn_res_carry_theta PARAMS FOUND -- key names may have changed; "
               f"sample keys: {list(sd)[:5]}")
 
     if a.json:
