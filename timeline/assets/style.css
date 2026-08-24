@@ -1,0 +1,77 @@
+/* BiBo timeline. Lab-notebook register: ink on paper, one signal colour for verdicts.
+   Tokens define the light palette; the two dark blocks only redefine tokens, so nothing
+   is ever declared for one theme only. */
+:root{
+  --ground:#F6F7F5; --surface:#FFFFFF; --panel:#ECEEE9;
+  --ink:#14171A; --ink-2:#3A4146; --muted:#666E73; --rule:#D8DCD6;
+  --accent:#2C5F4F;          /* shipped / measured */
+  --signal:#9A5B22;          /* verdict, emphasis */
+  --dim:#98A09B;
+  --display:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;
+  --body:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --data:ui-monospace,"Cascadia Code","SF Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#111413; --surface:#181C1B; --panel:#1F2422;
+    --ink:#E7EAE6; --ink-2:#BCC3BE; --muted:#8D9691; --rule:#2C3331;
+    --accent:#79B39C; --signal:#D39A5C; --dim:#6A736E;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#111413; --surface:#181C1B; --panel:#1F2422;
+  --ink:#E7EAE6; --ink-2:#BCC3BE; --muted:#8D9691; --rule:#2C3331;
+  --accent:#79B39C; --signal:#D39A5C; --dim:#6A736E;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--ground); color:var(--ink);
+  font-family:var(--body); font-size:16px; line-height:1.65;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1120px; margin:0 auto; padding:56px 24px 96px}
+.prose{max-width:70ch}
+nav.crumb{
+  font-family:var(--data); font-size:12px; letter-spacing:.1em; text-transform:uppercase;
+  color:var(--muted); margin-bottom:28px; display:flex; gap:10px; flex-wrap:wrap;
+}
+nav.crumb a{color:var(--muted); text-decoration:none; border-bottom:1px solid var(--rule)}
+nav.crumb a:hover{color:var(--accent); border-color:var(--accent)}
+h1{
+  font-family:var(--display); font-weight:600; font-size:clamp(34px,4.6vw,52px);
+  line-height:1.06; letter-spacing:-.015em; margin:0 0 22px; text-wrap:balance;
+}
+h2{
+  font-family:var(--display); font-weight:600; font-size:27px; letter-spacing:-.008em;
+  margin:56px 0 14px; padding-bottom:8px; border-bottom:1px solid var(--rule);
+  text-wrap:balance; max-width:70ch;
+}
+h3{font-weight:650; font-size:16.5px; margin:30px 0 8px}
+p,ul,ol{max-width:70ch}
+p{margin:0 0 15px}
+li{margin-bottom:7px}
+a{color:var(--accent)}
+strong{font-weight:650}
+em{color:var(--ink-2)}
+code{
+  font-family:var(--data); font-size:.88em; background:var(--panel);
+  padding:1.5px 5px; border-radius:3px; font-variant-numeric:tabular-nums;
+}
+hr{border:0; border-top:1px solid var(--rule); margin:44px 0}
+.tablewrap{overflow-x:auto; margin:22px 0}
+table{border-collapse:collapse; width:100%; font-size:14px; background:var(--surface)}
+th,td{padding:9px 13px; border-bottom:1px solid var(--rule); text-align:left; vertical-align:top}
+thead th{
+  font-family:var(--data); font-size:11px; letter-spacing:.08em; text-transform:uppercase;
+  color:var(--muted); font-weight:500; white-space:nowrap; border-bottom:1px solid var(--ink-2);
+}
+tbody tr:hover{background:var(--panel)}
+td:nth-child(n+3){font-variant-numeric:tabular-nums}
+blockquote{
+  margin:22px 0; padding:2px 0 2px 18px; border-left:2px solid var(--signal);
+  color:var(--ink-2); max-width:70ch;
+}
+footer{
+  margin-top:72px; padding-top:22px; border-top:1px solid var(--rule);
+  font-family:var(--data); font-size:12px; color:var(--muted);
+}
