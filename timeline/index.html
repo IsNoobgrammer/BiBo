@@ -6,80 +6,81 @@
 <div class="wrap">
 <nav class="crumb"><span>BiBo ablation timeline</span></nav>
 <h1>BiBo ablation timeline</h1>
-<p>Every axis we have swept, what it settled, and where the evidence lives. Built from 574 W&amp;B runs
-across 26 projects (1 May - 15 Aug 2026), 558 commits, and the round notes kept alongside them.</p>
-<p><strong>How to read a verdict.</strong> <code>SHIPPED</code> means it is in the default stack. <code>CLOSED NEGATIVE</code> means it
-was measured and rejected; the code may still exist behind a flag. <code>PARKED</code> means nothing cleared
-the noise floor, so the axis is neither won nor lost. <code>OPEN</code> means it is still running or still
-unresolved. A result with no noise floor beside it is not a result -- floors are <strong>per-stack</strong> and
-never transfer between them.</p>
-<h2>Topics</h2>
+<p>Every axis we have swept, what it settled, and where the evidence lives.</p>
+<p>Built from <strong>574 W&amp;B runs across 26 projects</strong> (1 May - 15 Aug 2026), <strong>558 commits</strong>, and the
+round notes kept alongside them. Nine topic folders, each with its verdicts, the numbers behind
+them, and the caveats that have to travel with the result.</p>
+<p>Start here, then open a topic. Every page exists twice: <code>README.md</code> for reading in the repo,
+<code>index.html</code> for reading in a browser. <strong>The markdown is the source</strong> - see
+<a href="#regenerating">Regenerating</a>.</p>
+<hr />
+<h2>How to read a verdict</h2>
 <div class="tablewrap"><table>
 <thead>
 <tr>
-<th></th>
-<th>Topic</th>
-<th>Span</th>
-<th>Headline</th>
+<th>Word</th>
+<th>Means</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>01</td>
-<td><a href="01-optimizer/index.html">Optimizer</a></td>
-<td>May - Aug</td>
-<td>Muon beats AdamW 2x; the NS coefficient axis is dead, weight decay is the live knob</td>
+<td><strong>SHIPPED</strong></td>
+<td>in the default stack today</td>
 </tr>
 <tr>
-<td>02</td>
-<td><a href="02-moe-routing/index.html">MoE routing</a></td>
-<td>Jul - Aug</td>
-<td>Balance is free; gate shape, router norm, temperature and identity experts all closed</td>
+<td><strong>CLOSED NEGATIVE</strong></td>
+<td>measured and rejected; the code may survive behind a flag</td>
 </tr>
 <tr>
-<td>03</td>
-<td><a href="03-expert-activation/index.html">Expert activation</a></td>
-<td>Jul - Aug</td>
-<td>Radial NormSiLU shipped; the axis then saturated at three different mechanisms</td>
+<td><strong>PARKED</strong></td>
+<td>nothing cleared the noise floor - neither won nor lost</td>
 </tr>
 <tr>
-<td>04</td>
-<td><a href="04-attention/index.html">Attention</a></td>
-<td>Aug</td>
-<td>XSA shipped with learnable per-head alpha; AttnRes parked at the noise floor</td>
-</tr>
-<tr>
-<td>05</td>
-<td><a href="05-positional-encoding/index.html">Positional encoding</a></td>
-<td>Aug</td>
-<td>Global NoPE + local full RoPE, fixed in code and no longer configurable</td>
-</tr>
-<tr>
-<td>06</td>
-<td><a href="06-ffn-placement/index.html">FFN placement</a></td>
-<td>Aug</td>
-<td>All-MoE beats dense end-layers by 0.066 val at matched active params, for 4.9% throughput</td>
-</tr>
-<tr>
-<td>07</td>
-<td><a href="07-kernels-and-speed/index.html">Kernels and speed</a></td>
-<td>May - Aug</td>
-<td>128.9k -&gt; 178.8k tps; bit-identity is the ship gate</td>
-</tr>
-<tr>
-<td>08</td>
-<td><a href="08-data-and-tokenizer/index.html">Data and tokenizer</a></td>
-<td>Aug</td>
-<td>Gigatoken 10.1x, parity-gated; the corpus was padded and we were scoring the padding</td>
-</tr>
-<tr>
-<td>09</td>
-<td><a href="09-methodology/index.html">Methodology</a></td>
-<td>throughout</td>
-<td>The lessons that cost the most: noise floors, ablate-downward, measure don't infer</td>
+<td><strong>OPEN</strong></td>
+<td>still running, or still unresolved</td>
 </tr>
 </tbody>
 </table></div>
+<p>A result quoted without its noise floor is not a result. Floors are <strong>per-stack</strong> and never
+transfer between them; the current board's val floor is <strong>0.0217</strong>.</p>
+<hr />
+<h2>Topics</h2>
+<h3><a href="01-optimizer/README.md">01 - Optimizer</a></h3>
+<p>Muon beats AdamW ~2x. Weight decay is the dominant knob (7x any coefficient change), and once wd
+was matched the entire Newton-Schulz coefficient family collapsed to a tie. Muon LR 3e-3, 4.3 sigma
+over the incumbent. Symmetric-matmul and gram-space NS both shipped on sm120.</p>
+<h3><a href="02-moe-routing/README.md">02 - MoE routing</a></h3>
+<p>Load balance is solved and free (entropy 0.9996, no aux loss). Gate shape, router input norm,
+temperature, signed identity experts, top-k reduction, MoE output norm and LatentMoE are all
+closed. Temperature has an <strong>interior</strong> optimum at T=2 - sharper is not better in either direction.</p>
+<h3><a href="03-expert-activation/README.md">03 - Expert activation</a></h3>
+<p>Radial NormSiLU shipped and is the default. The axis then <strong>saturated</strong>: three unrelated mechanisms
+all land at ~0.6767. The win shrinks 3.6x going from 524M to 1B, so a small-scale activation
+advantage is an upper bound, not a preview.</p>
+<h3><a href="04-attention/README.md">04 - Attention</a></h3>
+<p>XSA shipped with learnable per-head alpha, init 0 so the model switches it on itself. AttnRes is
+parked after 57 runs - its default was chosen on a <strong>1.5% throughput edge, not quality</strong>. The
+carry turned out to be a flat direction: the whole 512-dim vector is replaceable by the scalar 1.</p>
+<h3><a href="05-positional-encoding/README.md">05 - Positional encoding</a></h3>
+<p>Global NoPE + local full RoPE, now <strong>fixed in code rather than configurable</strong>. The global layers
+govern extrapolation; local rotary width is irrelevant to it. A dead dynamic-NTK branch had been
+silently rescaling the base at eval, making every pre-Aug-13 extrapolation number incomparable.</p>
+<h3><a href="06-ffn-placement/README.md">06 - FFN placement</a></h3>
+<p>All-MoE beats dense end-layers by <strong>0.066 val</strong> at matched active params, monotone across three
+arms, for 4.9% throughput. Matching active params is what made it an ablation rather than a
+capacity arm in disguise.</p>
+<h3><a href="07-kernels-and-speed/README.md">07 - Kernels and speed</a></h3>
+<p>128.9k to 178.8k tps. Bit identity is the ship gate - a kernel that was <em>more accurate</em> than eager
+cost real bpb. Microbenchmarks mispredicted one real cost by 13x in both directions.</p>
+<h3><a href="08-data-and-tokenizer/README.md">08 - Data and tokenizer</a></h3>
+<p>Gigatoken is 10.1x faster and shipped on <strong>0 mismatches over 3200 documents</strong>, not on speed. The
+bip2 corpus turned out to be padded, not packed - 15.93% of tokens - and we were scoring the
+padding.</p>
+<h3><a href="09-methodology/README.md">09 - Methodology</a></h3>
+<p>The lessons that cost the most time, all learned the hard way. Noise floors, ablate downward,
+a learned parameter value tells you nothing about whether it matters, and durability is verified
+rather than set up.</p>
+<hr />
 <h2>Chronology</h2>
 <div class="tablewrap"><table>
 <thead>
@@ -122,6 +123,12 @@ never transfer between them.</p>
 <td>sustained benchmarking</td>
 </tr>
 <tr>
+<td>May 29-30</td>
+<td><code>latentsig-med-triage-router</code></td>
+<td>7</td>
+<td>router work on a separate task</td>
+</tr>
+<tr>
 <td>Jul 8-13</td>
 <td><code>bibo-qwen-ablate</code></td>
 <td>44</td>
@@ -135,9 +142,9 @@ never transfer between them.</p>
 </tr>
 <tr>
 <td>Jul 22-26</td>
-<td><code>polyglu-ablations</code> x3</td>
+<td><code>polyglu-ablations</code>, <code>-large</code>, <code>-XL</code></td>
 <td>38</td>
-<td>expert activation, three scales</td>
+<td>expert activation at three scales</td>
 </tr>
 <tr>
 <td>Jul 24-25</td>
@@ -148,12 +155,12 @@ never transfer between them.</p>
 <tr>
 <td>Jul 26-30</td>
 <td><code>bibo-specials-conv</code></td>
-<td>176</td>
+<td><strong>176</strong></td>
 <td>special experts, conv router, temperature</td>
 </tr>
 <tr>
 <td>Jul 30</td>
-<td><code>bibo-manas-*</code></td>
+<td><code>bibo-manas-2k</code>, <code>-3way</code>, <code>-ladder</code></td>
 <td>7</td>
 <td>Manas optimizer on a real LM</td>
 </tr>
@@ -195,16 +202,73 @@ never transfer between them.</p>
 </tr>
 </tbody>
 </table></div>
-<p>Raw snapshot of every run: <a href="_data/wandb.json"><code>_data/wandb.json</code></a>.</p>
+<p>Every run indexed locally in <a href="_data/wandb.json"><code>_data/wandb.json</code></a> - W&amp;B is the system of record,
+but boxes and results have been lost before.</p>
+<p><strong>Coverage gap, stated plainly.</strong> The pre-July projects (<code>bibo-ablation</code>, <code>bibo-bench</code>, <code>8bit-test</code>,
+<code>bibo-long-context</code>, <code>bibo-vs-qwen</code>) predate the round notes and logged only <code>_step</code> - no readable
+loss key. They appear above as <em>what was being asked</em>, never as verdicts, because the conclusions
+are not reconstructable from what survives.</p>
+<hr />
 <h2>The five things worth remembering</h2>
 <ol>
-<li><strong>A measurement without a noise floor is a story.</strong> Floors are per-stack. The 2k board's val
-   floor is 0.0217; several "results" from earlier rounds sit under it.</li>
-<li><strong>Ablate downward.</strong> Ask "can this be deleted?" before "how do we improve it?" The largest
-   wins of the last month were deletions: the rope knobs, the eval package, the NS coefficient axis.</li>
-<li><strong>A learned parameter value tells you nothing about whether it matters.</strong> Only intervention does.</li>
-<li><strong>Kernels ship on bit identity</strong>, not on being close, and not on being "more accurate".</li>
+<li><strong>A measurement without a noise floor is a story.</strong> Floors are per-stack. Several older
+   "results" sit under the current board's 0.0217.</li>
+<li><strong>Ablate downward.</strong> Ask "can this be deleted?" before "how do we improve it?" The biggest recent
+   wins were deletions: the rope knobs, the eval package, the NS coefficient axis.</li>
+<li><strong>A learned parameter value tells you nothing about whether it matters.</strong> Only intervention does
+   - and even then it measures <em>this model's</em> dependence, not the mechanism's necessity.</li>
+<li><strong>Kernels ship on bit identity</strong>, not on being close and not on being more accurate.</li>
 <li><strong>Verify the artifact, not the plan.</strong> Grep finds definitions; only the test suite finds callers.</li>
 </ol>
+<hr />
+<h2>Open questions</h2>
+<div class="tablewrap"><table>
+<thead>
+<tr>
+<th>Topic</th>
+<th>Question</th>
+<th>What would settle it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>04, 06</td>
+<td>Is the AttnRes carry deletable?</td>
+<td>one arm at <code>attn_res_carry_scale=none, per_dim=False</code>; predicted within 0.003</td>
+</tr>
+<tr>
+<td>04</td>
+<td>Does the L0 carry collapse reproduce on raw?</td>
+<td><code>carry_ablate</code> on a raw checkpoint - both raw ones died with their box</td>
+</tr>
+<tr>
+<td>06</td>
+<td>Does all-MoE hold at a second seed?</td>
+<td>one repeat; the 0.066 is single-seed</td>
+</tr>
+<tr>
+<td>01</td>
+<td>Does the Manas champion transfer to BiBo?</td>
+<td>2k-scale arm</td>
+</tr>
+<tr>
+<td>01</td>
+<td><code>ns8</code> free compression</td>
+<td>121M A/B</td>
+</tr>
+<tr>
+<td>03</td>
+<td>Where does the activation win go at 3B+</td>
+<td>the gap shrank 3.6x from 524M to 1B</td>
+</tr>
+</tbody>
+</table></div>
+<hr />
+<h2>Regenerating</h2>
+<p><code>bash
+./.venv/Scripts/python.exe timeline/build.py    # renders every README.md to index.html</code></p>
+<p>Edit the markdown, never the HTML - the HTML carries a generated-file header and is overwritten.
+Adding a topic means adding <code>NN-name/README.md</code> and rerunning; the build picks it up.</p>
+<p>To refresh the run index after new experiments, re-run the snapshot in <code>_data/</code> against W&amp;B.</p>
 <footer>Generated from README.md &middot; BiBo ablation timeline</footer>
 </div>
