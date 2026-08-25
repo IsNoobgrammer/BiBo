@@ -19,3 +19,4 @@ bench/checkpoints/
 bench/configs/_tmp_*.yaml
 pyrightconfig.json
 paper_ideas/
+wandb/
