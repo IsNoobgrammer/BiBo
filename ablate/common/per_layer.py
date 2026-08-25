@@ -38,6 +38,7 @@ hooks are installed once and only fire while `enabled` is set, so the untraced s
 from . import _paths  # noqa: F401
 
 import math
+import re
 
 import torch
 
@@ -66,9 +67,15 @@ class PerLayerRouter:
         self.acc = {}
         self._handles = []
         self.n = 0
-        for _, mod in model.named_modules():
+        for name, mod in model.named_modules():
             if mod.__class__.__name__ == "BiBoMoERouter":
-                self._handles.append(mod.register_forward_hook(self._mk(self.n)))
+                # Key by the MODEL's layer index, not by discovery order. With dense end-layers
+                # (mlp_only_layers=[0,9]) the first router lives in layer 1, and a 0-based counter
+                # would label it layer_0 -- every per-layer chart off by one against every other
+                # per-layer series in the run.
+                m = re.search(r"layers\.(\d+)\.", name)
+                self._handles.append(mod.register_forward_hook(
+                    self._mk(int(m.group(1)) if m else self.n)))
                 self.n += 1
 
     def _mk(self, i):
@@ -76,7 +83,8 @@ class PerLayerRouter:
         def hook(mod, args, out):
             if not self.enabled or not args:
                 return
-            scores = torch.sigmoid(mod.router_logits(args[0]))          # (N, E), pre-bias
+            lg = mod.router_logits(args[0]).float()                     # (N, E) logits
+            scores = torch.sigmoid(lg)                                  # (N, E), pre-bias
             idx = out[0].reshape(-1, out[0].shape[-1])                  # (N, k) chosen experts
             a = self.acc.setdefault(i, {"counts": torch.zeros(self.E, dtype=torch.float64),
                                         "p": torch.zeros(self.E, dtype=torch.float64),
@@ -87,14 +95,13 @@ class PerLayerRouter:
             if self.k < self.E:
                 tk = scores.topk(self.k + 1, dim=-1).values
                 a["gap"] += (tk[..., self.k - 1] - tk[..., self.k]).mean().item()
-            lg = mod.router_logits(args[0]).float()
             a["z"] += (torch.logsumexp(lg, dim=-1) ** 2).mean().item()
             a["n"] += 1
         return hook
 
     def flush(self):
         """Metrics for the interval, then reset. Empty dict if nothing was traced."""
-        out = {}
+        out, loads = {}, {}
         for i, a in sorted(self.acc.items()):
             if not a["n"]:
                 continue
@@ -117,6 +124,11 @@ class PerLayerRouter:
             h = _hist(counts.tolist(), self.E)
             if h is not None:
                 out[f"{pre}/routing_hist"] = h
+            loads[i] = counts.tolist()
+        if loads:
+            m = load_map(loads)
+            if m is not None:
+                out["train/router/load_map"] = m
         self.acc = {}
         return out
 
@@ -161,3 +173,52 @@ def per_layer_params(model):
             out[f"{pre}/max"] = p.max().item()
             out[f"{pre}/std"] = p.std().item() if p.numel() > 1 else 0.0
     return out
+
+
+def _hsv_to_rgb(h, s, v):
+    """Vectorised HSV -> uint8 RGB. numpy only; matplotlib is not a training dependency."""
+    import numpy as np
+    i = np.floor(h * 6.0)
+    f = h * 6.0 - i
+    p, q, t = v * (1 - s), v * (1 - f * s), v * (1 - (1 - f) * s)
+    i = (i % 6).astype(int)
+    r = np.choose(i, [v, q, p, p, t, v])
+    g = np.choose(i, [t, v, v, q, p, p])
+    b = np.choose(i, [p, p, t, v, v, q])
+    return (np.stack([r, g, b], -1) * 255).astype("uint8")
+
+
+def load_rgb(loads, cell=10):
+    """The pixels behind load_map: (L*cell, E*cell, 3) uint8, plus E. Separate so the colour
+    encoding is testable without wandb."""
+    import numpy as np
+    a = np.array([np.asarray(loads[r], dtype="float64") for r in sorted(loads)])   # (L, E)
+    E = a.shape[1]
+    ratio = a / np.maximum(a.sum(1, keepdims=True), 1) * E                   # 1.0 == uniform
+    lg = np.clip(np.log2(np.maximum(ratio, 1e-6)) / 2.0, -1, 1)              # +-2 octaves -> +-1
+    img = _hsv_to_rgb(0.33 * (1 - lg), np.abs(lg), np.where(a > 0, 1.0, 0.0))
+    return np.repeat(np.repeat(img, cell, 0), cell, 1), E                    # nearest-neighbour zoom
+
+
+def load_map(loads, cell=10):
+    """One image: rows = layers, columns = experts, colour = load relative to uniform.
+
+    The per-layer histograms answer "what does layer 7 look like"; this answers "which layer is
+    the problem" in a single glance, which is the question actually being asked when a run drifts.
+    W&B's own histogram colouring is a density ramp we do not control, so the encoding is ours:
+
+      hue         blue = starved, green = uniform, red = overloaded (log2 of load/uniform, +-2)
+      saturation  distance from uniform -- a perfectly balanced layer is WHITE, i.e. boring
+      value       black == dead expert (zero tokens), the one state worth spotting instantly
+
+    `loads` is {layer_index: counts tensor/list}. Returns a wandb.Image, or None if wandb or numpy
+    is missing -- logging must never be able to kill a run.
+    """
+    try:
+        import wandb
+    except Exception:
+        return None
+    rows = sorted(loads)
+    img, E = load_rgb(loads, cell)
+    return wandb.Image(img, caption=f"rows=layers {rows[0]}-{rows[-1]}, cols=experts 0-{E-1}; "
+                                    "blue starved / white uniform / red hot / black dead")
