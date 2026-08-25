@@ -29,3 +29,11 @@ def test_load_map_encoding():
     assert tuple(_px(img, 2, 0)) == (0, 0, 0), "dead expert must be black"
     r, g, b = _px(img, 1, 0)
     assert b > r and b > g, "starved must be blue"
+
+
+def test_train_diagnostics_go_to_interp():
+    from ablate.common.train import _interp
+    out = _interp({"train/router/layer_3/max_load": 1, "train/attn_res_s/L0": 2,
+                   "grad/norm/layers.mlp.gate_proj": 3, "grad/norm_min_over_tensors": 4})
+    assert out == {"interp/router/layer_3/max_load": 1, "interp/attn_res_s/L0": 2,
+                   "grad/norm/layers.mlp.gate_proj": 3, "grad/norm_min_over_tensors": 4}

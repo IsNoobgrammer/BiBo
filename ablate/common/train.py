@@ -204,6 +204,20 @@ def _push_hf_async(api, repo, local_dir, path_in_repo, tag):
 # callers were the eval and sampling call sites. Restore from git history if sampling comes back.
 
 
+def _interp(rt):
+    """Move every diagnostic out of `train/` and into `interp/`.
+
+    `train/` is the panel you read while a run is in flight -- loss, lr, mfu, tps, grad norm. The
+    per-layer router/XSA/carry/radial tables are 200+ series and they were burying those five.
+    They keep their names, only the section changes, so `train/attn_res_s/L0` from an older run and
+    `interp/attn_res_s/L0` from a new one are the same series under a different heading.
+
+    Keys that are not already `train/*` (params/norm, grad/norm) are left alone: a dead gradient is
+    a training failure, not an interpretability question, and it belongs where you will see it.
+    """
+    return {("interp/" + k[6:] if k.startswith("train/") else k): v for k, v in rt.items()}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", choices=["qwen", "bibo_min"], required=True)
@@ -1141,7 +1155,7 @@ def main():
                         **({"train/loss_clean": loss_clean, "train/probe_gap": loss_clean - lv}
                            if loss_clean is not None else {}),
                         **({"train/probe_gamma": _mns.probe_gamma} if _mns is not None else {}),
-                        "tokens": toks, **rt, **val_flat}, step=step)
+                        "tokens": toks, **_interp(rt), **val_flat}, step=step)
         if args.ckpt_every and step > 0 and step % args.ckpt_every == 0:
             if hf_api is not None:
                 _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_step{step}"))

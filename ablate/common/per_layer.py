@@ -1,7 +1,8 @@
 """Per-layer, per-step diagnostics: expert load, balance, boundary gap, XSA alpha, radial p.
 
-Modelled on the marin_moe 67B run, which logs `train/router/layer_N/{routing_hist, ...}` for every
-layer and every step. W&B renders a per-step histogram series as a heatmap with step on x and the
+Modelled on the marin_moe 67B run, which logs `router/layer_N/{routing_hist, ...}` for every
+layer and every step. Keys are built with a `train/` prefix and train.py rewrites them to
+`interp/` at the log call, so `train/` stays down to the five numbers you read live. W&B renders a per-step histogram series as a heatmap with step on x and the
 bin on y, so a 64-expert load distribution over 2000 steps becomes one picture -- and a collapse,
 a dead expert, or a slow drift into bimodality is visible at a glance in a way that max-load and
 entropy cannot show. Both of those are summary statistics of exactly the distribution being hidden.
