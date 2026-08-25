@@ -949,6 +949,11 @@ def main():
             rt.update(tensor_norms(model))
             if plrouter is not None:
                 rt.update(plrouter.flush())
+                # OFF for the rest of this step. Validation and the extrapolation panels run their
+                # own forwards further down, and with the hooks still armed their tokens land in
+                # the next interval's expert counts -- 3.9% of the histogram on the board config,
+                # measured on base-allmoe-s2026, mixing held-out text into a TRAIN routing metric.
+                plrouter.enabled = False
             # XSA alpha and radial p per layer, read straight off the parameters. The depth ramp
             # in p was only ever visible per layer, and the aggregate min/mean/max hid it.
             rt.update(per_layer_params(model))

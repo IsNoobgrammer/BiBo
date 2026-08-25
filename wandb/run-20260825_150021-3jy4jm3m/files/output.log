@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\shaur\OneDrive\Documents\BiBo\ablate\tools\wandb_reorg.py", line 92, in <module>
+    main()
+  File "C:\Users\shaur\OneDrive\Documents\BiBo\ablate\tools\wandb_reorg.py", line 81, in main
+    nv = rebuild(v, args.media)
+         ^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\shaur\OneDrive\Documents\BiBo\ablate\tools\wandb_reorg.py", line 39, in rebuild
+    return wandb.Histogram(np_histogram=(v["values"], v["bins"]))
+                                                      ~^^^^^^^^
+KeyError: 'bins'

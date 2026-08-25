@@ -1,0 +1,20 @@
+{
+  "os":  "Windows-11-10.0.26200-SP0",
+  "python":  "CPython 3.12.5",
+  "startedAt":  "2026-08-25T09:31:29.478709Z",
+  "args":  [
+    "ablations-tinycompany-ai/bibo-dense-vs-moe-2k/o35njyt7",
+    "--media",
+    "C:/Users/shaur/AppData/Local/Temp/claude/C--Users-shaur-OneDrive-Documents-triton-kernel-fused/509592c5-d582-4321-9e07-8d252dfe1d8f/scratchpad/reorg"
+  ],
+  "program":  "-m ablate.tools.wandb_reorg",
+  "git":  {
+    "remote":  "https://github.com/IsNoobgrammer/BiBo.git",
+    "commit":  "1d16066de7fdf392d05e5d453e6862d37dfad4c1"
+  },
+  "email":  "shaurya.sharthak.work@gmail.com",
+  "root":  "C:\\Users\\shaur\\OneDrive\\Documents\\BiBo",
+  "host":  "SedGram",
+  "executable":  "C:\\Users\\shaur\\OneDrive\\Documents\\BiBo\\.venv\\Scripts\\python.exe",
+  "writerId":  "u90r7dsyc7qw2wkfb1heiwjr14zximx0"
+}

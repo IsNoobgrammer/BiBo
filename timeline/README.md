@@ -67,6 +67,12 @@ Gigatoken is 10.1x faster and shipped on **0 mismatches over 3200 documents**, n
 bip2 corpus turned out to be padded, not packed - 15.93% of tokens - and we were scoring the
 padding.
 
+### [10 - Per-layer interp](10-per-layer-interp/README.md)
+The first fully instrumented run. Attention type organises everything: global layers suppress the
+carry (0.844) while sliding layers amplify it with depth (up to 1.498). L1 runs XSA backwards and
+collapses radial p to pure NormSiLU. The routers saturate - top logits near 200 under a sigmoid
+gate - and expert identity churns rather than specialising.
+
 ### [09 - Methodology](09-methodology/README.md)
 The lessons that cost the most time, all learned the hard way. Noise floors, ablate downward,
 a learned parameter value tells you nothing about whether it matters, and durability is verified
@@ -96,6 +102,7 @@ rather than set up.
 | Aug 7 | `bibo-clean-v1`, `bibo-lr-sweep` | 13 | post-purge baseline, Muon LR |
 | Aug 8-13 | `bibo-baseline-2k` | 16 | the 2000-step board: carry, rope, noise floor |
 | Aug 15 | `bibo-dense-vs-moe-2k` | 5 | dense vs MoE end-layers, and the carry interp |
+| Aug 25 | `bibo-dense-vs-moe-2k` | +1 | all-MoE at a second seed, fully instrumented per layer |
 
 Every run indexed locally in [`_data/wandb.json`](_data/wandb.json) - W&B is the system of record,
 but boxes and results have been lost before.
