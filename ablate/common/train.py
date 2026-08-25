@@ -26,7 +26,8 @@ from .data import token_batches, TRAIN_DATASET
 TOKENIZER = "fhai50032/QTK-81K"
 from .router_trace import RouterTrace   # training-stream router diagnostic; survived the purge
 from . import validation as _val        # frozen small batch, CE logged on the training log line
-from .tensor_health import tensor_norms, RouterLogitScale
+from .tensor_health import tensor_norms
+from .per_layer import PerLayerRouter, per_layer_params
 from kernels.sm120.cross_entropy import fused_linear_cross_entropy   # sm120 (Blackwell); CE byte-identical to sm75
 
 DEV = "cuda"
@@ -649,9 +650,11 @@ def main():
               "the measured info cap) -- slice the batch to get votes", flush=True)
     _n_exp = getattr(cfg, "num_routed_experts", None) or getattr(cfg, "num_experts", 0)
     rtrace = RouterTrace(model, _n_exp, DEV) if (args.router_log and _n_exp >= 2) else None
-    # Borrowed from the marin_moe 67B run. Router z-loss is the router's LOGIT scale, which every
-    # other router diagnostic we log is blind to because they all read post-sigmoid scores.
-    zscale = RouterLogitScale(model) if (args.router_log and _n_exp >= 2) else None
+    # Per-LAYER router diagnostics: expert-load histogram, balance, boundary gap, logit scale.
+    # A model-wide mean cannot say WHICH layer collapsed, and max-load plus entropy are both
+    # summary statistics of the very distribution the histogram shows.
+    plrouter = (PerLayerRouter(model, _n_exp, args.top_k or SHARED["num_experts_per_tok"])
+                if (args.router_log and _n_exp >= 2) else None)
     opts, n_mat, n_oth = build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt,
                                           scale_mode=args.muon_scale_mode, xorth_post=args.xorth_post,
                                           xorth_gate_ref=args.xorth_gate_ref, xorth_ema=args.xorth_ema,
@@ -844,6 +847,10 @@ def main():
         print(f"[optim] manas gamma tracks lr: {probe_gamma:g} held through warmup "
               f"({_gs_warm} steps), then law(lr_t) -> ~0 at the end of the cosine", flush=True)
     for step in range(total_steps):
+        # The per-layer hooks fire only on steps that will actually be logged; every other step
+        # pays nothing. One traced step per interval is plenty for a distribution over 64 experts.
+        if plrouter is not None:
+            plrouter.enabled = (step % args.log_every == 0 or step == total_steps - 1)
         for o in opts:
             o.zero_grad(set_to_none=True)
         if _gs_on and step >= _gs_warm:                      # once per STEP, never between micros
@@ -926,8 +933,11 @@ def main():
             # shipped that bug twice (XSA alpha behind a passing parity test, ACT_CYCLE not
             # reaching the eager path). Both were invisible in the loss for days.
             rt.update(tensor_norms(model))
-            if zscale is not None:
-                rt.update(zscale.stats())
+            if plrouter is not None:
+                rt.update(plrouter.flush())
+            # XSA alpha and radial p per layer, read straight off the parameters. The depth ramp
+            # in p was only ever visible per layer, and the aggregate min/mean/max hid it.
+            rt.update(per_layer_params(model))
             xa_s = ((f" xa={rt['train/xsa_a_mean']:+.3f}"
                      f"[{rt['train/xsa_a_min']:+.2f},{rt['train/xsa_a_max']:+.2f}]"
                      if "train/xsa_a_mean" in rt else "")

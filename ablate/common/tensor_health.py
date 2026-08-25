@@ -1,7 +1,8 @@
-"""Per-tensor parameter and gradient norms, plus per-layer router logit scale.
+"""Per-tensor parameter and gradient norms.
 
-Both borrowed from the marin_moe 67B run (`params/norm/*`, `grad/norm/*`,
-`train/router/layer_N/router_z_loss`), which logs them for every weight tensor and every layer.
+Borrowed from the marin_moe 67B run (`params/norm/*`, `grad/norm/*`), which logs them for every
+weight tensor. The router half of that idea lives in per_layer.py, which owns every per-layer
+router metric so there is exactly one implementation of each.
 
 WHY THEY EARN THEIR PLACE HERE:
 
@@ -13,16 +14,6 @@ for days. A grad norm of 0.0 would have shown up in one step.
 
 `params/norm/*` catches the other half: a tensor that is growing without bound, or one that never
 moves from its initialisation.
-
-`router_z_loss` is the mean squared logsumexp of the router logits -- the router's LOGIT SCALE, as
-opposed to the entropy of its output distribution. We log entropy, top-1 weight and balance, all of
-which are computed AFTER the sigmoid, so none of them can see the logits growing. In the marin run
-this quantity climbs from 3.2 at layer 0 to 11-13 in the last third (peak 26.3), a depth profile
-that is invisible in entropy -- theirs is flat at 0.984-0.993 throughout. Given the temperature
-round found an interior optimum, logit scale by depth is exactly the missing variable.
-
-NOT applied as a loss. marin logs it with `router_z_loss_coef = 0` and so do we: this is a
-diagnostic, and turning it into an objective is a separate, pre-registered decision.
 
 Cost: one `.norm()` per tensor per logged step, grouped so the key count stays small.
 """
@@ -64,45 +55,3 @@ def tensor_norms(model, grads=True):
     if gn:
         out["grad/norm_min_over_tensors"] = min(out[k] for k in out if k.startswith("grad/norm/"))
     return out
-
-
-class RouterLogitScale:
-    """Per-layer router z-loss = mean(logsumexp(logits)^2), the router's logit SCALE.
-
-    Hooks `router_logits` on each router. That method exists precisely so the raw pre-activation
-    logits are reachable; every other router diagnostic we log reads post-sigmoid scores and is
-    therefore blind to this.
-    """
-
-    def __init__(self, model):
-        self.z = {}
-        self._handles = []
-        i = 0
-        for _, mod in model.named_modules():
-            if mod.__class__.__name__ == "BiBoMoERouter":
-                self._handles.append(mod.register_forward_hook(self._mk(i)))
-                i += 1
-        self.n_layers = i
-
-    def _mk(self, i):
-        @torch.no_grad()
-        def hook(mod, args, out):
-            h = args[0] if args else None
-            if h is None:
-                return
-            lg = mod.router_logits(h)
-            self.z[i] = (torch.logsumexp(lg.float(), dim=-1) ** 2).mean().item()
-        return hook
-
-    def stats(self, reset=True):
-        out = {f"train/router/layer_{i}/router_z_loss": v for i, v in self.z.items()}
-        if self.z:
-            out["train/router/z_loss_mean"] = sum(self.z.values()) / len(self.z)
-        if reset:
-            self.z = {}
-        return out
-
-    def close(self):
-        for h in self._handles:
-            h.remove()
-        self._handles = []
