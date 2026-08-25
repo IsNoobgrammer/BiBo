@@ -16,6 +16,11 @@ WHAT IS LOGGED PER LAYER
                       We already log this averaged over the model; per layer is the useful form,
                       since a model-wide mean cannot say WHICH layer is undecided.
   router_z_loss       logsumexp(logits)^2, the router's LOGIT scale (see tensor_health).
+  dead_experts        experts that got NO token IN THE TRACED MICRO-BATCH -- a sample statistic,
+                      not a claim that the expert is dead in training. At batch 8 x 1024 that is
+                      ~768 expected assignments each, so a nonzero count is real concentration,
+                      but it recovers between bias updates and is expected to be noisy early.
+  load_map            all layers in one image; see load_map() for the colour encoding.
 
   xsa_hist            tanh(alpha) per head, one bin per head. Only num_heads values (4 on the
                       board config), so the histogram is coarse by construction -- but as a

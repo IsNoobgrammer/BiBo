@@ -49,7 +49,7 @@ and Muon + Adam-for-vectors + wd 0.1.
         grad/norm_min_over_tensors is the inert-parameter detector we have needed twice.
 30. [x] log per-layer router z-loss (router LOGIT scale) -- DONE, same module. Diagnostic only,
         never added to the objective. Theirs climbs 3.2 -> 26.3 with depth while entropy stays flat.
-31. [ ] per-layer expert-load HISTOGRAM, not just max-load + entropy. Both summary stats hide a
+31. [x] per-layer expert-load HISTOGRAM, not just max-load + entropy. Both summary stats hide a
         bimodal load; marin logs all 256 bins per layer.
 32. [ ] per-domain bpb (marin logs Paloma across ~14 domains, plus macro_bpb vs bpb). We purged
         eval and now have a single val number, so we cannot tell a broad win from a one-domain win.
