@@ -6,8 +6,10 @@
 <div class="wrap">
 <nav class="crumb"><a href="../index.html">&larr; timeline</a><span>06-ffn-placement</span></nav>
 <h1>06 - FFN placement: dense vs MoE end-layers</h1>
-<p><strong>Span</strong> Aug 15-16 2026 &middot; <code>bibo-dense-vs-moe-2k</code>, 5 runs.</p>
-<h2>Verdict: all-MoE SHIPPED-pending, wins 0.066 val for 4.9% throughput</h2>
+<p><strong>Span</strong> Aug 15-25 2026 &middot; <code>bibo-dense-vs-moe-2k</code>, 7 runs.</p>
+<h2>Verdict: all-MoE SHIPPED-pending -- but the reason changed on the second seed</h2>
+<p><strong>Read the update at the bottom before quoting the 0.066.</strong> A second seed reversed the sign of the
+val gap. The result survives, on a different and much stronger metric: long-context extrapolation.</p>
 <p>The board config ran a dense FFN at layers 0 and 9 and a 64-expert top-6 MoE everywhere else. The
 question was whether those two layers want expert capacity too.</p>
 <div class="tablewrap"><table>
@@ -74,6 +76,109 @@ val at A's end-of-run slope, against the 0.066 all-MoE delivers.</p>
 <p>Under <code>swa_pattern block3</code>, layers 0 and 9 are <strong>also</strong> the full-attention layers, <strong>also</strong> the
 AttnRes block boundaries, and <strong>also</strong> the NoPE layers. "Dense FFN" is confounded with all three.
 This is "MoE-everywhere helps GIVEN this stack", never "dense end-layers are bad".</p>
+<h2>UPDATE, Aug 25 2026: a second seed, and val was the wrong metric</h2>
+<p><code>base-allmoe-s2026</code> and <code>dense0-s2026</code> repeat arms C and B at <strong>seed 2026</strong>, matched active params,
+bounded carry, full per-layer instrumentation.</p>
+<div class="tablewrap"><table>
+<thead>
+<tr>
+<th>arm</th>
+<th>seed</th>
+<th>val</th>
+<th>train</th>
+<th>ctx1024</th>
+<th>ctx4095</th>
+<th>delta_ctx4095</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>allmoe (C)</td>
+<td>42069</td>
+<td>3.5829</td>
+<td>3.6053</td>
+<td>3.2687</td>
+<td><strong>3.3098</strong></td>
+<td><strong>0.0411</strong></td>
+</tr>
+<tr>
+<td>allmoe (C2, sigmoid)</td>
+<td>42069</td>
+<td>3.5903</td>
+<td>3.6022</td>
+<td>3.2702</td>
+<td><strong>3.3223</strong></td>
+<td><strong>0.0521</strong></td>
+</tr>
+<tr>
+<td>allmoe (s2026)</td>
+<td>2026</td>
+<td>3.5952</td>
+<td>3.5947</td>
+<td>3.2619</td>
+<td><strong>3.3156</strong></td>
+<td><strong>0.0537</strong></td>
+</tr>
+<tr>
+<td>dense0 (B)</td>
+<td>42069</td>
+<td>3.6249</td>
+<td>3.6117</td>
+<td>3.2807</td>
+<td>3.4219</td>
+<td>0.1412</td>
+</tr>
+<tr>
+<td>dense0 (B2, sigmoid)</td>
+<td>42069</td>
+<td>3.6268</td>
+<td>3.6111</td>
+<td>3.2720</td>
+<td>3.4084</td>
+<td>0.1364</td>
+</tr>
+<tr>
+<td>dense0 (s2026)</td>
+<td>2026</td>
+<td><strong>3.5813</strong></td>
+<td>3.6004</td>
+<td>3.2569</td>
+<td>3.4082</td>
+<td>0.1513</td>
+</tr>
+<tr>
+<td>dense09 (A)</td>
+<td>42069</td>
+<td>3.6489</td>
+<td>3.6397</td>
+<td>3.3051</td>
+<td>3.4613</td>
+<td>0.1562</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>val flipped sign.</strong> At seed 42069 all-MoE beat dense-0 by 0.037; at seed 2026 dense-0 beat
+all-MoE by 0.014. Two runs of the same dense-0 config differ by <strong>0.0455</strong> across seeds -- twice
+the 0.0217 floor the round was reading against. <code>val/loss</code> is scored on <code>--val_seqs 2</code>, a
+two-sequence holdout. It is too small to carry a 0.03 effect and it never was.</p>
+<p><strong>Every other metric held, and one separated cleanly.</strong> Train loss (524M tokens) puts all-MoE ahead
+at both seeds, by 0.0089 and 0.0057 -- consistent, and an order of magnitude smaller than the val
+gap that was being quoted. And <code>delta_ctx4095</code>, the extrapolation penalty, separates the arms
+<strong>3 against 4 with no overlap</strong>:</p>
+<pre><code>all-MoE   0.0411  0.0521  0.0537
+dense     0.1364  0.1412  0.1513  0.1562
+</code></pre>
+<p>A 2.7x penalty, three runs each, both seeds, both carry parameterisations. At the trained length
+(ctx1024) the arms are within 0.024 of each other. <strong>The whole effect is at 4x extrapolation.</strong></p>
+<p><strong>And it is layer 0, not capacity.</strong> dense09 (0.1562) and dense0 (0.1364-0.1513) are the same
+within their own spread, so the second dense layer adds nothing to the damage. Under <code>block3</code>,
+layer 0 is a NoPE full-attention layer, and the rope round already established that the global
+layers govern extrapolation. Putting a dense FFN on the entry NoPE layer is what costs the
+long-context behaviour.</p>
+<p><strong>Restated verdict:</strong> all-MoE wins on long-context extrapolation by 2.7x on the degradation metric,
+consistently across seeds; it wins on train loss by ~0.007, consistently; and the val gap is noise
+that happened to point the right way at the first seed. The 4.9% throughput price now buys
+extrapolation, not 0.066 val.</p>
 <h2>Sources</h2>
 <p>Memory: <code>dense-moe-round</code>, <code>box-tps-drift</code>, <code>carry-is-flat</code>. Results:
 <code>ablate/certified_results/tps_probe_20260815.md</code>.</p>

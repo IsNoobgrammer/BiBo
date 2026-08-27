@@ -687,8 +687,151 @@ in the router charts than in every other per-layer series in the same run.</p>
 </tbody>
 </table></div>
 <hr />
+<hr />
+<h2>6. The follow-up arm: dense L0, and what moved</h2>
+<p><code>dense0-s2026</code> is the same config with a dense FFN at layer 0 (<code>--mlp_only_layers 0</code>,
+<code>dense_inter 4608</code>, active params matched to 0.02%), same seed, same instrumentation. It was run to
+ask one question: <strong>is the L0 pathology about L0 the layer, or L0 the entry position?</strong></p>
+<h3>The pathology mostly does NOT move</h3>
+<div class="tablewrap"><table>
+<thead>
+<tr>
+<th></th>
+<th>baseline L0 (MoE)</th>
+<th>baseline L1</th>
+<th>dense0 L1</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>logit scale (logsumexp)</td>
+<td><strong>31.0</strong></td>
+<td>198.9</td>
+<td>204.1</td>
+</tr>
+<tr>
+<td>boundary gap</td>
+<td><strong>0.0026</strong></td>
+<td>0.1033</td>
+<td><strong>0.0050</strong></td>
+</tr>
+<tr>
+<td>max load (x uniform)</td>
+<td><strong>6.17</strong></td>
+<td>3.48</td>
+<td>3.35</td>
+</tr>
+<tr>
+<td>longest dead run</td>
+<td><strong>48 logged steps</strong></td>
+<td>6</td>
+<td><strong>1</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>One of the four symptoms transfers. With L0 dense, the new entry MoE layer (L1) has a <strong>tied
+boundary</strong> -- 0.0050, twenty times smaller than the same layer had in the baseline and close to
+L0's 0.0026. But its logit scale, its load concentration, and its dead-expert behaviour are all
+normal.</p>
+<p>So the entry position does force one thing: whichever MoE layer sees the least-processed
+representation cannot separate its 6th choice from its 7th. The rest of the L0 syndrome -- the weak
+router, the 6x concentration, the 1200-step dead expert -- belonged to <strong>layer 0 specifically</strong>, and
+a dense FFN removes it rather than relocating it.</p>
+<p>Boundary gaps shrank across the whole stack (L2 0.0351 -&gt; 0.0177, L7 0.0518 -&gt; 0.0347, L8 0.0297 -&gt;
+0.0199) while max loads fell almost everywhere. Dense-L0 gives a better balanced and less decisive
+router at every depth.</p>
+<h3>The middle of the stack is reproducible; the ends are not</h3>
+<p>Same seed, one architectural change at layer 0, and the layers respond in two distinct groups:</p>
+<div class="tablewrap"><table>
+<thead>
+<tr>
+<th></th>
+<th>radial p, baseline -&gt; dense0</th>
+<th>carry, baseline -&gt; dense0</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>L1</td>
+<td>0.077 -&gt; <strong>0.579</strong></td>
+<td>0.966 -&gt; 1.084</td>
+</tr>
+<tr>
+<td>L2</td>
+<td>0.356 -&gt; <strong>0.811</strong></td>
+<td>1.062 -&gt; 1.095</td>
+</tr>
+<tr>
+<td>L3</td>
+<td>0.155 -&gt; 0.113</td>
+<td>1.046 -&gt; 1.036</td>
+</tr>
+<tr>
+<td>L4</td>
+<td>0.289 -&gt; 0.284</td>
+<td>1.198 -&gt; 1.168</td>
+</tr>
+<tr>
+<td>L5</td>
+<td>0.537 -&gt; 0.498</td>
+<td>1.220 -&gt; 1.159</td>
+</tr>
+<tr>
+<td>L6</td>
+<td>0.203 -&gt; 0.217</td>
+<td>0.921 -&gt; 0.982</td>
+</tr>
+<tr>
+<td>L7</td>
+<td>0.284 -&gt; 0.322</td>
+<td>1.297 -&gt; 1.378</td>
+</tr>
+<tr>
+<td>L8</td>
+<td>0.335 -&gt; 0.391</td>
+<td>1.498 -&gt; <strong>1.201</strong></td>
+</tr>
+<tr>
+<td>L9</td>
+<td>0.589 -&gt; 0.408</td>
+<td>0.651 -&gt; <strong>0.930</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>L3 through L7 barely move</strong> -- radial p within 0.042 and the carry within 0.081 on every one of
+them. <strong>L1, L2, L8 and L9 swing hard</strong>: p at L2 goes 0.356 -&gt; 0.811, and the L1 collapse to pure
+NormSiLU (0.077) is simply gone (0.579). The carry at L8 drops 0.298 and at L9 rises 0.279.</p>
+<p>This confirms, with an intervention rather than two unrelated runs, what was previously only a
+suspicion: <strong>the early and late layers are plastic and the middle is determined.</strong> Any per-layer
+claim about L0-L2 or L8-L9 needs a repeat before it means anything; L3-L7 can be read from one run.</p>
+<h3>The XSA sign flip moved</h3>
+<p>Baseline: L1 runs XSA backwards on all four heads (-0.53 to -0.94), L0 is positive.
+dense0: <strong>L0</strong> has two negative heads (-0.77, -0.89) and L1 is entirely positive (+0.18 to +0.50).</p>
+<p>The model keeps one layer near the entry that reverses XSA, and which layer that is follows the
+architecture. This is n=1 on each side and sits squarely inside the plastic region above, so it is
+a lead, not a result.</p>
+<h3>The quality answer</h3>
+<p>Dense-L0 does not fix anything worth 0.10 of extrapolation loss. See
+<a href="../06-ffn-placement/README.md">06 - FFN placement</a>: <code>delta_ctx4095</code> is 0.0537 for this baseline and
+0.1513 for dense-L0, and the six-run picture separates cleanly. The interp reading is that L0's
+router really is pathological <em>and</em> removing it costs long-context performance -- those are both
+true, so the fix is not "make L0 dense".</p>
+<p><strong>The narrower version is still open</strong>: fewer experts at L0 rather than none, which keeps routing
+at the entry while shrinking the choice the router cannot make. That is a code change
+(<code>num_routed_experts</code> is one global int threaded through the config, the MoE block, the router and
+the megakernel), and the tied-boundary result above is the argument for paying for it -- an entry
+router that cannot separate rank 6 from rank 7 is being asked to make a decision it has no
+information for.</p>
+<h3>The contamination fix, verified</h3>
+<p>Each traced step in this arm recorded exactly <strong>1,572,864</strong> assignments = <code>64 x 1024 x 6 x 4</code>,
+against the baseline's 1,634,304. The 3.9% of validation tokens is gone, which confirms both the
+diagnosis and the fix.</p>
+<hr />
 <h2>Caveats</h2>
 <ul>
+<li><strong>The early and late layers are plastic.</strong> Section 6 shows L1, L2, L8 and L9 reorganising
+  completely under a change at layer 0 while L3-L7 hold to within 0.04. Everything said about L0-L2
+  or L8-L9 in sections 1-5 is a single sample of an unstable region.</li>
 <li><strong>n = 1 for every per-layer number here.</strong> The val loss has three seeds behind it; the carry,
   XSA, p and router tables have one. The six architecturally identical windowed layers vary by up
   to 0.33 on carry across earlier arms, so treat any per-layer difference smaller than that as
