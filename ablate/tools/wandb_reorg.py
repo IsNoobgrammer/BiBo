@@ -48,6 +48,41 @@ def rebuild(v, media_root):
     return None                      # anything else (tables, audio) is not used by this repo
 
 
+def _verify(api, src_path, dst_id):
+    """Refuse to call a copy good without checking it. The original gets deleted on the strength
+    of this, so it checks row count and that every moved key actually landed."""
+    entity, project, _ = src_path.split("/")
+    src = api.run(src_path)
+    dst = api.run(f"{entity}/{project}/{dst_id}")
+    n_src, n_dst = len(_history(src)), len(_history(dst))
+    sj, dj = src.summary._json_dict, dst.summary._json_dict
+    missing = [k for k in sj if remap(k) != k and remap(k) not in dj]
+    ok = n_src == n_dst and not missing
+    print(f"  verify: rows {n_src} -> {n_dst}, {len(missing)} keys missing -> "
+          f"{'COMPLETE' if ok else 'INCOMPLETE ' + str(missing[:5])}")
+    return ok
+
+
+def _history(src, batch=8):
+    """Every history row, INCLUDING the histogram and image columns.
+
+    An unkeyed scan_history() silently omits them -- it returns only the scalar columns. Copying a
+    run with that alone loses every wandb.Histogram and every image while reporting the right row
+    count, so the copy looks complete and is missing exactly the per-layer data worth keeping.
+    Media keys are therefore re-fetched by name, in small batches, and merged back by step.
+    """
+    rows = {r["_step"]: dict(r) for r in src.scan_history(page_size=1000) if "_step" in r}
+    media = [k for k, v in src.summary._json_dict.items()
+             if isinstance(v, dict) and v.get("_type") in
+             ("histogram", "image-file", "images/separated")]
+    for i in range(0, len(media), batch):
+        for r in src.scan_history(keys=media[i:i + batch] + ["_step"]):
+            rows.get(r.get("_step"), {}).update({k: v for k, v in r.items() if k != "_step"})
+    if media:
+        print(f"  + {len(media)} histogram/image columns re-fetched by name")
+    return [rows[k] for k in sorted(rows)]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("run", help="entity/project/runid")
@@ -58,7 +93,7 @@ def main():
 
     api = wandb.Api()
     src = api.run(args.run)
-    rows = list(src.scan_history(page_size=1000))
+    rows = _history(src)
     moved = sorted({k for r in rows for k in r if remap(k) != k})
     print(f"{src.name}\n  {len(rows)} steps, {len(rows[0])} keys, {len(moved)} moving to interp/")
     for k in moved[:5]:
@@ -84,6 +119,7 @@ def main():
     finally:
         print("  copy:", dst.url)
         dst.finish()
+    _verify(api, args.run, dst.id)
 
 
 def _copy(src, dst, rows, media):
