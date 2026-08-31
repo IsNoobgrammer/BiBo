@@ -21,6 +21,8 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
+
+from src.modeling.layers import _layer_config
 from torch.utils.checkpoint import checkpoint
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation.utils import GenerationMixin
@@ -247,7 +249,11 @@ class BiBoDecoderLayer(nn.Module):
 
         self.self_attn = BiBoAttention(config=config, layer_idx=layer_idx)
         self.is_moe_layer = layer_idx not in config.mlp_only_layers
-        self.mlp = BiBoMoELayer(config) if self.is_moe_layer else BiBoMLP(config, is_expert=False)
+        # _layer_config, not config: per-layer expert geometry (--moe_override) must reach THIS
+        # path too. Every attn_res arm builds here, so an override applied only in src/ would be
+        # silently ignored by the entire round that needs it.
+        self.mlp = (BiBoMoELayer(_layer_config(config, layer_idx)) if self.is_moe_layer
+                    else BiBoMLP(config, is_expert=False))
 
         self.input_layernorm = BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
