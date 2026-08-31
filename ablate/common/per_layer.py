@@ -134,7 +134,11 @@ class PerLayerRouter:
             # k/E (9.4% on the board config), so this is directly comparable across geometries.
             out[f"{pre}/max_load_tokens"] = float(f.max()) * k
             out[f"{pre}/dead_experts"] = int((counts == 0).sum())
-            out[f"{pre}/boundary_gap"] = a["gap"] / a["n"]
+            # Omitted, not zeroed, when k == E: there is no k/k+1 boundary in an all-active
+            # ensemble, and a logged 0.0 reads as "perfectly tied" -- the strongest possible claim
+            # about a quantity that does not exist.
+            if k < E:
+                out[f"{pre}/boundary_gap"] = a["gap"] / a["n"]
             out[f"{pre}/router_z_loss"] = a["z"] / a["n"]
             h = _hist(counts.tolist(), E)
             if h is not None:
