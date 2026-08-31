@@ -1,4 +1,6 @@
 """Decoder layer"""
+import copy
+
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
@@ -9,6 +11,31 @@ from .attn import BiBoAttention
 from .ffn import BiBoMLP, BiBoMoELayer
 
 __all__ = ['BiBoDecoderLayer']
+
+
+def _layer_config(config, layer_idx):
+    """`config`, or a shallow copy carrying this layer's expert-geometry override.
+
+    Shallow is deliberate: the copy must share every other attribute with the real config, and the
+    three fields being replaced are plain ints. Returns the original object when there is no
+    override, so the common path allocates nothing and `cfg is config` stays true.
+    """
+    over = getattr(config, "moe_overrides", None)
+    if not over or layer_idx not in over:
+        return config
+    cfg = copy.copy(config)
+    for k, v in over[layer_idx].items():
+        setattr(cfg, k, v)
+    # num_glu_experts is DERIVED from num_routed_experts in the config constructor, and the expert
+    # stack sizes itself from the derived value -- not the one being overridden. Without this the
+    # router would be rebuilt at the new E while the weights stayed at the old one, which is the
+    # exact shape of bug the repo has shipped before.
+    cfg.num_glu_experts = (cfg.num_routed_experts - cfg.num_pos_identity_experts
+                           - cfg.num_neg_identity_experts)
+    if cfg.num_glu_experts < 1 or cfg.num_experts_per_tok > cfg.num_routed_experts:
+        raise ValueError(f"layer {layer_idx} override leaves {cfg.num_glu_experts} GLU experts "
+                         f"and top_k={cfg.num_experts_per_tok} of {cfg.num_routed_experts}")
+    return cfg
 
 
 class BiBoDecoderLayer(nn.Module):
@@ -44,7 +71,7 @@ class BiBoDecoderLayer(nn.Module):
         # MoE or dense MLP
         self.is_moe_layer = layer_idx not in config.mlp_only_layers
         if self.is_moe_layer:
-            self.mlp = BiBoMoELayer(config)
+            self.mlp = BiBoMoELayer(_layer_config(config, layer_idx))
         else:
             self.mlp = BiBoMLP(config, is_expert=False)
 

@@ -1,5 +1,7 @@
 """Model builder + param counter for the ablation. Swappable: build_arm(name) is the only entry."""
 from . import _paths  # noqa: F401
+import re
+
 import torch
 from .configs import ARMS, SHARED, glu_count, make_qwen_config, make_bibo_min_config
 from . import patches
@@ -8,6 +10,7 @@ from . import patches
 def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
               bias_update_threshold=10240, bias_update_factor=None, aux_coef=0.001,
               num_experts=None, special_pairs=0, mlp_only_layers=None,
+              moe_overrides=None,
               intermediate_size=None,
               use_xsa=False, xsa_alpha_init=0.0,
               pos_identity_expert=True, neg_identity_expert=True,
@@ -50,6 +53,7 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
         cfg = make_bibo_min_config(bias_update_threshold, bias_update_factor,
                                    num_experts=n_total, special_pairs=special_pairs,
                                    mlp_only_layers=mlp_only_layers,
+                                   moe_overrides=moe_overrides,
                                    intermediate_size=intermediate_size,
                                    rope_theta=rope_theta,
                                    use_xsa=use_xsa,
@@ -86,6 +90,9 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
     return model.to(device=device, dtype=dtype), cfg
 
 
+_LAYER_IDX = re.compile(r"layers\.(\d+)\.")
+
+
 def count_params(model, top_k=None, num_experts=None):
     """Return (total, trainable, active). trainable excludes inert (requires_grad=False) params like
     BiBo's zero-init router bias; the ablation is matched on trainable/active params. active discounts
@@ -100,6 +107,7 @@ def count_params(model, top_k=None, num_experts=None):
     cfg = getattr(model, "config", None)
     top_k = top_k or getattr(cfg, "num_experts_per_tok", None) or SHARED["num_experts_per_tok"]
     num_experts = num_experts or SHARED["num_experts"]
+    _over = getattr(cfg, "moe_overrides", None) or {}
     total = trainable = inactive = 0
     for n, p in model.named_parameters():
         total += p.numel()
@@ -107,5 +115,10 @@ def count_params(model, top_k=None, num_experts=None):
             trainable += p.numel()
         if p.ndim == 3 and ("expert" in n or "gate_up_proj" in n or "down_proj" in n):
             e = p.shape[0]
-            inactive += int(p.numel() * (1.0 - top_k / e))
+            # A layer with a moe_overrides entry routes to its OWN top_k. Using the global one
+            # here reports a layer that is coarser-but-narrower as +5.8% active when it is in
+            # fact matched, which would sink the very arm the override exists to run.
+            _m = _LAYER_IDX.search(n)
+            _k = _over.get(int(_m.group(1)), {}).get("num_experts_per_tok", top_k) if _m else top_k
+            inactive += int(p.numel() * (1.0 - _k / e))
     return total, trainable, total - inactive

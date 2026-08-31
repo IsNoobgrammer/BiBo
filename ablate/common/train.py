@@ -401,6 +401,14 @@ def main():
     # board config) makes a dense layer and an MoE layer cost the SAME active params, to within
     # the router's h*num_experts.
     ap.add_argument("--dense_inter", type=int, default=None)
+    # PER-LAYER expert geometry, "layer:E:top_k:width" (repeat with commas). Holding both active
+    # and total params fixed pins E/top_k = total/active, so a COARSER layer needs a smaller k:
+    # on the board config 0:32:3:1536 costs the same as the default 64/6/768 to 0.2%, while
+    # 0:32:6:768 would be half the layer. The point is to give the entry layer a decision it can
+    # actually make -- its router ends training unable to separate rank 6 from rank 7 (boundary
+    # gap 0.0026 vs 0.02-0.10 elsewhere) -- without paying the 0.10 ctx4095 that a dense L0 costs.
+    ap.add_argument("--moe_override", default="",
+                    help='per-layer expert geometry, e.g. "0:32:3:1536"')
     # XSA is part of the default stack now (learnable per-head alpha, init 0). BooleanOptionalAction
     # so the existing `--use_xsa` spelling still parses and `--no-use_xsa` is the ablation.
     ap.add_argument("--use_xsa", action=argparse.BooleanOptionalAction, default=True)
@@ -590,6 +598,15 @@ def main():
     # Shared with run_eval.py so a checkpoint's architecture can be reproduced exactly.
     _swa_pat, _win = resolve_swa(args.swa_pattern, args.sliding_window, SHARED["num_hidden_layers"])
     # None -> SHARED default [0, 9]; "none" -> [] (every layer MoE); else a comma list.
+    # "0:32:3:1536" -> {0: {num_routed_experts: 32, num_experts_per_tok: 3, moe_intermediate_size: 1536}}
+    _moe_over = {}
+    for _spec in filter(None, (x.strip() for x in args.moe_override.split(","))):
+        _L, _E, _k, _w = (int(x) for x in _spec.split(":"))
+        _moe_over[_L] = {"num_routed_experts": _E, "num_experts_per_tok": _k,
+                         "moe_intermediate_size": _w}
+        print(f"[ffn] layer {_L} expert geometry override: {_E} experts, top-{_k}, width {_w}",
+              flush=True)
+
     _dense = (None if args.mlp_only_layers is None else
               [] if args.mlp_only_layers.lower() == "none" else
               [int(v) for v in args.mlp_only_layers.split(",")])
@@ -612,6 +629,7 @@ def main():
                            swa_qk_norm=args.swa_qk_norm,
                            rope_theta=args.rope_theta,
                            mlp_only_layers=_dense,
+                           moe_overrides=_moe_over,
                            intermediate_size=args.dense_inter,
                            attn_res=args.attn_res, attn_res_sites=args.attn_res_sites,
                            attn_res_carry=args.attn_res_carry,
@@ -719,6 +737,9 @@ def main():
                 # A different dense/MoE split is a different model with a different param count;
                 # untagged it would overwrite the baseline's ckpt and _result.json on the same seed.
                 + (f"_di{args.dense_inter}" if args.dense_inter else "")
+                + ("" if not _moe_over else "_mo" + "-".join(
+                    f"{L}x{v['num_routed_experts']}k{v['num_experts_per_tok']}w{v['moe_intermediate_size']}"
+                    for L, v in sorted(_moe_over.items())))
                 + ("" if args.mlp_only_layers is None else
                    "_allmoe" if _dense == [] else "_dense" + "-".join(map(str, _dense)))
                 # activation is an axis again; an untagged silu arm would overwrite the radial

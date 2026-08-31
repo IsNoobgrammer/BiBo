@@ -36,6 +36,7 @@ class BiBoConfig(PretrainedConfig):
         tie_word_embeddings=True,
         use_cache=True,
         mlp_only_layers=None,
+        moe_overrides=None,
         moe_intermediate_size=None,
         num_experts_per_tok=6,
         num_routed_experts=6,
@@ -140,6 +141,18 @@ class BiBoConfig(PretrainedConfig):
             mlp_only_layers if mlp_only_layers is not None
             else sorted({0, num_hidden_layers - 1})
         )
+
+        # PER-LAYER expert geometry: {layer_idx: {"num_routed_experts", "num_experts_per_tok",
+        # "moe_intermediate_size"}}. Every consumer of these three reads them off `config`, so an
+        # override is applied by handing that layer a shallow config copy (see layers.py) rather
+        # than threading a per-layer value through the MoE block, the router and the expert stack.
+        #
+        # The reason this knob exists: holding BOTH active and total params fixed pins the ratio
+        # E / top_k. active ~ top_k*3*h*w and total ~ E*3*h*w, so E/top_k = total/active = 32/3 on
+        # the board config. "Fewer, bigger experts" at matched cost therefore REQUIRES a
+        # proportionally smaller top_k -- 64/6/768 and 32/3/1536 are the same cost, 32/6/768 is
+        # half the model. Keys are ints; JSON round-trips them as strings, hence the coercion.
+        self.moe_overrides = {int(k): v for k, v in (moe_overrides or {}).items()}
 
         super().__init__(
             pad_token_id=pad_token_id,
