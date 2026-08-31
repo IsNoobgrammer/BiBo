@@ -92,15 +92,18 @@ class PerLayerRouter:
             lg = mod.router_logits(args[0]).float()                     # (N, E) logits
             scores = torch.sigmoid(lg)                                  # (N, E), pre-bias
             idx = out[0].reshape(-1, out[0].shape[-1])                  # (N, k) chosen experts
-            a = self.acc.setdefault(i, {"counts": torch.zeros(self.E, dtype=torch.float64),
-                                        "p": torch.zeros(self.E, dtype=torch.float64),
-                                        "gap": 0.0, "z": 0.0, "n": 0})
-            a["counts"] += torch.bincount(idx.reshape(-1).to("cpu"),
-                                          minlength=self.E).double()
+            # E and k come off the MODULE, not off this object. --moe_override gives a layer its
+            # own expert count, and a single global E allocated a 64-wide accumulator for a
+            # 32-expert layer -- a shape error one step into the run.
+            E, k = mod.num_routed_experts, mod.top_k
+            a = self.acc.setdefault(i, {"counts": torch.zeros(E, dtype=torch.float64),
+                                        "p": torch.zeros(E, dtype=torch.float64),
+                                        "gap": 0.0, "z": 0.0, "n": 0, "E": E, "k": k})
+            a["counts"] += torch.bincount(idx.reshape(-1).to("cpu"), minlength=E).double()
             a["p"] += scores.float().mean(0).to("cpu").double()
-            if self.k < self.E:
-                tk = scores.topk(self.k + 1, dim=-1).values
-                a["gap"] += (tk[..., self.k - 1] - tk[..., self.k]).mean().item()
+            if k < E:
+                tk = scores.topk(k + 1, dim=-1).values
+                a["gap"] += (tk[..., k - 1] - tk[..., k]).mean().item()
             a["z"] += (torch.logsumexp(lg, dim=-1) ** 2).mean().item()
             a["n"] += 1
         return hook
@@ -112,6 +115,7 @@ class PerLayerRouter:
             if not a["n"]:
                 continue
             pre = f"train/router/layer_{i}"
+            E, k = a["E"], a["k"]
             counts = a["counts"]
             tot = counts.sum().clamp_min(1)
             f = counts / tot                                   # fraction of assignments per expert
@@ -119,15 +123,20 @@ class PerLayerRouter:
             p = p / p.sum().clamp_min(1e-12)                   # normalised mean router mass
             # Switch aux quantity, scaled so a uniform router reads exactly 1.0 -- the raw
             # E*sum(f*P) is 1.0 at uniform only for a softmax router, and ours is sigmoid.
-            out[f"{pre}/load_balancing_loss"] = float(self.E * (f * p).sum())
+            out[f"{pre}/load_balancing_loss"] = float(E * (f * p).sum())
             ent = float(-(f.clamp_min(1e-12) * f.clamp_min(1e-12).log()).sum())
             out[f"{pre}/routing_entropy"] = ent
-            out[f"{pre}/balance_entropy"] = ent / math.log(self.E)   # 1.0 = perfectly balanced
+            out[f"{pre}/balance_entropy"] = ent / math.log(E)   # 1.0 = perfectly balanced
             out[f"{pre}/max_load"] = float(f.max())
+            # Share of TOKENS the busiest expert sees, which is what max_load actually means once
+            # you remember each token makes k assignments. 0.096 of assignments at k=6 is 58% of
+            # tokens -- the same number, in the unit the question is usually asked in. Uniform is
+            # k/E (9.4% on the board config), so this is directly comparable across geometries.
+            out[f"{pre}/max_load_tokens"] = float(f.max()) * k
             out[f"{pre}/dead_experts"] = int((counts == 0).sum())
             out[f"{pre}/boundary_gap"] = a["gap"] / a["n"]
             out[f"{pre}/router_z_loss"] = a["z"] / a["n"]
-            h = _hist(counts.tolist(), self.E)
+            h = _hist(counts.tolist(), E)
             if h is not None:
                 out[f"{pre}/routing_hist"] = h
             loads[i] = counts.tolist()
@@ -198,8 +207,13 @@ def load_rgb(loads, cell=10):
     """The pixels behind load_map: (L*cell, E*cell, 3) uint8, plus E. Separate so the colour
     encoding is testable without wandb."""
     import numpy as np
-    a = np.array([np.asarray(loads[r], dtype="float64") for r in sorted(loads)])   # (L, E)
-    E = a.shape[1]
+    rows = [np.asarray(loads[r], dtype="float64") for r in sorted(loads)]
+    # Layers may differ in expert count (--moe_override). Widen the short rows by repeating each
+    # expert, so every row spans the same axis and a coarse layer simply draws wider blocks.
+    E = max(len(r) for r in rows)
+    a = np.array([np.repeat(r, E // len(r)) if E % len(r) == 0
+                  else np.interp(np.linspace(0, len(r) - 1, E), np.arange(len(r)), r)
+                  for r in rows])                                        # (L, E)
     ratio = a / np.maximum(a.sum(1, keepdims=True), 1) * E                   # 1.0 == uniform
     lg = np.clip(np.log2(np.maximum(ratio, 1e-6)) / 2.0, -1, 1)              # +-2 octaves -> +-1
     img = _hsv_to_rgb(0.33 * (1 - lg), np.abs(lg), np.where(a > 0, 1.0, 0.0))

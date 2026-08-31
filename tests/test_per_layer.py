@@ -66,3 +66,37 @@ def test_moe_override_changes_the_built_layer(attn_res):
     tb, _, ab = count_params(over)
     assert abs(ab - aa) / aa < 0.01, ("active not matched", aa, ab)
     assert abs(tb - ta) / ta < 0.01, ("total not matched", ta, tb)
+
+
+def test_load_map_handles_mixed_expert_counts():
+    """--moe_override lets one layer have fewer experts; the map must still be rectangular."""
+    img, E = load_rgb({0: [10] * 32, 1: [10] * 64})
+    assert E == 64 and img.shape[0] == 2 * 10 and img.shape[1] == 64 * 10
+
+
+def test_per_layer_router_survives_mixed_geometry():
+    """The bug that killed a launch: a 64-wide accumulator for a 32-expert layer.
+
+    Runs a real forward with the hooks armed, which is the only thing that would have caught it --
+    constructing the model was never the failing step.
+    """
+    import torch
+    from ablate.common.models import build_arm
+    from ablate.common.per_layer import PerLayerRouter
+
+    model, _ = build_arm("bibo_min", device="cpu", dtype=torch.float32, mlp_only_layers=[],
+                         num_experts=64, top_k=6, moe_overrides={
+                             0: {"num_routed_experts": 32, "num_experts_per_tok": 3,
+                                 "moe_intermediate_size": 1536}})
+    plr = PerLayerRouter(model, 64, 6)
+    plr.enabled = True
+    with torch.no_grad():
+        model(torch.randint(0, 1000, (1, 32)))
+    m = plr.flush()
+    plr.close()
+    assert m["train/router/layer_0/routing_hist"] is not None
+    assert len(m["train/router/layer_0/routing_hist"].histogram) == 32, "L0 has 32 bins"
+    assert len(m["train/router/layer_1/routing_hist"].histogram) == 64, "L1 has 64"
+    # uniform is k/E, so the two layers share a scale on max_load_tokens but not on max_load
+    assert m["train/router/layer_0/max_load_tokens"] > 0
+    assert "train/router/load_map" in m
