@@ -682,6 +682,10 @@ def main():
               "the measured info cap) -- slice the batch to get votes", flush=True)
     _n_exp = getattr(cfg, "num_routed_experts", None) or getattr(cfg, "num_experts", 0)
     rtrace = RouterTrace(model, _n_exp, DEV) if (args.router_log and _n_exp >= 2) else None
+    if rtrace is not None and getattr(rtrace, "mixed", False):
+        print("[router] per-layer expert counts differ (--moe_override): the MODEL-WIDE router "
+              "trace is off, since pooling counts across layers with different E is undefined. "
+              "The per-layer metrics under interp/router/layer_N/* cover all of it.", flush=True)
     # Per-LAYER router diagnostics: expert-load histogram, balance, boundary gap, logit scale.
     # A model-wide mean cannot say WHICH layer collapsed, and max-load plus entropy are both
     # summary statistics of the very distribution the histogram shows.

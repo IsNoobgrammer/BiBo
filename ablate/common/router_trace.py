@@ -84,16 +84,24 @@ class RouterTrace:
         # [split_top1, entropy, tokens, RAW_top1, RAW_sum, RAW_min, boundary_gap, n_router_fwd]
         self.acc = torch.zeros(8, device=device, dtype=torch.float32)
         self._handles = []
-        # Expert-block boundaries, so the ±Identity specials get their own load channels. Read off the
-        # first expert module (every layer shares the config). n_glu == E for a Qwen arm / no specials,
-        # in which case the special channels are constant 0 and simply uninformative.
+        # Expert-block boundaries, so the ±Identity specials get their own load channels. Read off
+        # the first expert module, which assumes EVERY LAYER SHARES THE CONFIG. Under
+        # --moe_override that is false: a 32-expert layer 0 made this read n_glu=32 and report 48%
+        # of all assignments as "special" when there are no special experts at all, and pooling
+        # per-expert counts across layers with different E is not a defined quantity either.
+        # per_layer.py measures all of this per layer, correctly, so the honest move is to stand
+        # down rather than log a pooled number that means nothing.
+        self.mixed = len({int(getattr(m, "num_glu_experts", self.E))
+                          for _, m in model.named_modules()
+                          if m.__class__.__name__ in _EXPERT_CLASSES}) > 1
         self.n_glu, self.pos_end = self.E, self.E
         for _, mod in model.named_modules():
             if mod.__class__.__name__ in _EXPERT_CLASSES:
                 if not self._handles:
                     self.n_glu = int(getattr(mod, "num_glu_experts", self.E))
                     self.pos_end = int(getattr(mod, "pos_end", self.E))
-                self._handles.append(mod.register_forward_pre_hook(self._hook))
+                if not self.mixed:
+                    self._handles.append(mod.register_forward_pre_hook(self._hook))
         # Routers, for the selection-BOUNDARY gap (rank-k vs rank-k+1 raw score). The expert hook
         # above never sees the full score vector -- it only gets (hidden, idx, weights) -- so this
         # has to be read off the router itself. It is the gap the balancing bias competes against.
@@ -132,7 +140,7 @@ class RouterTrace:
     @torch.no_grad()
     def flush(self):
         """Return the metrics for the interval and reset. Exactly one device->host transfer."""
-        if float(self.E) < 2:
+        if float(self.E) < 2 or getattr(self, "mixed", False):
             return {}
         load = self.counts / self.counts.sum().clamp_min(1.0)
         bal = -(load * load.clamp_min(1e-12).log()).sum() / math.log(self.E)   # 0*log0 == 0, as intended
