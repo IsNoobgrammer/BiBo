@@ -15,6 +15,7 @@ That list is duplicated from train.py's wb.log call on purpose -- this tool has 
 _interp() does at the sink for runs that predate it.
 """
 import argparse
+import json
 import os
 
 import wandb
@@ -45,7 +46,17 @@ def rebuild(v, media_root):
     if t in ("image-file", "images/separated"):
         p = os.path.join(media_root, v["path"])
         return wandb.Image(p) if os.path.exists(p) else None
-    return None                      # anything else (tables, audio) is not used by this repo
+    if t == "table-file":
+        # The end-of-run generation samples. Small, and the only place the model's actual output
+        # survives -- dropping it would make the copy lossy in the one way that matters if the
+        # original is then deleted.
+        p = os.path.join(media_root, v["path"])
+        if not os.path.exists(p):
+            return None
+        with open(p, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return wandb.Table(columns=d["columns"], data=d["data"])
+    return None                      # anything else (audio, video) is not used by this repo
 
 
 def _verify(api, src_path, dst_id):
@@ -56,7 +67,9 @@ def _verify(api, src_path, dst_id):
     dst = api.run(f"{entity}/{project}/{dst_id}")
     n_src, n_dst = len(_history(src)), len(_history(dst))
     sj, dj = src.summary._json_dict, dst.summary._json_dict
-    missing = [k for k in sj if remap(k) != k and remap(k) not in dj]
+    # EVERY key, not just the moved ones. Checking only `train/*` passed a copy that had silently
+    # dropped the `samples` table, because `samples` is not a key the remap touches.
+    missing = [k for k in sj if not k.startswith("_") and remap(k) not in dj]
     ok = n_src == n_dst and not missing
     print(f"  verify: rows {n_src} -> {n_dst}, {len(missing)} keys missing -> "
           f"{'COMPLETE' if ok else 'INCOMPLETE ' + str(missing[:5])}")
@@ -74,7 +87,7 @@ def _history(src, batch=8):
     rows = {r["_step"]: dict(r) for r in src.scan_history(page_size=1000) if "_step" in r}
     media = [k for k, v in src.summary._json_dict.items()
              if isinstance(v, dict) and v.get("_type") in
-             ("histogram", "image-file", "images/separated")]
+             ("histogram", "image-file", "images/separated", "table-file")]
     for i in range(0, len(media), batch):
         for r in src.scan_history(keys=media[i:i + batch] + ["_step"]):
             rows.get(r.get("_step"), {}).update({k: v for k, v in r.items() if k != "_step"})
@@ -101,9 +114,10 @@ def main():
     if args.dry:
         return
 
-    imgs = [f for f in src.files() if f.name.startswith("media/") and f.name.endswith(".png")]
+    imgs = [f for f in src.files() if f.name.startswith("media/")
+            and (f.name.endswith(".png") or f.name.endswith(".table.json"))]
     if imgs:
-        print(f"  downloading {len(imgs)} images -> {args.media}")
+        print(f"  downloading {len(imgs)} media files -> {args.media}")
         for f in imgs:
             if not os.path.exists(os.path.join(args.media, f.name)):
                 f.download(root=args.media)
