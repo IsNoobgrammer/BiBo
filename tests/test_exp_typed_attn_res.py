@@ -740,3 +740,33 @@ def test_fused_typed_read_matches_eager_through_full_model(monkeypatch):
     for name in eager[2]:
         torch.testing.assert_close(fused[2][name], eager[2][name], atol=2e-6, rtol=5e-4,
                                    msg=lambda msg: f"{name}: {msg}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_full_typed_model_keeps_bf16_streams_and_fp32_routing(monkeypatch):
+    import exp.modeling_bibo as modeling
+    if modeling._fused_typed_ar is None:
+        pytest.skip("requires sibling TKF typed_attn_res kernel")
+    model = make_full_memory_model(device="cuda", bf16_residual_stream=True).train()
+    original = modeling._fused_typed_ar
+    calls = []
+
+    def observed(chunks, types, source, weight, controller, bias, eps):
+        assert all(x.dtype == torch.bfloat16 for x in (*chunks, source))
+        assert all(x.dtype == torch.float32 for x in (weight, controller, bias))
+        mixed, probabilities = original(chunks, types, source, weight, controller, bias, eps)
+        assert mixed.dtype == torch.bfloat16
+        assert probabilities.dtype == torch.float32
+        calls.append(True)
+        return mixed, probabilities
+
+    monkeypatch.setattr(modeling, "_fused_typed_ar", observed)
+    monkeypatch.setattr(modeling, "_TYPED_AR_IMPL", "fused")
+    ids = tokens(batch=2, seq=13, device="cuda")
+    with torch.autocast("cuda", torch.bfloat16):
+        loss = model(ids, labels=ids, use_cache=False).loss
+    loss.backward()
+    assert len(calls) == 2 * model.config.num_hidden_layers + 1
+    assert all(p.dtype == torch.float32 for p in model.parameters())
+    assert all(p.grad.dtype == torch.float32 and torch.isfinite(p.grad).all()
+               for p in model.parameters() if p.grad is not None)

@@ -191,7 +191,7 @@ over the 2,000-step baseline.
 
 The CUDA path uses the sibling TKF repository's
 `kernels.sm120.typed_attn_res` when available. Validated kernel revision:
-[`4bb140a`](https://github.com/adi-kmt/triton-kernel-fused/commit/4bb140af1f4426ea24c39f22f0b9c3920d131e0c)
+[`b74cb90`](https://github.com/adi-kmt/triton-kernel-fused/commit/b74cb905a494395e00c23f68dd9a128833ff75bc)
 on the `typed-attn-res` branch. It reads each residual stream
 in place, keeping the content/type scores and mixing in fp32 and providing an
 analytic backward. Probability diagnostics remain available at every read site.
@@ -209,7 +209,7 @@ all gradients against the same fp32 reference, including bf16 quantization
 error, strided/mixed inputs, empty blocks, zero states, and aliasing. BiBo's
 `test_fused_typed_read_matches_eager_through_full_model` additionally checks
 that all read sites dispatch to the kernel and compares full-model logits,
-loss, and parameter gradients. The full CUDA suite passed 156 tests.
+loss, and parameter gradients. The full CUDA suite passed 157 tests, including a dtype guard at every typed read.
 
 
 The fused 100-step smoke at batch 32 × accumulation 8 completed on 2026-09-03:
@@ -225,3 +225,30 @@ a bf16 rounding boundary. The reload audit records the difference and uses a
 1e-3 loss tolerance; the independent typed-kernel fp32 gradient gate remains
 2e-5. These mixed-precision smoke results establish execution and performance,
 not better convergence than the earlier baseline.
+
+
+### Stream dtype guarantee
+
+With `bf16_residual_stream=True`, attention and MLP outputs rejoin the residual
+stream as bf16. The cast is after the expert ensemble, whose accumulation can
+remain fp32. This also covers the eager MoE fallback: fp32 routing weights must
+not silently promote all later archived, thought, or memory states. Routing
+parameters and AttnRes weighted-mixture accumulation remain fp32, and optimizer
+master parameters remain fp32.
+
+The sm120 tuning work dumps both Inductor forward and backward Triton, profiles
+actual CUDA kernels (excluding duplicate annotation ranges), and checks 344
+stage/full-operation launch configurations. See TKF's typed-attn-res kernel guide
+and `bench/results/typed_attn_res_optimization_sm120.json` for the retained
+configurations and rejected candidate-load experiment. This is a bounded tuning
+search; it does not establish a global optimum for the read or the full model.
+
+
+The tuned 100-step smoke
+[`1fsit8q8`](https://wandb.ai/ablations-tinycompany-ai/bibo-ideas/runs/1fsit8q8)
+completed with all numeric metrics finite and all 21 read sites logged:
+training loss 6.001724, running-20 loss 5.992804, validation loss 6.202785,
+109.4k tokens/s at the last measurement, and 46.55 GB peak allocation.
+Strict checkpoint loading succeeded; replay validation differed by 0.000100,
+within the existing 1e-3 MoE-atomic replay audit tolerance. The kernel's separate
+fp32 parity gate remains 2e-5; its worst observed error was 5.8e-6.

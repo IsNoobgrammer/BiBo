@@ -611,6 +611,7 @@ class BiBoDecoderLayer(nn.Module):
         # every AttnRes arm non-comparable to the baseline. Setting this keeps the stream in the
         # layer-input dtype so the ONLY difference from the control is AttnRes itself.
         self.attn_res_fp32_stream = getattr(config, "attn_res_fp32_stream", False)
+        self.bf16_stream = bool(getattr(config, "bf16_residual_stream", False))
         # CARRY SCALE. In carry the MLP reads Ht + A, so A enters at coefficient exactly 1,
         # deliberately OUTSIDE the softmax simplex -- that is why carry beats sites=2, where every
         # unit of probability spent on a previous block comes straight out of this layer's
@@ -953,6 +954,8 @@ class BiBoDecoderLayer(nn.Module):
             cache_position=cache_position,
             output_attentions=output_attentions,
         )
+        if self.bf16_stream:
+            attn_output = attn_output.to(torch.bfloat16)
         if prefix_sum is None:
             # boundary layer: the stream restarts from attn_output alone
             prefix_sum = (attn_output.to(_stream_dtype) if self.attn_res_fp32_stream
@@ -1110,8 +1113,14 @@ class BiBoDecoderLayer(nn.Module):
             )
         else:
             mlp_output = self._attn_res_mlp_forward(hidden_states)
-        # The canonical route always receives the untouched MLP result. Innovation filtering is
-        # confined to typed memory, so a bad gate can never erase the standard residual path.
+        # The eager MoE combines fp32 routing weights with bf16 expert outputs
+        # and may return fp32. Cast at the stream boundary, after its ensemble,
+        # so disabling a kernel cannot silently promote all subsequent states.
+        if self.bf16_stream:
+            mlp_output = mlp_output.to(torch.bfloat16)
+        # The canonical route receives the MLP result in the requested stream dtype.
+        # Innovation filtering is confined to typed memory, so a bad gate can never
+        # erase the standard residual path.
         prefix_sum = prefix_sum + mlp_output
         if self.use_typed_attn_res:
             memory_write = (
