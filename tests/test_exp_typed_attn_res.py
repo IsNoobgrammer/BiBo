@@ -706,3 +706,37 @@ def test_typed_reads_keep_fp32_math_under_autocast_and_diagnostics_are_detached(
 def test_typed_model_rejects_inert_ordinary_residual_options(options):
     with pytest.raises(ValueError, match="typed AttnRes requires"):
         make_config(**options)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_fused_typed_read_matches_eager_through_full_model(monkeypatch):
+    """Catch a correct standalone kernel that the model never actually dispatches."""
+    import exp.modeling_bibo as modeling
+    if modeling._fused_typed_ar is None:
+        pytest.skip("requires sibling TKF typed_attn_res kernel")
+    torch.manual_seed(81)
+    model = make_full_memory_model(device="cuda").eval()
+    ids = tokens(batch=2, seq=13, device="cuda")
+    results = []
+    calls = []
+    original = modeling._fused_typed_ar
+    def observed(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(modeling, "_fused_typed_ar", observed)
+    for mode in ("eager", "fused"):
+        monkeypatch.setattr(modeling, "_TYPED_AR_IMPL", mode)
+        model.zero_grad(set_to_none=True)
+        out = model(ids, labels=ids, use_cache=False)
+        out.loss.backward()
+        results.append((out.logits.detach(), out.loss.detach(),
+                        {name: p.grad.detach().clone() for name,p in model.named_parameters()
+                         if p.grad is not None}))
+    assert len(calls) == 2 * model.config.num_hidden_layers + 1
+    eager, fused = results
+    torch.testing.assert_close(fused[0], eager[0], atol=2e-6, rtol=2e-4)
+    torch.testing.assert_close(fused[1], eager[1], atol=1e-6, rtol=1e-6)
+    assert fused[2].keys() == eager[2].keys()
+    for name in eager[2]:
+        torch.testing.assert_close(fused[2][name], eager[2][name], atol=2e-6, rtol=5e-4,
+                                   msg=lambda msg: f"{name}: {msg}")

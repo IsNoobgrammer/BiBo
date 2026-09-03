@@ -895,6 +895,7 @@ def main():
         wb = wandb.init(project=args.wandb_project, name=run_name,
                         settings=wandb.Settings(console="wrap"),
                         config={**vars(args), "total_steps": total_steps,
+                                "typed_ar_impl": os.environ.get("BIBO_TYPED_AR_IMPL", "auto"),
                                 "params_total": total, "params_active": active})
 
     # async HF checkpoint push: save_pretrained locally (main thread), then upload_folder in the background.

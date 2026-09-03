@@ -29,6 +29,7 @@ Only the experimental package imports stable BiBo components. Nothing under
 
 import contextlib
 import math
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -75,6 +76,16 @@ try:
     _HAS_FUSED_RES_ADD = True
 except Exception:
     _HAS_FUSED_RES_ADD = False
+
+# An explicit eager switch supports matched A/B measurements and checkpoint audits.
+# Forced fused mode fails visibly if its dependency is missing.
+_TYPED_AR_IMPL = os.environ.get("BIBO_TYPED_AR_IMPL", "auto")
+if _TYPED_AR_IMPL not in ("auto", "eager", "fused"):
+    raise ValueError("BIBO_TYPED_AR_IMPL must be auto, eager, or fused")
+try:
+    from kernels.sm120.typed_attn_res import typed_attn_res as _fused_typed_ar
+except ImportError:
+    _fused_typed_ar = None
 
 # attn_res_carry_scale -> the kernel's transform code for the attn_out multiplier. "none" has no
 # theta at all (c is a hard 1.0) and is handled by the caller, not here.
@@ -409,30 +420,47 @@ def apply_typed_attention_residual(
         values.append(slow_memory_residual.unsqueeze(1))
         type_ids.append(_TYPED_SLOW_MEMORY)
 
-    candidates = torch.cat(values, dim=1)
     candidate_types = torch.tensor(type_ids, device=prefix_sum.device, dtype=torch.long)
-    candidates_float = candidates.float()
+    score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
+    use_fused = _TYPED_AR_IMPL != "eager" and prefix_sum.is_cuda and _fused_typed_ar is not None
+    if _TYPED_AR_IMPL == "fused" and prefix_sum.is_cuda and _fused_typed_ar is None:
+        raise RuntimeError("BIBO_TYPED_AR_IMPL=fused requires TKF typed_attn_res")
+    if use_fused:
+        # Chunks already exist above; do not concatenate them or build fp32 copies.
+        chunk_types = []
+        offset = 0
+        for value in values:
+            chunk_types.append(type_ids[offset])
+            offset += value.shape[1]
+        # The kernel accepts the prefix as a 2D chunk to define the output dtype.
+        chunks = [value.squeeze(1) if ty >= _TYPED_PREFIX else value
+                  for value, ty in zip(values, chunk_types)]
+        mixed, probabilities = _fused_typed_ar(
+            chunks, chunk_types, controller_source, score_weight,
+            type_controller, type_bias, norm.variance_epsilon)
+    else:
+        candidates = torch.cat(values, dim=1)
+        candidates_float = candidates.float()
 
-    with torch.autocast(device_type=prefix_sum.device.type, enabled=False):
-        score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
-        sq_sum = torch.linalg.vector_norm(candidates_float, dim=-1).square()
-        inv_rms = torch.rsqrt(
-            sq_sum / candidates_float.shape[-1] + norm.variance_epsilon
-        )
-        scores = torch.matmul(candidates_float, score_weight) * inv_rms
+        with torch.autocast(device_type=prefix_sum.device.type, enabled=False):
+            sq_sum = torch.linalg.vector_norm(candidates_float, dim=-1).square()
+            inv_rms = torch.rsqrt(
+                sq_sum / candidates_float.shape[-1] + norm.variance_epsilon
+            )
+            scores = torch.matmul(candidates_float, score_weight) * inv_rms
 
-        source_float = controller_source.float()
-        source_inv_rms = torch.rsqrt(
-            source_float.square().mean(dim=-1, keepdim=True) + norm.variance_epsilon
-        )
-        type_scores = F.linear(
-            source_float * source_inv_rms, type_controller.float()
-        )
-        scores = scores + type_scores[:, candidate_types] + type_bias.float()[candidate_types]
+            source_float = controller_source.float()
+            source_inv_rms = torch.rsqrt(
+                source_float.square().mean(dim=-1, keepdim=True) + norm.variance_epsilon
+            )
+            type_scores = F.linear(
+                source_float * source_inv_rms, type_controller.float()
+            )
+            scores = scores + type_scores[:, candidate_types] + type_bias.float()[candidate_types]
 
-        probabilities = scores.softmax(dim=-1)
-        mixed = torch.matmul(probabilities.unsqueeze(1), candidates_float).squeeze(1)
-    mixed = mixed.to(prefix_sum.dtype)
+            probabilities = scores.softmax(dim=-1)
+            mixed = torch.matmul(probabilities.unsqueeze(1), candidates_float).squeeze(1)
+        mixed = mixed.to(prefix_sum.dtype)
     if diagnostics is not None:
         with torch.no_grad():
             mass = probabilities.detach().mean(0)

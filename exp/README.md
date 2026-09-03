@@ -185,3 +185,43 @@ Strict checkpoint reload reproduced that held-out loss exactly. Peak allocated
 memory was 56.8 GB and steady throughput about 67.7k tokens/s. These smoke
 numbers validate execution and logging; they do not establish an improvement
 over the 2,000-step baseline.
+
+
+## Fused typed reads
+
+The CUDA path uses the sibling TKF repository's
+`kernels.sm120.typed_attn_res` when available. Validated kernel revision:
+[`4bb140a`](https://github.com/adi-kmt/triton-kernel-fused/commit/4bb140af1f4426ea24c39f22f0b9c3920d131e0c)
+on the `typed-attn-res` branch. It reads each residual stream
+in place, keeping the content/type scores and mixing in fp32 and providing an
+analytic backward. Probability diagnostics remain available at every read site.
+CPU and installations without that kernel retain the eager implementation.
+
+Set `BIBO_TYPED_AR_IMPL=fused` to require the kernel during GPU training, or
+`BIBO_TYPED_AR_IMPL=eager` for a matched reference run; the default is `auto`.
+W&B records this selection as `typed_ar_impl`. No model parameters or checkpoint
+keys change. Tiny fp32 reduction-order differences are expected; fp32 parity
+means numerical agreement, not bit-identical training trajectories through
+routing decisions and reduced-precision matrix operations.
+
+The TKF gate `python -m parity_check.parity_typed_attn_res` checks the read and
+all gradients against the same fp32 reference, including bf16 quantization
+error, strided/mixed inputs, empty blocks, zero states, and aliasing. BiBo's
+`test_fused_typed_read_matches_eager_through_full_model` additionally checks
+that all read sites dispatch to the kernel and compares full-model logits,
+loss, and parameter gradients. The full CUDA suite passed 156 tests.
+
+
+The fused 100-step smoke at batch 32 × accumulation 8 completed on 2026-09-03:
+training loss 6.0044, final running loss about 5.9950, validation 6.199862,
+steady throughput about 109k tokens/s, peak allocation 46.6 GB. The preceding
+eager typed smoke used the same data, seed, schedule, and effective batch and
+measured 67.7k tokens/s and 56.8 GB: about 1.6x training throughput.
+
+Checkpoint keys load strictly. Validation is numerically close, not bit-exact:
+reload audits gave 6.199658–6.200111. Replaying the existing MoE atomic scatter
+on identical operands showed fp32 differences up to 1.9e-6, occasionally crossing
+a bf16 rounding boundary. The reload audit records the difference and uses a
+1e-3 loss tolerance; the independent typed-kernel fp32 gradient gate remains
+2e-5. These mixed-precision smoke results establish execution and performance,
+not better convergence than the earlier baseline.
