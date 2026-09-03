@@ -16,7 +16,7 @@ from exp.modeling_bibo import (
     update_fast_slow_memory,
 )
 from ablate.common.configs import make_bibo_min_config
-from ablate.common.run_eval import _arch_kwargs
+from ablate.common.report_ckpt import _arch_kwargs
 from src.modeling.norm import BiBoRMSNorm
 
 from conftest import BASE, DEVICE, tokens
@@ -119,6 +119,8 @@ def test_ablation_and_eval_rebuild_plumbing_preserve_typed_architecture():
     rebuilt = _arch_kwargs(
         {
             "attn_res": "2",
+            "moe_override": "0:8:8:576",
+            "bf16_residual_stream": True,
             "typed_attn_res": True,
             "typed_attn_res_long_memory": False,
             "typed_attn_res_extra_init": 0.05,
@@ -129,6 +131,9 @@ def test_ablation_and_eval_rebuild_plumbing_preserve_typed_architecture():
             "typed_attn_res_innovation_init": 0.2,
         }
     )
+    assert rebuilt["moe_overrides"][0] == dict(
+        num_routed_experts=8, num_experts_per_tok=8, moe_intermediate_size=576)
+    assert rebuilt["bf16_residual_stream"] is True
     assert rebuilt["use_typed_attn_res"] is True
     assert rebuilt["typed_attn_res_long_memory"] is False
     assert rebuilt["typed_attn_res_extra_init"] == 0.05
@@ -665,3 +670,39 @@ def test_save_load_round_trip_is_exact_for_typed_model(full_memory):
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_typed_reads_keep_fp32_math_under_autocast_and_diagnostics_are_detached():
+    torch.manual_seed(7)
+    x = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    blocks = torch.randn(32, 3, 64, device="cuda", dtype=torch.bfloat16)
+    projection = torch.nn.Linear(64, 1, bias=False).cuda()
+    norm = BiBoRMSNorm(64).cuda()
+    controller = torch.randn(5, 64, device="cuda", requires_grad=True)
+    bias = torch.randn(5, device="cuda", requires_grad=True)
+    args = (x, blocks, x * .7, x * .3, blocks, projection, norm, controller, bias, x)
+    expected, probs, _ = apply_typed_attention_residual(*args, return_details=True)
+    diagnostics = {}
+    with torch.autocast("cuda", torch.bfloat16):
+        actual, amp_probs, _ = apply_typed_attention_residual(
+            *args, return_details=True, diagnostics=diagnostics)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(amp_probs, probs, rtol=0, atol=0)
+    torch.testing.assert_close(sum(diagnostics[f"read/type_mass_{i}"] for i in range(5)),
+                               torch.ones((), device="cuda"))
+    assert all(not value.requires_grad for value in diagnostics.values())
+    actual.float().square().mean().backward()
+    assert controller.grad is not None and torch.isfinite(controller.grad).all()
+
+
+@pytest.mark.parametrize("options", [
+    {"attn_res_carry": True}, {"attn_res_carry_scale": "sigmoid"},
+    {"attn_res_carry_per_dim": True, "attn_res_carry": True, "attn_res_carry_scale": "sigmoid"},
+    {"attn_res_score": "signorm"},
+    {"attn_res_topk": 2}, {"attn_res_emb_term": True},
+])
+def test_typed_model_rejects_inert_ordinary_residual_options(options):
+    with pytest.raises(ValueError, match="typed AttnRes requires"):
+        make_config(**options)

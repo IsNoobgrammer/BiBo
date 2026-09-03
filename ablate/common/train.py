@@ -20,9 +20,14 @@ from . import patches as patchmod
 from .optim import build_optimizers
 from .schedule import make_scheduler, make_wd_schedule
 from .data import token_batches, TRAIN_DATASET
-from .evaluate import evaluate, Tok, summarize
-from .eval.interp import RouterTrace
-from .eval.sample import generate_samples
+# EVAL REMOVED Aug 7 2026. The whole ablate/common/eval package and evaluate.py are gone; runs log
+# train loss, grad norm and throughput only. Nothing here is comparable to any previous board.
+# Kept because the HF checkpoint push still needs a tokenizer to save alongside the weights.
+TOKENIZER = "fhai50032/QTK-81K"
+from .router_trace import RouterTrace   # training-stream router diagnostic; survived the purge
+from . import validation as _val        # frozen small batch, CE logged on the training log line
+from .tensor_health import tensor_norms
+from .per_layer import PerLayerRouter, per_layer_params
 from kernels.sm120.cross_entropy import fused_linear_cross_entropy   # sm120 (Blackwell); CE byte-identical to sm75
 
 DEV = "cuda"
@@ -53,15 +58,30 @@ class _QwenAuxCollector:
         self.logits = []
 
 
-def _ce(model, ids, use_fused, aux=None, aux_coef=0.0, num_experts=6, top_k=2):
+def _ce(model, ids, use_fused, aux=None, aux_coef=0.0, num_experts=6, top_k=2, pad_id=None):
+    """CE over next-token targets, with `pad_id` (from --pad_id) excluded from the loss.
+
+    Default None = nothing is masked, which is correct for a PACKED corpus: it contains no padding,
+    so masking any id would only delete real tokens. Set --pad_id only for a corpus that pads rows.
+
+    Both branches take ignore_index explicitly. They used to take neither, so the kernel's default
+    of -100 applied and a padded corpus would have trained ON its padding -- pad ids are
+    non-negative and never matched -100.
+
+    In QTK-81K pad_token_id == eos_token_id == 0 (<|endoftext|>), so masking id 0 also masks every
+    end-of-text target. That is safe ONLY while documents are delimited by something else --
+    <|im_end|> (81914) in this corpus. If a future corpus separates documents with <|endoftext|>,
+    masking it would stop the model ever learning to terminate. main() warns on this.
+    """
     inp, tgt = ids[:, :-1], ids[:, 1:].reshape(-1)
     if aux is not None:
         aux.reset()
     out = model.model(input_ids=inp, use_cache=False)
     h = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
     sh = h.reshape(-1, h.shape[-1])
-    loss = (fused_linear_cross_entropy(sh, model.lm_head.weight, tgt) if use_fused
-            else torch.nn.functional.cross_entropy(model.lm_head(sh), tgt))
+    _ign = -100 if pad_id is None else int(pad_id)
+    loss = (fused_linear_cross_entropy(sh, model.lm_head.weight, tgt, ignore_index=_ign) if use_fused
+            else torch.nn.functional.cross_entropy(model.lm_head(sh), tgt, ignore_index=_ign))
     if aux is not None and aux_coef > 0 and aux.logits:      # Qwen aux load-balancing loss
         from baseline.qwen3moe.modeling import load_balancing_loss_func
         loss = loss + aux_coef * load_balancing_loss_func(tuple(aux.logits), num_experts, top_k)
@@ -135,12 +155,27 @@ def _router_corr(model):
 def _typed_memory_stats(model):
     """Learned depth timescales and innovation strength for typed-memory runs."""
     fast, slow, innovation, controller_rms = [], [], [], []
-    for module in model.modules():
+    result = {}
+    for module_name, module in model.named_modules():
+        prefix = f"train/typed/{module_name.removeprefix('model.').replace('layers.', 'layer_')}"
+        for name, value in (getattr(module, "_typed_diagnostics", None) or {}).items():
+            result[f"{prefix}/{name}"] = value.item()
+        # Disable capture before validation; only detached training-forward scalars are kept.
+        if getattr(module, "use_typed_attn_res", False):
+            module._typed_diagnostics = None
+        for name, value in module.named_parameters(recurse=False):
+            if "_res_type_controller" in name:
+                result[f"{prefix}/{name}_rms"] = value.detach().float().square().mean().sqrt().item()
+            elif "_res_type_bias" in name:
+                for type_id, bias in enumerate(value.detach().float()):
+                    result[f"{prefix}/{name}_{type_id}"] = bias.item()
         if hasattr(module, "typed_attn_res_fast_decay_logit"):
             f = module.typed_attn_res_fast_decay_logit.detach().float().sigmoid()
             gap = module.typed_attn_res_slow_decay_gap_logit.detach().float().sigmoid()
             fast.append(f)
             slow.append(f + (1.0 - f) * gap)
+            result[f"{prefix}/fast_decay"] = f.item()
+            result[f"{prefix}/slow_decay"] = slow[-1].item()
             controller_rms.append(
                 module.typed_attn_res_slow_write_controller.detach().float().square().mean().sqrt()
             )
@@ -148,7 +183,7 @@ def _typed_memory_stats(model):
             innovation.append(
                 module.typed_attn_res_innovation_logit.detach().float().sigmoid()
             )
-    result = {}
+            result[f"{prefix}/innovation_alpha"] = innovation[-1].item()
     for name, values in (
         ("typed_fast_decay", fast),
         ("typed_slow_decay", slow),
@@ -211,21 +246,23 @@ def _push_hf_async(api, repo, local_dir, path_in_repo, tag):
     return fut
 
 
-@contextlib.contextmanager
-def _eager(model):
-    """Run eval / sampling on the UN-compiled module. torch.compile chokes on the eval and generation
-    shapes: recompile-limit churn, and an inductor crash ('SymFloat' has no attribute 'size') on the long
-    length-extrap sequences. Eval isn't perf-critical, so swap compiled -> orig for the duration and restore
-    after. No-op when compile is off (orig is None)."""
-    compiled = getattr(model, "model", None)
-    orig = getattr(compiled, "_orig_mod", None)
-    if orig is not None:
-        model.model = orig
-    try:
-        yield
-    finally:
-        if orig is not None:
-            model.model = compiled
+# _eager() lived here: it swapped the compiled module for the eager one around eval/generation,
+# because torch.compile choked on the eval shapes. Deleted Aug 7 2026 with the eval -- its only
+# callers were the eval and sampling call sites. Restore from git history if sampling comes back.
+
+
+def _interp(rt):
+    """Move every diagnostic out of `train/` and into `interp/`.
+
+    `train/` is the panel you read while a run is in flight -- loss, lr, mfu, tps, grad norm. The
+    per-layer router/XSA/carry/radial tables are 200+ series and they were burying those five.
+    They keep their names, only the section changes, so `train/attn_res_s/L0` from an older run and
+    `interp/attn_res_s/L0` from a new one are the same series under a different heading.
+
+    Keys that are not already `train/*` (params/norm, grad/norm) are left alone: a dead gradient is
+    a training failure, not an interpretability question, and it belongs where you will see it.
+    """
+    return {("interp/" + k[6:] if k.startswith("train/") else k): v for k, v in rt.items()}
 
 
 def main():
@@ -239,13 +276,15 @@ def main():
     ap.add_argument("--batch", type=int, default=64)             # per micro-step
     ap.add_argument("--grad_accum", type=int, default=2)          # global batch = batch * grad_accum
     ap.add_argument("--seq_len", type=int, default=1024)
-    # Eval context is PINNED separately from training context. bpb depends strongly on how much
-    # context the model gets, so a --seq_len 2048 run evaluated at 2048 is not comparable to the
-    # board, which is all 1024 -- the number would move for a reason that has nothing to do with
-    # the arm. 0 = follow --seq_len (old behaviour).
-    ap.add_argument("--eval_seq_len", type=int, default=0)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16")  # NEVER fp16
     ap.add_argument("--attn", choices=["sdpa", "flash_attention_4"], default="sdpa")
+    # Token id excluded from the CE. None = nothing masked, correct for a PACKED corpus. Set it
+    # only when rows are actually padded. See _ce for the pad/eos collision this has to respect.
+    # Free-text suffix on the W&B run name. The auto-name is built from ARCHITECTURE flags only,
+    # so a sweep over a non-architecture knob (lr, wd, seed) produces N runs with ONE name and is
+    # unreadable in the UI. Use this to tag the swept value, e.g. --run_tag mlr1e-2.
+    ap.add_argument("--run_tag", default="")
+    ap.add_argument("--pad_id", type=int, default=None)
     ap.add_argument("--aux_coef", type=float, default=0.001)                      # Qwen aux load-balancing loss coef (0=off; paper 0.001)
     ap.add_argument("--experts", type=int, default=0)   # TOTAL routed experts (GLU + specials); 0 = SHARED (6). GLU count = experts - 2*special_pairs -- see configs.glu_count
     # PolyGLU expert activation. THE ACTIVATION AXIS IS CLOSED (Jul 26 2026): the six on/off switches
@@ -271,6 +310,13 @@ def main():
     # Sharing adam_lr would leave p stuck near its 0.5 init and look like "the axis does nothing".
     # 0 = share --adam_lr (the old default; kept so the A/B is one flag).
     ap.add_argument("--act_scale_lr", type=float, default=0.01)
+    # Route (1,H) "matrices" -- AttnRes pseudo-queries are nn.Linear(hidden,1) -- to AdamW instead
+    # of Muon. Default False = the ndim rule as it stands, which is what every arm so far ran.
+    ap.add_argument("--vec_matrices_adamw", type=_bool, default=False)
+    # ...and WHICH AdamW group they land in. "default" = lr adam_lr, wd wd (step 0.0027 measured);
+    # "act" = the act-scale group, lr act_scale_lr, wd 0 (step 0.054). Muon's is 0.0449, so the two
+    # settings bracket it. Only meaningful with --vec_matrices_adamw true.
+    ap.add_argument("--vec_adamw_group", choices=("default", "act"), default="default")
     # radial p parameterization. sigmoid = every result on the board; tanh additionally lets
     # p go NEGATIVE (gain r^p < 1, shrinking high-rms rows), which sigmoid cannot express.
     # Kernel act code 8 vs 10. Tag _ptanh.
@@ -303,6 +349,71 @@ def main():
     # Store the part of each MLP output not already parallel to the current thought stream.
     ap.add_argument("--typed_attn_res_innovation_write", action="store_true")
     ap.add_argument("--typed_attn_res_innovation_init", type=float, default=0.01)
+    # Keep the residual stream in the layer-input dtype (fp32 under autocast, as the
+    # standard-residual control does) so AttnRes is the ONLY difference from the baseline.
+    ap.add_argument("--attn_res_fp32_stream", type=_bool, default=False)
+    # Learnable per-layer coefficient on the carry term: A_coeff = 2*sigmoid(theta), init 1.0
+    # so it is a strict generalization of plain carry. Logged as cs= to get the depth profile.
+    # none = c fixed at 1 (no parameter). raw = c learnable, unconstrained. rms = c learnable AND
+    # the stream it multiplies is RMS-normalised, which is what removes the need to bound c: the
+    # bounded transforms existed only to stop an unbounded c running away (7936 by step 400).
+    ap.add_argument("--attn_res_carry_scale",
+                    choices=["none", "raw", "unbounded", "rms", "sigmoid", "tanh",
+                             "sigmoid_rms", "tanh_rms", "slope05", "slope15"], default="none")
+    # Third, OFF-SIMPLEX term on the carry write: h = attn_read + c*attn_out + d*embedding.
+    # d is per-layer, learnable, init 0 -> strict generalization of plain carry. Tests whether
+    # layer 1's negative XSA alpha is a workaround for a missing token-identity channel.
+    # Force the EAGER carry write even when the fused kernel imports. The kernel is provably
+    # correct (parity + a per-call probe at 2.5e-03, exactly the bf16 scalar rounding it removes)
+    # but it perturbs MoE top-k for ~3.9% of token-layer decisions from step 0, so a kernel run is
+    # a different TRAJECTORY, not the same model. This flag exists to run matched same-box pairs
+    # and find out whether the observed +0.0037 bpb is a real cost or seed noise.
+    ap.add_argument("--fused_res_add", type=_bool, default=True)
+    ap.add_argument("--attn_res_emb_term", type=_bool, default=False)
+    # d = f(theta). "none" = raw (what the first emb arm ran). Plain "sigmoid" caps d at 1.0,
+    # which CLIPS layer 1 -- it asked for 1.32, the largest value on that axis. "2sigmoid"
+    # spans (0,2) and covers it.
+    ap.add_argument("--attn_res_emb_scale",
+                    choices=["none", "sigmoid", "2sigmoid", "tanh", "2tanh"], default="none")
+    # WHERE the embedding skip is applied. "mlp" = the retired path, d*emb on the carry write.
+    # "ht" = a RADIAL gain on the depth-mix output: emb * r^(p-1), r = rms(emb) per token,
+    # p = sigmoid(theta) in (0,1), theta init -4 so it starts near UNIT NORM. At "ht" the skip
+    # also reaches ATTENTION, since input_layernorm(HT) feeds self_attn -- the mlp site never did.
+    ap.add_argument("--attn_res_emb_site", choices=["mlp", "ht"], default="mlp")
+    # REPLACE the radial exponent with a flat gain on the RAW embedding: HT = AR(...) + i * emb.
+    # One scalar per layer, no norm of any kind, theta is not created, and the add goes through
+    # the fused residual kernel as a second stream. Both normed ht arms lost (radial 0.6672 vs
+    # 0.6579 c-only) while the only emb arm that ever won -- mlp-site d*emb, 0.6572 -- was
+    # unnormed, and the MoE-output-norm round measured "norm the addend" at -0.010 bpb in all 3
+    # variants. i inits 0 (strict generalization). ht site only.
+    ap.add_argument("--attn_res_emb_gain", type=_bool, default=False)
+    # Depth-score -> weight map. BOTH are convex combinations (weights sum to 1), so this does
+    # not change whether the read is a weighted average -- only how scores land on the simplex.
+    # softmax is shift-invariant (N-1 usable dof); signorm = sigmoid(x_i)/sum_j sigmoid(x_j) is
+    # shift-sensitive (all N live) and saturates toward uniform at large positive scores.
+    ap.add_argument("--attn_res_score", choices=["softmax", "signorm"], default="softmax")
+    # Sparse depth mix: keep only the k highest-scoring candidates, prefix_sum always among
+    # them, renormalize over the survivors. 0 = dense. Inert wherever the pool is <= k, so at
+    # --attn_res 1 it first binds at layer k-1 and at --attn_res 3 (pool never exceeds 5) any
+    # k >= 5 does nothing at all.
+    ap.add_argument("--attn_res_topk", type=int, default=0)
+    # c per HIDDEN CHANNEL instead of one scalar per layer: M_in = attn_read + c (*) attn_out.
+    # 512 params/layer. Real capacity, not a reparameterization -- attn_output also feeds the
+    # prefix-sum stream, so a diagonal scale on the MLP-facing copy cannot fold into o_proj.
+    ap.add_argument("--attn_res_carry_per_dim", type=_bool, default=False)
+    # c = SiLU(W @ attn_read), input-dependent, bias-free. Subsumes per_dim and carry_scale.
+    # W is (hidden, hidden) per layer -- at H=512 that is 2.6M params (+1.9%); at the 7168 both
+    # Kimi K3 and DeepSeek-V3 use it would be 51.4M/layer, i.e. one extra attention projection.
+    ap.add_argument("--attn_res_carry_gate", choices=["none", "diag", "full"], default="none")
+    # d per hidden channel, the widening that made c worth -0.0011 for free.
+    ap.add_argument("--attn_res_emb_per_dim", type=_bool, default=False)
+    # BF16 RESIDUAL STREAM (src/ baseline only). The stream is fp32 by default -- not by
+    # choice, but because weights are fp32 master and nn.Embedding is not autocast, so
+    # inputs_embeds is fp32 and every residual add promotes back up. modded-nanogpt runs
+    # the whole stream in bf16. Master weights and optimizer state are unaffected.
+    ap.add_argument("--bf16_residual_stream", type=_bool, default=False)
+    # Round the sublayer OUTPUT to bf16 before the residual add, stream stays fp32.
+    ap.add_argument("--bf16_moe_out", type=_bool, default=False)
     # init for the (E,) act-scale param. 1.0 for the INPUT-SCALE codes (alpha multiplies the gate, so
     # 1 = feature off). 0.0 for radial (code 8), where the param is the exponent LOGIT and
     # p=sigmoid(0)=0.5 is the intended start -- leaving it at 1.0 would silently start p at 0.731.
@@ -314,7 +425,11 @@ def main():
     # Motivated by measurement: CV(rms(gate)) across tokens is 28% at MoE layer 0 but only ~4% from
     # layer 2 on, so NormSiLU's per-token norm earns its keep early and is nearly a constant divide
     # later -- where a per-expert scalar reproduces it and skips the RMS pre-pass.
-    ap.add_argument("--special_pairs", type=int, default=0)                       # BiBo param-free special experts, per-type count
+    ap.add_argument("--special_pairs", type=int, default=0)
+    # ASYMMETRIC identity counts. --special_pairs is per-type and applies to BOTH signs, so it
+    # cannot express e.g. 6 +Identity with 2 -Identity. These override it independently.
+    ap.add_argument("--pos_identity_n", type=int, default=None)
+    ap.add_argument("--neg_identity_n", type=int, default=None)                       # BiBo param-free special experts, per-type count
     ap.add_argument("--no_pos_identity", dest="pos_identity_expert", action="store_false")  # drop +Identity (code 3); test -Identity alone
     ap.add_argument("--no_neg_identity", dest="neg_identity_expert", action="store_false")  # drop -Identity (code 4); test +Identity alone
     ap.add_argument("--norm_topk_prob", type=int, default=1)  # 1 = normalize top-k weights to sum to 1 (BiBo model default). 0 = raw scores as weights (old ablate behavior)
@@ -332,6 +447,29 @@ def main():
     # QK-norm on the WINDOWED layers only (global layers always keep it). False = the arm that
     # asks whether a 128-token span already bounds logits well enough to make it redundant.
     ap.add_argument("--swa_qk_norm", type=_bool, default=True)
+    # Positional encoding is FIXED: NoPE on full-attention layers, full RoPE on windowed ones.
+    # Not a knob -- the rope round settled it. This is only the base for the windowed layers.
+    ap.add_argument("--rope_theta", type=float, default=None)
+    # Which layers keep a DENSE FFN instead of the MoE block. Default [0, 9] on the board config,
+    # which under swa_pattern block3 are exactly the full-attention layers. "none" = every layer
+    # is MoE. Changing this changes the PARAMETER COUNT -- these arms are not param-matched, and
+    # the comparison is quality per (total, active) params, both of which train.py prints.
+    ap.add_argument("--mlp_only_layers", type=str, default=None,
+                    help='comma list of dense-FFN layer indices, or "none" for all-MoE')
+    # Width of the DENSE FFN on mlp_only_layers. Default 1024 leaves a dense layer far cheaper
+    # than the MoE block it sits next to, so swapping one for the other moves active params by
+    # +5.0% and the arms are not comparable at matched compute. top_k*moe_inter (=4608 on the
+    # board config) makes a dense layer and an MoE layer cost the SAME active params, to within
+    # the router's h*num_experts.
+    ap.add_argument("--dense_inter", type=int, default=None)
+    # PER-LAYER expert geometry, "layer:E:top_k:width" (repeat with commas). Holding both active
+    # and total params fixed pins E/top_k = total/active, so a COARSER layer needs a smaller k:
+    # on the board config 0:32:3:1536 costs the same as the default 64/6/768 to 0.2%, while
+    # 0:32:6:768 would be half the layer. The point is to give the entry layer a decision it can
+    # actually make -- its router ends training unable to separate rank 6 from rank 7 (boundary
+    # gap 0.0026 vs 0.02-0.10 elsewhere) -- without paying the 0.10 ctx4095 that a dense L0 costs.
+    ap.add_argument("--moe_override", default="",
+                    help='per-layer expert geometry, e.g. "0:32:3:1536"')
     # XSA is part of the default stack now (learnable per-head alpha, init 0). BooleanOptionalAction
     # so the existing `--use_xsa` spelling still parses and `--no-use_xsa` is the ablation.
     ap.add_argument("--use_xsa", action=argparse.BooleanOptionalAction, default=True)
@@ -352,7 +490,10 @@ def main():
     ap.add_argument("--compile", action="store_true")           # torch.compile the transformer body
     ap.add_argument("--peak_tflops", type=float, default=0.0)   # MFU denominator: 0=auto-measure achievable GEMM;
     #                                                             else theoretical, e.g. 480 (dense bf16) / 960 (sparse)
-    ap.add_argument("--patches", default="liger_norm,liger_rope,ce,moe")
+    # 'megakernel' is DEFAULT: it fuses post_attention_layernorm + router + experts into one block
+    # and supersedes 'moe' on MoE layers. 'moe' stays in the list because the dense mlp_only_layers
+    # and the Qwen arm still route through BiBoFusedExperts.forward.
+    ap.add_argument("--patches", default="liger_norm,liger_rope,ce,moe,megakernel")
     ap.add_argument("--muon_scale_mode", choices=["polar", "normuon", "aurora", "aurora_ema", "aurora_ema_v2"],
                     default="aurora")  # post-NS row scaling; EMA variants: normuon / aurora_ema / aurora_ema_v2
     ap.add_argument("--xorth_post", type=float, default=0.0)       # cross-expert whitening MAX strength (0=off), scoped to MoE expert stacks
@@ -360,7 +501,10 @@ def main():
     ap.add_argument("--xorth_ema", type=float, default=0.95)       # EMA decay of the persistent per-stack (E,E) gram
     ap.add_argument("--xorth_warmup_steps", type=int, default=0)   # gate xorth OFF until step > this (0 = active from step 1)
     ap.add_argument("--xorth_where", choices=["pre", "post"], default="post")  # whiten momentum PRE-NS or orthogonalized update POST-NS
-    ap.add_argument("--muon_lr", type=float, default=3e-4)
+    # 1e-2 is the BOARD LR. It used to be 3e-4 here while every launch script passed --muon_lr 0.01,
+    # so the default was dead code that read as the real setting -- an argparse default nobody runs
+    # is worse than no default. Anything not passing --muon_lr now gets what the board runs.
+    ap.add_argument("--muon_lr", type=float, default=1e-2)
     ap.add_argument("--adam_lr", type=float, default=3e-4)
     ap.add_argument("--wd", type=float, default=0.1)
     # REVERSE-COSINE wd ramp: --wd is the START, --wd_end the finish, rising while the LR decays.
@@ -426,21 +570,31 @@ def main():
     ap.add_argument("--hf_repo", default="")     # if set, push model+tokenizer to this HF repo every --ckpt_every steps (async, non-blocking)
     ap.add_argument("--hf_token", default="")    # HF WRITE token; falls back to $HF_TOKEN / $HUGGING_FACE_HUB_TOKEN
     ap.add_argument("--hf_private", action="store_true")  # create the repo private
-    # in-training eval -> W&B curves (this is the point; not a post-hoc-only eval)
-    # 0 = FINAL EVAL ONLY (the default). Periodic evals cost ~2.4 min each and only exist to draw
-    # W&B curves; the number every comparison actually uses is the final one. >0 re-enables them.
-    #  -1 = NO EVAL AT ALL (use for short diagnostic/throughput runs -- a full eval is ~2.5 min
-    #       and dwarfs a 100-step run; it is also where runs have hung in teardown)
-    #   0 = FINAL EVAL ONLY (default)   >0 = periodic evals on top
-    ap.add_argument("--eval_every", type=int, default=0)
-    ap.add_argument("--sample_every", type=int, default=0)       # 0 = same as eval_every; steps between 2en+2hi samples
-    ap.add_argument("--eval_mcq_n", type=int, default=200)       # cheap periodic MCQ sample
-    ap.add_argument("--eval_bpb_n", type=int, default=200)       # cheap periodic bpb sample/source
-    ap.add_argument("--eval_extrap", default="")                 # periodic length-extrap (default off; e.g. 1024,2048,4096)
-    ap.add_argument("--final_mcq_n", type=int, default=500)      # full final eval
-    ap.add_argument("--final_extrap", default="1024,2048,4096")
-    ap.add_argument("--no_eval_icl", action="store_true")        # ICL-slope metric is ON by default (periodic + final)
-    ap.add_argument("--eval_icl_n", type=int, default=50)        # periodic ICL items/lang/shot (final uses 100)
+    # EVAL REMOVED Aug 7 2026 -- these are accepted and IGNORED so existing launch scripts and
+    # queue files keep running instead of dying on an unknown flag. Nothing reads them.
+    for _dead in ("--eval_every", "--sample_every", "--eval_mcq_n", "--eval_bpb_n",
+                  "--final_mcq_n", "--eval_icl_n", "--eval_seq_len"):
+        ap.add_argument(_dead, type=int, default=0, help="IGNORED: eval removed")
+    for _dead in ("--eval_extrap", "--final_extrap"):
+        ap.add_argument(_dead, default="", help="IGNORED: eval removed")
+    ap.add_argument("--no_eval_icl", action="store_true", help="IGNORED: eval removed")
+    # per-step validation on a FROZEN small batch (2 en + 2 hi instruction-following sources).
+    # Logged on the training log line. 0 = follow --log_every, -1 = off.
+    ap.add_argument("--val_every", type=int, default=0)
+    ap.add_argument("--val_seqs", type=int, default=2)            # sequences per source
+    # Skip validation until this step. At init the loss is ~11.4 (uniform over an 81920 vocab), and
+    # a single point that high pins every downstream chart's y-axis to it, flattening the range the
+    # run actually spends its life in. Purely cosmetic -- the number at step 0 is not informative,
+    # it is log(vocab). Set 0 to log from the start.
+    ap.add_argument("--val_start", type=int, default=100)
+    # END-OF-RUN report on the final weights: 4 fixed prompts (2 en + 2 hi) + degeneration metrics
+    # + val CE at each --extrap_lens. Runs after the checkpoint is written, once, so it costs
+    # nothing during training and cannot lose the weights if it fails.
+    ap.add_argument("--final_report", type=lambda s: str(s).lower() not in ("0", "false", "no"),
+                    default=True)
+    ap.add_argument("--sample_tokens", type=int, default=96)     # tokens generated per prompt
+    # 1024 is the TRAINED length; 2048/4096 are beyond anything RoPE saw. Logged one panel each.
+    ap.add_argument("--extrap_lens", default="1024,2048,4096")
     ap.add_argument("--out", default=None)
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_project", default="polyglu-ablations")
@@ -455,10 +609,38 @@ def main():
     if not args.norm_topk_prob:
         print("[router] warning: norm_topk_prob=0 -> NO top-k normalization; raw sigmoid scores are "
               "the combine weights and they will NOT sum to 1.", flush=True)
+    if args.pad_id is not None:
+        # Warn, do not block: masking id 0 is CORRECT for a corpus delimited by <|im_end|> (81914),
+        # and wrong for one delimited by <|endoftext|>. Only the corpus knows which, so state the
+        # assumption loudly rather than guess -- the failure is silent (the model never learns to
+        # stop) and would read as a mysterious degeneration rather than a bug.
+        from transformers import AutoTokenizer
+        _eos = AutoTokenizer.from_pretrained(TOKENIZER).eos_token_id
+        print(f"[loss] pad_id={args.pad_id} excluded from CE", flush=True)
+        if _eos is not None and int(args.pad_id) == int(_eos):
+            print(f"[loss] WARNING: pad_id == eos_token_id ({_eos}). Every end-of-text target is "
+                  f"now masked. This is safe ONLY if documents are separated by <|im_end|> "
+                  f"(81914); if they are separated by <|endoftext|>, the model will never learn "
+                  f"to terminate.", flush=True)
     n_total = args.experts or SHARED["num_experts"]
-    n_glu = glu_count(n_total, args.special_pairs, args.pos_identity_expert, args.neg_identity_expert)
-    print(f"[experts] {n_total} routed = {n_glu} GLU ({args.act}) + {n_total - n_glu} +/-Identity "
-          f"(special_pairs={args.special_pairs})", flush=True)
+    # --pos_identity_n / --neg_identity_n override special_pairs, so glu_count() alone would print
+    # a GLU count the model does not have. A wrong expert-layout line in the log is exactly the
+    # kind of thing that gets believed later.
+    if args.pos_identity_n is not None or args.neg_identity_n is not None:
+        _npos = args.pos_identity_n if args.pos_identity_n is not None else (
+            args.special_pairs if args.pos_identity_expert else 0)
+        _nneg = args.neg_identity_n if args.neg_identity_n is not None else (
+            args.special_pairs if args.neg_identity_expert else 0)
+        n_glu = n_total - _npos - _nneg
+        _how = f"pos_identity_n={_npos}, neg_identity_n={_nneg}"
+    else:
+        n_glu = glu_count(n_total, args.special_pairs, args.pos_identity_expert,
+                          args.neg_identity_expert)
+        _npos = args.special_pairs if args.pos_identity_expert else 0
+        _nneg = args.special_pairs if args.neg_identity_expert else 0
+        _how = f"special_pairs={args.special_pairs}"
+    print(f"[experts] {n_total} routed = {n_glu} GLU ({args.act}) + {_npos} +Identity "
+          f"+ {_nneg} -Identity  ({_how})", flush=True)
     assert "moe" in patch_list, "the fused-moe patch is required: eager experts are ~3x slower"
     patchmod.RADIAL_P = args.radial_p
     patchmod.EXPERT_ACT = args.act
@@ -476,6 +658,25 @@ def main():
           + f" -> kernel act code {_glu_code}", flush=True)
     # Shared with run_eval.py so a checkpoint's architecture can be reproduced exactly.
     _swa_pat, _win = resolve_swa(args.swa_pattern, args.sliding_window, SHARED["num_hidden_layers"])
+    # None -> SHARED default [0, 9]; "none" -> [] (every layer MoE); else a comma list.
+    # "0:32:3:1536" -> {0: {num_routed_experts: 32, num_experts_per_tok: 3, moe_intermediate_size: 1536}}
+    _moe_over = {}
+    for _spec in filter(None, (x.strip() for x in args.moe_override.split(","))):
+        _L, _E, _k, _w = (int(x) for x in _spec.split(":"))
+        _moe_over[_L] = {"num_routed_experts": _E, "num_experts_per_tok": _k,
+                         "moe_intermediate_size": _w}
+        print(f"[ffn] layer {_L} expert geometry override: {_E} experts, top-{_k}, width {_w}",
+              flush=True)
+
+    _dense = (None if args.mlp_only_layers is None else
+              [] if args.mlp_only_layers.lower() == "none" else
+              [int(v) for v in args.mlp_only_layers.split(",")])
+    if _dense is not None:
+        _bad = [i for i in _dense if not 0 <= i < SHARED["num_hidden_layers"]]
+        if _bad:
+            raise ValueError(f"--mlp_only_layers {_bad} out of range for "
+                             f"{SHARED['num_hidden_layers']} layers")
+        print(f"[ffn] dense layers {_dense or 'NONE - every layer is MoE'}", flush=True)
     if _swa_pat is not None:
         print(f"[swa] pattern {_swa_pat} (1=windowed) window={_win} "
               f"qk_norm={args.swa_qk_norm}", flush=True)
@@ -487,6 +688,10 @@ def main():
                            xsa_alpha_init=args.xsa_alpha_init,
                            hybrid_layer_pattern=_swa_pat, sliding_window=_win,
                            swa_qk_norm=args.swa_qk_norm,
+                           rope_theta=args.rope_theta,
+                           mlp_only_layers=_dense,
+                           moe_overrides=_moe_over,
+                           intermediate_size=args.dense_inter,
                            attn_res=args.attn_res, attn_res_sites=args.attn_res_sites,
                            attn_res_carry=args.attn_res_carry,
                            use_typed_attn_res=args.typed_attn_res,
@@ -497,6 +702,21 @@ def main():
                            typed_attn_res_slow_decay_init=args.typed_attn_res_slow_decay_init,
                            use_typed_attn_res_innovation_write=args.typed_attn_res_innovation_write,
                            typed_attn_res_innovation_init=args.typed_attn_res_innovation_init,
+                           attn_res_fp32_stream=args.attn_res_fp32_stream,
+                           attn_res_carry_scale=args.attn_res_carry_scale,
+                           attn_res_emb_term=args.attn_res_emb_term,
+                           attn_res_emb_scale=args.attn_res_emb_scale,
+                           attn_res_emb_site=args.attn_res_emb_site,
+                           attn_res_emb_gain=args.attn_res_emb_gain,
+                           attn_res_score=args.attn_res_score,
+                           attn_res_topk=args.attn_res_topk,
+                           num_pos_identity_experts=args.pos_identity_n,
+                           num_neg_identity_experts=args.neg_identity_n,
+                           attn_res_carry_per_dim=args.attn_res_carry_per_dim,
+                           attn_res_carry_gate=args.attn_res_carry_gate,
+                           attn_res_emb_per_dim=args.attn_res_emb_per_dim,
+                           bf16_residual_stream=args.bf16_residual_stream,
+                           bf16_moe_out=args.bf16_moe_out,
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
@@ -511,6 +731,11 @@ def main():
               f"-> tanh = {math.tanh(args.xsa_alpha_init):.3f}", flush=True)
     total, trainable, active = count_params(model)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
+    if not args.fused_res_add:
+        import exp.modeling_bibo as _E
+        _E._HAS_FUSED_RES_ADD = False
+        print("[res_add] fused kernel DISABLED by --fused_res_add false; eager carry write",
+              flush=True)
     # router mechanics traced on the TRAINING stream (eval-time MoEStats sees eval data only, every
     # eval_every steps). GPU-resident accumulators -> one device->host transfer per log_every.
     # Manas dose law (measured, .autoresearch/manas/): per-vote gamma scales with the vote count and
@@ -526,12 +751,23 @@ def main():
               "the measured info cap) -- slice the batch to get votes", flush=True)
     _n_exp = getattr(cfg, "num_routed_experts", None) or getattr(cfg, "num_experts", 0)
     rtrace = RouterTrace(model, _n_exp, DEV) if (args.router_log and _n_exp >= 2) else None
+    if rtrace is not None and getattr(rtrace, "mixed", False):
+        print("[router] per-layer expert counts differ (--moe_override): the MODEL-WIDE router "
+              "trace is off, since pooling counts across layers with different E is undefined. "
+              "The per-layer metrics under interp/router/layer_N/* cover all of it.", flush=True)
+    # Per-LAYER router diagnostics: expert-load histogram, balance, boundary gap, logit scale.
+    # A model-wide mean cannot say WHICH layer collapsed, and max-load plus entropy are both
+    # summary statistics of the very distribution the histogram shows.
+    plrouter = (PerLayerRouter(model, _n_exp, args.top_k or SHARED["num_experts_per_tok"])
+                if (args.router_log and _n_exp >= 2) else None)
     opts, n_mat, n_oth = build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt,
                                           scale_mode=args.muon_scale_mode, xorth_post=args.xorth_post,
                                           xorth_gate_ref=args.xorth_gate_ref, xorth_ema=args.xorth_ema,
                                           xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where,
                                           router_adamw=(args.router_optim == "adamw"),
                                           act_scale_lr=args.act_scale_lr,
+                                          vec_matrices_adamw=args.vec_matrices_adamw,
+                                          vec_adamw_group=args.vec_adamw_group,
                                           cautious_decay=args.cautious_decay,
                                           optim=args.optim, probe_gamma=probe_gamma,
                                           probe_rho_step=args.probe_rho_step,
@@ -555,6 +791,8 @@ def main():
     # The acts- tag is gone: radial is the only activation src implements, so every bibo_min run has it.
     run_name = (f"{args.arm}_seed{args.seed}"
                 + (("_aS" + f"{args.act_scale_lr:g}") if args.act_scale_lr else "")
+                + (("_vecadamw" + ("act" if args.vec_adamw_group == "act" else ""))
+                   if args.vec_matrices_adamw else "")
                 + ("_ptanh" if args.radial_p == "tanh" else "")
                 # XSA MUST be tagged: without it the xsa arm shares a run name with its own
                 # control and overwrites its _final.pt / _result.json. That happened once --
@@ -568,6 +806,15 @@ def main():
                 + (f"_swa{args.swa_pattern}w{str(args.sliding_window).replace(',', '-')}"
                    if args.swa_pattern != "none" else "")
                 + ("_noqkn" if args.swa_pattern != "none" and not args.swa_qk_norm else "")
+                + (f"_rt{args.rope_theta/1000:g}k" if args.rope_theta else "")
+                # A different dense/MoE split is a different model with a different param count;
+                # untagged it would overwrite the baseline's ckpt and _result.json on the same seed.
+                + (f"_di{args.dense_inter}" if args.dense_inter else "")
+                + ("" if not _moe_over else "_mo" + "-".join(
+                    f"{L}x{v['num_routed_experts']}k{v['num_experts_per_tok']}w{v['moe_intermediate_size']}"
+                    for L, v in sorted(_moe_over.items())))
+                + ("" if args.mlp_only_layers is None else
+                   "_allmoe" if _dense == [] else "_dense" + "-".join(map(str, _dense)))
                 # activation is an axis again; an untagged silu arm would overwrite the radial
                 # control's ckpt/_result.json on the same seed+experts
                 + (f"_act{args.act}" if args.act != "radial" else "")
@@ -585,6 +832,27 @@ def main():
                    if args.typed_attn_res_fast_slow_memory else "")
                 + (f"-iw{args.typed_attn_res_innovation_init:g}"
                    if args.typed_attn_res_innovation_write else "")
+                + ("f32s" if args.attn_res != "off" and args.attn_res_fp32_stream else "")
+                + (f"cs{args.attn_res_carry_scale}" if args.attn_res != "off"
+                   and args.attn_res_carry_scale != "none" else "")
+                + ("" if args.fused_res_add else "_eagerRA")
+                + ("emb" if args.attn_res != "off" and args.attn_res_emb_term else "")
+                + (args.attn_res_emb_scale if args.attn_res_emb_term
+                   and args.attn_res_emb_scale != "none" else "")
+                + ("_signorm" if args.attn_res != "off" and args.attn_res_score == "signorm"
+                   else "")
+                + (f"_top{args.attn_res_topk}" if args.attn_res != "off" and args.attn_res_topk
+                   else "")
+                + ("_cperdim" if args.attn_res != "off" and args.attn_res_carry_per_dim
+                   else "")
+                + (f"_cgate{args.attn_res_carry_gate}" if args.attn_res != "off"
+                   and args.attn_res_carry_gate != "none" else "")
+                + ("_dperdim" if args.attn_res != "off" and args.attn_res_emb_per_dim else "")
+                + ("_bf16stream" if args.bf16_residual_stream else "")
+                + ("_bf16moeout" if args.bf16_moe_out else "")
+                + ("ht" if args.attn_res_emb_term and args.attn_res_emb_site == "ht" else "")
+                + ("i" if args.attn_res_emb_term and args.attn_res_emb_site == "ht"
+                   and args.attn_res_emb_gain else "")
                 # wd is an ablation axis (scale-equilibrium test) -- untagged runs would collide
                 # with the wd=0.1 baselines on the same arm+seed and overwrite their ckpt/log names
                 + (f"_wdr{args.wd:g}-{args.wd_end:g}" if args.wd_schedule == "rcos"
@@ -595,6 +863,8 @@ def main():
                    if args.optim == "manas" else "")
                 + (f"_e{n_total}" if n_total != SHARED["num_experts"] else "")
                 + (f"_se{args.special_pairs}" if args.special_pairs else "")
+                + (f"_id{args.pos_identity_n}p{args.neg_identity_n or 0}n"
+                   if args.pos_identity_n is not None else "")
                 + (("_posonly" if not args.neg_identity_expert else "") if args.special_pairs else "")
                 + (("_negonly" if not args.pos_identity_expert else "") if args.special_pairs else "")
                 # bias_update_factor MUST be in the tag: it is a first-class ablation axis (it sets
@@ -610,29 +880,22 @@ def main():
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + ("" if args.norm_topk_prob else "_nontp")   # normalization is the default; mark when OFF
                 + ("_radamw" if args.router_optim == "adamw" else "")
-                + ("_cos" if args.scheduler == "cosine" else ""))
+                + ("_cos" if args.scheduler == "cosine" else "")
+                + (f"_{args.run_tag}" if args.run_tag else ""))
     out_dir = args.out or os.path.join(os.path.dirname(__file__), "..", "runs")
     os.makedirs(out_dir, exist_ok=True)
 
     wb = None
     if args.wandb:
         import wandb
+        # console="wrap": capture stdout into the run's Logs tab. The end-of-run report prints every
+        # greedy AND sampled generation there on purpose -- W&B renders long text poorly in a table,
+        # and the log is the readable place for it. Default "auto" can decline to capture when
+        # stdout is already redirected, which is exactly how these runs are launched (nohup > log).
         wb = wandb.init(project=args.wandb_project, name=run_name,
+                        settings=wandb.Settings(console="wrap"),
                         config={**vars(args), "total_steps": total_steps,
                                 "params_total": total, "params_active": active})
-
-    # in-training eval (needs the real corpus/tokenizer + benchmark datasets)
-    # do_eval gates the FINAL eval (the number every comparison uses); --eval_every only adds
-    # periodic ones on top. They were one flag, so --eval_every 0 silently suppressed the final
-    # eval as well -- which is why "final only" was previously spelled --eval_every 100000.
-    do_eval = args.data == "real" and args.eval_every >= 0
-    tok = Tok() if do_eval else None
-    if args.eval_every < 0:
-        print("[eval] disabled entirely (--eval_every -1)", flush=True)
-    elif not do_eval:
-        print("[eval] disabled: --data synthetic (benchmark eval needs the real corpus + downloads)", flush=True)
-    ev_extrap = tuple(int(x) for x in args.eval_extrap.split(",") if x.strip()) or None
-    sample_every = args.sample_every if args.sample_every > 0 else args.eval_every   # default: sample when we eval
 
     # async HF checkpoint push: save_pretrained locally (main thread), then upload_folder in the background.
     hf_api = hf_tok = None
@@ -640,22 +903,40 @@ def main():
     if args.hf_repo:
         from huggingface_hub import HfApi
         from transformers import AutoTokenizer
-        from .evaluate import TOKENIZER
         _hf_token = args.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
         hf_api = HfApi(token=_hf_token)
         hf_api.create_repo(args.hf_repo, private=args.hf_private, exist_ok=True)
-        hf_tok = tok._t if tok is not None else AutoTokenizer.from_pretrained(TOKENIZER)   # reuse the eval tokenizer
+        hf_tok = AutoTokenizer.from_pretrained(TOKENIZER)   # saved next to the weights so from_pretrained works
         print(f"[{run_name}] HF push -> {args.hf_repo} every {args.ckpt_every} steps (async, non-blocking); "
               f"periodic -> step<N>/, final -> repo root", flush=True)
 
+    # FROZEN validation batches, built once. Failure is FATAL by design: a silently-skipped source
+    # would leave the run logging a val number that means something different from every other run.
+    val_batches = val_holdout = None
+    val_every = args.log_every if args.val_every == 0 else args.val_every
+    if args.val_every >= 0 and args.data == "real":
+        from transformers import AutoTokenizer
+        _vt = AutoTokenizer.from_pretrained(TOKENIZER)
+        # TIER 1 -- val/loss, the ranking number: held-out shard of THIS corpus, in-distribution.
+        val_holdout = _val.build_holdout(args.dataset, args.seq_len, args.val_seqs, DEV)
+        # TIER 2 -- val/ext/*, external instruction sources. Watched, never averaged into val/loss.
+        # Separator is <|im_end|> (validation.SEP_ID), NOT eos: the val CE masks the pad id and
+        # pad == eos == 0 here, so an eos separator would be deleted from the loss.
+        val_batches = _val.build(_vt, args.seq_len, args.val_seqs, DEV)
+        if val_holdout is None:
+            print("[val] WARNING: no held-out shard (Hub-streamed dataset) -- val/loss is ABSENT "
+                  "and only val/ext/* is logged. Nothing in-distribution ranks these arms.", flush=True)
+        print(f"[val] every {val_every} steps from step {args.val_start} | val/loss=holdout"
+              f"{'' if val_holdout is None else f' {tuple(val_holdout.shape)}'} | "
+              f"val/ext: {', '.join(f'{n}/{l}' for n, l, _ in val_batches)}", flush=True)
+
     print(f"[{run_name}] params total={total/1e6:.2f}M active={active/1e6:.2f}M | steps={total_steps} "
           f"tok/step={tok_per_step} patches={patch_list} {args.precision} attn={args.attn} "
-          f"muon_mats={n_mat} eval="
-          f"{'off' if not do_eval else (f'every {args.eval_every}' if args.eval_every > 0 else 'final only')}",
-          flush=True)
+          f"muon_mats={n_mat} eval=REMOVED val={'on' if val_batches else 'off'}", flush=True)
 
     gen = token_batches(args.batch, args.seq_len, DEV, dataset=args.dataset,
-                        synthetic=(args.data == "synthetic"), vocab=cfg.vocab_size, seed=args.seed)
+                        synthetic=(args.data == "synthetic"), vocab=cfg.vocab_size, seed=args.seed,
+                        pad_id=0 if args.pad_id is None else int(args.pad_id))
     # MFU denominator: measured achievable GEMM peak, or --peak_tflops (theoretical). FLOPs/token = 6N + attn.
     measured_peak = _measure_peak_tflops(DEV, dt)
     peak_tflops = args.peak_tflops if args.peak_tflops > 0 else measured_peak
@@ -684,6 +965,16 @@ def main():
         print(f"[optim] manas gamma tracks lr: {probe_gamma:g} held through warmup "
               f"({_gs_warm} steps), then law(lr_t) -> ~0 at the end of the cosine", flush=True)
     for step in range(total_steps):
+        if args.typed_attn_res:
+            for module in model.modules():
+                if getattr(module, "use_typed_attn_res", False):
+                    module._typed_diagnostics = (
+                        {} if step % args.log_every == 0 or step == total_steps - 1 else None
+                    )
+        # The per-layer hooks fire only on steps that will actually be logged; every other step
+        # pays nothing. One traced step per interval is plenty for a distribution over 64 experts.
+        if plrouter is not None:
+            plrouter.enabled = (step % args.log_every == 0 or step == total_steps - 1)
         for o in opts:
             o.zero_grad(set_to_none=True)
         if _gs_on and step >= _gs_warm:                      # once per STEP, never between micros
@@ -697,7 +988,8 @@ def main():
             with _probe():
                 with amp:
                     loss = _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
-                               getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok) / args.grad_accum
+                               getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok,
+                               pad_id=args.pad_id) / args.grad_accum
                 loss.backward()
             _vote()
             loss_val += loss.item()
@@ -761,6 +1053,21 @@ def main():
             # at a glance -- an arm that never switches XSA on is a null, not a win.
             rt.update(patchmod.xsa_alpha_stats(model))
             rt.update(_typed_memory_stats(model))
+            # Per-tensor param and grad norms. The one that earns its keep is grad/norm_min: a
+            # tensor whose gradient is 0.0 while training proceeds is INERT, and this repo has
+            # shipped that bug twice (XSA alpha behind a passing parity test, ACT_CYCLE not
+            # reaching the eager path). Both were invisible in the loss for days.
+            rt.update(tensor_norms(model))
+            if plrouter is not None:
+                rt.update(plrouter.flush())
+                # OFF for the rest of this step. Validation and the extrapolation panels run their
+                # own forwards further down, and with the hooks still armed their tokens land in
+                # the next interval's expert counts -- 3.9% of the histogram on the board config,
+                # measured on base-allmoe-s2026, mixing held-out text into a TRAIN routing metric.
+                plrouter.enabled = False
+            # XSA alpha and radial p per layer, read straight off the parameters. The depth ramp
+            # in p was only ever visible per layer, and the aggregate min/mean/max hid it.
+            rt.update(per_layer_params(model))
             xa_s = ((f" xa={rt['train/xsa_a_mean']:+.3f}"
                      f"[{rt['train/xsa_a_min']:+.2f},{rt['train/xsa_a_max']:+.2f}]"
                      if "train/xsa_a_mean" in rt else "")
@@ -774,6 +1081,153 @@ def main():
                 )
             if "train/typed_innovation_alpha_mean" in rt:
                 typed_s += f" innov={rt['train/typed_innovation_alpha_mean']:.3f}"
+            cs_s = ""
+            # cs = the learnable carry coefficient, reported as 2*sigmoid(theta) because that is
+            # what multiplies attn_output. Init is exactly 1.0, so a cs pinned at 1.000 across
+            # every layer means the MLP does not want the knob and it can be removed; a DEPTH
+            # PROFILE (early layers wanting mixing, late wanting their own attention) is the
+            # result worth having, and is the same shape radial p turned out to have.
+            _cs = [m.attn_res_carry_theta for m in model.modules()
+                   if getattr(m, "attn_res_carry_theta", None) is not None]
+            if _cs:
+                _mode = getattr(model.config, "attn_res_carry_scale", "none")
+                # THE SAME map the model uses, imported rather than re-spelled. This chain was
+                # once a hand-written if/elif ending in an unguarded `else 2*tanh`; when the mode
+                # names changed, the new ones fell through to it and s= reported 2*tanh(1.0)=1.523
+                # for a c that was exactly 1.0. A second copy of a transform is a second chance to
+                # display a number the model never computed.
+                from exp.modeling_bibo import _CARRY_C
+                assert _mode in _CARRY_C, (
+                    f"attn_res_carry_scale={_mode!r} is not in _CARRY_C; s= would report a value "
+                    f"the model never used")
+                _xf = _CARRY_C[_mode]
+                _cl = [_xf(t.detach().float().flatten()) for t in _cs]   # one entry per LAYER
+                _c = torch.cat(_cl)
+                rt.update({"train/attn_res_s_mean": _c.mean().item(),
+                           "train/attn_res_s_min": _c.min().item(),
+                           "train/attn_res_s_max": _c.max().item()})
+                # PER LAYER too. min/max/mean over 10 layers cannot answer the question this
+                # arm exists for -- "do early layers want the depth mix and late layers their
+                # own attention?" needs to know WHICH layer, the same way radial p's depth ramp
+                # was only visible per layer and its global mean actively misled.
+                # With per-dim c each layer holds (hidden,) values, so L{i} carries that layer's
+                # MEAN -- enumerating the flat cat would emit 5120 keys named L0..L5119 and
+                # destroy the very depth panel this block exists for. The within-layer spread is
+                # its own series, because "which layer wants a SHAPED c" is the new question and
+                # a mean hides it exactly the way the global mean hid the depth ramp.
+                # MEAN, not rms. c is unbounded so channels can go NEGATIVE (the ht-site i already
+                # did), and rms discards the sign; it also conflates magnitude with spread, since
+                # rms^2 = mean^2 + var, so a layer centred on 0 with a wide spread would read as a
+                # large rms. The mean is additionally the quantity that compares directly to the
+                # scalar arm, because a scalar IS a uniform vector.
+                rt.update({f"train/attn_res_s/L{i}": v.mean().item() for i, v in enumerate(_cl)})
+                if _cl[0].numel() > 1:
+                    # THE NUMBER THIS ARM TURNS ON. If std stays near 0 the vector has collapsed
+                    # back to a scalar, per-dim bought nothing, and any bpb delta is noise -- that
+                    # verdict is not visible in the mean. std rather than max-min because one
+                    # runaway lane out of 512 would otherwise define the range and hide the
+                    # other 511.
+                    rt.update({f"train/attn_res_s_std/L{i}": v.std().item()
+                               for i, v in enumerate(_cl)})
+                    # Per-channel AND unbounded is the first configuration where an individual
+                    # channel can flip sign, i.e. the MLP sees that attention channel negated
+                    # while the residual stream still gets it unnegated. Cheap to count, and it
+                    # is the thing a scalar c could never express.
+                    rt.update({f"train/attn_res_s_negfrac/L{i}": (v < 0).float().mean().item()
+                               for i, v in enumerate(_cl)})
+                    _sd = torch.stack([v.std() for v in _cl])
+                    rt["train/attn_res_s_std_mean"] = _sd.mean().item()
+                    rt["train/attn_res_s_std_max"] = _sd.max().item()
+                    _sd_tag = f" sd={_sd.mean().item():.3f}"
+                else:
+                    _sd_tag = ""
+                # AFTER the assignment below, never before it: cs_s is reset here every log step
+                # (it starts as "" up at the top), so appending first put the tag on a string that
+                # was then thrown away. W&B still got the keys -- they go into rt -- so this was
+                # only ever a missing console tag, not lost data.
+                cs_s = (f" s={_c.mean().item():.3f}"
+                        f"[{_c.min().item():.2f},{_c.max().item():.2f}]" + _sd_tag)
+                aS_s = xa_s + cs_s        # covers the no-radial case; the radial block below
+                                          # rebuilds from xa_s + cs_s so neither clobbers the other
+            # d = the embedding-skip knob, PER LAYER. The whole arm is a depth-profile question --
+            # "does layer 1 alone want a token-identity channel?" -- so a mean would answer nothing.
+            # Note d does not exist at layer 0, so L index here is layer_idx-1.
+            # attn_res_emb_gain (the unit-norm i) logs under the SAME attn_res_d/* keys on purpose:
+            # it is the same axis re-parameterized, and sharing the keys keeps one wandb panel
+            # across arms. They are mutually exclusive by construction -- the gain REPLACES theta --
+            # so there is never a collision. Read the console tag (d= vs i=) for which one it is;
+            # the units differ (theta is a logit, i is directly the injected rms).
+            # GATE. There is no bias, so there is no static component to report -- the whole
+            # coefficient is SiLU(W @ attn_read) and W is the only parameter. Its RMS is the
+            # "is input-dependence actually being used" signal, the analogue of s_std for the
+            # static per-dim arm: standard init puts it near 1/sqrt(H) = 0.044, so growth means
+            # the gate is learning to discriminate and a flat trace means it is not.
+            # The gate OUTPUT distribution is what we really want, but reading it needs a hook in
+            # the forward and a sync every step; it is recoverable from the checkpoint afterwards.
+            _gm = [m for m in model.modules() if getattr(m, "_gate_mean", None) is not None]
+            if _gm:
+                # SAME PANEL as the scalar and per-dim arms. The gate output is c, so it goes to
+                # attn_res_s/* and attn_res_s_std/*, not to keys of its own -- the depth profile
+                # is only readable if every parameterization of c plots on one axis. No collision
+                # is possible: the gate requires carry_scale=none, so the theta-based block above
+                # found nothing and left these keys free.
+                _mu = torch.stack([m._gate_mean for m in _gm])
+                _sd = torch.stack([m._gate_std for m in _gm])
+                rt.update({f"train/attn_res_s/L{i}": v for i, v in enumerate(_mu.tolist())})
+                rt.update({f"train/attn_res_s_std/L{i}": v for i, v in enumerate(_sd.tolist())})
+                rt.update({"train/attn_res_s_mean": _mu.mean().item(),
+                           "train/attn_res_s_min": min(m._gate_min.item() for m in _gm),
+                           "train/attn_res_s_max": max(m._gate_max.item() for m in _gm),
+                           "train/attn_res_s_std_mean": _sd.mean().item(),
+                           "train/attn_res_s_std_max": _sd.max().item()})
+                # W's RMS is a DIFFERENT quantity -- a parameter norm, not a coefficient value --
+                # so it keeps its own key rather than polluting the s axis it is 25x below.
+                # It answers "is the input-dependence being used at all": standard init is
+                # ~1/sqrt(H)=0.044, and a flat trace means the gate is behaving as a constant.
+                _r = torch.stack([m.attn_res_carry_gate.detach().float().pow(2).mean().sqrt()
+                                  for m in _gm])
+                rt.update({f"train/attn_res_gate_w/L{i}": v for i, v in enumerate(_r.tolist())})
+                rt["train/attn_res_gate_w_mean"] = _r.mean().item()
+                cs_s += (f" s={_mu.mean().item():.3f}"
+                         f"[{min(m._gate_min.item() for m in _gm):.2f},"
+                         f"{max(m._gate_max.item() for m in _gm):.2f}]"
+                         f" sd={_sd.mean().item():.3f} gw={_r.mean().item():.4f}")
+                aS_s = xa_s + cs_s
+            _de = [m.attn_res_emb_theta for m in model.modules()
+                   if getattr(m, "attn_res_emb_theta", None) is not None]
+            _dtag = "d"
+            if not _de:
+                _de = [m.attn_res_emb_gain for m in model.modules()
+                       if getattr(m, "attn_res_emb_gain", None) is not None]
+                _dtag = "i"
+            if _de:
+                _d = torch.cat([t.detach().float().flatten() for t in _de])
+                rt.update({"train/attn_res_d_mean": _d.mean().item(),
+                           "train/attn_res_d_min": _d.min().item(),
+                           "train/attn_res_d_max": _d.max().item()})
+                # L{i+1} carries that layer's MEAN (d does not exist at layer 0). With per-dim d
+                # each layer holds (hidden,) values, so enumerating the flat cat would emit keys
+                # L1..L5120 and destroy the depth panel -- the same trap per-dim c hit.
+                rt.update({f"train/attn_res_d/L{i + 1}": t.detach().float().mean().item()
+                           for i, t in enumerate(_de)})
+                _dsd = torch.stack([t.detach().float().flatten().std() for t in _de]) \
+                    if _de[0].numel() > 1 else None
+                if _dsd is not None:
+                    rt.update({f"train/attn_res_d_std/L{i + 1}": v
+                               for i, v in enumerate(_dsd.tolist())})
+                    rt["train/attn_res_d_std_mean"] = _dsd.mean().item()
+                    rt["train/attn_res_d_std_max"] = _dsd.max().item()
+                    # Symmetric with per-dim c. Both per-dim c arms measured negfrac = 0 at every
+                    # layer -- no attention channel ever wanted to be negated. d is a different
+                    # question: it weights the EMBEDDING, and a channel wanting the token identity
+                    # subtracted is not obviously absurd the way a negated attention channel was.
+                    rt.update({f"train/attn_res_d_negfrac/L{i + 1}":
+                               (t.detach() < 0).float().mean().item()
+                               for i, t in enumerate(_de)})
+                cs_s += (f" {_dtag}={_d.mean().item():.3f}"
+                         f"[{_d.min().item():.2f},{_d.max().item():.2f}]"
+                         + (f" dsd={_dsd.mean().item():.3f}" if _dsd is not None else ""))
+                aS_s = xa_s + cs_s
             _th = [m.radial_theta for m in model.modules() if hasattr(m, "radial_theta")]
             if _th:
                 _t = torch.cat([t.detach().float().flatten() for t in _th])
@@ -790,12 +1244,27 @@ def main():
                            "train/radial_p_mean": _p.mean().item(),
                            "train/radial_p_min": _p.min().item(),
                            "train/radial_p_max": _p.max().item()})
-                aS_s = (xa_s + f" p={rt['train/radial_p_mean']:.3f}"
+                aS_s = (xa_s + cs_s + f" p={rt['train/radial_p_mean']:.3f}"
                         f"[{rt['train/radial_p_min']:.2f},{rt['train/radial_p_max']:.2f}]"
                         f" th={rt['train/act_alpha_mean']:+.3f}")
+            # VALIDATION on the frozen batch. Unlike train loss this is the same text every step and
+            # every arm, so it is the only number here that can rank two runs.
+            val_s, val_flat = "", {}
+            if ((val_holdout is not None or val_batches) and step >= args.val_start
+                    and (step % val_every == 0 or step == total_steps - 1)):
+                _vo, val_flat = _val.losses(model, val_holdout, val_batches,
+                                            fused_linear_cross_entropy, amp,
+                                            pad_id=0 if args.pad_id is None else int(args.pad_id))
+                # headline first and on its own; the external sources follow, tagged, so the two
+                # tiers can never be misread as one aggregate.
+                val_s = ("" if _vo is None else f" val={_vo:.4f}") + (
+                    " ext[" + " ".join(f"{k.rsplit('/', 1)[1][:2]}={v:.2f}"
+                                       for k, v in val_flat.items()
+                                       if k.startswith("val/ext/") and k.rsplit("/", 1)[1]
+                                       not in ("en", "hi")) + "]" if val_batches else "")
             print(f"  step {step}/{total_steps} loss={lv:.4f} run{len(_loss_hist)}={lv_run:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
-                  f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{rt_s}{aS_s}{typed_s}"
+                  f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{val_s}{rt_s}{aS_s}{typed_s}"
                   f"{f' wd={cur_wd:.4f}' if wd_sched is not None else ''}"
                   # clean = loss at RESTORED theta; probe = how much of `loss` is the probe sitting
                   # downhill. Under muon probe is ~0 by construction (nothing to restore).
@@ -810,23 +1279,7 @@ def main():
                         **({"train/loss_clean": loss_clean, "train/probe_gap": loss_clean - lv}
                            if loss_clean is not None else {}),
                         **({"train/probe_gamma": _mns.probe_gamma} if _mns is not None else {}),
-                        "tokens": toks, **rt}, step=step)
-        # `step > 0`: step 0 evaluates a RANDOM-INIT model, so the numbers are noise (measured
-        # bpb hi=2.04 en=4.19 vs 0.74/1.64 at the end) while costing a full eval pass -- ~2.4 min
-        # of a 12.5 min 500-step arm, i.e. ~19%. The final eval still runs, and any --eval_every
-        # multiple after 0 still runs, so curves are unaffected.
-        if do_eval and args.eval_every > 0 and step > 0 and step % args.eval_every == 0:   # periodic eval -> W&B curves
-            with _eager(model):                                # eval on the un-compiled module (see _eager)
-                _, flat = evaluate(model, tok, seq_len=(args.eval_seq_len or args.seq_len), mcq_n=args.eval_mcq_n, bpb_n=args.eval_bpb_n,
-                                   extrap_lengths=ev_extrap, do_samples=False,
-                                   do_icl=not args.no_eval_icl, icl_n=args.eval_icl_n, device=DEV, dtype=dt)
-            if wb:
-                wb.log(flat, step=step)
-            print(f"  [eval @{step}] {summarize(flat)}", flush=True)
-        if do_eval and sample_every > 0 and step > 0 and step % sample_every == 0:   # samples on their own cadence (default = eval_every)
-            with _eager(model):
-                for s in generate_samples(model, tok, device=DEV, dtype=dt):
-                    print(f"    [sample {s['lang']}] {s['prompt']} -> {s['completion']}", flush=True)
+                        "tokens": toks, **_interp(rt), **val_flat}, step=step)
         if args.ckpt_every and step > 0 and step % args.ckpt_every == 0:
             if hf_api is not None:
                 _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_step{step}"))
@@ -837,28 +1290,37 @@ def main():
 
     ckpt = os.path.join(out_dir, f"{run_name}_final.pt")
     torch.save(model.state_dict(), ckpt)
+
+    # ---- END-OF-RUN REPORT on the FINAL weights: samples + degeneration + length extrapolation.
+    # After the checkpoint is written, never before: a bug in reporting must not cost the run its
+    # weights. final_report swallows its own exceptions for the same reason.
+    final_flat = {}
+    if args.final_report and args.data == "real":
+        from . import final_report as _fr
+        from transformers import AutoTokenizer as _AT
+        print(f"\n[{run_name}] final report: {len(_fr.PROMPTS)} prompts + extrapolation "
+              f"at {args.extrap_lens}", flush=True)
+        try:
+            _rt = _AT.from_pretrained(TOKENIZER)
+            _lens = tuple(int(x) for x in str(args.extrap_lens).split(",") if x.strip())
+            final_flat = _fr.run(model, _rt, args.dataset, fused_linear_cross_entropy, amp,
+                                 device=DEV, wb=wb, max_new=args.sample_tokens,
+                                 n_seqs=args.val_seqs, lens=_lens)
+        except Exception as _e:
+            print(f"[{run_name}] final report FAILED: {type(_e).__name__}: {_e}", flush=True)
     if hf_api is not None:                                  # final -> repo root so `from_pretrained(repo)` just works
         _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_final"))
         hf_futures.append(_push_hf_async(hf_api, args.hf_repo, _dir, "final", f"{run_name} final"))
-    final_eval = None
-    if do_eval:
-        try:                                                   # best-effort: a final-eval failure must NOT
-            fe = tuple(int(x) for x in args.final_extrap.split(",") if x.strip()) or None   # abort the HF
-            with _eager(model):                                # drain / result.json / wb.finish below
-                final_eval, full_flat = evaluate(model, tok, seq_len=(args.eval_seq_len or args.seq_len), mcq_n=args.final_mcq_n,
-                                                 extrap_lengths=fe, do_icl=not args.no_eval_icl, icl_n=100,
-                                                 device=DEV, dtype=dt)
-            if wb:
-                wb.log(full_flat, step=total_steps)
-            print(f"  [final eval] {summarize(full_flat)}", flush=True)
-            for s in final_eval.get("samples", []):
-                print(f"    [sample {s['lang']}] {s['prompt']} -> {s['completion']}", flush=True)
-        except Exception as e:
-            print(f"  [final eval] FAILED: {type(e).__name__}: {str(e)[:200]} (checkpoints already pushed)",
-                  flush=True)
     res = {"arm": args.arm, "seed": args.seed, "steps": total_steps, "tokens": total_steps * tok_per_step,
            "final_loss": loss_val, "final_loss_running": sum(_loss_hist) / len(_loss_hist), "params_total": total, "params_active": active,
-           "ckpt": ckpt, "wall_s": time.time() - t0, "eval": final_eval, "config": vars(args)}
+           "ckpt": ckpt, "wall_s": time.time() - t0, "eval": None,
+           # the W&B run id, so report_ckpt.py can RESUME this run rather than opening a second one.
+           # A report logged to its own run cannot be compared against the training curves it
+           # describes, which is the entire point of logging it.
+           "wandb_id": (getattr(wb, "id", None) if wb else None),
+           "wandb_project": (args.wandb_project if wb else None),
+           "final_report": final_flat,
+           "config": vars(args)}
     with open(os.path.join(out_dir, f"{run_name}_result.json"), "w") as f:
         json.dump(res, f, indent=2)
     if hf_futures:                                         # drain: block until every background upload lands,

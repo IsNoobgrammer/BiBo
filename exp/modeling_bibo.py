@@ -27,6 +27,7 @@ Only the experimental package imports stable BiBo components. Nothing under
 ``src`` imports or probes ``exp``.
 """
 
+import contextlib
 import math
 from typing import Optional, Tuple, Union
 
@@ -34,6 +35,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
+
+from src.modeling.layers import _layer_config
 from torch.utils.checkpoint import checkpoint
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation.utils import GenerationMixin
@@ -47,6 +50,76 @@ from src.modeling.models import BiBoPreTrainedModel as _StableBiBoPreTrainedMode
 from src.modeling.norm import BiBoRMSNorm
 
 from .configuration_bibo import BiBoConfig
+
+try:
+    # Fused AR: one read of V, fp32 accumulation, and a custom backward that saves only the
+    # INPUTS. Measured fwd+bwd at T=16384/H=512: 16-20x faster than this file's torch path and
+    # 4.7x less peak memory at N=11 (2450 -> 520 MB per site). Parity and gradcheck live in
+    # triton-kernel-fused/parity_check/parity_attn_res.py, graded against FP32 eager at every
+    # dtype -- the bf16 kernel matches bf16 eager's error to the digit on all three gradients.
+    from kernels.sm120.attn_res import attn_res as _fused_ar
+    _HAS_FUSED_AR = True
+except Exception:                                   # no triton / no kernels checkout
+    _HAS_FUSED_AR = False
+
+try:
+    # Fused carry write: h = attn_read + c*attn_out + d*emb in ONE pass instead of one elementwise
+    # pass per stream. Benched at the board shape (65536 x 512): 2.52x forward / 1.90x fwd+bwd at
+    # two streams, and the gap widens with stream count. It is also MORE ACCURATE than this file's
+    # torch path, not just faster: eager evaluates `_c.to(attn_output.dtype) * attn_output`, which
+    # rounds the learned fp32 scalar to BF16 and multiplies in bf16, while the kernel promotes
+    # every operand to fp32 and accumulates there -- measured 30,000-47,000x closer to fp64 truth
+    # on the real dtype layout. So enabling it SHIFTS TRAINING NUMERICS (toward correct); an arm
+    # run on it is not bit-comparable to one run without it.
+    from kernels.sm120.residual_add import make_mlp_input as _fused_res_add
+    _HAS_FUSED_RES_ADD = True
+except Exception:
+    _HAS_FUSED_RES_ADD = False
+
+# attn_res_carry_scale -> the kernel's transform code for the attn_out multiplier. "none" has no
+# theta at all (c is a hard 1.0) and is handled by the caller, not here.
+# The kernel's mode set is now {none, rms}; the bounded transforms are gone. "raw" keeps c as the
+# unconstrained parameter; "rms" additionally normalises the stream c multiplies, which is what
+# removes the need for a cage on c at all.
+# TWO ORTHOGONAL AXES, not one mode list.
+#
+#   _CARRY_C      how c is parameterised from theta.   Applied in TORCH, on the (H,) vector.
+#   _CARRY_STREAM whether the stream c multiplies is RMS-normalised. Applied in the KERNEL.
+#
+# The transform lives on the torch side ON PURPOSE. It is a function of theta -- 512 values --
+# not of the (T,H) data, so it costs one tiny op per layer. The previous kernel evaluated it
+# INSIDE the loop in fp64: at grid 8192 that is ~4.2M fp64 exp calls per launch to produce 512
+# distinct numbers, which is why "sigmoid" looked expensive when the maths is nearly free.
+# Autograd chains through it for free, so the kernel never needs a d(transform)/d(theta) rule.
+#
+# Splitting them also makes the combinations reachable: sigmoid+rms, tanh+rms, raw+rms.
+_CARRY_C = {
+    "raw": lambda t: t,
+    "unbounded": lambda t: t,                       # original name for raw
+    "rms": lambda t: t,                             # rms constrains the STREAM, not c
+    "sigmoid": lambda t: 2.0 * torch.sigmoid(t),    # (0, 2), init theta=0 -> c=1
+    "tanh": lambda t: 2.0 * torch.tanh(t),          # (-2, 2), init atanh(.5) -> c=1
+    "sigmoid_rms": lambda t: 2.0 * torch.sigmoid(t),
+    "tanh_rms": lambda t: 2.0 * torch.tanh(t),
+    # SLOPE FAMILY: c = 1 + s*(theta-1), theta init 1 -> c=1, dc/dtheta = s, UNBOUNDED.
+    # These exist to separate the two things sigmoid/tanh confound. Measured at seed 42069, val
+    # over steps 1575-2000 orders by slope at init, NOT by boundedness:
+    #     2*sigmoid  slope 0.50  3.5847     tanh  slope 1.50  3.6109
+    #     raw        slope 1.00  3.6055     (tanh is bounded like sigmoid and still lost)
+    # theta is AdamW-optimised, and Adam's update is gradient-SCALE invariant: |d_theta| ~ lr
+    # regardless of s. So s does not change how fast theta moves -- it changes how far c moves per
+    # unit of theta, |dc| = s*|d_theta|. That is the effective LR on c, and it is the whole claim.
+    # If slope05 reproduces sigmoid, the bound is decoration. If it reproduces raw, it is not.
+    "slope05": lambda t: 0.5 * t + 0.5,             # slope 0.5, matches sigmoid at c=1
+    "slope15": lambda t: 1.5 * t - 0.5,             # slope 1.5, matches tanh at c=1
+}
+_CARRY_STREAM = {"raw": "none", "unbounded": "none", "sigmoid": "none", "tanh": "none",
+                 "rms": "rms", "sigmoid_rms": "rms", "tanh_rms": "rms",
+                 "slope05": "none", "slope15": "none"}
+# How the depth scores become weights. BOTH are convex combinations -- the weights sum to 1
+# either way, so this does not change whether the read is a weighted average, only the map onto
+# the simplex. See apply_attention_residual for what signorm buys (the shift dimension).
+_SCORE_MODE = {"softmax": 0, "signorm": 1}
 
 logger = logging.get_logger(__name__)
 
@@ -114,6 +187,8 @@ def apply_attention_residual(
     block_residual: torch.Tensor,
     projection: nn.Linear,
     norm: BiBoRMSNorm,
+    score_mode: int = 0,
+    topk: int = 0,
 ) -> torch.Tensor:
     """Mix completed blocks and the current prefix across model depth.
 
@@ -124,6 +199,25 @@ def apply_attention_residual(
         projection: Learned pseudo-query represented as a bias-free ``hidden -> 1``
             projection.
         norm: Gain-bearing RMSNorm applied independently to every candidate key.
+        score_mode: 0 = softmax (K3, and every arm before Aug 5 2026). 1 = sigmoid/sum,
+            ``sigmoid(x_i) / sum_j sigmoid(x_j)``. Mode 1 is STILL a convex combination -- the
+            depth weights sum to 1 either way, so the read stays a weighted average and cannot
+            grow with the candidate count. What it buys is the shift dimension: softmax sees only
+            score DIFFERENCES, so N scores carry N-1 usable degrees of freedom, while sigmoid/sum
+            responds to the absolute level and uses all N. It also saturates toward uniform once
+            every score is large and positive, which softmax does not.
+        topk: 0 = dense, mix over every candidate. k > 0 = SPARSE DEPTH: score all candidates,
+            keep only the k highest, renormalize over those. Still a convex combination -- the
+            surviving weights sum to 1 -- just on a k-face of the simplex instead of its interior.
+            ``prefix_sum`` is FORCED into the selection and consumes one of the k slots, so k=4
+            means the live stream plus the 3 best committed blocks. It is forced because it is the
+            only candidate carrying THIS layer's attention output: dropping it would not
+            down-weight attention, it would disconnect the layer from the depth read entirely and
+            zero its gradient through this path for that token.
+            A no-op wherever k >= candidate count, which is what makes k a depth threshold. At
+            block_size=1 the pool is 2,3,...,11 across the 20 mix sites, so k first binds at
+            layer k-1's second site and sparsifies everything below it; at block_size=3 the pool
+            never exceeds 5, so any k >= 5 does nothing at all.
 
     Returns:
         The depth-attended state with shape ``(tokens, hidden)`` and the same
@@ -151,12 +245,27 @@ def apply_attention_residual(
             f"{tuple(prefix_sum.shape)} vs {tuple(block_residual.shape)}"
         )
 
+    # norm(values) @ projection.weight, with both parameter vectors multiplied first so the
+    # implementation matches Kimi K3's checkpoint semantics. Autograd splits the gradient back
+    # to norm.weight and projection.weight through this product, so the kernel only needs the
+    # folded vector.
+    score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
+
+    if _HAS_FUSED_AR and prefix_sum.is_cuda:
+        return _fused_ar(block_residual, prefix_sum, score_weight, norm.variance_epsilon,
+                         score_mode, topk)
+
+    # AUTOCAST MUST BE OFF HERE. Under torch.autocast(bf16) `torch.matmul` is autocast-eligible,
+    # so the two matmuls below get their fp32 inputs silently cast back to bf16 and the whole
+    # "fp32 scores and aggregation" this function documents does not happen. K3's reference has
+    # the same hole. The Triton kernel accumulates in true fp32, so without this the two paths
+    # disagree by bf16-level error compounded over every layer -- 3.9e-01 in the hidden state,
+    # measured by test_attn_res_gpu.
+    _ac = (torch.autocast("cuda", enabled=False) if prefix_sum.is_cuda
+           else contextlib.nullcontext())
+
     values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
     values_float = values.float()
-
-    # norm(values) @ projection.weight, with both parameter vectors multiplied first so the
-    # implementation matches Kimi K3's checkpoint semantics.
-    score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
 
     # ALGEBRAICALLY IDENTICAL to `(rms_norm(values) * score_weight).sum(-1)`, but without ever
     # building a normalized copy. The RMS factor is per (token, block) and broadcasts over hidden,
@@ -166,12 +275,26 @@ def apply_attention_residual(
     # normalized keys and the keys*weight product -- and both were kept alive for backward, at
     # every residual site of every layer. This form contracts with a single GEMV straight to
     # (tokens, blocks+1) and allocates nothing of hidden size.
-    sq_sum = torch.linalg.vector_norm(values_float, dim=-1).square()   # fused; no squared copy
-    inv_rms = torch.rsqrt(sq_sum / values_float.shape[-1] + norm.variance_epsilon)
-    scores = torch.matmul(values_float, score_weight) * inv_rms
-
-    probabilities = scores.softmax(dim=-1).unsqueeze(1)
-    mixed = torch.matmul(probabilities, values_float).squeeze(1)
+    with _ac:
+        sq_sum = torch.linalg.vector_norm(values_float, dim=-1).square()
+        inv_rms = torch.rsqrt(sq_sum / values_float.shape[-1] + norm.variance_epsilon)
+        scores = torch.matmul(values_float, score_weight) * inv_rms
+        if topk and topk < scores.shape[-1]:
+            # Same rule as the kernel's `_topk_sel`: last column (the prefix sum) forced in via
+            # +inf, and `<` rather than `<=` so exact ties keep every tied candidate.
+            _key = scores.clone()
+            _key[..., -1] = float("inf")
+            _kth = _key.topk(topk, dim=-1).values[..., -1:]
+            scores = scores.masked_fill(_key < _kth, float("-inf"))
+        if score_mode == 0:
+            probabilities = scores.softmax(dim=-1)
+        else:
+            # clamp_min matches the kernel's 1e-30 floor exactly. If every candidate saturates
+            # sigmoid to 0 this is 0/0, and the two paths must agree at that tail rather than one
+            # returning NaN and the other a number.
+            _sp = torch.sigmoid(scores)
+            probabilities = _sp / _sp.sum(dim=-1, keepdim=True).clamp_min(1e-30)
+        mixed = torch.matmul(probabilities.unsqueeze(1), values_float).squeeze(1)
     return mixed.to(values.dtype)
 
 
@@ -192,6 +315,8 @@ def apply_typed_attention_residual(
     include_memory: bool = True,
     include_slow_memory: bool = True,
     return_details: bool = False,
+    diagnostics: Optional[dict] = None,
+    diagnostic_site: str = "read",
 ):
     """AttnRes read over full, thought, and memory residual candidates.
 
@@ -288,25 +413,39 @@ def apply_typed_attention_residual(
     candidate_types = torch.tensor(type_ids, device=prefix_sum.device, dtype=torch.long)
     candidates_float = candidates.float()
 
-    score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
-    sq_sum = torch.linalg.vector_norm(candidates_float, dim=-1).square()
-    inv_rms = torch.rsqrt(
-        sq_sum / candidates_float.shape[-1] + norm.variance_epsilon
-    )
-    scores = torch.matmul(candidates_float, score_weight) * inv_rms
+    with torch.autocast(device_type=prefix_sum.device.type, enabled=False):
+        score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
+        sq_sum = torch.linalg.vector_norm(candidates_float, dim=-1).square()
+        inv_rms = torch.rsqrt(
+            sq_sum / candidates_float.shape[-1] + norm.variance_epsilon
+        )
+        scores = torch.matmul(candidates_float, score_weight) * inv_rms
 
-    source_float = controller_source.float()
-    source_inv_rms = torch.rsqrt(
-        source_float.square().mean(dim=-1, keepdim=True) + norm.variance_epsilon
-    )
-    type_scores = F.linear(
-        source_float * source_inv_rms, type_controller.float()
-    )
-    scores = scores + type_scores[:, candidate_types] + type_bias.float()[candidate_types]
+        source_float = controller_source.float()
+        source_inv_rms = torch.rsqrt(
+            source_float.square().mean(dim=-1, keepdim=True) + norm.variance_epsilon
+        )
+        type_scores = F.linear(
+            source_float * source_inv_rms, type_controller.float()
+        )
+        scores = scores + type_scores[:, candidate_types] + type_bias.float()[candidate_types]
 
-    probabilities = scores.softmax(dim=-1)
-    mixed = torch.matmul(probabilities.unsqueeze(1), candidates_float).squeeze(1)
+        probabilities = scores.softmax(dim=-1)
+        mixed = torch.matmul(probabilities.unsqueeze(1), candidates_float).squeeze(1)
     mixed = mixed.to(prefix_sum.dtype)
+    if diagnostics is not None:
+        with torch.no_grad():
+            mass = probabilities.detach().mean(0)
+            for type_id in range(num_types):
+                diagnostics[f"{diagnostic_site}/type_mass_{type_id}"] = mass[candidate_types == type_id].sum()
+            diagnostics[f"{diagnostic_site}/entropy"] = -(
+                probabilities.detach() * probabilities.detach().clamp_min(1e-30).log()
+            ).sum(-1).mean()
+            diagnostics[f"{diagnostic_site}/output_rms"] = mixed.detach().float().square().mean().sqrt()
+            for name, state in (("canonical", prefix_sum), ("thought", thought_residual),
+                                ("fast_memory", memory_residual), ("slow_memory", slow_memory_residual)):
+                if state is not None:
+                    diagnostics[f"{diagnostic_site}/{name}_rms"] = state.detach().float().square().mean().sqrt()
     if return_details:
         return mixed, probabilities, candidate_types
     return mixed
@@ -317,6 +456,7 @@ def apply_innovation_memory_write(
     thought_residual: torch.Tensor,
     innovation_logit: torch.Tensor,
     eps: float,
+    diagnostics: Optional[dict] = None,
 ) -> torch.Tensor:
     """Remove a learned fraction of the MLP write parallel to current thought.
 
@@ -342,6 +482,11 @@ def apply_innovation_memory_write(
     )
     alpha = innovation_logit.float().sigmoid()
     innovation = output_float - alpha * coefficient * thought_float
+    if diagnostics is not None:
+        with torch.no_grad():
+            diagnostics["write/removed_rms"] = (output_float - innovation).detach().square().mean().sqrt()
+            diagnostics["write/raw_rms"] = output_float.detach().square().mean().sqrt()
+            diagnostics["write/innovation_rms"] = innovation.detach().square().mean().sqrt()
     return innovation.to(mlp_output.dtype)
 
 
@@ -355,6 +500,7 @@ def update_fast_slow_memory(
     slow_write_controller: torch.Tensor,
     slow_write_bias: torch.Tensor,
     eps: float,
+    diagnostics: Optional[dict] = None,
 ):
     """Apply ordered depth decay and an attention-conditioned slow-memory write.
 
@@ -370,9 +516,16 @@ def update_fast_slow_memory(
     source = source * torch.rsqrt(
         source.square().mean(dim=-1, keepdim=True) + eps
     )
-    slow_gain = 2.0 * torch.sigmoid(
-        F.linear(source, slow_write_controller.float().unsqueeze(0), slow_write_bias.float())
-    )
+    with torch.autocast(device_type=attention_output.device.type, enabled=False):
+        slow_gain = 2.0 * torch.sigmoid(
+            F.linear(source, slow_write_controller.float().unsqueeze(0), slow_write_bias.float())
+        )
+    if diagnostics is not None:
+        with torch.no_grad():
+            gain = slow_gain.detach()
+            diagnostics["write/slow_gain_mean"] = gain.mean()
+            diagnostics["write/slow_gain_min"] = gain.min()
+            diagnostics["write/slow_gain_max"] = gain.max()
     write_float = memory_write.float()
     fast = write_float if fast_memory is None else fast_decay * fast_memory.float() + write_float
     slow = slow_decay * slow_memory.float() + slow_gain * write_float
@@ -398,10 +551,17 @@ class BiBoDecoderLayer(nn.Module):
         self.use_innovation_write = getattr(
             config, "use_typed_attn_res_innovation_write", False
         )
+        # 0 = softmax, 1 = sigmoid/sum. Int, not a string, because it reaches a Triton constexpr.
+        self.attn_res_score_mode = _SCORE_MODE[getattr(config, "attn_res_score", "softmax")]
+        self.attn_res_topk = int(getattr(config, "attn_res_topk", 0) or 0)
 
         self.self_attn = BiBoAttention(config=config, layer_idx=layer_idx)
         self.is_moe_layer = layer_idx not in config.mlp_only_layers
-        self.mlp = BiBoMoELayer(config) if self.is_moe_layer else BiBoMLP(config, is_expert=False)
+        # _layer_config, not config: per-layer expert geometry (--moe_override) must reach THIS
+        # path too. Every attn_res arm builds here, so an override applied only in src/ would be
+        # silently ignored by the entire round that needs it.
+        self.mlp = (BiBoMoELayer(_layer_config(config, layer_idx)) if self.is_moe_layer
+                    else BiBoMLP(config, is_expert=False))
 
         self.input_layernorm = BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -416,6 +576,153 @@ class BiBoDecoderLayer(nn.Module):
         # MLP keeps a depth-mixed base one sublayer stale AND still sees attention. Default False
         # so a config written before this flag existed rebuilds to what it actually ran.
         self.attn_res_carry = getattr(config, "attn_res_carry", False)
+        # The block-boundary reset (prefix_sum = None -> prefix_sum = attn_output) drops the fp32
+        # embedding out of the residual stream, so under bf16 autocast an AttnRes model runs a
+        # BF16 stream while the standard-residual control runs FP32 (the embedding is fp32 and
+        # `fp32 + bf16` promotes, forever). That is worth ~2-3% throughput and 0.7 GB and it made
+        # every AttnRes arm non-comparable to the baseline. Setting this keeps the stream in the
+        # layer-input dtype so the ONLY difference from the control is AttnRes itself.
+        self.attn_res_fp32_stream = getattr(config, "attn_res_fp32_stream", False)
+        # CARRY SCALE. In carry the MLP reads Ht + A, so A enters at coefficient exactly 1,
+        # deliberately OUTSIDE the softmax simplex -- that is why carry beats sites=2, where every
+        # unit of probability spent on a previous block comes straight out of this layer's
+        # attention, and where simply having more blocks flattens the distribution and shrinks
+        # p_last for reasons that have nothing to do with what the MLP wants.
+        #
+        # 1 is still an arbitrary coefficient. Modes, ALL initialised to exactly s = 1.0 so each
+        # is a strict generalization of plain carry and the three are mutually comparable:
+        #
+        #   "unbounded"  s = theta,           init 1.0     range R    <- DIAGNOSTIC, run first
+        #   "sigmoid"    s = 2*sigmoid(theta) init th=0    range (0,2)
+        #   "tanh"       s = 2*tanh(theta)    init th=atanh(.5)  range (-2,2)
+        #
+        # RAW IS THE DEFAULT (Aug 9 2026), and the paragraph that used to live here was wrong.
+        # It said "every unbounded scale we have tried has eventually run away, so this is a
+        # measurement, not a candidate". Measured over 2000 steps, raw's max c goes
+        # 1.39 -> 3.22 -> 4.29 -> 4.38 -> 4.38 and is FLAT from ~step 1400. It converges.
+        # Meanwhile the bounded modes end pressed against their ceiling -- sigmoid 1.76 of 2.0
+        # (88%), tanh 1.91 of 2.0 (95%) -- so the cage BINDS, and the (0,2) it was set to
+        # "brackets the measured static range [0.18, 2.13]" is wrong by 2x against the 4.38 the
+        # unconstrained run actually wants.
+        # Quality cannot separate them: the one comparison in the round not straddling a kernel
+        # rewrite is raw 3.6055 vs tanh 3.6109 at the same seed -- 0.005, null. The sigmoid arm
+        # that looked like a winner (3.5847) ran on the pre-rewrite kernel and is not comparable;
+        # on current code sigmoid sits at 3.6191. So this is a tie, and raw wins it by being the
+        # one that needs no transform, no bound, and no justification.
+        _cs_mode = getattr(config, "attn_res_carry_scale", "none")
+        _cs_mode = "none" if _cs_mode in (False, None) else str(_cs_mode)
+        self.attn_res_carry_scale = _cs_mode
+        # both surviving modes start c at EXACTLY 1.0, so each is a strict generalization of
+        # plain carry and step 0 is bit-identical to it
+        # every mode starts c at EXACTLY 1.0, so each is a strict generalization of plain carry
+        _init = {"raw": 1.0, "unbounded": 1.0, "rms": 1.0, "sigmoid": 0.0,
+                 "sigmoid_rms": 0.0, "tanh": math.atanh(0.5),
+                 "tanh_rms": math.atanh(0.5),
+                 "slope05": 1.0, "slope15": 1.0}.get(_cs_mode)
+        # PER-CHANNEL c. Shape (hidden,) instead of (1,), every entry at the same init, so it is a
+        # strict generalization of the scalar and step 0 is bit-identical to it.
+        # It is real capacity, not a reparameterization: attn_output feeds TWO consumers -- the
+        # prefix-sum stream and the MLP input -- and c scales only the MLP-facing copy, so a
+        # diagonal scale here cannot be absorbed into o_proj without changing what the stream
+        # carries. 512 params/layer, 5120 total, 0.0008% of the model.
+        # SELF-GATED CARRY:  c = 2*sigmoid(G(attn_out)),  ht = attn_read + c * attn_out
+        #
+        # Three properties, each forced by a measured failure of the first attempt
+        # (SiLU(W @ attn_read), which ran the coefficient to 7936 by step 400):
+        #   SELF-GATED  G reads attn_out, the tensor it multiplies. Reading attn_read instead let
+        #               the model inflate the gate and shrink o_proj at no cost, because the two
+        #               were independent. Gating what you multiply couples them: shrinking
+        #               attn_out by k shrinks the product by k^2.
+        #   STARTS AT 1 G is ZERO-INITIALISED and 2*sigmoid(0) = 1 exactly, so the arm begins as
+        #               plain carry. SiLU(0)=0 instead began with attention BLOCKED from the MLP,
+        #               so the weights had to grow just to open the path and nothing said stop.
+        #               d/dG of 2*sigmoid(G a)*a is 0.5*a^2 at G=0 -- inert but not stuck.
+        #   BOUNDED     (0, 2) brackets the measured static range [0.18, 2.13]; the bound comes
+        #               from the per-dim arm, not from taste. SiLU is unbounded above and that is
+        #               what let 7936 happen at all.
+        # NO BIAS anywhere: the router's balancing bias stays the only one in the architecture.
+        #
+        # Note what this is: 2*sigmoid(W x)*x with W = I is exactly 2*SiLU(x). The matrix buys
+        # CROSS-CHANNEL gating and nothing else, which is why "diag" exists as the control -- if
+        # a per-channel temperature captures the gain, the (H,H) matrix was never needed.
+        #   "diag"  w: (H,)   512 params/layer, elementwise, no matmul
+        #   "full"  W: (H,H)  262k params/layer, cross-channel
+        # nn.Parameter, not nn.Linear, so post_init()'s _init_weights cannot silently overwrite
+        # the zero init -- that would restore the exact failure this design exists to avoid.
+        _gm = str(getattr(config, "attn_res_carry_gate", "none") or "none")
+        if _gm is True or _gm == "True":       # tolerate the old bool flag
+            _gm = "full"
+        self.attn_res_carry_gate_mode = _gm
+        self.attn_res_carry_gate = None
+        if _gm != "none":
+            if not (self.use_attn_residuals and self.attn_res_carry):
+                raise ValueError("attn_res_carry_gate needs attn_res_carry=True on an AttnRes arm")
+            _shape = ((config.hidden_size,) if _gm == "diag"
+                      else (config.hidden_size, config.hidden_size))
+            self.attn_res_carry_gate = nn.Parameter(torch.zeros(*_shape))
+        self.attn_res_carry_per_dim = bool(getattr(config, "attn_res_carry_per_dim", False))
+        _cshape = (config.hidden_size,) if self.attn_res_carry_per_dim else (1,)
+        self.attn_res_carry_theta = (
+            nn.Parameter(torch.full(_cshape, float(_init)))
+            if (_init is not None and self.use_attn_residuals and self.attn_res_carry) else None)
+        # d: off-simplex embedding gain on the carry write. Init EXACTLY 0 so the arm is a strict
+        # generalization -- at step 0 it is bit-identical to plain carry, and any nonzero final
+        # value is the model asking for it. Not created at layer 0: there attn_read IS the
+        # embedding (block_residual is empty, so the depth read is skipped), so d would be a
+        # duplicate of the identity path. Unnormed on purpose -- see attn_res_emb_term in the
+        # config, and the MoE-output-norm round, which measured "norm the addend" at -0.010 bpb.
+        # attn_res_emb_scale picks d = f(theta). "none" keeps the raw scalar, which is what the
+        # first emb arm ran and what produced the measured profile d = [1.32, 0.55, 0.40, 0.33,
+        # 0.33, 0.49, 0.28, 0.42, 0.30]. NOTE the range: plain "sigmoid" caps d at 1.0 and would
+        # CLIP layer 1, which asked for 1.32 -- the single largest and most informative value on
+        # that axis. "2sigmoid" spans (0, 2) and covers it.
+        _es = str(getattr(config, "attn_res_emb_scale", "none"))
+        if _es not in ("none", "sigmoid", "2sigmoid", "tanh", "2tanh"):
+            raise ValueError(f"attn_res_emb_scale must be none/sigmoid/2sigmoid/tanh/2tanh, got {_es!r}")
+        self.attn_res_emb_scale = _es
+        # site="ht": d is a RADIAL gain on the depth-mix output, emb * r^(p-1) with r = rms(emb)
+        # per token and p = sigmoid(theta) in (0,1). p=1 is the raw embedding (rms 0.04), p=0 is
+        # unit-norm (rms 1). Same trick as radial_theta on the activation, and it exists because the
+        # raw embedding is 500-10000x smaller than everything it is added to, so an unnormalised
+        # skip cannot matter. Init theta=-4 -> p=0.018 -> rms ~1, i.e. NEAR UNIT NORM.
+        # site="mlp" is the retired path: d*emb added to the carry write, theta init 0, no norm.
+        _es = str(getattr(config, "attn_res_emb_site", "mlp"))
+        if _es not in ("mlp", "ht"):
+            raise ValueError(f"attn_res_emb_site must be mlp or ht, got {_es!r}")
+        self.attn_res_emb_site = _es
+        self.attn_res_emb_eps = config.rms_norm_eps
+        _need_carry = self.attn_res_carry or _es == "ht"
+        _emb_on = (getattr(config, "attn_res_emb_term", False) and self.use_attn_residuals
+                   and _need_carry and layer_idx > 0)
+        # attn_res_emb_gain REPLACES the radial exponent with a flat gain on the RAW embedding:
+        # i * emb, ONE scalar, no norm, and theta is not created at all. Two reasons the norm is
+        # gone. (1) The radial version measured itself out of existence -- every layer drove theta
+        # from -4 down to [-4.55, -5.55] over 1250 steps, and all that travel moved the real
+        # magnitude r^p from 0.944 to 0.98, a 4% range; p was asymptoting to r^p == 1, i.e. to a
+        # plain unit-norm skip, so the radial machinery had already collapsed to a norm. (2) That
+        # arm LOST (0.6672 vs 0.6579 c-only) while the one emb arm that ever won, mlp-site d*emb
+        # at 0.6572, was unnormed -- and the MoE-output-norm round independently measured
+        # "RMS-norm the addend" at -0.010 bpb in all 3 variants. So the norm is the suspect.
+        # Init EXACTLY 0 so the arm is bit-identical to plain carry at step 0 and is a strict
+        # generalization -- same discipline as c and d. dL/di is nonzero there (gate 8 asserts it),
+        # so it can leave.
+        _gain_on = bool(getattr(config, "attn_res_emb_gain", False)) and _es == "ht"
+        # PER-DIM d, same axis as per-dim c. c per-channel beat scalar c by -0.0011 for free,
+        # so the question is whether shaping the EMBEDDING contribution per channel does the same.
+        # Worth asking despite d and c measuring as substitutes (d on scalar c was worth -0.0016,
+        # on per-dim c only -0.0001): that showed a SCALAR d adds nothing once c is shaped, not
+        # that a shaped d adds nothing. Init is unchanged, so it stays a strict generalization.
+        self.attn_res_emb_per_dim = bool(getattr(config, "attn_res_emb_per_dim", False))
+        _dshape = (config.hidden_size,) if self.attn_res_emb_per_dim else (1,)
+        self.attn_res_emb_theta = (
+            nn.Parameter(torch.full(_dshape, -4.0 if _es == "ht" else 0.0))
+            if (_emb_on and not _gain_on) else None)
+        self.attn_res_emb_gain = nn.Parameter(torch.zeros(1)) if (_emb_on and _gain_on) else None
+        # Non-persistent so it never enters the state_dict: an extra key would break every existing
+        # checkpoint load and the exp(control) == src equality that gates this whole family.
+        if self.use_attn_residuals and self.attn_res_carry:
+            self.register_buffer("attn_res_carry_one", torch.ones(1), persistent=False)
+
         if self.use_attn_residuals:
             self.self_attention_res_norm = BiBoRMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -505,6 +812,7 @@ class BiBoDecoderLayer(nn.Module):
         slow_memory_residual: Optional[torch.Tensor],
     ):
         batch_size, seq_len, hidden_size = hidden_states.shape
+        _stream_dtype = hidden_states.dtype      # what the control's stream would be
         prefix_sum = hidden_states
 
         if block_residual is None:
@@ -539,6 +847,8 @@ class BiBoDecoderLayer(nn.Module):
                     else None
                 ),
                 include_thought=self.layer_idx > 0,
+                diagnostics=getattr(self, "_typed_diagnostics", None),
+                diagnostic_site="attention",
                 include_memory=self.layer_idx > 0,
                 include_slow_memory=self.layer_idx > 0,
             ).reshape(batch_size, seq_len, hidden_size)
@@ -548,7 +858,34 @@ class BiBoDecoderLayer(nn.Module):
                 block_residual,
                 self.self_attention_res_proj,
                 self.self_attention_res_norm,
+                self.attn_res_score_mode,
+                self.attn_res_topk,
             ).reshape(batch_size, seq_len, hidden_size)
+            if self.attn_res_emb_gain is not None:
+                # HT = AR(...) + i * emb, the RAW embedding. No norm of any kind.
+                # Both normed ht arms lost (radial 0.6672, and the radial is what unit-norm
+                # collapses to) while the only emb arm that ever won -- mlp-site d*emb at
+                # 0.6572 -- was unnormed, so the NORM is the suspect, not the site. The
+                # MoE-output-norm round says the same thing from the other direction: RMS-norming
+                # an addend into the residual stream cost -0.010 bpb in all 3 variants.
+                # Scale note: that winning arm peaked at d = 1.32, i.e. it injected rms ~0.05,
+                # not ~1. Loud was plausibly the bug, so raw is the regime that already works.
+                # Same fused kernel as the carry -- this is exactly a second stream on the add.
+                # ALWAYS eager, never the kernel: this stream is FP32 under --attn_res_fp32_stream
+                # and the kernel's FP32 path is 1 ULP off eager (FMA contraction), which is enough
+                # to flip MoE top-k. Only the BF16 attention stream is bit-exact through the kernel.
+                _emb = block_residual[:, 0].reshape(batch_size, seq_len, hidden_size)
+                _g = self.attn_res_emb_gain.float().to(_emb.dtype)
+                hidden_states = hidden_states + (_g * _emb).to(hidden_states.dtype)
+            elif self.attn_res_emb_theta is not None and self.attn_res_emb_site == "ht":
+                # retired: radial, emb * r^(p-1) with p = sigmoid(theta). Kept so the arms
+                # already on disk still load. It measured itself down to r^p -> 1, i.e. to a
+                # plain unit-norm skip, and lost.
+                _emb = block_residual[:, 0].reshape(batch_size, seq_len, hidden_size).float()
+                _ms = _emb.square().mean(-1, keepdim=True).add(self.attn_res_emb_eps)
+                _p = torch.sigmoid(self.attn_res_emb_theta.float())
+                hidden_states = hidden_states + (
+                    _emb * _ms.sqrt().pow(_p - 1.0)).to(hidden_states.dtype)
         # K3's site-1 read, unchanged. Kept for the carry variant: the mix computed at the END of
         # layer l-1 from (S, B) is the SAME tensor as this one -- S and B do not change across the
         # layer boundary -- so "defer the mix to the end of the layer" and "keep K3's site-1 mix"
@@ -588,7 +925,12 @@ class BiBoDecoderLayer(nn.Module):
             cache_position=cache_position,
             output_attentions=output_attentions,
         )
-        prefix_sum = attn_output if prefix_sum is None else prefix_sum + attn_output
+        if prefix_sum is None:
+            # boundary layer: the stream restarts from attn_output alone
+            prefix_sum = (attn_output.to(_stream_dtype) if self.attn_res_fp32_stream
+                          else attn_output)
+        else:
+            prefix_sum = prefix_sum + attn_output
         if self.use_typed_attn_res:
             thought_residual = (
                 attn_output
@@ -619,6 +961,8 @@ class BiBoDecoderLayer(nn.Module):
                 ),
                 include_thought=True,
                 include_memory=memory_residual is not None,
+                diagnostics=getattr(self, "_typed_diagnostics", None),
+                diagnostic_site="mlp",
                 include_slow_memory=self.layer_idx > 0,
             ).reshape(batch_size, seq_len, hidden_size)
         elif self.attn_res_sites == 2:
@@ -627,13 +971,107 @@ class BiBoDecoderLayer(nn.Module):
                 block_residual,
                 self.mlp_res_proj,
                 self.mlp_res_norm,
+                self.attn_res_score_mode,
+                self.attn_res_topk,
             ).reshape(batch_size, seq_len, hidden_size)
         elif self.attn_res_carry:
             # ONE mix per layer, CARRY: the MLP reads the site-1 mix plus this layer's attention
             # output. Depth-mixed (one sublayer stale) and attention IS visible, which the plain
             # prefix-sum variant below is not -- that one deleted depth-mixing from the MLP rather
             # than halving it, and cost +0.00815 bpb for it.
-            hidden_states = attn_read + attn_output
+            # block_residual[:, 0] IS the embedding, always: layer 0 is a block boundary for every
+            # block size (0 % n == 0), so the untransformed embedding is what gets archived there.
+            # Reusing it costs no new plumbing through the layer signature.
+            # INPUT-DEPENDENT GATE on the MLP-facing copy of attention:
+            #     ht = attn_read + SiLU(W @ attn_read) * attn_out
+            # SiLU, not sigmoid, because the coefficient it replaces is not bounded by 1: the
+            # static per-dim c reached 2.133 with per-layer means up to 1.66, so a sigmoid gate
+            # could not represent what the static version already learned. Qwen's G1 uses sigmoid,
+            # but it gates a raw attention output whose scale is absorbed downstream; here the
+            # coefficient goes straight into a residual add where its magnitude is the point.
+            # NO BIAS, matching the rest of the model -- q/k/v/o are bias-free via
+            # attention_bias=False and the router's balancing bias is the only one in the
+            # architecture. Consequence, stated rather than hidden: SiLU(0) = 0, so with a
+            # standard-init W the gate starts near zero and attention reaches the MLP only
+            # weakly at step 0, then has to grow. That is a real handicap for the first few
+            # hundred steps and it is accepted deliberately -- over 500M tokens at this LR the
+            # init washes out, and what is being tested is the RANGE the gate can express.
+            _ao = attn_output
+            if self.attn_res_carry_gate is not None:
+                _w = self.attn_res_carry_gate
+                _z = (_w * attn_output) if _w.ndim == 1 else (attn_output @ _w.t())
+                _g = 2.0 * torch.sigmoid(_z)
+                # CAST BACK. The gate is an fp32 Parameter and attn_output is bf16, so the product
+                # promotes to fp32 -- and _fused_res_add then promotes the whole residual stream
+                # with it, silently turning a bf16-stream arm into an fp32-stream one. Caught by
+                # the init test: with the gate at zero this arm must be bit-identical to plain
+                # carry, and it read 3.703 instead of 0 for exactly this reason. The gate ITSELF
+                # stays fp32 (sigmoid is worth computing there); only the product rejoins bf16.
+                _ao = (_g * attn_output).to(attn_output.dtype)
+                # The gate output IS c -- the same carry coefficient the scalar and per-dim arms
+                # learn, just computed per token instead of stored. So it logs under the SAME
+                # attn_res_s/* keys and lands in the existing panel, exactly as the emb gain i
+                # shares d's keys. They cannot collide: the gate requires carry_scale=none, so
+                # attn_res_carry_theta does not exist whenever these are populated.
+                # Strided over tokens: this is a diagnostic on 33M values per layer per step, and
+                # every 16th token is far more than enough for a mean and a std while costing
+                # 1/16th of the traffic. Detached 0-dim tensors, .item() deferred to the logger,
+                # so there is no GPU sync in the training step.
+                with torch.no_grad():
+                    _gs = _g[:, ::16].float()
+                    self._gate_mean, self._gate_std = _gs.mean(), _gs.std()
+                    self._gate_min, self._gate_max = _gs.min(), _gs.max()
+            _has_emb = (self.attn_res_emb_theta is not None and block_residual.shape[1] > 0
+                    and self.attn_res_emb_site == "mlp")
+            _emb = (block_residual[:, 0].reshape(batch_size, seq_len, hidden_size)
+                    if _has_emb else None)
+            # BOTH streams go through the kernel again. The earlier restriction to the attention
+            # stream was correct at the time -- the fp32 embedding stream took an FMA-contracted
+            # path that was 1 ULP off eager, and 1 ULP flips MoE top-k. That is fixed and graded:
+            # 352 measurements over every dtype assignment for K=1..4, kernel never worse than
+            # eager on mean OR max, median error ratio 0.45, and 0.64 ms vs eager's 0.90 ms.
+            # NOTE this makes fused and eager DIFFERENT MODELS, not one model computed two ways --
+            # the kernel is deliberately more accurate. Hold the path fixed across compared arms.
+            if _HAS_FUSED_RES_ADD and attn_read.is_cuda:
+                # attn_res_carry_one is a non-persistent ones buffer, so carry_scale="none"
+                # (a hard c = 1.0) goes down the same fused path instead of forking the formula.
+                _m = self.attn_res_carry_theta
+                # SINGLE STREAM. make_mlp_input now takes exactly one (theta, stream) pair -- the
+                # embedding term was retired along with the multi-stream kernel. An emb arm must
+                # run --fused_res_add false, and the assert below says so instead of letting the
+                # kernel silently drop a term the caller asked for.
+                assert not _has_emb, (
+                    "attn_res_emb_term needs --fused_res_add false: the fused residual add is "
+                    "single-stream since the embedding term was retired")
+                # c = f(theta) in TORCH: cheap on (H,), and autograd chains it without the
+                # kernel needing a derivative rule for the transform.
+                if _m is not None:
+                    _c = _CARRY_C[self.attn_res_carry_scale](_m)
+                    _mode = _CARRY_STREAM[self.attn_res_carry_scale]
+                else:
+                    _c, _mode = self.attn_res_carry_one, "none"
+                hidden_states = _fused_res_add(attn_read, _c, _ao, modes=(_mode,))
+            else:
+                if self.attn_res_carry_theta is not None:
+                    # same two axes as the fused path, so eager and kernel cannot disagree
+                    _c = _CARRY_C[self.attn_res_carry_scale](
+                        self.attn_res_carry_theta.float())
+                    _s = _ao
+                    if _CARRY_STREAM[self.attn_res_carry_scale] == "rms":
+                        _s32 = _s.float()
+                        _s = (_s32 * torch.rsqrt(_s32.pow(2).mean(-1, keepdim=True)
+                                                 + 1e-6)).to(_ao.dtype)
+                    hidden_states = attn_read + _c.to(_s.dtype) * _s
+                else:
+                    hidden_states = attn_read + _ao
+                if _has_emb:
+                    _d = self.attn_res_emb_theta.float()
+                    _d = ({"none": lambda x: x, "sigmoid": torch.sigmoid,
+                           "2sigmoid": lambda x: 2.0 * torch.sigmoid(x),
+                           "tanh": torch.tanh, "2tanh": lambda x: 2.0 * torch.tanh(x)}
+                          [self.attn_res_emb_scale](_d))
+                    hidden_states = hidden_states + (
+                        _d.to(hidden_states.dtype) * _emb.to(hidden_states.dtype))
         else:
             # ONE mix per layer, PREFIX: the MLP reads the raw within-block sum. Measured and lost.
             hidden_states = prefix_sum
@@ -654,6 +1092,7 @@ class BiBoDecoderLayer(nn.Module):
                     thought_residual,
                     self.typed_attn_res_innovation_logit,
                     self.post_attention_layernorm.variance_epsilon,
+                    diagnostics=getattr(self, "_typed_diagnostics", None),
                 )
                 if self.use_innovation_write
                 else mlp_output
@@ -669,6 +1108,7 @@ class BiBoDecoderLayer(nn.Module):
                     self.typed_attn_res_slow_write_controller,
                     self.typed_attn_res_slow_write_bias,
                     self.post_attention_layernorm.variance_epsilon,
+                    diagnostics=getattr(self, "_typed_diagnostics", None),
                 )
             else:
                 memory_residual = (
@@ -745,6 +1185,7 @@ class BiBoModel(BiBoPreTrainedModel):
     """Experimental BiBo transformer trunk."""
 
     def __init__(self, config: BiBoConfig):
+        self.bf16_stream = bool(getattr(config, 'bf16_residual_stream', False))
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -753,6 +1194,8 @@ class BiBoModel(BiBoPreTrainedModel):
         self.use_fast_slow_memory = getattr(
             config, "use_typed_attn_res_fast_slow_memory", False
         )
+        self.attn_res_score_mode = _SCORE_MODE[getattr(config, "attn_res_score", "softmax")]
+        self.attn_res_topk = int(getattr(config, "attn_res_topk", 0) or 0)
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
@@ -764,13 +1207,8 @@ class BiBoModel(BiBoPreTrainedModel):
             if getattr(config, "exp_post_embed_norm", False)
             else None
         )
-        self.rotary_emb = BiBoRotaryEmbedding(
-            config.rope_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-            rope_type=config.rope_scaling["type"],
-            scaling_factor=config.rope_scaling.get("factor", 1.0),
-        )
+        # ONE rotary, full head_dim, used by the windowed layers only (global layers are NoPE).
+        self.rotary_emb = BiBoRotaryEmbedding(config.head_dim, base=config.rope_theta)
         if self.use_attn_residuals:
             self.output_attn_res_norm = BiBoRMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
@@ -821,12 +1259,16 @@ class BiBoModel(BiBoPreTrainedModel):
                 include_thought=True,
                 include_memory=True,
                 include_slow_memory=self.use_fast_slow_memory,
+                diagnostics=getattr(self, "_typed_diagnostics", None),
+                diagnostic_site="output",
             ).reshape(batch_size, seq_len, hidden_size)
         return apply_attention_residual(
             hidden_states.reshape(-1, hidden_size),
             block_residual,
             self.output_attn_res_proj,
             self.output_attn_res_norm,
+            self.attn_res_score_mode,
+            self.attn_res_topk,
         ).reshape(batch_size, seq_len, hidden_size)
 
     def forward(
@@ -906,12 +1348,23 @@ class BiBoModel(BiBoPreTrainedModel):
         hidden_states = inputs_embeds
         if self.embed_norm is not None:
             hidden_states = self.embed_norm(hidden_states)
+        # BF16 STREAM. nn.Embedding is NOT an autocast op, so embed_tokens returns the WEIGHT's
+        # dtype -- fp32, because we keep fp32 master weights. That single un-autocast lookup is
+        # the only place fp32 enters: it becomes hidden_states, becomes prefix_sum at layer 0,
+        # and gets archived as block_residual[0], where it stays fp32 for the entire forward and
+        # promotes every depth mix that reads it (out = promote(fp32, bf16) = fp32).
+        # --attn_res_fp32_stream false does NOT fix this: that flag only stops attn_output being
+        # UP-cast, it never touches what the embedding injects. Measured before this cast:
+        #   AR in: ps=bfloat16  br=float32  -> out=float32
+        # block_residual is the largest tensor in the AttnRes path -- (T, N-1, H), 402 MB fp32 vs
+        # 201 MB bf16 at N=4 -- and it is re-read by every mix, so leaving it fp32 cost most of
+        # the bf16 throughput win (Kimi b3s2 gained 2.6% where the AttnRes-free baseline gained
+        # 8.8%). DeepSeek does not hit this because their weights ARE bf16, so the lookup returns
+        # bf16 with no cast needed.
+        if self.bf16_stream:
+            hidden_states = hidden_states.to(torch.bfloat16)
 
-        position_embeddings = self.rotary_emb(
-            hidden_states,
-            position_ids,
-            seq_len=past_seen_tokens + seq_length,
-        )
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None

@@ -14,8 +14,8 @@ def test_auto_derived_hyperparameters():
     assert c.moe_intermediate_size == 96 // 3, "moe_intermediate = intermediate // top_k (FLOP parity)"
     assert c.mlp_only_layers == [0, 5], "first + last layer dense"
     assert c.head_dim == 64 // 4
-    assert c.rope_dim == 4 and c.rope_dim % 2 == 0, "round(0.334*16)=5 -> forced even -> 4"
-    assert c.rope_scaling["type"] == "dynamic" and c.rope_scaling["factor"] == 1.0
+    # rope_dim / rope_scaling are GONE (55143cb): the rotary is the full head_dim on windowed
+    # layers and absent on full-attention ones, with no scaling. Nothing left to derive.
 
 
 def test_mlp_only_layers_dedupes_single_layer_model():
@@ -47,7 +47,6 @@ def test_explicit_bias_update_factor_wins():
     (dict(num_experts_per_tok=0), "top_k must be >= 1"),
     (dict(num_routed_experts=2, special_expert_pairs=1), "specials would leave 0 GLU experts"),
     (dict(hidden_size=63), "hidden_size % num_attention_heads != 0"),
-    (dict(partial_rotary_factor=0.05), "rope_dim < 2"),
     (dict(hybrid_layer_pattern=[1, 0, 0, 0], sliding_window=0), "SWA needs a positive window"),
     (dict(hybrid_layer_pattern=[1, 0]), "pattern length != num_hidden_layers"),
 ])
@@ -77,16 +76,16 @@ def test_config_round_trip_preserves_derived_fields():
     with tempfile.TemporaryDirectory() as d:
         c.save_pretrained(d)
         c2 = BiBoConfig.from_pretrained(d)
-    for k in ("head_dim", "rope_dim", "num_routed_experts", "norm_topk_prob",
+    for k in ("head_dim", "num_routed_experts", "norm_topk_prob",
               "moe_intermediate_size", "bias_update_factor", "layer_types", "sliding_window"):
         assert getattr(c, k, None) == getattr(c2, k, None), f"{k} did not survive save/load"
 
 
 def test_derived_dims_ignore_stale_serialized_values():
-    """head_dim/rope_dim are computed AFTER super().__init__, so a hand-edited config.json cannot
-    override the current derivation."""
-    c = make_config(head_dim=999, rope_dim=999)
-    assert c.head_dim == 16 and c.rope_dim == 4
+    """head_dim is computed AFTER super().__init__, so a hand-edited config.json cannot override
+    the current derivation."""
+    c = make_config(head_dim=999)
+    assert c.head_dim == 16
 
 
 def test_sliding_window_serializes_as_none_without_swa_layers():

@@ -1,10 +1,11 @@
 """Arm configs for the BiBo-min vs Qwen ablation -- parameter-matched by construction.
 
 Both arms share identical dims / experts / top_k. Because a GLU expert == SwiGLU in params and
-partial-vs-full RoPE is parameter-free, the two models have the SAME parameter count exactly.
+RoPE width is parameter-free, the two models have the SAME parameter count exactly.
 
   'qwen'     : stock Qwen3MoE (SwiGLU experts, full RoPE, softmax router).
-  'bibo_min' : BiBo stripped to Qwen-equivalence EXCEPT radial-NormSiLU experts + partial RoPE.
+  'bibo_min' : BiBo stripped to Qwen-equivalence EXCEPT radial-NormSiLU experts + the
+               split RoPE (NoPE on full-attention layers, full RoPE on windowed ones).
 
 EXPERT COUNTING CHANGED Aug 1 2026. num_routed_experts is now the TOTAL and the GLU count is
 DERIVED as total - 2*special_pairs. It used to be the other way round (polyglu_mult*3 GLU experts
@@ -33,9 +34,6 @@ SHARED = dict(
     norm_topk_prob="sum",         # "sum" (MiMo div-sum) | "softmax" | False
 )
 
-PARTIAL_ROPE = 0.334              # BiBo-min partial rotary; 1.0 == Qwen full RoPE
-
-
 def glu_count(num_experts, special_pairs, pos_identity=True, neg_identity=True):
     """GLU experts left after the param-free specials take their slots. This is the number Qwen has
     to be built with for the param match, and it is what a run's expert count should be read as."""
@@ -43,7 +41,7 @@ def glu_count(num_experts, special_pairs, pos_identity=True, neg_identity=True):
     return num_experts - n_special
 
 
-def make_qwen_config(attn_impl="sdpa", aux_coef=0.001, num_experts=None):
+def make_qwen_config(attn_impl="sdpa", aux_coef=0.001, num_experts=None, mlp_only_layers=None):
     from baseline.qwen3moe.config import Qwen3MoeConfig
     cfg = Qwen3MoeConfig(
         vocab_size=SHARED["vocab_size"], hidden_size=SHARED["hidden_size"],
@@ -53,7 +51,8 @@ def make_qwen_config(attn_impl="sdpa", aux_coef=0.001, num_experts=None):
         num_experts_per_tok=SHARED["num_experts_per_tok"],
         moe_intermediate_size=SHARED["moe_intermediate_size"],
         norm_topk_prob=bool(SHARED["norm_topk_prob"]),
-        max_position_embeddings=SHARED["max_position_embeddings"], mlp_only_layers=SHARED["mlp_only_layers"],
+        max_position_embeddings=SHARED["max_position_embeddings"],
+        mlp_only_layers=(SHARED["mlp_only_layers"] if mlp_only_layers is None else list(mlp_only_layers)),
         rms_norm_eps=SHARED["rms_norm_eps"], rope_theta=SHARED["rope_theta"],
         tie_word_embeddings=SHARED["tie_word_embeddings"], router_aux_loss_coef=aux_coef,
     )
@@ -121,13 +120,25 @@ def resolve_swa(swa_pattern, sliding_window, n_layers):
 
 
 def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
-                         num_experts=None, special_pairs=0,
+                         num_experts=None, special_pairs=0, mlp_only_layers=None,
+                         moe_overrides=None,
+                         intermediate_size=None,
                          use_xsa=False, xsa_alpha_init=0.0,
+                         num_pos_identity_experts=None, num_neg_identity_experts=None,
                          pos_identity_expert=True, neg_identity_expert=True,
                          top_k=None, moe_intermediate_size=None, num_shared_experts=0,
                          hybrid_layer_pattern=None, sliding_window=128,
-                         swa_qk_norm=True, attn_res="off", attn_res_sites=2,
-                         attn_res_carry=False, use_typed_attn_res=False,
+                         swa_qk_norm=True, rope_theta=None,
+                         attn_res="off", attn_res_sites=2,
+                         attn_res_carry=False, attn_res_fp32_stream=False,
+                         attn_res_carry_scale="none",
+                         attn_res_emb_term=False, attn_res_emb_scale="none",
+                         attn_res_emb_site="mlp", attn_res_emb_gain=False,
+                         attn_res_score="softmax", attn_res_topk=0,
+                         attn_res_carry_per_dim=False,
+                         attn_res_carry_gate="none", attn_res_emb_per_dim=False,
+                         bf16_residual_stream=False, bf16_moe_out=False,
+                         use_typed_attn_res=False,
                          typed_attn_res_long_memory=True,
                          typed_attn_res_extra_init=0.01,
                          use_typed_attn_res_fast_slow_memory=False,
@@ -150,8 +161,22 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
             "use_typed_attn_res requires an enabled integer attn_res block size"
         )
     if attn_res == "off":
+        if attn_res_topk:
+            raise NotImplementedError(
+                "attn_res_topk only exists inside the AttnRes depth mix, so with --attn_res off "
+                "it would be silently inert.")
+        if attn_res_score != "softmax":
+            raise NotImplementedError(
+                "attn_res_score only exists inside the AttnRes depth mix, so with --attn_res off "
+                "it would be silently inert -- same trap as bf16_moe_out below.")
         from src.configuration_bibo import BiBoConfig
-        extra = {}
+        extra = {"bf16_residual_stream": bf16_residual_stream,
+                 "bf16_moe_out": bf16_moe_out}
+    elif bf16_moe_out:
+        raise NotImplementedError(
+            "bf16_moe_out is src/ only. The exp/ MoE output is already bf16 via the Triton "
+            "patch, so the flag would be inert there rather than wrong -- but silent inertness "
+            "is how an arm ends up not being what its name says.")
     else:
         from exp.configuration_bibo import BiBoConfig
         extra = {"attn_res_block_size": None if attn_res == "control" else int(attn_res),
@@ -164,27 +189,46 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                  "typed_attn_res_fast_decay_init": typed_attn_res_fast_decay_init,
                  "typed_attn_res_slow_decay_init": typed_attn_res_slow_decay_init,
                  "use_typed_attn_res_innovation_write": use_typed_attn_res_innovation_write,
-                 "typed_attn_res_innovation_init": typed_attn_res_innovation_init}
+                 "typed_attn_res_innovation_init": typed_attn_res_innovation_init,
+                 "attn_res_fp32_stream": attn_res_fp32_stream,
+                 "attn_res_carry_scale": attn_res_carry_scale,
+                 "attn_res_emb_term": attn_res_emb_term,
+                 "attn_res_emb_scale": attn_res_emb_scale,
+                 "attn_res_emb_site": attn_res_emb_site,
+                 "attn_res_emb_gain": attn_res_emb_gain,
+                 "attn_res_score": attn_res_score,
+                 "attn_res_topk": attn_res_topk,
+                 "attn_res_carry_per_dim": attn_res_carry_per_dim,
+                 "attn_res_carry_gate": attn_res_carry_gate,
+                 "attn_res_emb_per_dim": attn_res_emb_per_dim,
+                 "bf16_residual_stream": bf16_residual_stream}
+    if num_pos_identity_experts is not None:
+        extra['num_pos_identity_experts'] = num_pos_identity_experts
+    if num_neg_identity_experts is not None:
+        extra['num_neg_identity_experts'] = num_neg_identity_experts
     return BiBoConfig(
         **extra,
         bias_update_threshold=bias_update_threshold,
         bias_update_factor=bias_update_factor,      # None -> BiBoConfig default (0.4, proportional)
         vocab_size=SHARED["vocab_size"], hidden_size=SHARED["hidden_size"],
-        intermediate_size=SHARED["intermediate_size"], num_hidden_layers=SHARED["num_hidden_layers"],
+        intermediate_size=(intermediate_size or SHARED["intermediate_size"]),
+        num_hidden_layers=SHARED["num_hidden_layers"],
         num_attention_heads=SHARED["num_attention_heads"], num_key_value_heads=SHARED["num_key_value_heads"],
         # Raising top_k WITHOUT shrinking moe_intermediate_size multiplies active expert FLOPs by the
         # same factor -- pass both to hold compute constant.
         moe_intermediate_size=(moe_intermediate_size or SHARED["moe_intermediate_size"]),
         num_experts_per_tok=(top_k or SHARED["num_experts_per_tok"]),
-        max_position_embeddings=SHARED["max_position_embeddings"], mlp_only_layers=SHARED["mlp_only_layers"],
-        rms_norm_eps=SHARED["rms_norm_eps"], rope_theta=SHARED["rope_theta"],
+        max_position_embeddings=SHARED["max_position_embeddings"],
+        mlp_only_layers=(SHARED["mlp_only_layers"] if mlp_only_layers is None else list(mlp_only_layers)),
+        moe_overrides=moe_overrides or {},
+        rms_norm_eps=SHARED["rms_norm_eps"],
+        rope_theta=(rope_theta if rope_theta is not None else SHARED["rope_theta"]),
         tie_word_embeddings=SHARED["tie_word_embeddings"], norm_topk_prob=SHARED["norm_topk_prob"],
-        # --- the ablation delta: radial-NormSiLU experts + partial RoPE ---
+        # --- the ablation delta: radial-NormSiLU experts + split RoPE ---
         num_routed_experts=(num_experts or SHARED["num_experts"]),
         special_expert_pairs=special_pairs,
         pos_identity_expert=pos_identity_expert,
         neg_identity_expert=neg_identity_expert,
-        partial_rotary_factor=PARTIAL_ROPE,
         # --- everything else stripped to Qwen-equivalence ---
         use_xsa=use_xsa, xsa_alpha_init=xsa_alpha_init,
         hybrid_layer_pattern=hybrid_layer_pattern,

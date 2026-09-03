@@ -1,4 +1,6 @@
 """Decoder layer"""
+import copy
+
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
@@ -11,6 +13,31 @@ from .ffn import BiBoMLP, BiBoMoELayer
 __all__ = ['BiBoDecoderLayer']
 
 
+def _layer_config(config, layer_idx):
+    """`config`, or a shallow copy carrying this layer's expert-geometry override.
+
+    Shallow is deliberate: the copy must share every other attribute with the real config, and the
+    three fields being replaced are plain ints. Returns the original object when there is no
+    override, so the common path allocates nothing and `cfg is config` stays true.
+    """
+    over = getattr(config, "moe_overrides", None)
+    if not over or layer_idx not in over:
+        return config
+    cfg = copy.copy(config)
+    for k, v in over[layer_idx].items():
+        setattr(cfg, k, v)
+    # num_glu_experts is DERIVED from num_routed_experts in the config constructor, and the expert
+    # stack sizes itself from the derived value -- not the one being overridden. Without this the
+    # router would be rebuilt at the new E while the weights stayed at the old one, which is the
+    # exact shape of bug the repo has shipped before.
+    cfg.num_glu_experts = (cfg.num_routed_experts - cfg.num_pos_identity_experts
+                           - cfg.num_neg_identity_experts)
+    if cfg.num_glu_experts < 1 or cfg.num_experts_per_tok > cfg.num_routed_experts:
+        raise ValueError(f"layer {layer_idx} override leaves {cfg.num_glu_experts} GLU experts "
+                         f"and top_k={cfg.num_experts_per_tok} of {cfg.num_routed_experts}")
+    return cfg
+
+
 class BiBoDecoderLayer(nn.Module):
     """
     Transformer decoder layer.
@@ -20,6 +47,21 @@ class BiBoDecoderLayer(nn.Module):
         layer_idx: Layer index
     """
     def __init__(self, config: BiBoConfig, layer_idx: int):
+        # BF16 residual stream. Casting once at the embedding is NOT enough: the MoE
+        # combine returns fp32 (the router weights are fp32), so `residual + mlp_out`
+        # promotes the stream straight back at the first MoE layer. Measured: with only
+        # the embedding cast, layer 1 saw bf16 and layers 3 and 9 saw fp32 again. So the
+        # cast has to happen at every residual add.
+        self._bf16_stream = bool(getattr(config, 'bf16_residual_stream', False))
+        # Round the SUBLAYER CONTRIBUTION to bf16 before it enters the fp32 stream, so the MoE
+        # and attention enter on equal terms. Measured asymmetry without this: attn_out is bf16
+        # (autocast) but mlp_out is fp32 at every MoE layer, because the router emits fp32
+        # weights and the expert combine inherits them. Nobody chose that; it is a side effect.
+        # Router weights and the combine stay FP32 -- this rounds the OUTPUT only, which is the
+        # storage/contribution, not the gating precision DeepSeek keeps high. Applied at the mlp
+        # call site rather than inside the MoE so the Triton-patched MoE is covered too; on a
+        # dense layer it is a no-op because that output is already bf16.
+        self._bf16_moe_out = bool(getattr(config, 'bf16_moe_out', False))
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
@@ -29,7 +71,7 @@ class BiBoDecoderLayer(nn.Module):
         # MoE or dense MLP
         self.is_moe_layer = layer_idx not in config.mlp_only_layers
         if self.is_moe_layer:
-            self.mlp = BiBoMoELayer(config)
+            self.mlp = BiBoMoELayer(_layer_config(config, layer_idx))
         else:
             self.mlp = BiBoMLP(config, is_expert=False)
 
@@ -44,7 +86,11 @@ class BiBoDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if self._bf16_moe_out:
+            hidden_states = hidden_states.to(torch.bfloat16)
         hidden_states = residual + hidden_states
+        if self._bf16_stream:
+            hidden_states = hidden_states.to(torch.bfloat16)
         return hidden_states
 
     def forward(
@@ -71,6 +117,8 @@ class BiBoDecoderLayer(nn.Module):
             output_attentions=output_attentions,
         )
         hidden_states = residual + attn_output
+        if self._bf16_stream:
+            hidden_states = hidden_states.to(torch.bfloat16)
 
         # FFN with selective checkpointing
         if self.use_selective_checkpointing and self.training:

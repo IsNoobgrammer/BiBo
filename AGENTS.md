@@ -150,7 +150,7 @@ BiBoForCausalLM
 | ~~`use_router_logit_norm` / `router_lambda`~~ | removed | **Skywork logit-norm REMOVED (Jun 28 2026)** — MiMo has none. Router is pure MiMo. |
 | ~~`moe_shared_scaling`~~ | removed | **DEPRECATED (Jun 28 2026)** — shared expert adds directly (DeepSeek-V3/Gemma), no learned/MC scalar. |
 | `mlp_only_layers` | [0, N-1] | Which layers use dense MLP instead of MoE (first + last) |
-| `partial_rotary_factor` | 0.334 | **Dim-wise** partial RoPE: fraction of EACH head's `head_dim` that rotates; the rest is NoPE. Replaces head-wise `rope_nope_ratio` (Jul 1 2026). `rope_dim=even(round(factor·head_dim))`. 1.0 = full RoPE. No KV-alignment constraint (applies to all heads uniformly). |
+| positional encoding | **fixed, not configurable**: NoPE on full-attention layers, full RoPE on windowed ones. No partial-rotary fraction, no per-layer width, no NTK. | **Dim-wise** partial RoPE: fraction of EACH head's `head_dim` that rotates; the rest is NoPE. Replaces head-wise `rope_nope_ratio` (Jul 1 2026). `rope_dim=even(round(factor·head_dim))`. 1.0 = full RoPE. No KV-alignment constraint (applies to all heads uniformly). |
 | `rope_theta` | 1e7 | RoPE base. Default raised 10000→1e7 (matched to dim-wise partial RoPE / MiMo-V2.5). |
 | `hybrid_layer_pattern` | None | Per-layer list: 1=sliding-window (SWA), 0=full/global. None = all-global (current). |
 | `sliding_window` | 128 | SWA window `W` (keys visible per query on windowed layers). |

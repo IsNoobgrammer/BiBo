@@ -32,6 +32,7 @@ common/            hardware-agnostic, modular, swappable
     bpb.py         tokenizer-independent bits-per-byte, per language/domain
     mcq.py         log-likelihood MCQ (Belebele, XNLI, optional Global-MMLU), per language
   smoke.py         local build+patch+param-match+train verification
+marimo.md          how to drive the molab GPU box (execute-code.sh + cm). READ IT FIRST.
 rtx_6000/run.sh    single GPU, global batch 40, 1B tokens, bf16
 t4_x2/run.sh       2x T4, one arm per GPU, micro 10 x accum 4 = same global batch 40
 ```
@@ -79,8 +80,8 @@ fp16-divergence finding). Compare `bpb[hi]`/`bpb[en]` and `acc[hi]`/`acc[en]` be
 | `--seq_len` | 1024 | sequence length |
 | `--precision` | bf16 | `bf16` \| `fp32` (never fp16) |
 | `--attn` | sdpa | `sdpa` \| `flash_attention_4` (auto-downgrades to sdpa if flash_attn/arch missing) |
-| `--patches` | liger_norm,liger_rope,ce,moe | any subset of these 4 |
-| `--muon_lr` / `--adam_lr` | 3e-4 | LRs |
+| `--patches` | liger_norm,liger_rope,ce,moe | any subset of `liger_norm,liger_rope,ce,moe,xsa,megakernel` |
+| `--muon_lr` / `--adam_lr` | 1e-2 / 3e-4 | LRs (muon_lr 1e-2 is the board setting) |
 | `--wd` | 0.1 | weight decay |
 | `--warmup_frac` / `--decay_frac` | 0.05 / 0.20 | WSD phases |
 | `--grad_clip` | 1.0 | max grad norm (0=off) |

@@ -1,0 +1,4474 @@
+{
+ "bibo-dense-vs-moe-2k": {
+  "n": 5,
+  "start": "2026-08-15",
+  "end": "2026-08-15",
+  "runs": [
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_di4608_dense0-9_ares3s1ccsraw_cperdim_bf16stream_e64_u0.4_k6_cos_ffn-A-dense09",
+    "state": "finished",
+    "created": "2026-08-15",
+    "loss": 3.6397,
+    "ctx4095": 3.4613,
+    "tps": 178799.2154,
+    "_step": 1999
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_di4608_dense0_ares3s1ccsraw_cperdim_bf16stream_e64_u0.4_k6_cos_ffn-B-dense0",
+    "state": "finished",
+    "created": "2026-08-15",
+    "loss": 3.6117,
+    "ctx4095": 3.4219,
+    "tps": 140417.836,
+    "_step": 1999
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_di4608_allmoe_ares3s1ccsraw_cperdim_bf16stream_e64_u0.4_k6_cos_ffn-C-allmoe",
+    "state": "finished",
+    "created": "2026-08-15",
+    "loss": 3.6053,
+    "ctx4095": 3.3098,
+    "tps": 138377.419,
+    "_step": 1999
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_di4608_allmoe_ares3s1ccssigmoid_cperdim_bf16stream_e64_u0.4_k6_cos_ffn-C2-allmoe-sig",
+    "state": "finished",
+    "created": "2026-08-15",
+    "loss": 3.6022,
+    "ctx4095": 3.3223,
+    "tps": 171000.1844,
+    "_step": 1999
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_di4608_dense0_ares3s1ccssigmoid_cperdim_bf16stream_e64_u0.4_k6_cos_ffn-B2-dense0-sig",
+    "state": "finished",
+    "created": "2026-08-15",
+    "loss": 3.6111,
+    "ctx4095": 3.4084,
+    "tps": 175199.8583,
+    "_step": 1999
+   }
+  ]
+ },
+ "bibo-baseline-2k": {
+  "n": 16,
+  "start": "2026-08-08",
+  "end": "2026-08-13",
+  "runs": [
+   {
+    "name": "01-baseline-radial",
+    "state": "finished",
+    "created": "2026-08-08",
+    "loss": 3.6459,
+    "ctx4095": 3.3947,
+    "tps": 192226.18,
+    "_step": 2002
+   },
+   {
+    "name": "02-baseline-silu",
+    "state": "finished",
+    "created": "2026-08-08",
+    "loss": 3.6651,
+    "ctx4095": 3.4203,
+    "tps": 201256.257,
+    "_step": 1999
+   },
+   {
+    "name": "03-attnres-b3s2-radial",
+    "state": "finished",
+    "created": "2026-08-08",
+    "loss": 3.621,
+    "ctx4095": 3.3346,
+    "tps": 182590.8917,
+    "_step": 1999
+   },
+   {
+    "name": "04-attnres-b3s1-carry-perdim",
+    "state": "finished",
+    "created": "2026-08-08",
+    "loss": 3.614,
+    "ctx4095": 3.3033,
+    "tps": 183137.3245,
+    "_step": 1999
+   },
+   {
+    "name": "05-attnres-b3s1-carry-perdim-silu",
+    "state": "finished",
+    "created": "2026-08-08",
+    "loss": 3.6228,
+    "ctx4095": 3.3466,
+    "tps": 190275.0811,
+    "_step": 1999
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_ares3s1ccsrms_cperdim_bf16stream_e64_u0.4_k6_cos_b3s1-carry-perdim-rms",
+    "state": "finished",
+    "created": "2026-08-08",
+    "loss": 3.6046,
+    "ctx4095": 3.3393,
+    "tps": 185866.6402,
+    "_step": 1999
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_ares3s1ccsraw_cperdim_bf16stream_e64_u0.4_k6_cos_b3s1-carry-perdim-raw",
+    "state": "crashed",
+    "created": "2026-08-08",
+    "loss": 3.5339,
+    "tps": 184716.4451,
+    "_step": 1450
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_ares3s1ccsraw_cperdim_bf16stream_e64_u0.4_k6_cos_b3s1-carry-perdim-raw",
+    "state": "finished",
+    "created": "2026-08-08",
+    "loss": 3.6156,
+    "ctx4095": 3.3142,
+    "tps": 182957.5478,
+    "_step": 1999
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_ares3s1ccstanh_cperdim_bf16stream_e64_u0.4_k6_cos_b3s1-carry-perdim-tanh",
+    "state": "finished",
+    "created": "2026-08-08",
+    "loss": 3.6162,
+    "ctx4095": 3.3193,
+    "tps": 183485.0749,
+    "_step": 1999
+   },
+   {
+    "name": "bibo_min_seed23_aS0.01_vecadamw_xsa_swablock3w128_ares3s1ccssigmoid_cperdim_bf16stream_e64_u0.4_k6_cos_b3s1-carry-perdim-sigmoid-s23",
+    "state": "finished",
+    "created": "2026-08-09",
+    "loss": 3.5986,
+    "ctx4095": 3.3106,
+    "tps": 186908.879,
+    "_step": 1999
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_ares3s1ccssigmoid_cperdim_bf16stream_e64_u0.4_k6_cos_b3s1-carry-perdim-sigmoid-newkernel",
+    "state": "finished",
+    "created": "2026-08-09",
+    "loss": 3.6129,
+    "ctx4095": 3.3236,
+    "tps": 185379.2433,
+    "_step": 1999
+   },
+   {
+    "name": "bibo_min_seed23_aS0.01_vecadamw_xsa_swablock3w128_ares3_bf16stream_e64_u0.4_k6_cos_b3s2-radial-xsa-swa-s23",
+    "state": "finished",
+    "created": "2026-08-09",
+    "loss": 3.6103,
+    "ctx4095": 3.3193,
+    "tps": 182586.341,
+    "_step": 1999
+   },
+   {
+    "name": "Global Partial RoPE + Local Partial RoPE",
+    "state": "finished",
+    "created": "2026-08-13",
+    "loss": 3.605,
+    "ctx4095": 3.3245,
+    "tps": 184905.2386,
+    "_step": 1999
+   },
+   {
+    "name": "Global Full RoPE + Local Full RoPE",
+    "state": "finished",
+    "created": "2026-08-13",
+    "loss": 3.613,
+    "ctx4095": 3.3805,
+    "tps": 190511.378,
+    "_step": 1999
+   },
+   {
+    "name": "Global NoPE + Local Partial RoPE",
+    "state": "finished",
+    "created": "2026-08-13",
+    "loss": 3.6202,
+    "ctx4095": 3.3144,
+    "tps": 188751.5175,
+    "_step": 1999
+   },
+   {
+    "name": "Global NoPE + Local Full RoPE",
+    "state": "finished",
+    "created": "2026-08-13",
+    "loss": 3.613,
+    "ctx4095": 3.3107,
+    "tps": 191183.2979,
+    "_step": 1999
+   }
+  ]
+ },
+ "bibo-clean-v1": {
+  "n": 2,
+  "start": "2026-08-07",
+  "end": "2026-08-07",
+  "runs": [
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_bf16stream_e64_u0.4_k6_cos_mlr3e-3",
+    "state": "finished",
+    "created": "2026-08-07",
+    "loss": 1.8823,
+    "tps": 171997.6941,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_ares3s1ccsunbounded_cperdim_bf16stream_e64_u0.4_k6_cos_ares-mlr3e-3",
+    "state": "finished",
+    "created": "2026-08-07",
+    "loss": 1.8607,
+    "tps": 164909.1164,
+    "_step": 2000
+   }
+  ]
+ },
+ "bibo-lr-sweep": {
+  "n": 11,
+  "start": "2026-08-07",
+  "end": "2026-08-07",
+  "runs": [
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_bf16stream_e64_u0.4_k6_cos_mlr1e-2",
+    "state": "finished",
+    "created": "2026-08-07",
+    "loss": 2.423,
+    "tps": 186240.461,
+    "_step": 800
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_bf16stream_e64_u0.4_k6_cos_mlr3e-4",
+    "state": "finished",
+    "created": "2026-08-07",
+    "loss": 3.1115,
+    "tps": 186442.1167,
+    "_step": 800
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_bf16stream_e64_u0.4_k6_cos_mlr3e-3",
+    "state": "finished",
+    "created": "2026-08-07",
+    "loss": 2.4225,
+    "tps": 185590.1914,
+    "_step": 800
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_bf16stream_e64_u0.4_k6_cos_mlr5e-3",
+    "state": "finished",
+    "created": "2026-08-07",
+    "loss": 2.4127,
+    "tps": 186665.3076,
+    "_step": 800
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_bf16stream_e64_u0.4_k6_cos_mlr1e-4",
+    "state": "crashed",
+    "created": "2026-08-07",
+    "loss": 7.9257,
+    "tps": 187518.4106,
+    "_step": 75
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_bf16stream_e64_u0.4_k6_cos_fw-mlr3e-3",
+    "state": "failed",
+    "created": "2026-08-07"
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_bf16stream_e64_u0.4_k6_cos_fw-mlr5e-3",
+    "state": "failed",
+    "created": "2026-08-07"
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_bf16stream_e64_u0.4_k6_cos_fw-mlr1e-2",
+    "state": "failed",
+    "created": "2026-08-07"
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_bf16stream_e64_u0.4_k6_cos_fw-mlr3e-3",
+    "state": "finished",
+    "created": "2026-08-07",
+    "loss": 3.9108,
+    "tps": 192154.5,
+    "_step": 799
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_bf16stream_e64_u0.4_k6_cos_fw-mlr5e-3",
+    "state": "finished",
+    "created": "2026-08-07",
+    "loss": 3.8941,
+    "tps": 191177.1855,
+    "_step": 799
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_bf16stream_e64_u0.4_k6_cos_fw-mlr1e-2",
+    "state": "crashed",
+    "created": "2026-08-07",
+    "loss": 6.1221,
+    "tps": 193249.7947,
+    "_step": 100
+   }
+  ]
+ },
+ "bibo-attnres-1b": {
+  "n": 4,
+  "start": "2026-08-06",
+  "end": "2026-08-06",
+  "runs": [
+   {
+    "name": "Baseline (SWA + XSA)",
+    "state": "finished",
+    "created": "2026-08-06",
+    "loss": 1.4351,
+    "tps": 187125.3376,
+    "_step": 4000
+   },
+   {
+    "name": "AttnRes + per-dim carry (ours)",
+    "state": "finished",
+    "created": "2026-08-06",
+    "loss": 1.4119,
+    "tps": 180549.97,
+    "_step": 4000
+   },
+   {
+    "name": "Kimi K3 AttnRes",
+    "state": "finished",
+    "created": "2026-08-06",
+    "loss": 1.4193,
+    "tps": 178043.683,
+    "_step": 4000
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_ares1s1ccsunbounded_cperdim_bf16stream_e64_u0.4_k6_cos",
+    "state": "finished",
+    "created": "2026-08-06",
+    "loss": 1.4139,
+    "tps": 174723.3746,
+    "_step": 4000
+   }
+  ]
+ },
+ "bibo-attnres-v2": {
+  "n": 23,
+  "start": "2026-08-05",
+  "end": "2026-08-07",
+  "runs": [
+   {
+    "name": "V2-Baseline-FP32Stream",
+    "state": "finished",
+    "created": "2026-08-05",
+    "loss": 1.7471,
+    "tps": 172095.3883,
+    "_step": 2000
+   },
+   {
+    "name": "V2-Baseline-BF16Stream",
+    "state": "finished",
+    "created": "2026-08-05",
+    "loss": 1.748,
+    "tps": 187424.7908,
+    "_step": 2000
+   },
+   {
+    "name": "V2-Kimi-B3S2-BF16",
+    "state": "finished",
+    "created": "2026-08-05",
+    "loss": 1.7259,
+    "tps": 177900.5078,
+    "_step": 2000
+   },
+   {
+    "name": "V2-B3S1-LearnC-BF16",
+    "state": "finished",
+    "created": "2026-08-05",
+    "loss": 1.7194,
+    "tps": 180368.3639,
+    "_step": 2000
+   },
+   {
+    "name": "V2-B3S1-LearnC-Emb-BF16",
+    "state": "finished",
+    "created": "2026-08-05",
+    "loss": 1.7146,
+    "tps": 177386.6592,
+    "_step": 2000
+   },
+   {
+    "name": "V2-B3S1-LearnC-HTEmb-BF16",
+    "state": "finished",
+    "created": "2026-08-05",
+    "loss": 1.7179,
+    "tps": 176473.2145,
+    "_step": 2000
+   },
+   {
+    "name": "V2-B3S1-LearnC-Emb-Signorm",
+    "state": "finished",
+    "created": "2026-08-05",
+    "loss": 1.7164,
+    "tps": 177139.4652,
+    "_step": 2000
+   },
+   {
+    "name": "V2-Kimi-B3S2-Signorm",
+    "state": "finished",
+    "created": "2026-08-05",
+    "loss": 1.7289,
+    "tps": 177956.8228,
+    "_step": 2000
+   },
+   {
+    "name": "V2-B3S1-PerDimC-BF16",
+    "state": "finished",
+    "created": "2026-08-05",
+    "loss": 1.7171,
+    "tps": 180397.8165,
+    "_step": 2000
+   },
+   {
+    "name": "V2-B3S1-PerDimC-Emb-BF16",
+    "state": "finished",
+    "created": "2026-08-05",
+    "loss": 1.7186,
+    "tps": 177322.6479,
+    "_step": 2000
+   },
+   {
+    "name": "V2-B3S1-Gate-SiLU-Unbounded-KILLED",
+    "state": "crashed",
+    "created": "2026-08-06",
+    "loss": 2.4304,
+    "tps": 175904.8103,
+    "_step": 525
+   },
+   {
+    "name": "V2-B3S1-Gate-SelfSigmoid-KILLED",
+    "state": "crashed",
+    "created": "2026-08-06",
+    "loss": 2.2608,
+    "tps": 175777.5035,
+    "_step": 825
+   },
+   {
+    "name": "V2-Kimi-B1S2-BF16",
+    "state": "finished",
+    "created": "2026-08-06",
+    "loss": 1.7436,
+    "tps": 167891.9596,
+    "_step": 2000
+   },
+   {
+    "name": "V2-Kimi-B1S2-Signorm",
+    "state": "finished",
+    "created": "2026-08-06",
+    "loss": 1.7375,
+    "tps": 167940.2226,
+    "_step": 2000
+   },
+   {
+    "name": "V2-B3S1-PerDimC-PerDimD-BF16",
+    "state": "finished",
+    "created": "2026-08-06",
+    "loss": 1.7197,
+    "tps": 177369.5913,
+    "_step": 2000
+   },
+   {
+    "name": "V2-B3S1-PerDimC-BF16-Repro",
+    "state": "finished",
+    "created": "2026-08-06",
+    "loss": 1.7207,
+    "tps": 180640.4318,
+    "_step": 2000
+   },
+   {
+    "name": "V2-Kimi-B1S2-Signorm-Top4",
+    "state": "finished",
+    "created": "2026-08-06",
+    "loss": 1.7921,
+    "tps": 167748.7393,
+    "_step": 2000
+   },
+   {
+    "name": "V2-Kimi-B1S2-Signorm-Top6",
+    "state": "finished",
+    "created": "2026-08-06",
+    "loss": 1.7547,
+    "tps": 167606.1612,
+    "_step": 2000
+   },
+   {
+    "name": "V2-B3S1-PerDimC-Id6Pos",
+    "state": "finished",
+    "created": "2026-08-06",
+    "loss": 1.7223,
+    "tps": 183081.465,
+    "_step": 2000
+   },
+   {
+    "name": "V2-B3S1-PerDimC-Id8Pos",
+    "state": "finished",
+    "created": "2026-08-06",
+    "loss": 1.7263,
+    "tps": 183872.7421,
+    "_step": 2000
+   },
+   {
+    "name": "V2-B3S1-PerDimC-Id6Pos2Neg",
+    "state": "finished",
+    "created": "2026-08-06",
+    "loss": 1.7184,
+    "tps": 183448.0873,
+    "_step": 2000
+   },
+   {
+    "name": "V2-B3S1-PerDimC-PadMask",
+    "state": "finished",
+    "created": "2026-08-07",
+    "loss": 1.8493,
+    "tps": 179399.4945,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_ares3s1ccsunbounded_cperdim_bf16stream_e64_u0.4_k6_cos_mlr3e-3",
+    "state": "crashed",
+    "created": "2026-08-07",
+    "loss": 1.8658,
+    "tps": 178911.481,
+    "_step": 1825
+   }
+  ]
+ },
+ "bibo-attnres": {
+  "n": 30,
+  "start": "2026-08-03",
+  "end": "2026-08-05",
+  "runs": [
+   {
+    "name": "AR-Control-Off-600",
+    "state": "finished",
+    "created": "2026-08-03",
+    "loss": 2.0744,
+    "tps": 172201.901,
+    "_step": 600
+   },
+   {
+    "name": "AR-B3S1-Carry-600",
+    "state": "finished",
+    "created": "2026-08-03",
+    "loss": 2.069,
+    "tps": 137999.5118,
+    "_step": 600
+   },
+   {
+    "name": "AR-B1S1-Carry-600",
+    "state": "finished",
+    "created": "2026-08-03",
+    "loss": 2.1396,
+    "tps": 116551.3105,
+    "_step": 600
+   },
+   {
+    "name": "BiBo-Baseline",
+    "state": "finished",
+    "created": "2026-08-03",
+    "loss": 1.7492,
+    "tps": 171523.7424,
+    "_step": 2000
+   },
+   {
+    "name": "AR-B3S1-Unbounded",
+    "state": "finished",
+    "created": "2026-08-03",
+    "loss": 1.7528,
+    "tps": 160998.8944,
+    "_step": 2000
+   },
+   {
+    "name": "AR-Muon-0.01",
+    "state": "finished",
+    "created": "2026-08-03",
+    "loss": 1.7569,
+    "tps": 162438.604,
+    "_step": 2000
+   },
+   {
+    "name": "Attn-Res-AdamW-LowLR",
+    "state": "crashed",
+    "created": "2026-08-03",
+    "loss": 1.7189,
+    "tps": 162859.5934,
+    "_step": 1250
+   },
+   {
+    "name": "AdamW-Attn-Res-LR0.01",
+    "state": "crashed",
+    "created": "2026-08-03",
+    "loss": 1.6774,
+    "tps": 162355.9251,
+    "_step": 1975
+   },
+   {
+    "name": "AR-B3S1-Fixed",
+    "state": "finished",
+    "created": "2026-08-03",
+    "loss": 1.7202,
+    "tps": 162864.8306,
+    "_step": 2000
+   },
+   {
+    "name": "AR-Kimi-B3S2",
+    "state": "finished",
+    "created": "2026-08-03",
+    "loss": 1.7323,
+    "tps": 157223.6079,
+    "_step": 2000
+   },
+   {
+    "name": "AR-B3S1-Learnable-Attn",
+    "state": "finished",
+    "created": "2026-08-03",
+    "loss": 1.7193,
+    "tps": 161415.3292,
+    "_step": 2000
+   },
+   {
+    "name": "AR-B3S1-Learnable-Attn-embedding",
+    "state": "finished",
+    "created": "2026-08-03",
+    "loss": 1.7132,
+    "tps": 154802.095,
+    "_step": 2000
+   },
+   {
+    "name": "AR-B3S1-Embed-Bounded",
+    "state": "finished",
+    "created": "2026-08-03",
+    "loss": 1.7392,
+    "tps": 157779.7985,
+    "_step": 2000
+   },
+   {
+    "name": "AR-B3S1-U-Embed-Fused",
+    "state": "finished",
+    "created": "2026-08-04",
+    "loss": 1.7185,
+    "tps": 157526.1687,
+    "_step": 2000
+   },
+   {
+    "name": "AR-B3S1-Learnable-Attn-Fused",
+    "state": "finished",
+    "created": "2026-08-04",
+    "loss": 1.7211,
+    "tps": 162348.1922,
+    "_step": 2000
+   },
+   {
+    "name": "AR-B3S1-Learnable-Attn-Seed2026",
+    "state": "finished",
+    "created": "2026-08-04",
+    "loss": 1.7132,
+    "tps": 161527.1835,
+    "_step": 2000
+   },
+   {
+    "name": "AR-Kimi-B3S2-Seed2026",
+    "state": "finished",
+    "created": "2026-08-04",
+    "loss": 1.7307,
+    "tps": 157762.0025,
+    "_step": 2000
+   },
+   {
+    "name": "AR-B3S1-Learnable-Attn-Fused-Bitmatch",
+    "state": "finished",
+    "created": "2026-08-04",
+    "loss": 1.7163,
+    "tps": 162452.8442,
+    "_step": 2000
+   },
+   {
+    "name": "AR-B3S1-Bounded-Attn-Fused",
+    "state": "finished",
+    "created": "2026-08-04",
+    "loss": 1.7144,
+    "tps": 162499.7184,
+    "_step": 2000
+   },
+   {
+    "name": "AR-B3S1-Bounded-Attn-Embed-Fused",
+    "state": "finished",
+    "created": "2026-08-04",
+    "loss": 1.7403,
+    "tps": 157873.9504,
+    "_step": 2000
+   },
+   {
+    "name": "AR-B3S1-U-Embed-Eager-Repro",
+    "state": "finished",
+    "created": "2026-08-04",
+    "loss": 1.7168,
+    "tps": 154771.1716,
+    "_step": 2000
+   },
+   {
+    "name": "AR-B3S1-U-Embed-HT-Radial",
+    "state": "finished",
+    "created": "2026-08-04",
+    "loss": 1.7308,
+    "tps": 151011.2552,
+    "_step": 2000
+   },
+   {
+    "name": "AR-B3S1-U-Embed-HT-UnitNorm-Killed",
+    "state": "crashed",
+    "created": "2026-08-04",
+    "loss": 1.9562,
+    "tps": 151604.0055,
+    "_step": 1800
+   },
+   {
+    "name": "AR-B3S1-U-Embed-HT-Raw-Eager",
+    "state": "finished",
+    "created": "2026-08-04",
+    "loss": 1.7157,
+    "tps": 154679.5534,
+    "_step": 2000
+   },
+   {
+    "name": "AR-B1S1-Learnable-Attn-Eager",
+    "state": "finished",
+    "created": "2026-08-04",
+    "loss": 1.7466,
+    "tps": 152244.8122,
+    "_step": 2000
+   },
+   {
+    "name": "AR-Kimi-B1S2",
+    "state": "finished",
+    "created": "2026-08-05",
+    "loss": 1.7416,
+    "tps": 142741.6643,
+    "_step": 2000
+   },
+   {
+    "name": "AR-B1S1-U-Embed-Eager",
+    "state": "finished",
+    "created": "2026-08-05",
+    "loss": 1.7372,
+    "tps": 142317.4673,
+    "_step": 2000
+   },
+   {
+    "name": "AR-B3S1-U-Embed-Eager-Repro2",
+    "state": "finished",
+    "created": "2026-08-05",
+    "loss": 1.711,
+    "tps": 154485.1281,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_ares3s1cf32scsunboundedemb_e64_u0.4_k6_cos",
+    "state": "crashed",
+    "created": "2026-08-05",
+    "loss": 3.3532,
+    "tps": 157657.962,
+    "_step": 150
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_vecadamw_xsa_swablock3w128_ares3s1cf32scsunboundedemb_e64_u0.4_k6_cos",
+    "state": "crashed",
+    "created": "2026-08-05",
+    "loss": 2.3236,
+    "tps": 134867.5446,
+    "_step": 525
+   }
+  ]
+ },
+ "bibo-xsa-524m": {
+  "n": 17,
+  "start": "2026-08-01",
+  "end": "2026-08-03",
+  "runs": [
+   {
+    "name": "Baseline Bibo",
+    "state": "finished",
+    "created": "2026-08-01",
+    "loss": 1.7552,
+    "tps": 173920.4947,
+    "_step": 2000
+   },
+   {
+    "name": "Xsa-Fixed",
+    "state": "finished",
+    "created": "2026-08-01",
+    "loss": 1.7603,
+    "tps": 171252.9635,
+    "_step": 2000
+   },
+   {
+    "name": "Radial-tanh",
+    "state": "finished",
+    "created": "2026-08-01",
+    "loss": 1.7577,
+    "tps": 173461.2707,
+    "_step": 2000
+   },
+   {
+    "name": "XSA-Learnable",
+    "state": "finished",
+    "created": "2026-08-02",
+    "loss": 1.748,
+    "tps": 170417.4682,
+    "_step": 2000
+   },
+   {
+    "name": "XSA+SSMAX",
+    "state": "finished",
+    "created": "2026-08-02",
+    "loss": 1.7588,
+    "tps": 168724.3734,
+    "_step": 2000
+   },
+   {
+    "name": "SWA128",
+    "state": "crashed",
+    "created": "2026-08-02",
+    "loss": 2.3826,
+    "tps": 175466.9535,
+    "_step": 450
+   },
+   {
+    "name": "SWA128+sink",
+    "state": "finished",
+    "created": "2026-08-02",
+    "loss": 1.7546,
+    "tps": 173792.0951,
+    "_step": 2000
+   },
+   {
+    "name": "SWA128-NoSink",
+    "state": "finished",
+    "created": "2026-08-02",
+    "loss": 1.7566,
+    "tps": 174904.2176,
+    "_step": 2000
+   },
+   {
+    "name": "SWA128-XSA-NoSink",
+    "state": "finished",
+    "created": "2026-08-02",
+    "loss": 1.7484,
+    "tps": 171822.1664,
+    "_step": 2000
+   },
+   {
+    "name": "SWA128+XSA+Sink",
+    "state": "crashed",
+    "created": "2026-08-02",
+    "loss": 1.6139,
+    "tps": 170789.276,
+    "_step": 1850
+   },
+   {
+    "name": "SWA512+XSA+NoSink",
+    "state": "finished",
+    "created": "2026-08-02",
+    "loss": 1.7489,
+    "tps": 170568.663,
+    "_step": 2000
+   },
+   {
+    "name": "HSWA[512-128]-XSA",
+    "state": "finished",
+    "created": "2026-08-02",
+    "loss": 1.7563,
+    "tps": 171463.4161,
+    "_step": 2000
+   },
+   {
+    "name": "HSWA[128-512]-XSA",
+    "state": "finished",
+    "created": "2026-08-02",
+    "loss": 1.746,
+    "tps": 171658.0574,
+    "_step": 2000
+   },
+   {
+    "name": "SWA-128-NoQKNorm-XSA",
+    "state": "crashed",
+    "created": "2026-08-02",
+    "loss": 2.4065,
+    "tps": 173895.8453,
+    "_step": 825
+   },
+   {
+    "name": "SWA128-XSA-NoSink-Silu",
+    "state": "finished",
+    "created": "2026-08-02",
+    "loss": 1.7692,
+    "tps": 178354.1087,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_xsa_swablock3w128_ares3_e64_u0.4_k6_cos",
+    "state": "finished",
+    "created": "2026-08-03",
+    "loss": 2.0831,
+    "tps": 115891.4184,
+    "_step": 600
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_xsa_swablock3w128_ares3s1_e64_u0.4_k6_cos",
+    "state": "finished",
+    "created": "2026-08-03",
+    "loss": 2.1263,
+    "tps": 142631.968,
+    "_step": 600
+   }
+  ]
+ },
+ "bibo-act-1b": {
+  "n": 6,
+  "start": "2026-07-31",
+  "end": "2026-08-01",
+  "runs": [
+   {
+    "name": "Silu-8/64-1B",
+    "state": "finished",
+    "created": "2026-07-31",
+    "loss": 1.4537,
+    "tps": 163079.5402,
+    "_step": 4000
+   },
+   {
+    "name": "NormSilu-8/64-1B",
+    "state": "finished",
+    "created": "2026-07-31",
+    "loss": 1.4392,
+    "tps": 158278.0786,
+    "_step": 4000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-R_aS0.01_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-31",
+    "loss": 1.4354,
+    "tps": 153260.859,
+    "_step": 4000
+   },
+   {
+    "name": "Learned-Silu-8/64",
+    "state": "finished",
+    "created": "2026-07-31",
+    "loss": 1.4357,
+    "tps": 153392.4791,
+    "_step": 4000
+   },
+   {
+    "name": "Radial-NormSilu-8-64",
+    "state": "finished",
+    "created": "2026-08-01",
+    "loss": 1.4299,
+    "tps": 158121.8498,
+    "_step": 4000
+   },
+   {
+    "name": "bibo_min_seed42069_aS0.01_e64_u0.4_k6_cos",
+    "state": "crashed",
+    "created": "2026-08-01",
+    "loss": 1.6369,
+    "tps": 173661.3597,
+    "_step": 2975
+   }
+  ]
+ },
+ "bibo-manas-2k": {
+  "n": 3,
+  "start": "2026-07-30",
+  "end": "2026-07-30",
+  "runs": [
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-30",
+    "loss": 1.7607,
+    "tps": 163338.1368,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_manas-g0.23094_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-30",
+    "loss": 1.752,
+    "tps": 150729.1354,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_manas-g0.23094-gs_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-30",
+    "loss": 2.3107,
+    "tps": 150297.6896,
+    "_step": 550
+   }
+  ]
+ },
+ "bibo-manas-3way": {
+  "n": 3,
+  "start": "2026-07-30",
+  "end": "2026-07-30",
+  "runs": [
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-30",
+    "loss": 2.261,
+    "tps": 163380.1003,
+    "_step": 399
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_manas-g0.23094_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-30",
+    "loss": 2.1794,
+    "tps": 150717.1923,
+    "_step": 399
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_manas-g0.23094-gs_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-30",
+    "loss": 2.217,
+    "tps": 150710.5169,
+    "_step": 399
+   }
+  ]
+ },
+ "bibo-manas-ladder": {
+  "n": 1,
+  "start": "2026-07-30",
+  "end": "2026-07-30",
+  "runs": [
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-30",
+    "loss": 2.8631,
+    "tps": 163505.7448,
+    "_step": 225
+   }
+  ]
+ },
+ "bibo-specials-conv": {
+  "n": 176,
+  "start": "2026-07-26",
+  "end": "2026-07-30",
+  "runs": [
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9953,
+    "tps": 230577.0919,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_rconv3_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 3.0768,
+    "tps": 238941.0069,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_se2_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 3.0991,
+    "tps": 244675.3696,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_se2_gb0.8_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 3.0969,
+    "tps": 243898.562,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_se2_xsp_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 3.1071,
+    "tps": 244547.5324,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_se2_xsp_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9908,
+    "tps": 231952.5383,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_rconv3_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 3.0744,
+    "tps": 235414.2071,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_se2_u0.005_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9981,
+    "tps": 234922.899,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_se2_u0.01_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 3.0878,
+    "tps": 232993.791,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 3.0059,
+    "tps": 231256.6034,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_se4_negonly_u0.005_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 3.3141,
+    "tps": 233063.7131,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_se4_posonly_u0.005_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9312,
+    "tps": 234673.3104,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_u0.001_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 3.0215,
+    "tps": 231505.1041,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_u0.005_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9357,
+    "tps": 233526.6656,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_u0.08_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9577,
+    "tps": 234962.6258,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9531,
+    "tps": 232021.26,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_u0.02_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9778,
+    "tps": 234742.7519,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_u2_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9773,
+    "tps": 234753.3772,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_se2_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.993,
+    "tps": 232570.9183,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_se2_posonly_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9328,
+    "tps": 233182.966,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_se4_posonly_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9303,
+    "tps": 236489.6576,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_se6_posonly_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9288,
+    "tps": 236103.9575,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_se8_posonly_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9341,
+    "tps": 235083.2049,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_rconv3_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 3.1334,
+    "tps": 223155.8284,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_rconv5_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 3.22,
+    "tps": 228077.4001,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_rconv3_u0.4_prop_rt-situ-softmax_cos",
+    "state": "failed",
+    "created": "2026-07-26"
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_se4_posonly_rconv3_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 3.1167,
+    "tps": 228773.3952,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_rconv3_u0.4_prop_rt-situ-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 3.1537,
+    "tps": 229006.9074,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e18_u0.4_prop_rt-situ-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9947,
+    "tps": 232129.8642,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_nontp_cos",
+    "state": "crashed",
+    "created": "2026-07-26",
+    "loss": 2.7847,
+    "tps": 210093.7942,
+    "_step": 490
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9075,
+    "tps": 211195.162,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se4_posonly_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9361,
+    "tps": 211446.9474,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se10_posonly_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.8924,
+    "tps": 214601.2549,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se16_posonly_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9095,
+    "tps": 213000.9435,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se8_posonly_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9219,
+    "tps": 211000.0191,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se12_posonly_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9109,
+    "tps": 209508.3819,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.891,
+    "tps": 213097.4607,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se10_posonly_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.8936,
+    "tps": 212743.8725,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se10_posonly_gb0.75_u0.4_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.8948,
+    "tps": 214369.5708,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se10_posonly_gb0.75_u1_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.9046,
+    "tps": 212175.5248,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se10_posonly_gb0.75_u2_prop_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.8945,
+    "tps": 213265.7789,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 3.0252,
+    "tps": 189301.0821,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se10_posonly_u0.4_prop_k4_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.8589,
+    "tps": 195100.6536,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.8867,
+    "tps": 190510.5523,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se4_posonly_u0.4_prop_k4_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.8949,
+    "tps": 193211.9797,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se10_posonly_u0.4_prop_k4_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.8633,
+    "tps": 193443.1084,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se12_posonly_u0.4_prop_k4_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.8818,
+    "tps": 197389.2877,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_rt-sigmoid-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.8299,
+    "tps": 191547.7801,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.832,
+    "tps": 191929.296,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se10_posonly_u0.4_prop_k4_rt-sigmoid-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8238,
+    "tps": 194603.805,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se10_posonly_u0.4_prop_k4_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8243,
+    "tps": 194299.9634,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_rt-situ-softmax_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.9379,
+    "tps": 192115.522,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_rt-situ-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8929,
+    "tps": 190445.194,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se10_posonly_u0.4_prop_k4_rt-situ-softmax_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.9132,
+    "tps": 196663.7345,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_se10_posonly_u0.4_prop_k4_rt-situ-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8753,
+    "tps": 195382.2369,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_rt-sigmoid-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8253,
+    "tps": 100507.139,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_T0.5_rt-sigmoid-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8525,
+    "tps": 99251.801,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_T2_rt-sigmoid-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8258,
+    "tps": 191639.2126,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_T4_rt-sigmoid-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8456,
+    "tps": 191034.6913,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_polar_rt-sigmoid-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8746,
+    "tps": 191715.5029,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_normuon_rt-sigmoid-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8305,
+    "tps": 191185.691,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_aurora_ema_rt-sigmoid-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8436,
+    "tps": 191375.465,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_aurora_ema_v2_rt-sigmoid-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8499,
+    "tps": 188297.3086,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_rt-tsig-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8313,
+    "tps": 191595.407,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_rt-sigtanh-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8609,
+    "tps": 191849.5252,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_rt-sqsp-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8237,
+    "tps": 189869.9464,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_rt-sigtanh-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8562,
+    "tps": 189360.0696,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_T2_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8171,
+    "tps": 189876.8393,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.881,
+    "tps": 192916.6025,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_T2_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8397,
+    "tps": 190702.7583,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed1337_acts-s_e30_u0.4_prop_k4_T2_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8188,
+    "tps": 190340.6539,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed1337_acts-s_e30_u0.4_prop_k4_T2_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8464,
+    "tps": 190532.7666,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed1337_acts-s_e30_u0.4_prop_k4_normuon_rt-sigmoid-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8372,
+    "tps": 189957.6396,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_rt-sigmoid-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8409,
+    "tps": 190033.3922,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_rin-unit_rt-sigmoid-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8231,
+    "tps": 182176.2681,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_rin-rms_rt-sigmoid-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8444,
+    "tps": 185737.6861,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8212,
+    "tps": 189609.6114,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_normuon_rt-sigmoid-sum_rs1.5_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8589,
+    "tps": 190114.5303,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_normuon_rt-sigmoid-sum_rs2_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8895,
+    "tps": 188418.2405,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_normuon_rt-sigmoid-sum_rs2.5_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.9053,
+    "tps": 188801.0382,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_normuon_rt-sigmoid-sum_rsL_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8242,
+    "tps": 189203.2057,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8192,
+    "tps": 189410.9652,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e30_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8193,
+    "tps": 189305.8333,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_e30_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8203,
+    "tps": 189886.1376,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-snX_e30_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8201,
+    "tps": 188647.2277,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-nX_e30_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-27",
+    "loss": 2.7079,
+    "tps": 189274.7488,
+    "_step": 490
+   },
+   {
+    "name": "bibo_min_seed42069_acts-nX_e30_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8225,
+    "tps": 188565.9715,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-sn_e30_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8344,
+    "tps": 190008.66,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-Xs_e30_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.83,
+    "tps": 188634.138,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-nX_e30_se10_posonly_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8006,
+    "tps": 192694.3013,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e30_se10_posonly_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.7994,
+    "tps": 190826.6536,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_e30_se10_posonly_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.7957,
+    "tps": 190851.0397,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e39_u0.4_prop_k3_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8441,
+    "tps": 181993.875,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e39_u0.4_prop_k3_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8274,
+    "tps": 182002.3302,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_e39_u0.4_prop_k3_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8112,
+    "tps": 182759.7794,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e39_se13_posonly_u0.4_prop_k3_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8327,
+    "tps": 185921.069,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_e39_se13_posonly_u0.4_prop_k3_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8268,
+    "tps": 184579.1096,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-nX_e39_u0.4_prop_k3_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8231,
+    "tps": 182099.0151,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_e39_se13_posonly_gb0.75_u0.4_prop_k3_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8379,
+    "tps": 182770.9052,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_e39_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8151,
+    "tps": 173113.6039,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e39_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8083,
+    "tps": 175300.3343,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_e39_se13_posonly_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8083,
+    "tps": 177035.2279,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e39_se13_posonly_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8219,
+    "tps": 177193.1845,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-nX_e39_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8165,
+    "tps": 174995.4454,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-nX_e39_se13_posonly_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-27",
+    "loss": 2.8201,
+    "tps": 177442.1724,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_e30_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-28",
+    "loss": 2.6918,
+    "tps": 187915.6987,
+    "_step": 490
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 2.8326,
+    "tps": 189525.2083,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k3_sh1_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 2.8973,
+    "tps": 182483.9441,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k2_sh2_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 2.9163,
+    "tps": 180711.7862,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k1_sh3_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 2.9928,
+    "tps": 181247.0701,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_u0.4_prop_k4_sh1_normuon_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-28",
+    "loss": 5.1642,
+    "tps": 175163.4392,
+    "_step": 60
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 2.7613,
+    "tps": 147471.3517,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 2.7631,
+    "tps": 147150.8919,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 2.7536,
+    "tps": 140803.1034,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 2.7594,
+    "tps": 140214.4478,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-28",
+    "loss": 2.4666,
+    "tps": 123099.3557,
+    "_step": 470
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 2.7544,
+    "tps": 146997.8217,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 2.7568,
+    "tps": 143285.7068,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 2.7491,
+    "tps": 143521.4649,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 2.7548,
+    "tps": 147736.9405,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 2.7531,
+    "tps": 143298.6295,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 2.7626,
+    "tps": 143444.5255,
+    "_step": 500
+   },
+   {
+    "name": "bibo_min_seed23_acts-s_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-28",
+    "loss": 2.6657,
+    "tps": 147019.4502,
+    "_step": 490
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 1.9282,
+    "tps": 157738.6043,
+    "_step": 1200
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 1.9246,
+    "tps": 152834.4592,
+    "_step": 1200
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 1.924,
+    "tps": 152990.3949,
+    "_step": 1200
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 1.921,
+    "tps": 152863.5851,
+    "_step": 1200
+   },
+   {
+    "name": "bibo_min_seed42069_acts-nX_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 1.9226,
+    "tps": 152326.0644,
+    "_step": 1200
+   },
+   {
+    "name": "bibo_min_seed23_acts-n_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-28",
+    "loss": 2.9558,
+    "tps": 152805.7087,
+    "_step": 220
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e62_u0.4_prop_k7_sh1_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 1.9426,
+    "tps": 152602.2477,
+    "_step": 1200
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e62_u0.4_prop_k6_sh2_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-28",
+    "loss": 1.9556,
+    "tps": 151820.5926,
+    "_step": 1200
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e60_u0.4_prop_k5_sh3_normuon_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-28",
+    "loss": 2.2522,
+    "tps": 152269.513,
+    "_step": 620
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e48_se16_posonly_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-28",
+    "loss": 4.4276,
+    "tps": 166516.1693,
+    "_step": 100
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_se22_posonly_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-28",
+    "loss": 2.3007,
+    "tps": 163673.9819,
+    "_step": 880
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e20_u0.4_prop_k4_rt-situ-softmax_nontp_cos",
+    "state": "crashed",
+    "created": "2026-07-29",
+    "loss": 3.1989,
+    "tps": 210599.5133,
+    "_step": 220
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_se8_posonly_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 1.9384,
+    "tps": 156791.9605,
+    "_step": 1200
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_se8_negonly_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 1.9794,
+    "tps": 157588.8579,
+    "_step": 1200
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_se4_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 1.9452,
+    "tps": 157628.5989,
+    "_step": 1200
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_se11_posonly_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 1.9387,
+    "tps": 159059.2445,
+    "_step": 1200
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-29",
+    "loss": 9.7051,
+    "tps": 156741.7511,
+    "_step": 20
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_aurora_ema_v2_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 2.1184,
+    "tps": 153967.5253,
+    "_step": 1800
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_aurora_ema_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 2.1331,
+    "tps": 157596.0907,
+    "_step": 1800
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 2.2898,
+    "tps": 157580.3491,
+    "_step": 1800
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_normuon_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 2.1097,
+    "tps": 157789.4967,
+    "_step": 1800
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 2.1181,
+    "tps": 157594.179,
+    "_step": 1800
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 2.0992,
+    "tps": 152650.8207,
+    "_step": 1800
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 2.1338,
+    "tps": 152128.3199,
+    "_step": 1800
+   },
+   {
+    "name": "bibo_min_seed42069_acts-nX_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 2.1028,
+    "tps": 151352.0614,
+    "_step": 1800
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 2.0924,
+    "tps": 152497.5976,
+    "_step": 1800
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e64_u0.4_prop_k8_mon-rms_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 2.1193,
+    "tps": 151607.8083,
+    "_step": 1800
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e64_u0.4_prop_k8_mon-rms_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 2.121,
+    "tps": 151712.1922,
+    "_step": 1800
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e64_u0.4_prop_k8_mon-unit_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 2.1213,
+    "tps": 146684.5254,
+    "_step": 1800
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 1.7621,
+    "tps": 163181.2837,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-29",
+    "loss": 1.9111,
+    "tps": 157677.1617,
+    "_step": 725
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 1.763,
+    "tps": 162871.8792,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 1.7523,
+    "tps": 157165.4393,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 1.7579,
+    "tps": 157509.8786,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_aS_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-29",
+    "loss": 2.1616,
+    "tps": 159239.3241,
+    "_step": 575
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_aS0.01_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 1.7525,
+    "tps": 155677.7032,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_aS0.01_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 1.7506,
+    "tps": 156017.7522,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_aS0.01_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-29",
+    "loss": 1.7621,
+    "tps": 156021.1533,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_aS0.01_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-30"
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_wd0.01_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-30",
+    "loss": 1.7795,
+    "tps": 163335.7913,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_wd0.05_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-30",
+    "loss": 1.7692,
+    "tps": 163393.8758,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_wd0.01_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-30",
+    "loss": 1.7663,
+    "tps": 157901.8894,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_wd0.05_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-30",
+    "loss": 2.1055,
+    "tps": 157825.5396,
+    "_step": 600
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_wdr0.01-0.1_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-30",
+    "loss": 1.7722,
+    "tps": 163463.7123,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_wdr0.01-0.1_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-30",
+    "loss": 1.7611,
+    "tps": 157263.8357,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-R_aS0.01_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-30",
+    "loss": 1.7452,
+    "tps": 154494.6865,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n-t2s_aS0.01_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-30",
+    "loss": 2.1243,
+    "tps": 154792.6124,
+    "_step": 1325
+   },
+   {
+    "name": "bibo_min_seed42069_acts-G_aS0.01_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-30",
+    "loss": 2.3377,
+    "tps": 152315.2428,
+    "_step": 850
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_cwd_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "finished",
+    "created": "2026-07-30",
+    "loss": 1.759,
+    "tps": 156444.5847,
+    "_step": 2000
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_cwd_e64_u0.4_prop_k8_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-30",
+    "loss": 2.397,
+    "tps": 161537.2785,
+    "_step": 350
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_lat256_e64_u0.4_prop_k8_mi1536_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-30",
+    "loss": 2.3522,
+    "tps": 126248.0719,
+    "_step": 400
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_lat256_e64_u0.4_prop_k8_mi1536_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-30"
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_lat256_e128_u0.4_prop_k16_mi768_rt-sigmoid-sum_cos",
+    "state": "crashed",
+    "created": "2026-07-30",
+    "loss": 2.3151,
+    "tps": 129166.7639,
+    "_step": 500
+   }
+  ]
+ },
+ "BiBo-Router": {
+  "n": 13,
+  "start": "2026-07-24",
+  "end": "2026-07-25",
+  "runs": [
+   {
+    "name": "normsilu_sigmoid_sum",
+    "state": "finished",
+    "created": "2026-07-24",
+    "loss": 2.1908,
+    "tps": 217492.8068,
+    "_step": 1271
+   },
+   {
+    "name": "normsilu_router_situ-softmax",
+    "state": "finished",
+    "created": "2026-07-24",
+    "loss": 2.1017,
+    "tps": 220292.3105,
+    "_step": 1271
+   },
+   {
+    "name": "NormSilu-sigmoid-softmax",
+    "state": "finished",
+    "created": "2026-07-24",
+    "loss": 2.0695,
+    "tps": 217077.8875,
+    "_step": 1271
+   },
+   {
+    "name": "NormSitu-sigmoid-softmax",
+    "state": "finished",
+    "created": "2026-07-25",
+    "loss": 2.0822,
+    "tps": 216114.3425,
+    "_step": 1271
+   },
+   {
+    "name": "silu_sigmoid-softmax",
+    "state": "finished",
+    "created": "2026-07-25",
+    "loss": 2.1089,
+    "tps": 215907.5635,
+    "_step": 1271
+   },
+   {
+    "name": "NormSilu+NormSitu_sigmoid-softmax",
+    "state": "finished",
+    "created": "2026-07-25",
+    "loss": 2.0756,
+    "tps": 215881.5603,
+    "_step": 1271
+   },
+   {
+    "name": "Norm(SIlu+relu+Situ)_sigmoid-softmax",
+    "state": "finished",
+    "created": "2026-07-25",
+    "loss": 2.0939,
+    "tps": 214944.4596,
+    "_step": 1271
+   },
+   {
+    "name": "NormSilu+NormSItu_sigmoid-softmax_rs1.35",
+    "state": "finished",
+    "created": "2026-07-25",
+    "loss": 2.0767,
+    "tps": 216152.5316,
+    "_step": 1271
+   },
+   {
+    "name": "bibo_min_seed42069_acts-nX_e30_rt-sigmoid-softmax_esL_cos",
+    "state": "finished",
+    "created": "2026-07-25",
+    "loss": 2.0775,
+    "tps": 202606.657,
+    "_step": 1271
+   },
+   {
+    "name": "bibo_min_seed42069_acts-nX_e30_rt-situ-softmax_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-25",
+    "loss": 2.0811,
+    "tps": 218212.7566,
+    "_step": 1271
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e30_rt-situ-softmax_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-25",
+    "loss": 2.0572,
+    "tps": 217581.0692,
+    "_step": 1271
+   },
+   {
+    "name": "bibo_min_seed42069_acts-s_e30_rt-situ-softmax_nontp_cos",
+    "state": "crashed",
+    "created": "2026-07-25",
+    "loss": 1.8744,
+    "tps": 220263.3328,
+    "_step": 980
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_e30_rt-situ-softmax_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-25",
+    "loss": 2.0643,
+    "tps": 218153.2831,
+    "_step": 1271
+   }
+  ]
+ },
+ "polyglu-ablations-XL": {
+  "n": 15,
+  "start": "2026-07-23",
+  "end": "2026-07-26",
+  "runs": [
+   {
+    "name": "NormSilu",
+    "state": "finished",
+    "created": "2026-07-23",
+    "loss": 2.0567,
+    "tps": 219682.3649,
+    "_step": 1271
+   },
+   {
+    "name": "Normsilu+situ",
+    "state": "finished",
+    "created": "2026-07-23",
+    "loss": 2.0874,
+    "tps": 219370.475,
+    "_step": 1271
+   },
+   {
+    "name": "Silu",
+    "state": "finished",
+    "created": "2026-07-23",
+    "loss": 2.1081,
+    "tps": 224157.5685,
+    "_step": 1271
+   },
+   {
+    "name": "relu+normsilu",
+    "state": "finished",
+    "created": "2026-07-24",
+    "loss": 2.1337,
+    "tps": 234662.5232,
+    "_step": 1271
+   },
+   {
+    "name": "silu+situ+normsilu",
+    "state": "finished",
+    "created": "2026-07-24",
+    "loss": 2.1172,
+    "tps": 221254.1827,
+    "_step": 1271
+   },
+   {
+    "name": "silu+normsilu",
+    "state": "finished",
+    "created": "2026-07-24",
+    "loss": 2.1011,
+    "tps": 224002.7618,
+    "_step": 1271
+   },
+   {
+    "name": "silu+situ",
+    "state": "finished",
+    "created": "2026-07-24",
+    "loss": 2.1215,
+    "tps": 222165.8071,
+    "_step": 1271
+   },
+   {
+    "name": "NormRelu",
+    "state": "finished",
+    "created": "2026-07-24",
+    "loss": 2.1464,
+    "tps": 225599.7973,
+    "_step": 1271
+   },
+   {
+    "name": "normsitu",
+    "state": "finished",
+    "created": "2026-07-24",
+    "loss": 2.0543,
+    "tps": 218400.4931,
+    "_step": 1271
+   },
+   {
+    "name": "normsilu+normsitu",
+    "state": "finished",
+    "created": "2026-07-24",
+    "loss": 2.052,
+    "tps": 219909.7732,
+    "_step": 1271
+   },
+   {
+    "name": "normsilu+situ+normsitu",
+    "state": "finished",
+    "created": "2026-07-24",
+    "loss": 2.0727,
+    "tps": 217228.881,
+    "_step": 1271
+   },
+   {
+    "name": "silu+normsilu+normsitu",
+    "state": "finished",
+    "created": "2026-07-24",
+    "loss": 2.1012,
+    "tps": 223662.7252,
+    "_step": 1271
+   },
+   {
+    "name": "bibo_min_seed42069_acts-X_e18_rt-situ-softmax_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-25",
+    "loss": 2.114,
+    "tps": 237439.3763,
+    "_step": 1271
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e18_rt-sigmoid-softmax_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.099,
+    "tps": 236170.3806,
+    "_step": 1271
+   },
+   {
+    "name": "bibo_min_seed42069_acts-n_e18_rt-sigmoid-softmax_nontp_cos",
+    "state": "finished",
+    "created": "2026-07-26",
+    "loss": 2.0843,
+    "tps": 235480.4533,
+    "_step": 1271
+   }
+  ]
+ },
+ "polyglu-ablations-large": {
+  "n": 12,
+  "start": "2026-07-22",
+  "end": "2026-07-23",
+  "runs": [
+   {
+    "name": "silu",
+    "state": "finished",
+    "created": "2026-07-22",
+    "loss": 2.136,
+    "tps": 244187.5381,
+    "_step": 1271
+   },
+   {
+    "name": "relu2",
+    "state": "finished",
+    "created": "2026-07-22",
+    "loss": 2.4558,
+    "tps": 258766.9271,
+    "_step": 1271
+   },
+   {
+    "name": "normsilu",
+    "state": "finished",
+    "created": "2026-07-23",
+    "loss": 2.0831,
+    "tps": 241943.5295,
+    "_step": 1271
+   },
+   {
+    "name": "normsilu+silu",
+    "state": "finished",
+    "created": "2026-07-23",
+    "loss": 2.1227,
+    "tps": 242232.6773,
+    "_step": 1271
+   },
+   {
+    "name": "situ",
+    "state": "finished",
+    "created": "2026-07-23",
+    "loss": 2.1599,
+    "tps": 242817.9668,
+    "_step": 1271
+   },
+   {
+    "name": "normsilu+silu+situ",
+    "state": "finished",
+    "created": "2026-07-23",
+    "loss": 2.1284,
+    "tps": 242552.7949,
+    "_step": 1271
+   },
+   {
+    "name": "normsilu+situ",
+    "state": "finished",
+    "created": "2026-07-23",
+    "loss": 2.1081,
+    "tps": 239544.1158,
+    "_step": 1271
+   },
+   {
+    "name": "normsilu_learned",
+    "state": "finished",
+    "created": "2026-07-23",
+    "loss": 2.0881,
+    "tps": 221929.1632,
+    "_step": 1271
+   },
+   {
+    "name": "normsilu-+situ-learned",
+    "state": "finished",
+    "created": "2026-07-23",
+    "loss": 2.1142,
+    "tps": 224564.8212,
+    "_step": 1271
+   },
+   {
+    "name": "RadialNormsilu",
+    "state": "finished",
+    "created": "2026-07-23",
+    "loss": 2.0897,
+    "tps": 242300.4748,
+    "_step": 1271
+   },
+   {
+    "name": "Normsilu",
+    "state": "finished",
+    "created": "2026-07-23",
+    "loss": 2.083,
+    "tps": 241226.2818,
+    "_step": 1271
+   },
+   {
+    "name": "bibo_min_seed42069_acts-T_e18_cos",
+    "state": "finished",
+    "created": "2026-07-23",
+    "loss": 2.151,
+    "tps": 186311.5462,
+    "_step": 1271
+   }
+  ]
+ },
+ "polyglu-ablations": {
+  "n": 11,
+  "start": "2026-07-22",
+  "end": "2026-07-23",
+  "runs": [
+   {
+    "name": "silu",
+    "state": "finished",
+    "created": "2026-07-22",
+    "loss": 2.1694,
+    "tps": 264954.7382,
+    "_step": 1271
+   },
+   {
+    "name": "relu2",
+    "state": "finished",
+    "created": "2026-07-22",
+    "loss": 2.3376,
+    "tps": 266666.3177,
+    "_step": 1271
+   },
+   {
+    "name": "normsilu",
+    "state": "finished",
+    "created": "2026-07-22",
+    "loss": 2.151,
+    "tps": 262501.4325,
+    "_step": 1271
+   },
+   {
+    "name": "acts-sn_cos",
+    "state": "finished",
+    "created": "2026-07-22",
+    "loss": 2.1593,
+    "tps": 261709.9615,
+    "_step": 1271
+   },
+   {
+    "name": "acts-sr_cos",
+    "state": "finished",
+    "created": "2026-07-22",
+    "loss": 2.2149,
+    "tps": 266145.6075,
+    "_step": 1271
+   },
+   {
+    "name": "acts-rn_cos",
+    "state": "finished",
+    "created": "2026-07-22",
+    "loss": 2.1903,
+    "tps": 266145.5989,
+    "_step": 1271
+   },
+   {
+    "name": "acts-sr_cos",
+    "state": "finished",
+    "created": "2026-07-22",
+    "loss": 2.2033,
+    "tps": 266277.8771,
+    "_step": 1271
+   },
+   {
+    "name": "acts-srn_cos",
+    "state": "finished",
+    "created": "2026-07-22",
+    "loss": 2.1856,
+    "tps": 266764.8671,
+    "_step": 1271
+   },
+   {
+    "name": "SiTU",
+    "state": "finished",
+    "created": "2026-07-22",
+    "loss": 2.218,
+    "tps": 266219.7829,
+    "_step": 1271
+   },
+   {
+    "name": "acts-t_situL_cos",
+    "state": "finished",
+    "created": "2026-07-22",
+    "loss": 2.2099,
+    "tps": 263673.4888,
+    "_step": 1271
+   },
+   {
+    "name": "bibo_min_seed42069_acts-nt_cos",
+    "state": "finished",
+    "created": "2026-07-23",
+    "loss": 2.1775,
+    "tps": 266806.0674,
+    "_step": 1271
+   }
+  ]
+ },
+ "bibo-qwen-ablate-optimizer": {
+  "n": 15,
+  "start": "2026-07-13",
+  "end": "2026-07-16",
+  "runs": [
+   {
+    "name": "bibo_min_seed2026_manas_g0.505964r1mvrs0.96sk0.96",
+    "state": "crashed",
+    "created": "2026-07-13",
+    "loss": 3.3367,
+    "tps": 249536.5926,
+    "_step": 180
+   },
+   {
+    "name": "manas_seed2026_g0.505964r1mvrs0.96sk0.96",
+    "state": "finished",
+    "created": "2026-07-13",
+    "loss": 2.0863,
+    "tps": 248869.9123,
+    "_step": 1907
+   },
+   {
+    "name": "Muon_seed2026",
+    "state": "finished",
+    "created": "2026-07-13",
+    "loss": 2.1067,
+    "tps": 256952.8144,
+    "_step": 1907
+   },
+   {
+    "name": "Muon_seed2026_run2",
+    "state": "finished",
+    "created": "2026-07-13",
+    "loss": 2.1051,
+    "tps": 257411.8682,
+    "_step": 1907
+   },
+   {
+    "name": "manas_seed2026_g0.505964r1mvrs0.96sk0.96",
+    "state": "finished",
+    "created": "2026-07-14",
+    "loss": 2.0835,
+    "tps": 249609.9065,
+    "_step": 1907
+   },
+   {
+    "name": "manas_seed2026_g0.505964r1mvrs0.96sk0.96",
+    "state": "finished",
+    "created": "2026-07-14",
+    "loss": 2.0734,
+    "tps": 248298.3918,
+    "_step": 1907
+   },
+   {
+    "name": "Muon_seed2026_3",
+    "state": "finished",
+    "created": "2026-07-14",
+    "loss": 2.1075,
+    "tps": 256775.9413,
+    "_step": 1907
+   },
+   {
+    "name": "manas_seed2026_g1r1mvrs0.96sk0.96",
+    "state": "finished",
+    "created": "2026-07-14",
+    "loss": 2.0987,
+    "tps": 253549.9117,
+    "_step": 1907
+   },
+   {
+    "name": "Muon_seed2307",
+    "state": "finished",
+    "created": "2026-07-14",
+    "loss": 2.1077,
+    "tps": 256862.6522,
+    "_step": 1907
+   },
+   {
+    "name": "bibo_min_seed2307_manas_g0.505964r1mvrs0.96sk0.96",
+    "state": "finished",
+    "created": "2026-07-14",
+    "loss": 2.1013,
+    "tps": 253042.9858,
+    "_step": 1907
+   },
+   {
+    "name": "bibo_min_seed42069",
+    "state": "failed",
+    "created": "2026-07-15",
+    "loss": 1.6586,
+    "tps": 255943.1476,
+    "_step": 2542
+   },
+   {
+    "name": "bibo_min_seed42069",
+    "state": "finished",
+    "created": "2026-07-15",
+    "loss": 1.6474,
+    "tps": 259139.0737,
+    "_step": 2543
+   },
+   {
+    "name": "bibo_min_seed42069_manas_g0.979796r1mvrs0.96sk0.96",
+    "state": "crashed",
+    "created": "2026-07-15",
+    "loss": 2.1149,
+    "tps": 252015.0569,
+    "_step": 1080
+   },
+   {
+    "name": "bibo_min_seed42069_manas_g0.979796r1mvrs0.96sk0.96_cos",
+    "state": "finished",
+    "created": "2026-07-15",
+    "loss": 1.7148,
+    "tps": 249724.2829,
+    "_step": 2543
+   },
+   {
+    "name": "bibo_min_seed42069_cos",
+    "state": "finished",
+    "created": "2026-07-16",
+    "loss": 1.7456,
+    "tps": 258650.1329,
+    "_step": 2543
+   }
+  ]
+ },
+ "bibo-qwen-ablate": {
+  "n": 44,
+  "start": "2026-07-08",
+  "end": "2026-07-13",
+  "runs": [
+   {
+    "name": "bibo_min_seed0",
+    "state": "crashed",
+    "created": "2026-07-08",
+    "loss": 1.7009,
+    "_step": 10980
+   },
+   {
+    "name": "bibo_PolyGLU_only_42069",
+    "state": "finished",
+    "created": "2026-07-08",
+    "loss": 2.1145,
+    "tps": 205960.3253,
+    "_step": 4577
+   },
+   {
+    "name": "qwen_seed42069",
+    "state": "finished",
+    "created": "2026-07-08",
+    "loss": 2.1603,
+    "tps": 246368.0844,
+    "_step": 4577
+   },
+   {
+    "name": "qwen_seed2026",
+    "state": "finished",
+    "created": "2026-07-08",
+    "loss": 2.1662,
+    "tps": 256797.2012,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU_only_2026",
+    "state": "finished",
+    "created": "2026-07-08",
+    "loss": 2.1082,
+    "tps": 246718.7406,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU+SE_2026",
+    "state": "finished",
+    "created": "2026-07-08",
+    "loss": 2.1133,
+    "tps": 249929.2222,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU+SE_42069",
+    "state": "finished",
+    "created": "2026-07-08",
+    "loss": 2.1106,
+    "tps": 252595.2342,
+    "_step": 4577
+   },
+   {
+    "name": "qwen_seed2307",
+    "state": "finished",
+    "created": "2026-07-09",
+    "loss": 2.1654,
+    "tps": 256988.1582,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU_only_2307",
+    "state": "finished",
+    "created": "2026-07-09",
+    "loss": 2.1119,
+    "tps": 246183.6762,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU+SE_2307",
+    "state": "finished",
+    "created": "2026-07-09",
+    "loss": 2.1178,
+    "tps": 251442.6792,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU+SE_conv3_2026",
+    "state": "finished",
+    "created": "2026-07-09",
+    "loss": 2.1332,
+    "tps": 199669.7861,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU_only_conv3_2026",
+    "state": "finished",
+    "created": "2026-07-09",
+    "loss": 2.125,
+    "tps": 237496.4933,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU_nobais_conv3_2026",
+    "state": "finished",
+    "created": "2026-07-09",
+    "loss": 2.1846,
+    "tps": 254725.8891,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU+XSA_2026",
+    "state": "finished",
+    "created": "2026-07-09",
+    "loss": 2.1254,
+    "tps": 215730.1794,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU+XSA_42069",
+    "state": "finished",
+    "created": "2026-07-09",
+    "loss": 2.1223,
+    "tps": 216589.5771,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU+SSMax_42069",
+    "state": "finished",
+    "created": "2026-07-09",
+    "loss": 2.112,
+    "tps": 234720.6635,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU+SSMax_2026",
+    "state": "finished",
+    "created": "2026-07-09",
+    "loss": 2.1113,
+    "tps": 232657.0504,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_SSMax_XSA_42069",
+    "state": "finished",
+    "created": "2026-07-09",
+    "loss": 2.1242,
+    "tps": 207669.0015,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_SSMax_XSA_2026 (VM Crashed)",
+    "state": "crashed",
+    "created": "2026-07-09",
+    "loss": 2.2362,
+    "tps": 8795.2378,
+    "_step": 2520
+   },
+   {
+    "name": "bibo_SSMax_XSA_2026",
+    "state": "finished",
+    "created": "2026-07-09",
+    "loss": 2.1284,
+    "tps": 207178.1091,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU+SE_xsp_2026",
+    "state": "finished",
+    "created": "2026-07-09",
+    "loss": 2.1125,
+    "tps": 247456.4671,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU+SE(ID)_xsp_xsa_2026",
+    "state": "finished",
+    "created": "2026-07-09",
+    "loss": 2.1239,
+    "tps": 217168.3069,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU+SE(ID)_2026",
+    "state": "finished",
+    "created": "2026-07-10",
+    "loss": 2.112,
+    "tps": 247602.2866,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU+SE(ID)_2037",
+    "state": "finished",
+    "created": "2026-07-10",
+    "loss": 2.1231,
+    "tps": 248482.6369,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU_BiggerBais_2026",
+    "state": "finished",
+    "created": "2026-07-10",
+    "loss": 2.112,
+    "tps": 247558.8864,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_PolyGLU_only_2026",
+    "state": "finished",
+    "created": "2026-07-10",
+    "loss": 2.1089,
+    "tps": 247444.1318,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_min_seed2026_normuon",
+    "state": "finished",
+    "created": "2026-07-10",
+    "loss": 2.1068,
+    "tps": 246314.6311,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_min_seed2026_aurora_ema",
+    "state": "finished",
+    "created": "2026-07-10",
+    "loss": 2.4552,
+    "tps": 248470.8589,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_min_seed2026_aurora_ema_v2",
+    "state": "finished",
+    "created": "2026-07-10",
+    "loss": 2.4539,
+    "tps": 248098.5664,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_min_seed2026_aurora_ema",
+    "state": "finished",
+    "created": "2026-07-10",
+    "loss": 2.1078,
+    "tps": 246214.2447,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_min_seed2026_aurora_ema_v2",
+    "state": "finished",
+    "created": "2026-07-10",
+    "loss": 2.1089,
+    "tps": 245107.4065,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_min_seed2026_xo0.1post",
+    "state": "finished",
+    "created": "2026-07-10",
+    "loss": 2.1079,
+    "tps": 233294.0206,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_min_seed2026",
+    "state": "finished",
+    "created": "2026-07-10",
+    "loss": 2.1067,
+    "tps": 127352.762,
+    "_step": 4577
+   },
+   {
+    "name": "bibo_min_seed2026",
+    "state": "finished",
+    "created": "2026-07-13",
+    "loss": 2.1058,
+    "tps": 257932.6759,
+    "_step": 1907
+   },
+   {
+    "name": "bibo_min_seed2026_manas_g0.178885r1mvrs0.96sk0.96",
+    "state": "crashed",
+    "created": "2026-07-13",
+    "loss": 1.9512,
+    "tps": 240018.6511,
+    "_step": 1900
+   },
+   {
+    "name": "bibo_min_seed2026_manas_g0.178885r1mvrs0.96sk0.96-32",
+    "state": "finished",
+    "created": "2026-07-13",
+    "loss": 2.0772,
+    "tps": 236911.1823,
+    "_step": 1907
+   },
+   {
+    "name": "bibo_min_seed2026_manas_g0.178885r1mvrs0.96sk0.96-32",
+    "state": "finished",
+    "created": "2026-07-13",
+    "loss": 2.0834,
+    "tps": 238036.3299,
+    "_step": 1907
+   },
+   {
+    "name": "bibo_min_seed2026_manas_g0.178885r1mvrs0.96sk0.96-64",
+    "state": "finished",
+    "created": "2026-07-13",
+    "loss": 2.0772,
+    "tps": 234914.924,
+    "_step": 1907
+   },
+   {
+    "name": "bibo_min_seed2026_manas_g0.178885r1mvrs0.96sk0.96-64",
+    "state": "finished",
+    "created": "2026-07-13",
+    "loss": 2.0837,
+    "tps": 234901.6326,
+    "_step": 1907
+   },
+   {
+    "name": "bibo_min_seed2026",
+    "state": "crashed",
+    "created": "2026-07-13",
+    "loss": 7.4623,
+    "tps": 257813.7619,
+    "_step": 40
+   },
+   {
+    "name": "bibo_min_seed2026_32x8",
+    "state": "finished",
+    "created": "2026-07-13",
+    "loss": 2.1072,
+    "tps": 257512.0959,
+    "_step": 1907
+   },
+   {
+    "name": "bibo_min_seed2026_manas_g0.505964r1mvrs0.96sk0.96-r32_32x8",
+    "state": "finished",
+    "created": "2026-07-13",
+    "loss": 2.0783,
+    "tps": 228017.6327,
+    "_step": 1907
+   },
+   {
+    "name": "bibo_min_seed2026_manas_g0.505964r1mvrs0.96sk0.96_r512_32x8",
+    "state": "finished",
+    "created": "2026-07-13",
+    "loss": 2.067,
+    "tps": 169482.9806,
+    "_step": 1907
+   },
+   {
+    "name": "bibo_min_seed2026_manas_g0.178885r1mvrs0.96sk0.96",
+    "state": "crashed",
+    "created": "2026-07-13",
+    "loss": 2.0786,
+    "tps": 177013.6794,
+    "_step": 1720
+   }
+  ]
+ },
+ "latentsig-med-triage-router": {
+  "n": 7,
+  "start": "2026-05-29",
+  "end": "2026-05-30",
+  "runs": [
+   {
+    "name": "qwen3-4b-qlora-v1",
+    "state": "finished",
+    "created": "2026-05-29"
+   },
+   {
+    "name": "qwen3-4b-qlora-v1",
+    "state": "crashed",
+    "created": "2026-05-29",
+    "loss": 0.9382,
+    "_step": 0
+   },
+   {
+    "name": "qwen3-4b-qlora-v1",
+    "state": "crashed",
+    "created": "2026-05-29",
+    "loss": 0.1342,
+    "_step": 260
+   },
+   {
+    "name": "qwen3-4b-qlora-v2",
+    "state": "crashed",
+    "created": "2026-05-30",
+    "loss": 0.2295,
+    "_step": 122
+   },
+   {
+    "name": "qwen3-4b-qlora-v3",
+    "state": "finished",
+    "created": "2026-05-30"
+   },
+   {
+    "name": "qwen3-4b-qlora-v3",
+    "state": "crashed",
+    "created": "2026-05-30",
+    "loss": 0.1587,
+    "_step": 88
+   },
+   {
+    "name": "qwen3-4b-qlora-v3",
+    "state": "crashed",
+    "created": "2026-05-30",
+    "loss": 0.1707,
+    "_step": 137
+   }
+  ]
+ },
+ "bibo-bench": {
+  "n": 86,
+  "start": "2026-05-27",
+  "end": "2026-06-28",
+  "runs": [
+   {
+    "name": "baseline-50m",
+    "state": "failed",
+    "created": "2026-05-27"
+   },
+   {
+    "name": "baseline-50m",
+    "state": "failed",
+    "created": "2026-05-27"
+   },
+   {
+    "name": "baseline-50m",
+    "state": "failed",
+    "created": "2026-05-27"
+   },
+   {
+    "name": "baseline-50m",
+    "state": "failed",
+    "created": "2026-05-27",
+    "loss": 11.3887,
+    "_step": 0
+   },
+   {
+    "name": "baseline-50m",
+    "state": "failed",
+    "created": "2026-05-27",
+    "loss": 11.3854,
+    "_step": 0
+   },
+   {
+    "name": "baseline-50m",
+    "state": "failed",
+    "created": "2026-05-27",
+    "loss": 11.3853,
+    "_step": 0
+   },
+   {
+    "name": "baseline-50m",
+    "state": "killed",
+    "created": "2026-05-27",
+    "loss": 7.5773,
+    "_step": 50
+   },
+   {
+    "name": "baseline-50m",
+    "state": "failed",
+    "created": "2026-05-27",
+    "loss": 10.6192,
+    "_step": 10
+   },
+   {
+    "name": "baseline-50m",
+    "state": "failed",
+    "created": "2026-05-27",
+    "loss": 10.689,
+    "_step": 10
+   },
+   {
+    "name": "baseline-50m",
+    "state": "failed",
+    "created": "2026-05-27"
+   },
+   {
+    "name": "baseline-50m",
+    "state": "killed",
+    "created": "2026-05-27",
+    "loss": 10.8201,
+    "_step": 7
+   },
+   {
+    "name": "baseline-50m",
+    "state": "failed",
+    "created": "2026-05-27",
+    "loss": 8.7914,
+    "_step": 105
+   },
+   {
+    "name": "baseline-50m",
+    "state": "crashed",
+    "created": "2026-05-27",
+    "loss": 7.7823,
+    "_step": 35
+   },
+   {
+    "name": "Qwen",
+    "state": "crashed",
+    "created": "2026-05-27",
+    "loss": 12.5206,
+    "_step": 142
+   },
+   {
+    "name": "BiBo",
+    "state": "crashed",
+    "created": "2026-05-27",
+    "loss": 9.7577,
+    "_step": 105
+   },
+   {
+    "name": "qwen-vs-bibo",
+    "state": "failed",
+    "created": "2026-05-27",
+    "loss": 9.7552,
+    "_step": 213
+   },
+   {
+    "name": "qwen-vs-bibo",
+    "state": "failed",
+    "created": "2026-05-27",
+    "loss": 11.7681,
+    "_step": 214
+   },
+   {
+    "name": "qwen",
+    "state": "failed",
+    "created": "2026-05-28",
+    "loss": 4.4871,
+    "_step": 213
+   },
+   {
+    "name": "bibo",
+    "state": "failed",
+    "created": "2026-05-28",
+    "loss": 4.7478,
+    "_step": 214
+   },
+   {
+    "name": "bibo",
+    "state": "failed",
+    "created": "2026-05-28"
+   },
+   {
+    "name": "qwen",
+    "state": "crashed",
+    "created": "2026-05-28"
+   },
+   {
+    "name": "bibo",
+    "state": "failed",
+    "created": "2026-05-28"
+   },
+   {
+    "name": "qwen",
+    "state": "crashed",
+    "created": "2026-05-28",
+    "loss": 11.4063,
+    "_step": 0
+   },
+   {
+    "name": "bibo",
+    "state": "crashed",
+    "created": "2026-05-28",
+    "loss": 9.379,
+    "_step": 7
+   },
+   {
+    "name": "qwen mlp [0,9]",
+    "state": "finished",
+    "created": "2026-05-28",
+    "loss": 3.9529,
+    "_step": 319
+   },
+   {
+    "name": " bibo mlp [0,9]",
+    "state": "finished",
+    "created": "2026-05-28",
+    "loss": 3.6246,
+    "_step": 320
+   },
+   {
+    "name": "bibo mlp [0,1]",
+    "state": "finished",
+    "created": "2026-05-28",
+    "loss": 3.7546,
+    "_step": 1344
+   },
+   {
+    "name": "bibo",
+    "state": "finished",
+    "created": "2026-05-28",
+    "loss": 3.7436,
+    "_step": 1344
+   },
+   {
+    "name": "qwen",
+    "state": "crashed",
+    "created": "2026-05-28",
+    "loss": 3.741,
+    "_step": 246
+   },
+   {
+    "name": "bibo",
+    "state": "crashed",
+    "created": "2026-05-29",
+    "loss": 4.3032,
+    "_step": 626
+   },
+   {
+    "name": "qwen",
+    "state": "crashed",
+    "created": "2026-05-29",
+    "loss": 4.2065,
+    "_step": 138
+   },
+   {
+    "name": " bibo mlp [0,9] fully trition",
+    "state": "crashed",
+    "created": "2026-05-29",
+    "loss": 5.2061,
+    "_step": 86
+   },
+   {
+    "name": "qwen",
+    "state": "crashed",
+    "created": "2026-05-29",
+    "loss": 5.181,
+    "_step": 65
+   },
+   {
+    "name": "qwen",
+    "state": "crashed",
+    "created": "2026-05-29",
+    "loss": 4.1531,
+    "_step": 212
+   },
+   {
+    "name": "bibo mlp [0,9] triton fully fixed",
+    "state": "crashed",
+    "created": "2026-05-29",
+    "loss": 3.7992,
+    "_step": 241
+   },
+   {
+    "name": "bibo",
+    "state": "finished",
+    "created": "2026-05-29",
+    "loss": 3.6265,
+    "_step": 320
+   },
+   {
+    "name": "qwen",
+    "state": "finished",
+    "created": "2026-05-29",
+    "loss": 3.9476,
+    "_step": 319
+   },
+   {
+    "name": "qwen3moe_1",
+    "state": "failed",
+    "created": "2026-06-13"
+   },
+   {
+    "name": "bibo_0",
+    "state": "failed",
+    "created": "2026-06-13"
+   },
+   {
+    "name": "qwen3moe_1",
+    "state": "failed",
+    "created": "2026-06-13"
+   },
+   {
+    "name": "bibo_0",
+    "state": "failed",
+    "created": "2026-06-13"
+   },
+   {
+    "name": "qwen3moe_1",
+    "state": "failed",
+    "created": "2026-06-13"
+   },
+   {
+    "name": "bibo_0",
+    "state": "failed",
+    "created": "2026-06-13"
+   },
+   {
+    "name": "qwen3moe_1",
+    "state": "failed",
+    "created": "2026-06-13"
+   },
+   {
+    "name": "bibo_0",
+    "state": "failed",
+    "created": "2026-06-13"
+   },
+   {
+    "name": "qwen3moe_1",
+    "state": "failed",
+    "created": "2026-06-13"
+   },
+   {
+    "name": "bibo_0",
+    "state": "failed",
+    "created": "2026-06-13"
+   },
+   {
+    "name": "qwen3moe_1",
+    "state": "failed",
+    "created": "2026-06-13"
+   },
+   {
+    "name": "bibo_0",
+    "state": "failed",
+    "created": "2026-06-13"
+   },
+   {
+    "name": "bibo_0",
+    "state": "crashed",
+    "created": "2026-06-13",
+    "loss": 10.8778,
+    "_step": 6
+   },
+   {
+    "name": "qwen3moe_1",
+    "state": "crashed",
+    "created": "2026-06-13",
+    "loss": 10.9442,
+    "_step": 7
+   },
+   {
+    "name": "bibo_0",
+    "state": "failed",
+    "created": "2026-06-13"
+   },
+   {
+    "name": "qwen3moe_1",
+    "state": "failed",
+    "created": "2026-06-13"
+   },
+   {
+    "name": "qwen3moe_1",
+    "state": "failed",
+    "created": "2026-06-13",
+    "loss": 10.7507,
+    "_step": 50
+   },
+   {
+    "name": "bibo_0",
+    "state": "failed",
+    "created": "2026-06-13",
+    "loss": 10.8263,
+    "_step": 50
+   },
+   {
+    "name": "bibo-smoke",
+    "state": "crashed",
+    "created": "2026-06-26",
+    "loss": 5.7418,
+    "_step": 38
+   },
+   {
+    "name": "bibo-smoke",
+    "state": "killed",
+    "created": "2026-06-26",
+    "loss": 6.9694,
+    "_step": 9
+   },
+   {
+    "name": "bibo-smoke",
+    "state": "killed",
+    "created": "2026-06-26",
+    "loss": 5.8451,
+    "_step": 27
+   },
+   {
+    "name": "bibo-smoke",
+    "state": "killed",
+    "created": "2026-06-26",
+    "loss": 5.9953,
+    "_step": 55
+   },
+   {
+    "name": "bibo-smoke",
+    "state": "failed",
+    "created": "2026-06-26"
+   },
+   {
+    "name": "bibo-smoke",
+    "state": "failed",
+    "created": "2026-06-26",
+    "loss": 7.0517,
+    "_step": 10
+   },
+   {
+    "name": "bibo-smoke",
+    "state": "finished",
+    "created": "2026-06-26",
+    "loss": 6.0546,
+    "_step": 56
+   },
+   {
+    "name": "bibo-no-ssmax",
+    "state": "failed",
+    "created": "2026-06-26"
+   },
+   {
+    "name": "bibo-no-ssmax",
+    "state": "finished",
+    "created": "2026-06-26",
+    "loss": 6.0056,
+    "_step": 56
+   },
+   {
+    "name": "bibo-no-ssmax",
+    "state": "failed",
+    "created": "2026-06-26",
+    "loss": 6.8493,
+    "_step": 10
+   },
+   {
+    "name": "bibo_vanilla",
+    "state": "finished",
+    "created": "2026-06-26",
+    "loss": 5.0492,
+    "_step": 112
+   },
+   {
+    "name": "qwen_baseline",
+    "state": "finished",
+    "created": "2026-06-26",
+    "loss": 4.9827,
+    "_step": 112
+   },
+   {
+    "name": "bibo_vanilla_Adamw8",
+    "state": "crashed",
+    "created": "2026-06-26",
+    "loss": 4.1998,
+    "_step": 220
+   },
+   {
+    "name": "bibo_vanilla_no_shared_expert",
+    "state": "failed",
+    "created": "2026-06-26",
+    "loss": 5.8837,
+    "_step": 55
+   },
+   {
+    "name": "bibo_vanilla_no_shared_expert_seed_42",
+    "state": "killed",
+    "created": "2026-06-27",
+    "loss": 5.6403,
+    "_step": 109
+   },
+   {
+    "name": "bibo_vanilla_muon_bad",
+    "state": "finished",
+    "created": "2026-06-27",
+    "loss": 5.2169,
+    "_step": 223
+   },
+   {
+    "name": "bibo_vanilla_muon",
+    "state": "finished",
+    "created": "2026-06-27",
+    "loss": 4.2201,
+    "_step": 223
+   },
+   {
+    "name": "bibo_vanilla",
+    "state": "finished",
+    "created": "2026-06-27",
+    "loss": 3.5087,
+    "_step": 337
+   },
+   {
+    "name": "qwen3moe",
+    "state": "crashed",
+    "created": "2026-06-27",
+    "loss": 4.4146,
+    "_step": 207
+   },
+   {
+    "name": "bibo_vanilla_conv",
+    "state": "killed",
+    "created": "2026-06-27",
+    "loss": 3.5773,
+    "_step": 284
+   },
+   {
+    "name": "bibo_vanilla_muon_mod",
+    "state": "killed",
+    "created": "2026-06-27",
+    "loss": 4.1322,
+    "_step": 169
+   },
+   {
+    "name": "bibo_vanilla_muon_mod2",
+    "state": "killed",
+    "created": "2026-06-27",
+    "loss": 5.262,
+    "_step": 66
+   },
+   {
+    "name": "bibo_vanilla_post_emb",
+    "state": "killed",
+    "created": "2026-06-27",
+    "loss": 4.654,
+    "_step": 101
+   },
+   {
+    "name": "bibo_vanilla",
+    "state": "finished",
+    "created": "2026-06-27",
+    "loss": 3.6187,
+    "_step": 337
+   },
+   {
+    "name": "bibo_full",
+    "state": "killed",
+    "created": "2026-06-27",
+    "loss": 5.3523,
+    "_step": 66
+   },
+   {
+    "name": "bibo_vanilla",
+    "state": "killed",
+    "created": "2026-06-27",
+    "loss": 7.4523,
+    "_step": 14
+   },
+   {
+    "name": "bibo_vanilla",
+    "state": "killed",
+    "created": "2026-06-27",
+    "loss": 5.7459,
+    "_step": 32
+   },
+   {
+    "name": "bibo_full",
+    "state": "finished",
+    "created": "2026-06-27",
+    "loss": 3.6722,
+    "_step": 337
+   },
+   {
+    "name": "bibo_full",
+    "state": "crashed",
+    "created": "2026-06-27",
+    "loss": 4.8943,
+    "_step": 112
+   },
+   {
+    "name": "bibo_full",
+    "state": "finished",
+    "created": "2026-06-28",
+    "loss": 3.5144,
+    "_step": 337
+   },
+   {
+    "name": "qwen3moe_base",
+    "state": "crashed",
+    "created": "2026-06-28",
+    "loss": 3.276,
+    "_step": 260
+   }
+  ]
+ },
+ "bibo-vs-qwen": {
+  "n": 8,
+  "start": "2026-05-23",
+  "end": "2026-05-23",
+  "runs": [
+   {
+    "name": "arithemtic-bibo",
+    "state": "crashed",
+    "created": "2026-05-23",
+    "_step": 609
+   },
+   {
+    "name": "arithemtic-qwen3moe",
+    "state": "crashed",
+    "created": "2026-05-23",
+    "_step": 609
+   },
+   {
+    "name": "arithemtic-qwen3moe",
+    "state": "finished",
+    "created": "2026-05-23",
+    "_step": 4776
+   },
+   {
+    "name": "arithemtic-bibo",
+    "state": "finished",
+    "created": "2026-05-23",
+    "_step": 4776
+   },
+   {
+    "name": "arithemtic-bibo",
+    "state": "finished",
+    "created": "2026-05-23",
+    "_step": 4776
+   },
+   {
+    "name": "arithemtic-qwen3moe",
+    "state": "finished",
+    "created": "2026-05-23",
+    "_step": 4776
+   },
+   {
+    "name": "arithemtic-bibo",
+    "state": "finished",
+    "created": "2026-05-23",
+    "_step": 7967
+   },
+   {
+    "name": "arithemtic-qwen3moe",
+    "state": "finished",
+    "created": "2026-05-23",
+    "_step": 7967
+   }
+  ]
+ },
+ "bibo-ablation": {
+  "n": 51,
+  "start": "2026-05-15",
+  "end": "2026-05-23",
+  "runs": [
+   {
+    "name": "qwen3moe-vs-bibo-50M",
+    "state": "killed",
+    "created": "2026-05-15"
+   },
+   {
+    "name": "qwen3moe-vs-bibo-10M",
+    "state": "killed",
+    "created": "2026-05-15"
+   },
+   {
+    "name": "qwen3moe-vs-bibo-10M",
+    "state": "killed",
+    "created": "2026-05-15",
+    "_step": 189
+   },
+   {
+    "name": "qwen3moe-vs-bibo-10M",
+    "state": "finished",
+    "created": "2026-05-15",
+    "_step": 384
+   },
+   {
+    "name": "bibo-vs-qwen3moe-kaggle-t4",
+    "state": "crashed",
+    "created": "2026-05-15",
+    "_step": 3505
+   },
+   {
+    "name": "bibo-vs-qwen3moe-2xT4",
+    "state": "crashed",
+    "created": "2026-05-15",
+    "_step": 2833
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-qwen3moe",
+    "state": "failed",
+    "created": "2026-05-15",
+    "_step": 1
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-bibo",
+    "state": "failed",
+    "created": "2026-05-15",
+    "_step": 1
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-qwen3moe",
+    "state": "crashed",
+    "created": "2026-05-15",
+    "_step": 3383
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-bibo",
+    "state": "crashed",
+    "created": "2026-05-15",
+    "_step": 3383
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-qwen3moe",
+    "state": "finished",
+    "created": "2026-05-15",
+    "_step": 5639
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-bibo",
+    "state": "finished",
+    "created": "2026-05-15",
+    "_step": 5639
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-bibo",
+    "state": "finished",
+    "created": "2026-05-16",
+    "_step": 5649
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-qwen3moe",
+    "state": "finished",
+    "created": "2026-05-16",
+    "_step": 5649
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-qwen3moe",
+    "state": "crashed",
+    "created": "2026-05-16",
+    "_step": 5790
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-bibo",
+    "state": "crashed",
+    "created": "2026-05-16",
+    "_step": 5624
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-qwen3moe",
+    "state": "crashed",
+    "created": "2026-05-16",
+    "_step": 1962
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-bibo",
+    "state": "crashed",
+    "created": "2026-05-16",
+    "_step": 1856
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-qwen3moe",
+    "state": "crashed",
+    "created": "2026-05-16"
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-qwen3moe",
+    "state": "finished",
+    "created": "2026-05-16",
+    "_step": 6260
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-bibo",
+    "state": "finished",
+    "created": "2026-05-16",
+    "_step": 6260
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-v2-bibo",
+    "state": "crashed",
+    "created": "2026-05-16",
+    "_step": 5795
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-v2-qwen3moe",
+    "state": "crashed",
+    "created": "2026-05-16",
+    "_step": 6133
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-v2-qwen3moe",
+    "state": "finished",
+    "created": "2026-05-17",
+    "_step": 4692
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-v2-bibo",
+    "state": "finished",
+    "created": "2026-05-17",
+    "_step": 4692
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-v2-qwen3moe",
+    "state": "finished",
+    "created": "2026-05-17",
+    "_step": 6262
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-v2-bibo",
+    "state": "finished",
+    "created": "2026-05-17",
+    "_step": 6262
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-v3-polyglu-bibo",
+    "state": "finished",
+    "created": "2026-05-17",
+    "_step": 4700
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-v3-polyglu-qwen3moe",
+    "state": "finished",
+    "created": "2026-05-17",
+    "_step": 4700
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-qwen3moe",
+    "state": "finished",
+    "created": "2026-05-18",
+    "_step": 4773
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-bibo",
+    "state": "finished",
+    "created": "2026-05-18",
+    "_step": 4773
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-v1-bibo",
+    "state": "finished",
+    "created": "2026-05-21",
+    "_step": 4773
+   },
+   {
+    "name": "bibo-vs-qwen3moe-sort-v1-qwen3moe",
+    "state": "finished",
+    "created": "2026-05-21",
+    "_step": 4773
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-bibo",
+    "state": "crashed",
+    "created": "2026-05-22",
+    "_step": 2136
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-qwen3moe",
+    "state": "crashed",
+    "created": "2026-05-22",
+    "_step": 2138
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-qwen3moe",
+    "state": "crashed",
+    "created": "2026-05-22",
+    "_step": 1830
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-bibo",
+    "state": "crashed",
+    "created": "2026-05-22",
+    "_step": 1830
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-qwen3moe",
+    "state": "finished",
+    "created": "2026-05-22",
+    "_step": 4776
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-bibo",
+    "state": "finished",
+    "created": "2026-05-22",
+    "_step": 4776
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-bibo",
+    "state": "crashed",
+    "created": "2026-05-23",
+    "_step": 3677
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-qwen3moe",
+    "state": "crashed",
+    "created": "2026-05-23",
+    "_step": 3882
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-qwen3moe",
+    "state": "finished",
+    "created": "2026-05-23",
+    "_step": 4776
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-bibo",
+    "state": "finished",
+    "created": "2026-05-23",
+    "_step": 4776
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-qwen3moe",
+    "state": "crashed",
+    "created": "2026-05-23",
+    "_step": 4278
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-bibo",
+    "state": "crashed",
+    "created": "2026-05-23",
+    "_step": 4099
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-bibo",
+    "state": "crashed",
+    "created": "2026-05-23",
+    "_step": 2613
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-qwen3moe",
+    "state": "crashed",
+    "created": "2026-05-23",
+    "_step": 2547
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-qwen3moe",
+    "state": "failed",
+    "created": "2026-05-23"
+   },
+   {
+    "name": "bibo-vs-qwen3moe-arithmetic-v1-qwen3moe",
+    "state": "crashed",
+    "created": "2026-05-23"
+   },
+   {
+    "name": "arith-v2-qwen3moe",
+    "state": "crashed",
+    "created": "2026-05-23",
+    "_step": 254
+   },
+   {
+    "name": "arith-v2-bibo",
+    "state": "crashed",
+    "created": "2026-05-23",
+    "_step": 247
+   }
+  ]
+ },
+ "bibo-long-context": {
+  "n": 2,
+  "start": "2026-05-04",
+  "end": "2026-05-04",
+  "runs": [
+   {
+    "name": "bibo_vs_qwen_1777925782",
+    "state": "failed",
+    "created": "2026-05-04",
+    "_step": 1899
+   },
+   {
+    "name": "validation-comparison",
+    "state": "finished",
+    "created": "2026-05-04",
+    "_step": 4
+   }
+  ]
+ },
+ "bibo-benchmark": {
+  "n": 6,
+  "start": "2026-05-03",
+  "end": "2026-05-04",
+  "runs": [
+   {
+    "name": "bibo_vs_qwen3moe_1777839576",
+    "state": "finished",
+    "created": "2026-05-03",
+    "_step": 400
+   },
+   {
+    "name": "bibo_vs_qwen3moe_1777840205",
+    "state": "failed",
+    "created": "2026-05-03"
+   },
+   {
+    "name": "bibo_vs_qwen3moe_1777840457",
+    "state": "killed",
+    "created": "2026-05-03",
+    "_step": 23
+   },
+   {
+    "name": "bibo_vs_qwen3moe_1777841561",
+    "state": "finished",
+    "created": "2026-05-03",
+    "_step": 1000
+   },
+   {
+    "name": "bibo_vs_qwen3moe_1777846208",
+    "state": "finished",
+    "created": "2026-05-03",
+    "_step": 1200
+   },
+   {
+    "name": "bibo_vs_qwen3moe_1777910532",
+    "state": "finished",
+    "created": "2026-05-04",
+    "_step": 1200
+   }
+  ]
+ },
+ "8bit-test": {
+  "n": 7,
+  "start": "2026-05-01",
+  "end": "2026-05-01",
+  "runs": [
+   {
+    "name": "helpful-cosmos-5",
+    "state": "finished",
+    "created": "2026-05-01"
+   },
+   {
+    "name": "likely-oath-6",
+    "state": "finished",
+    "created": "2026-05-01"
+   },
+   {
+    "name": "lucky-eon-7",
+    "state": "finished",
+    "created": "2026-05-01"
+   },
+   {
+    "name": "feasible-fog-8",
+    "state": "finished",
+    "created": "2026-05-01"
+   },
+   {
+    "name": "earthy-breeze-9",
+    "state": "finished",
+    "created": "2026-05-01"
+   },
+   {
+    "name": "soft-eon-10",
+    "state": "finished",
+    "created": "2026-05-01"
+   },
+   {
+    "name": "olive-music-11",
+    "state": "crashed",
+    "created": "2026-05-01",
+    "_step": 29
+   }
+  ]
+ }
+}

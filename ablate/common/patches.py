@@ -45,7 +45,7 @@ def patch_liger_rope():
         return LigerRopeFunction.apply(q, k, cos[:1], sin[:1], None, unsqueeze_dim)
     import src.modeling.attn.base as bibo_attn_base
     import baseline.qwen3moe.modeling as qwen_mod
-    bibo_attn_base.apply_rotary_pos_emb = _nc(_liger_rope)   # bibo calls it on the rope_dim slice
+    bibo_attn_base.apply_rotary_pos_emb = _nc(_liger_rope)   # windowed layers only; globals are NoPE
     qwen_mod.apply_rotary_pos_emb = _nc(_liger_rope)          # qwen calls it on full head_dim
 
 
@@ -69,6 +69,78 @@ POS_IDENTITY_CODE = 3
 NEG_IDENTITY_CODE = 4
 
 
+_neg_identity_checked = []
+
+
+def _assert_kernel_does_neg_identity(device, dtype):
+    """One-time probe: does THIS kernel build implement act code 4 as -Identity (-w*x), or is it
+    still the old ZERO expert (contribute nothing)?
+
+    triton-kernel-fused is a separate repo on a separate checkout. A box that cloned it before
+    Jul 26 2026 answers 'zero', and then every token routed to a -Identity expert is silently
+    DROPPED instead of subtracted. No exception, no shape error, no warning: just a quietly wrong
+    model and a wasted run. Version strings can't catch it -- only asking the kernel does."""
+    from kernels.sm120.moe import moe_per_expert as moe_fused
+    H, I = 8, 2
+    x = torch.ones(1, H, device=device, dtype=dtype)
+    gu = torch.zeros(1, 2 * I, H, device=device, dtype=dtype)   # 1 dummy GLU slot, never routed
+    dn = torch.zeros(1, H, I, device=device, dtype=dtype)
+    codes = torch.tensor([0, NEG_IDENTITY_CODE], dtype=torch.int32, device=device)
+    out = moe_fused(x, torch.tensor([[1]], device=device),
+                    torch.ones(1, 1, device=device, dtype=dtype), gu, dn, codes)
+    if torch.allclose(out.float(), -x.float(), atol=1e-3):
+        return
+    import kernels
+    raise RuntimeError(
+        f"kernel act code 4 is NOT -Identity: routing w=1 through it gave {out.flatten()[:4].tolist()} "
+        f"(expected all -1). This kernel still implements code 4 as the ZERO expert, so every "
+        f"-Identity token would be silently dropped instead of subtracted.\n"
+        f"  kernels package: {getattr(kernels, '__file__', '?')}\n"
+        f"  Fix: update the triton-kernel-fused checkout (needs commit 46727c8 or later, on "
+        f"master), or run with --no_neg_identity / --special_pairs 0.")
+
+
+def _expert_codes(experts, device, dtype):
+    """Per-expert-id act codes, cached on the module. SHARED by the 'moe' and 'megakernel' patches
+    on purpose: two copies of this mapping would be free to drift, and a stack where the two paths
+    disagree about what an expert computes fails as a quality result rather than an error."""
+    codes = getattr(experts, "_act_codes", None)
+    if codes is not None and codes.device == device:
+        return codes
+    n_neg = experts.neg_end - experts.neg_start
+    if n_neg and not _neg_identity_checked:
+        _assert_kernel_does_neg_identity(device, dtype)
+        _neg_identity_checked.append(True)
+        print("[moe] kernel probe: act code 4 == -Identity (-w*x) OK", flush=True)
+    glu_code = SILU_CODE if EXPERT_ACT == "silu" else RADIAL_CODES[RADIAL_P]
+    lst = ([glu_code] * experts.num_glu_experts
+           + [POS_IDENTITY_CODE] * (experts.pos_end - experts.pos_start)
+           + [NEG_IDENTITY_CODE] * n_neg)
+    codes = torch.tensor(lst, dtype=torch.int32, device=device)
+    experts._act_codes = codes
+    return codes
+
+
+def _act_params(experts):
+    """radial_theta is the exponent LOGIT, and the kernel reads it from act_params column 0.
+    It is not optional -- code 8 raises without it (see parity_check/parity_radial.py).
+    act_params rows are indexed by EXPERT ID, so the ±Identity specials need rows too even
+    though nothing reads them: radial_theta is only (num_glu,). Passing the short tensor makes
+    backward hand autograd a gradient of the wrong shape, several frames from the cause.
+
+    act code 0 does not read act_params. Returning None rather than the tensor makes that
+    explicit: radial_theta then provably cannot reach the kernel, so it takes no gradient and
+    `p` stays pinned at its init in the log -- a live check that the --act silu arm really is
+    SiLU and not radial wearing a different tag."""
+    if EXPERT_ACT == "silu":
+        return None
+    ap = experts.radial_theta
+    n_pad = experts.neg_end - experts.num_glu_experts
+    if n_pad:
+        ap = torch.cat([ap, ap.new_zeros(n_pad)])
+    return ap.unsqueeze(1)
+
+
 def patch_fused_moe():
     from kernels.sm120.moe import moe_per_expert as moe_fused
     from kernels.sm75.moe import _code_max
@@ -82,65 +154,9 @@ def patch_fused_moe():
     # on a stack with no GLU experts -- kept for the A/B, not expected to fire.
     _DISPATCH = os.environ.get("BIBO_MOE_DISPATCH", "per_expert")
 
-    _neg_identity_checked = []
-
-    def _assert_kernel_does_neg_identity(device, dtype):
-        """One-time probe: does THIS kernel build implement act code 4 as -Identity (-w*x), or is it
-        still the old ZERO expert (contribute nothing)?
-
-        triton-kernel-fused is a separate repo on a separate checkout. A box that cloned it before
-        Jul 26 2026 answers 'zero', and then every token routed to a -Identity expert is silently
-        DROPPED instead of subtracted. No exception, no shape error, no warning: just a quietly wrong
-        model and a wasted run. Version strings can't catch it -- only asking the kernel does."""
-        H, I = 8, 2
-        x = torch.ones(1, H, device=device, dtype=dtype)
-        gu = torch.zeros(1, 2 * I, H, device=device, dtype=dtype)   # 1 dummy GLU slot, never routed
-        dn = torch.zeros(1, H, I, device=device, dtype=dtype)
-        codes = torch.tensor([0, NEG_IDENTITY_CODE], dtype=torch.int32, device=device)
-        out = moe_fused(x, torch.tensor([[1]], device=device),
-                        torch.ones(1, 1, device=device, dtype=dtype), gu, dn, codes)
-        if torch.allclose(out.float(), -x.float(), atol=1e-3):
-            return
-        import kernels
-        raise RuntimeError(
-            f"kernel act code 4 is NOT -Identity: routing w=1 through it gave {out.flatten()[:4].tolist()} "
-            f"(expected all -1). This kernel still implements code 4 as the ZERO expert, so every "
-            f"-Identity token would be silently dropped instead of subtracted.\n"
-            f"  kernels package: {getattr(kernels, '__file__', '?')}\n"
-            f"  Fix: update the triton-kernel-fused checkout (needs commit 46727c8 or later, on "
-            f"master), or run with --no_neg_identity / --special_pairs 0.")
-
     def _bibo_moe(self, hidden_states, top_k_indices, top_k_weights):
-        codes = getattr(self, "_act_codes", None)
-        if codes is None or codes.device != hidden_states.device:
-            n_neg = self.neg_end - self.neg_start
-            if n_neg and not _neg_identity_checked:
-                _assert_kernel_does_neg_identity(hidden_states.device, hidden_states.dtype)
-                _neg_identity_checked.append(True)
-                print("[moe] kernel probe: act code 4 == -Identity (-w*x) OK", flush=True)
-            _glu_code = SILU_CODE if EXPERT_ACT == "silu" else RADIAL_CODES[RADIAL_P]
-            lst = ([_glu_code] * self.num_glu_experts
-                   + [POS_IDENTITY_CODE] * (self.pos_end - self.pos_start)
-                   + [NEG_IDENTITY_CODE] * n_neg)
-            codes = torch.tensor(lst, dtype=torch.int32, device=hidden_states.device)
-            self._act_codes = codes
-        # radial_theta is the exponent LOGIT, and the kernel reads it from act_params column 0.
-        # It is not optional -- code 8 raises without it (see parity_check/parity_radial.py).
-        # act_params rows are indexed by EXPERT ID, so the ±Identity specials need rows too even
-        # though nothing reads them: radial_theta is only (num_glu,). Passing the short tensor makes
-        # backward hand autograd a gradient of the wrong shape, several frames from the cause.
-        # act code 0 does not read act_params. Passing None rather than the tensor makes that
-        # explicit: radial_theta then provably cannot reach the kernel, so it takes no gradient and
-        # `p` stays pinned at its init in the log -- a live check that the --act silu arm really is
-        # SiLU and not radial wearing a different tag.
-        if EXPERT_ACT == "silu":
-            ap = None
-        else:
-            n_pad = self.neg_end - self.num_glu_experts
-            ap = self.radial_theta
-            if n_pad:
-                ap = torch.cat([ap, ap.new_zeros(n_pad)])
-            ap = ap.unsqueeze(1)
+        codes = _expert_codes(self, hidden_states.device, hidden_states.dtype)
+        ap = _act_params(self)
         if _DISPATCH != "per_expert" and _code_max(codes) <= 4:
             from kernels.sm120.moe_grouped import moe_grouped_cublas_polyglu, grouped_supported
             if grouped_supported(hidden_states, self.gate_up_proj, self.down_proj):
@@ -162,6 +178,144 @@ def patch_fused_moe():
     from baseline.qwen3moe.modeling import Qwen3MoeExperts
     BiBoFusedExperts.forward = _nc(_bibo_moe)
     Qwen3MoeExperts.forward = _nc(_qwen_moe)
+
+
+# ───────────────────────── megakernel: norm + router + experts ─────────────────────────
+def patch_megakernel():
+    """Replace post_attention_layernorm + router + experts with ONE fused block on MoE layers.
+
+    The seam is BiBoDecoderLayer._ffn_forward, NOT BiBoFusedExperts.forward, because the megakernel
+    eats the NORM and the norm lives on the decoder layer one level above the MoE module. Both
+    branches of BiBoDecoderLayer.forward (checkpointed and not) route through _ffn_forward, so this
+    is the only place that needs patching.
+
+    Dense layers (config.mlp_only_layers, 0 and 9 on the board config) fall through untouched.
+
+    This SUPERSEDES 'moe' on MoE layers: the fused block calls moe_per_expert itself, so a run with
+    both patches simply leaves BiBoFusedExperts.forward patched and never calls it.
+
+    All router diagnostics are preserved (top1w / rent / bal / gap) by replaying the hooks of the
+    two modules this path bypasses -- see the comment at the call site.
+    """
+    from kernels.sm120.megakernel.moe.block import megakernel_block
+    from src.modeling.layers import BiBoDecoderLayer
+
+    _orig = getattr(BiBoDecoderLayer, "_orig_ffn_forward", None) or BiBoDecoderLayer._ffn_forward
+    BiBoDecoderLayer._orig_ffn_forward = _orig
+
+    def _unsupported(moe):
+        """Why this layer cannot take the fused path, or None. Checked per layer because the
+        megakernel is now the DEFAULT patch: a config it cannot express must fall back to the
+        original block, not crash the run. The fallback is ANNOUNCED, never silent -- a quietly
+        disabled kernel is how a 'speedup' gets attributed to the wrong thing."""
+        if moe.use_shared_expert:
+            # a shared expert consumes the NORMED hidden, which the fused block computes
+            # internally and never returns
+            return "shared experts"
+        if not moe.gate.norm_topk_prob or moe.gate.norm_topk_prob == "softmax":
+            # the fused router hardcodes sum-norm; softmax would be silently renormalised
+            return f"norm_topk_prob={moe.gate.norm_topk_prob!r} (fused router is sum-norm only)"
+        return None
+
+    _announced = []
+
+    def _use_mk(layer):
+        """Can this layer take the fused path? Announces the decision ONCE, either way.
+
+        The caller decides what to fall back TO -- src's layer adds a residual and casts, the
+        AttnRes layer does not, so a fallback inside _mk_mlp would return the wrong thing for one
+        of them."""
+        if not layer.is_moe_layer:
+            return False
+        why = _unsupported(layer.mlp)
+        if not _announced:
+            _announced.append(True)
+            print(f"[megakernel] DISABLED -- {why}; falling back to the eager norm+router+experts"
+                  f" block" if why else
+                  "[megakernel] ENGAGED on MoE layers (fused norm + router + experts)", flush=True)
+        return why is None
+
+    def _mk_mlp(self, hidden_states):
+        """norm + router + experts, fused. Returns the MoE output ONLY -- the residual add and any
+        dtype casts belong to the caller, because the stable and AttnRes layers do them
+        differently. Callers must gate on _use_mk() first."""
+        moe = self.mlp
+        b, s, h = hidden_states.shape
+        # gate_proj is nn.Linear(H, E) so .weight is [E,H]; the kernel takes [H,E] and reads it with
+        # no stride arguments, so a transposed VIEW would be silently misread -- .contiguous() is
+        # load-bearing, not tidiness. 512x64 elements, so the copy is free.
+        w = {"nw": self.post_attention_layernorm.weight,
+             "rw": moe.gate.gate_proj.weight.t().contiguous(),
+             "bias": moe.gate.bias,
+             "gu": moe.experts.gate_up_proj, "dn": moe.experts.down_proj}
+        flat = hidden_states.reshape(b * s, h)
+        # RouterTrace sets _probe_gap on the router when it wants the boundary gap; the fused
+        # kernel only pays for it when asked
+        want_gap = bool(getattr(moe.gate, "_probe_gap", False))
+        out, idx, wgt, gap = megakernel_block(
+            flat, w, _expert_codes(moe.experts, hidden_states.device, hidden_states.dtype),
+            top_k=moe.gate.top_k, eps=self.post_attention_layernorm.variance_epsilon,
+            act_params=_act_params(moe.experts), return_routing=True, want_gap=want_gap)
+        # The diagnostics hang off TWO modules this path no longer calls, so both sets of hooks
+        # have to be replayed or the log line silently goes blank while the model stays correct:
+        #   BiBoFusedExperts forward PRE-hook -> top1w, rent, bal   (MoEStats + RouterTrace)
+        #   BiBoMoERouter    forward hook     -> gap                (RouterTrace, reads .boundary_gap)
+        # `bal` is how expert collapse gets noticed, so losing it quietly is the expensive failure.
+        for _h in moe.experts._forward_pre_hooks.values():
+            _h(moe.experts, (flat, idx.long(), wgt))
+        if gap is not None:
+            moe.gate.boundary_gap = gap.mean()
+        for _h in moe.gate._forward_hooks.values():
+            _h(moe.gate, (hidden_states,), (idx.view(b, s, -1).long(), wgt.view(b, s, -1).float()))
+        # the balancing bias is driven from these indices and mutated by .add_() outside the
+        # optimizer; it must fire exactly once per forward, exactly as BiBoMoELayer.forward does it
+        if moe.training and moe.bias_update_factor > 0:
+            tpe = moe._balance_step(idx.view(b, s, -1).long(), b * s)
+            if tpe is not None:
+                moe.update_bias(tpe)
+        return out.view(b, s, h)
+
+    def _ffn(self, hidden_states):
+        """src's stable layer: residual + bf16 casts around the fused block."""
+        if not _use_mk(self):
+            return _orig(self, hidden_states)
+        out = _mk_mlp(self, hidden_states)
+        if self._bf16_moe_out:
+            out = out.to(torch.bfloat16)
+        hidden_states = hidden_states + out
+        if self._bf16_stream:
+            hidden_states = hidden_states.to(torch.bfloat16)
+        return hidden_states
+
+    BiBoDecoderLayer._ffn_forward = _nc(_ffn)
+
+    # exp/modeling_bibo defines its OWN BiBoDecoderLayer, and build_arm switches to it whenever
+    # attn_res != "off". Patching only src's class meant an AttnRes run silently got the eager
+    # norm+router -- no error, and not even the ENGAGED line, because the method was never called.
+    # That would have made every AttnRes arm non-comparable to a megakernel baseline.
+    try:
+        from exp.modeling_bibo import BiBoDecoderLayer as _ExpLayer
+    except Exception:
+        _ExpLayer = None
+    if _ExpLayer is not None and _ExpLayer is not BiBoDecoderLayer:
+        _exp_std = getattr(_ExpLayer, "_orig_std_ffn", None) or _ExpLayer._standard_ffn_forward
+        _exp_ar = getattr(_ExpLayer, "_orig_ar_mlp", None) or _ExpLayer._attn_res_mlp_forward
+        _ExpLayer._orig_std_ffn = _exp_std
+        _ExpLayer._orig_ar_mlp = _exp_ar
+
+        def _exp_standard(self, hidden_states):
+            if not _use_mk(self):
+                return _exp_std(self, hidden_states)
+            return hidden_states + _mk_mlp(self, hidden_states)
+
+        def _exp_attn_res(self, hidden_states):
+            # NO residual here: the AttnRes path adds its own depth-mixed residual downstream
+            if not _use_mk(self):
+                return _exp_ar(self, hidden_states)
+            return _mk_mlp(self, hidden_states)
+
+        _ExpLayer._standard_ffn_forward = _nc(_exp_standard)
+        _ExpLayer._attn_res_mlp_forward = _nc(_exp_attn_res)
 
 
 # ───────────────────────── fused XSA (BiBo only) ─────────────────────────
@@ -246,11 +400,12 @@ def patch_bibo_flash():
 
 
 _APPLY = {"liger_norm": patch_liger_norm, "liger_rope": patch_liger_rope, "moe": patch_fused_moe,
-          "xsa": patch_fused_xsa}
+          "xsa": patch_fused_xsa, "megakernel": patch_megakernel}
 
 
 def apply(components):
-    """components: subset of {'liger_norm','liger_rope','moe','xsa'} ('ce' lives in the loop)."""
+    """components: subset of {'liger_norm','liger_rope','moe','xsa','megakernel'} ('ce' lives in
+    the loop)."""
     done = []
     for c in components:
         if c == "ce":

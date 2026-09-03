@@ -5,8 +5,8 @@ The `from_pretrained` tests here are REGRESSION GUARDS for two severe bugs fixed
   1. Raw `param.data.normal_()` writes ignored the `_is_hf_initialized` flag that transformers >=5
      uses to protect loaded weights -> 25 of 54 tensors were re-randomized on every load.
   2. No `RotaryEmbedding` branch, so the `persistent=False` inv_freq buffers came back as
-     uninitialized memory. With `original_inv_freq` zeroed, dynamic-NTK returns zeros in-window,
-     cos=1/sin=0, and RoPE degenerates to the identity -> the model loses positional encoding.
+     uninitialized memory. With `inv_freq` zeroed, cos=1/sin=0 and RoPE degenerates to the
+     identity -> the model silently loses positional encoding.
 If either of these regresses, the tests below fail loudly instead of silently ruining checkpoints.
 """
 import os
@@ -140,8 +140,8 @@ def test_from_pretrained_rebuilds_non_persistent_buffers():
         d = (before[k].float() - after[k].float()).abs().max().item()
         assert d == 0, f"buffer {k} differs after load by {d:.3e}"
     r = reloaded.model.rotary_emb
-    assert r.original_inv_freq.abs().max() > 0, "zeroed inv_freq => cos=1/sin=0 => RoPE is a no-op"
-    assert r.original_inv_freq.flatten()[0].item() == 1.0
+    assert r.inv_freq.abs().max() > 0, "zeroed inv_freq => cos=1/sin=0 => RoPE is a no-op"
+    assert r.inv_freq.flatten()[0].item() == 1.0
 
 
 def test_save_load_round_trip_is_logit_exact():

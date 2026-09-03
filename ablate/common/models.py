@@ -1,5 +1,7 @@
 """Model builder + param counter for the ablation. Swappable: build_arm(name) is the only entry."""
 from . import _paths  # noqa: F401
+import re
+
 import torch
 from .configs import ARMS, SHARED, glu_count, make_qwen_config, make_bibo_min_config
 from . import patches
@@ -7,13 +9,24 @@ from . import patches
 
 def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
               bias_update_threshold=10240, bias_update_factor=None, aux_coef=0.001,
-              num_experts=None, special_pairs=0,
+              num_experts=None, special_pairs=0, mlp_only_layers=None,
+              moe_overrides=None,
+              intermediate_size=None,
               use_xsa=False, xsa_alpha_init=0.0,
               pos_identity_expert=True, neg_identity_expert=True,
               top_k=None, moe_intermediate_size=None, num_shared_experts=0,
               hybrid_layer_pattern=None, sliding_window=128,
-              swa_qk_norm=True, attn_res="off", attn_res_sites=2,
-              attn_res_carry=False, use_typed_attn_res=False,
+              swa_qk_norm=True, rope_theta=None,
+              attn_res="off", attn_res_sites=2,
+              attn_res_carry=False, attn_res_fp32_stream=False,
+              attn_res_carry_scale="none", attn_res_emb_term=False, attn_res_emb_scale="none",
+              attn_res_emb_site="mlp", attn_res_emb_gain=False, attn_res_score="softmax",
+              attn_res_topk=0,
+              num_pos_identity_experts=None, num_neg_identity_experts=None,
+              attn_res_carry_per_dim=False, attn_res_carry_gate="none",
+              attn_res_emb_per_dim=False,
+              bf16_residual_stream=False, bf16_moe_out=False,
+              use_typed_attn_res=False,
               typed_attn_res_long_memory=True,
               typed_attn_res_extra_init=0.01,
               use_typed_attn_res_fast_slow_memory=False,
@@ -40,7 +53,8 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
                          f"{n_glu} GLU experts; raise --experts or lower --special_pairs")
     if arm == "qwen":
         from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
-        cfg = make_qwen_config(eff, aux_coef=aux_coef, num_experts=n_glu)
+        cfg = make_qwen_config(eff, aux_coef=aux_coef, num_experts=n_glu,
+                               mlp_only_layers=mlp_only_layers)
         model = Qwen3MoeForCausalLM(cfg)
     elif arm == "bibo_min":
         # exp/ reimplements only the residual topology (decoder layer + trunk); it imports
@@ -53,6 +67,10 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
             from exp.modeling_bibo import BiBoForCausalLM
         cfg = make_bibo_min_config(bias_update_threshold, bias_update_factor,
                                    num_experts=n_total, special_pairs=special_pairs,
+                                   mlp_only_layers=mlp_only_layers,
+                                   moe_overrides=moe_overrides,
+                                   intermediate_size=intermediate_size,
+                                   rope_theta=rope_theta,
                                    use_xsa=use_xsa,
                                    xsa_alpha_init=xsa_alpha_init,
                                    pos_identity_expert=pos_identity_expert,
@@ -71,13 +89,31 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
                                    typed_attn_res_fast_decay_init=typed_attn_res_fast_decay_init,
                                    typed_attn_res_slow_decay_init=typed_attn_res_slow_decay_init,
                                    use_typed_attn_res_innovation_write=use_typed_attn_res_innovation_write,
-                                   typed_attn_res_innovation_init=typed_attn_res_innovation_init)
+                                   typed_attn_res_innovation_init=typed_attn_res_innovation_init,
+                                   attn_res_fp32_stream=attn_res_fp32_stream,
+                                   attn_res_carry_scale=attn_res_carry_scale,
+                                   attn_res_emb_term=attn_res_emb_term,
+                                   attn_res_emb_scale=attn_res_emb_scale,
+                                   attn_res_emb_site=attn_res_emb_site,
+                                   attn_res_emb_gain=attn_res_emb_gain,
+                                   attn_res_score=attn_res_score,
+                                   attn_res_topk=attn_res_topk,
+                                   num_pos_identity_experts=num_pos_identity_experts,
+                                   num_neg_identity_experts=num_neg_identity_experts,
+                                   attn_res_carry_per_dim=attn_res_carry_per_dim,
+                                   attn_res_carry_gate=attn_res_carry_gate,
+                                   attn_res_emb_per_dim=attn_res_emb_per_dim,
+                                   bf16_residual_stream=bf16_residual_stream,
+                                   bf16_moe_out=bf16_moe_out)
         model = BiBoForCausalLM(cfg)
         if eff.startswith("flash"):
             patches.patch_bibo_flash()
     else:
         raise ValueError(f"unknown arm {arm!r}; valid: {list(ARMS)}")
     return model.to(device=device, dtype=dtype), cfg
+
+
+_LAYER_IDX = re.compile(r"layers\.(\d+)\.")
 
 
 def count_params(model, top_k=None, num_experts=None):
@@ -94,6 +130,7 @@ def count_params(model, top_k=None, num_experts=None):
     cfg = getattr(model, "config", None)
     top_k = top_k or getattr(cfg, "num_experts_per_tok", None) or SHARED["num_experts_per_tok"]
     num_experts = num_experts or SHARED["num_experts"]
+    _over = getattr(cfg, "moe_overrides", None) or {}
     total = trainable = inactive = 0
     for n, p in model.named_parameters():
         total += p.numel()
@@ -101,5 +138,10 @@ def count_params(model, top_k=None, num_experts=None):
             trainable += p.numel()
         if p.ndim == 3 and ("expert" in n or "gate_up_proj" in n or "down_proj" in n):
             e = p.shape[0]
-            inactive += int(p.numel() * (1.0 - top_k / e))
+            # A layer with a moe_overrides entry routes to its OWN top_k. Using the global one
+            # here reports a layer that is coarser-but-narrower as +5.8% active when it is in
+            # fact matched, which would sink the very arm the override exists to run.
+            _m = _LAYER_IDX.search(n)
+            _k = _over.get(int(_m.group(1)), {}).get("num_experts_per_tok", top_k) if _m else top_k
+            inactive += int(p.numel() * (1.0 - _k / e))
     return total, trainable, total - inactive

@@ -58,10 +58,11 @@ _KJ, _PIN = (3.4445, -4.7750, 2.0315), (2.0, -1.5, 0.5)
 NS8 = (_KJ,) * 6 + (_PIN,) * 2
 
 
-def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, ns_dtype=torch.bfloat16,
+def build_optimizers(model, muon_lr=1e-2, adam_lr=3e-4, wd=0.1, momentum=0.95, ns_dtype=torch.bfloat16,
                      scale_mode="aurora", xorth_post=0.0, xorth_gate_ref=0.3, xorth_ema=0.95,
                      xorth_warmup_steps=0, xorth_where="post", router_adamw=False,
-                     act_scale_lr=None, cautious_decay=False,
+                     act_scale_lr=None, cautious_decay=False, vec_matrices_adamw=False,
+                     vec_adamw_group="default",
                      optim="muon", probe_gamma=0.0, probe_rho_step=0.96, probe_rank=0):
     from kernels.sm120.muon import FusedMuon   # Blackwell: gram-NS (self-gates to symmul/cuBLAS on small mats) + 8M knee
     stacks, mats, other = [], [], []
@@ -103,6 +104,14 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
             other.append((n, p))            # -> AdamW (ablation: router off Muon)
         elif "embed" in n or p.ndim not in (2, 3):
             other.append((n, p))            # -> AdamW (1D norms/biases, embeddings)
+        elif vec_matrices_adamw and p.ndim == 2 and 1 in p.shape:
+            # A (1, H) parameter is a VECTOR wearing a matrix shape -- AttnRes's pseudo-queries
+            # are nn.Linear(hidden, 1). The ndim rule catches them by accident: Muon's convention
+            # is 2D HIDDEN-LAYER MATRICES, with embeddings/heads/norms/biases on AdamW. For a
+            # (1,H) the spectral norm IS the L2 norm, so Newton-Schulz returns the unit-normalised
+            # row -- a fixed-L2-norm update every step regardless of gradient magnitude. Not
+            # degenerate, but a very different dynamic from AdamW, and not one we chose.
+            other.append((n, p))
         elif p.ndim == 3:
             stacks.append(p)                # 3D MoE expert stacks -> the xorth (cross-expert whitening) target
         else:
@@ -155,7 +164,18 @@ def build_optimizers(model, muon_lr=3e-4, adam_lr=3e-4, wd=0.1, momentum=0.95, n
     # ramp runs p 0.11 -> 0.93, i.e. theta from about -2.1 to +2.6. AdamW at adam_lr=5e-4 moves it
     # ~0.5 over 2000 steps, so it needs its own group and its own lr. wd=0: decay on an exponent
     # would just re-impose the lr/wd equilibrium this axis exists to escape.
-    _is_as = lambda n: "radial_theta" in n or "xsa_alpha" in n
+    # vec_adamw_group="act": the AttnRes pseudo-queries get lr=act_scale_lr, wd=0 instead of the
+    # default AdamW group. This is an LR PROBE on those 11 vectors, nothing more -- measured
+    # per-neuron step is 0.0027 in the default group vs 0.054 here vs 0.0449 under Muon, so "act"
+    # brackets Muon from above and "default" from below. wd=0 is the substantive half: with
+    # score_weight = norm.weight * proj.weight (apply_attention_residual, modeling_bibo.py:106),
+    # ||score_weight|| IS the softmax temperature over blocks, and decay pins it to an lr/wd
+    # equilibrium instead of the loss. Caveat: norm.weight is 1D and stays in the DEFAULT group, so
+    # "act" splits the two factors of that product across two lrs -- "default" keeps them together.
+    _is_as = lambda n: ("radial_theta" in n or "xsa_alpha" in n
+                        or "attn_res_carry_theta" in n or "attn_res_emb_theta" in n
+                        or "attn_res_emb_gain" in n
+                        or (vec_adamw_group == "act" and "res_proj" in n))
     _is_typed_read = lambda n: (
         "_res_type_controller" in n
         or "_res_type_bias" in n

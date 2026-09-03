@@ -54,14 +54,12 @@ class BiBoPreTrainedModel(PreTrainedModel):
         elif isinstance(module, BiBoRMSNorm):
             hf_init.ones_(module.weight)                 # Qwen3 parity; needed on meta-init
         elif isinstance(module, BiBoRotaryEmbedding):
-            # inv_freq/original_inv_freq are persistent=False, so they are NOT in the checkpoint and
-            # from_pretrained's lazy/meta path never runs __init__'s computation for them. Without
-            # this branch they come back as uninitialized memory — and since dynamic-NTK returns
-            # original_inv_freq in-window, a zeroed buffer means cos=1/sin=0, i.e. RoPE silently
-            # becomes the identity on every loaded checkpoint. (Stock Llama does the same thing.)
-            freqs = module._compute_inv_freq(module.base, module.inv_freq.device)
-            hf_init.copy_(module.inv_freq, freqs)
-            hf_init.copy_(module.original_inv_freq, freqs)
+            # inv_freq is persistent=False, so it is NOT in the checkpoint and from_pretrained's
+            # lazy/meta path never runs __init__'s computation for it. Without this branch it comes
+            # back as uninitialized memory, and a zeroed buffer means cos=1/sin=0, i.e. RoPE
+            # silently becomes the identity on every loaded checkpoint. (Stock Llama does the same.)
+            # `original_inv_freq` is gone with dynamic-NTK; there is one buffer now.
+            hf_init.copy_(module.inv_freq, module._compute_inv_freq(module.inv_freq.device))
 
 
 class BiBoModel(BiBoPreTrainedModel):
@@ -80,14 +78,8 @@ class BiBoModel(BiBoPreTrainedModel):
         # unchanged otherwise. self.norm (pre-LM-head) is always present either way.
         self.embed_norm = (BiBoRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
                            if getattr(config, "exp_post_embed_norm", False) else None)
-        # rope_dim, NOT head_dim — cos/sin cover only the rotated slice of each head.
-        self.rotary_emb = BiBoRotaryEmbedding(
-            config.rope_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-            rope_type=config.rope_scaling["type"],
-            scaling_factor=config.rope_scaling.get("factor", 1.0),
-        )
+        # ONE rotary, full head_dim, used by the windowed layers only (global layers are NoPE).
+        self.rotary_emb = BiBoRotaryEmbedding(config.head_dim, base=config.rope_theta)
         self.gradient_checkpointing = False
         self.post_init()
 
@@ -166,10 +158,16 @@ class BiBoModel(BiBoPreTrainedModel):
         hidden_states = inputs_embeds
         if self.embed_norm is not None:
             hidden_states = self.embed_norm(hidden_states)
+        # BF16 RESIDUAL STREAM. Without this the stream is fp32 for a subtle reason: weights
+        # are fp32 master and nn.Embedding is NOT autocast, so inputs_embeds arrives fp32 and
+        # every `residual + attn_out` promotes the bf16 sublayer output back up. One cast here
+        # keeps the whole stream bf16, which is what modded-nanogpt does. Master weights and
+        # optimizer state are untouched.
+        if getattr(self.config, 'bf16_residual_stream', False):
+            hidden_states = hidden_states.to(torch.bfloat16)
 
         # seq_len as a host int keeps the dynamic-NTK path free of a per-step GPU sync / graph break.
-        position_embeddings = self.rotary_emb(
-            hidden_states, position_ids, seq_len=past_seen_tokens + seq_length)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None

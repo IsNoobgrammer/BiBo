@@ -29,21 +29,28 @@ class BiBoConfig(PretrainedConfig):
         hybrid_layer_pattern=None,
         sliding_window=128,
         swa_qk_norm=True,
-        rope_theta=None,
-        rope_scaling=None,
-        partial_rotary_factor=0.334,
+        rope_theta=None,                     # base for the WINDOWED layers; global layers are NoPE
         pad_token_id=None,
         bos_token_id=0,
         eos_token_id=0,
         tie_word_embeddings=True,
         use_cache=True,
         mlp_only_layers=None,
+        moe_overrides=None,
         moe_intermediate_size=None,
         num_experts_per_tok=6,
         num_routed_experts=6,
         special_expert_pairs=1,
         pos_identity_expert=True,
         neg_identity_expert=True,
+        # ASYMMETRIC override. `special_expert_pairs` is a per-type count applied to BOTH signs,
+        # so it can only express n(+Identity) == n(-Identity). These let the two differ -- e.g.
+        # 6 positive and 2 negative, to test whether signed pass-through needs as much subtractive
+        # capacity as additive. Both the eager MoE and the Triton act-code path already build
+        # their expert ranges from the two counts independently, so nothing downstream changes.
+        # None = derive from special_expert_pairs as before.
+        num_pos_identity_experts=None,
+        num_neg_identity_experts=None,
         use_shared_expert=False,
         shared_expert_type="mlp",
         num_shared_experts=1,
@@ -51,8 +58,16 @@ class BiBoConfig(PretrainedConfig):
         norm_topk_prob="sum",
         bias_update_factor=None,
         bias_update_threshold=8000,
+        bf16_residual_stream=False,
+        bf16_moe_out=False,
         **kwargs,
     ):
+        # Cast the residual stream to BF16 at the embedding, so every `residual + sublayer`
+        # add downstream stays bf16 instead of promoting back to fp32. Master weights and
+        # optimizer state are UNCHANGED (still fp32) -- this is the stream only, which is
+        # what modded-nanogpt runs and what halves residual traffic.
+        self.bf16_residual_stream = bool(bf16_residual_stream)
+        self.bf16_moe_out = bool(bf16_moe_out)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -79,8 +94,6 @@ class BiBoConfig(PretrainedConfig):
         # QK-norm anywhere, Gemma 4 applies it on every layer; this flag tests the middle.
         self.swa_qk_norm = swa_qk_norm
 
-        self.rope_scaling = rope_scaling
-        self.partial_rotary_factor = partial_rotary_factor
 
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
@@ -93,8 +106,15 @@ class BiBoConfig(PretrainedConfig):
         self.special_expert_pairs = special_expert_pairs
         self.pos_identity_expert = pos_identity_expert
         self.neg_identity_expert = neg_identity_expert
-        self.num_pos_identity_experts = special_expert_pairs if pos_identity_expert else 0
-        self.num_neg_identity_experts = special_expert_pairs if neg_identity_expert else 0
+        self.num_pos_identity_experts = (
+            int(num_pos_identity_experts) if num_pos_identity_experts is not None
+            else (special_expert_pairs if pos_identity_expert else 0))
+        self.num_neg_identity_experts = (
+            int(num_neg_identity_experts) if num_neg_identity_experts is not None
+            else (special_expert_pairs if neg_identity_expert else 0))
+        if self.num_pos_identity_experts < 0 or self.num_neg_identity_experts < 0:
+            raise ValueError("identity expert counts must be >= 0, got "
+                             f"+{self.num_pos_identity_experts} / -{self.num_neg_identity_experts}")
         self.num_glu_experts = (num_routed_experts - self.num_pos_identity_experts
                                 - self.num_neg_identity_experts)
 
@@ -117,13 +137,22 @@ class BiBoConfig(PretrainedConfig):
 
         self.bias_update_threshold = bias_update_threshold if bias_update_threshold is not None else 8000
 
-        if self.rope_scaling is None:
-            self.rope_scaling = {"type": "dynamic", "factor": 1.0}
-
         self.mlp_only_layers = (
             mlp_only_layers if mlp_only_layers is not None
             else sorted({0, num_hidden_layers - 1})
         )
+
+        # PER-LAYER expert geometry: {layer_idx: {"num_routed_experts", "num_experts_per_tok",
+        # "moe_intermediate_size"}}. Every consumer of these three reads them off `config`, so an
+        # override is applied by handing that layer a shallow config copy (see layers.py) rather
+        # than threading a per-layer value through the MoE block, the router and the expert stack.
+        #
+        # The reason this knob exists: holding BOTH active and total params fixed pins the ratio
+        # E / top_k. active ~ top_k*3*h*w and total ~ E*3*h*w, so E/top_k = total/active = 32/3 on
+        # the board config. "Fewer, bigger experts" at matched cost therefore REQUIRES a
+        # proportionally smaller top_k -- 64/6/768 and 32/3/1536 are the same cost, 32/6/768 is
+        # half the model. Keys are ints; JSON round-trips them as strings, hence the coercion.
+        self.moe_overrides = {int(k): v for k, v in (moe_overrides or {}).items()}
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -133,9 +162,13 @@ class BiBoConfig(PretrainedConfig):
             **kwargs,
         )
 
+        # POSITIONAL ENCODING IS FIXED, NOT CONFIGURABLE (Aug 14 2026). Full-attention layers get
+        # NoPE; sliding-window layers get full RoPE over the whole head_dim. There is no partial
+        # rotary fraction, no per-layer-type width, no second base and no NTK scaling -- each of
+        # those was a knob whose value the measurement settled, so it is spelled in the code
+        # instead. See docs/ and the rope round: ctx4095 came out 3.3107 (global NoPE) / 3.3245
+        # (partial) / 3.3805 (full), while local width moved it 0.0037, inside the noise floor.
         self.head_dim = self.hidden_size // self.num_attention_heads
-        _rope_dim = round(self.partial_rotary_factor * self.head_dim)
-        self.rope_dim = _rope_dim - (_rope_dim % 2)
 
         if self.hidden_size % self.num_attention_heads != 0:
             raise ValueError(
@@ -153,11 +186,6 @@ class BiBoConfig(PretrainedConfig):
                 f"{self.num_pos_identity_experts + self.num_neg_identity_experts} +/-Identity specials "
                 f"leaves {self.num_glu_experts} GLU experts; need at least 1. Raise "
                 f"num_routed_experts or lower special_expert_pairs."
-            )
-        if self.rope_dim < 2:
-            raise ValueError(
-                f"partial_rotary_factor={self.partial_rotary_factor} gives rope_dim={self.rope_dim} "
-                f"(head_dim={self.head_dim}); need at least 2 rotary dims."
             )
         if self.norm_topk_prob and self.norm_topk_prob not in NORM_TOPK_MODES:
             raise ValueError(

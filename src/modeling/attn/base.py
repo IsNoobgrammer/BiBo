@@ -1,4 +1,4 @@
-"""BiBoAttention — minimal shared shell: projections, QK-norm, partial RoPE, KV cache,
+"""BiBoAttention — minimal shared shell: projections, QK-norm, RoPE, KV cache,
 per-layer dispatch to the SWA or full-attention flavor module, XSA, output projection.
 The attention flavors themselves live in swa.py (flex band + eager reference) and
 full_attention.py (SDPA fast path / mask path)."""
@@ -30,10 +30,10 @@ class BiBoAttention(nn.Module):
         self.use_xsa = config.use_xsa
         self.attention_dropout = config.attention_dropout
         self.scaling = self.head_dim ** -0.5
-        self.rope_dim = config.rope_dim   # dim-wise partial RoPE: first rope_dim rotates, rest NoPE
-
         pattern = getattr(config, "hybrid_layer_pattern", None)
         self.is_swa = bool(pattern[layer_idx]) if pattern is not None else False
+
+
         # Hierarchical SWA reads its per-layer window off `sliding_window_per_layer`; plain
         # `sliding_window` stays scalar because transformers' cache indexes with it directly.
         _per = getattr(config, "sliding_window_per_layer", None)
@@ -80,17 +80,15 @@ class BiBoAttention(nn.Module):
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        # cos/sin are sized rope_dim (built at model level); the tail passes through as NoPE.
-        cos, sin = position_embeddings
-        rd = self.rope_dim
-        if rd < self.head_dim:
-            q_rot, q_pass = query_states[..., :rd], query_states[..., rd:]
-            k_rot, k_pass = key_states[..., :rd], key_states[..., rd:]
-            q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
-            query_states = torch.cat([q_rot, q_pass], dim=-1)
-            key_states = torch.cat([k_rot, k_pass], dim=-1)
-        else:
+        # FIXED ARCHITECTURE: full RoPE on the sliding-window layers, NoPE on the full-attention
+        # layers. Nothing to configure -- a window-W layer only ever resolves relative distances
+        # <= W and a full-attention layer resolves the whole context, and measurement said the
+        # global width is what governs length generalization while the local width barely moves it.
+        if self.is_swa:
+            cos, sin = position_embeddings
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        else:
+            cos = sin = None
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}

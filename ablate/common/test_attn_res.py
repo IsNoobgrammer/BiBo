@@ -152,6 +152,144 @@ def main():
     assert dp > 1e-3, f"carry == prefix variant ({dp:.2e}) -- the flag did nothing"
     assert dd > 1e-3, f"carry == sites=2 ({dd:.2e})"
     print(f"  [5] carry: same {nc - n_ctl} params as sites=1; vs prefix {dp:.3f}, vs sites=2 {dd:.3f}")
+
+    # (6) the learnable carry coefficient is a STRICT GENERALIZATION: 2*sigmoid(0) == 1.0, so at
+    #     init it must be bit-identical to plain carry. If it is not, the knob has changed the
+    #     model before learning anything and the arm is not attributable.
+    torch.manual_seed(0)
+    ms, _ = build_arm("bibo_min", device="cpu", dtype=torch.float32, num_experts=6,
+                      special_pairs=0, use_xsa=True, hybrid_layer_pattern=pattern,
+                      sliding_window=128, attn_res="3", attn_res_sites=1,
+                      attn_res_carry=True, attn_res_carry_scale="raw")
+    ms.eval()
+    ms.load_state_dict(mc.state_dict(), strict=False)
+    n_theta = sum(1 for n, _ in ms.named_parameters() if "attn_res_carry_theta" in n)
+    assert n_theta == NL, f"expected one carry theta per layer, got {n_theta}"
+    with torch.no_grad():
+        ys = ms(input_ids=ids).logits
+    d0 = (ys - yc).abs().max().item()
+    assert d0 < 1e-5, (f"carry_scale is NOT identity at init (diff {d0:.2e}); 2*sigmoid(0) must "
+                       f"be exactly 1.0 or the arm is not a generalization of carry")
+    print(f"  [6] carry_scale unbounded: {n_theta} thetas, init 1.0 -> identical to carry at init "
+          f"({d0:.1e})")
+
+    # (7) the off-simplex embedding term. Three things, and the THIRD is the one that matters:
+    #     init d=0 must be bit-identical (strict generalization), setting d must CHANGE the logits,
+    #     and each layer's d must be independently live. A knob can pass every numeric parity gate
+    #     while being dead plumbing -- that has happened here before, with xsa alpha.
+    torch.manual_seed(0)
+    me, _ = build_arm("bibo_min", device="cpu", dtype=torch.float32, num_experts=6,
+                      special_pairs=0, use_xsa=True, hybrid_layer_pattern=pattern,
+                      sliding_window=128, attn_res="3", attn_res_sites=1, attn_res_carry=True,
+                      attn_res_carry_scale="raw", attn_res_emb_term=True)
+    me.eval()
+    me.load_state_dict(ms.state_dict(), strict=False)
+    ds = [(n, p) for n, p in me.named_parameters() if "attn_res_emb_theta" in n]
+    assert len(ds) == NL - 1, f"expected one d per layer EXCEPT layer 0, got {len(ds)} for {NL} layers"
+    assert not any(".0.attn_res_emb_theta" in n for n, _ in ds), (
+        "layer 0 must not get a d: its attn_read IS the embedding (the depth read is skipped "
+        "there because block_residual is empty), so d would duplicate the identity path")
+    with torch.no_grad():
+        y_d0 = me(input_ids=ids).logits
+    dz = (y_d0 - ys).abs().max().item()
+    assert dz == 0.0, f"d=0 is not bit-identical to carry_scale alone ({dz:.2e}); not a generalization"
+    with torch.no_grad():
+        for _, p in ds:
+            p.fill_(0.3)
+        y_d1 = me(input_ids=ids).logits
+    dl = (y_d1 - y_d0).abs().max().item()
+    assert dl > 1e-2, f"setting d changed nothing ({dl:.2e}) -- the embedding term is dead plumbing"
+    with torch.no_grad():
+        for _, p in ds:
+            p.fill_(0.0)
+        dict(me.named_parameters())["model.layers.1.attn_res_emb_theta"].fill_(0.3)
+        y_l1 = me(input_ids=ids).logits
+    dl1 = (y_l1 - y_d0).abs().max().item()
+    assert dl1 > 1e-2, f"layer-1 d alone changed nothing ({dl1:.2e}) -- d is not per-layer"
+    print(f"  [7] emb term: {len(ds)} d (no L0); d=0 identical ({dz:.1e}), d=0.3 moves "
+          f"{dl:.3f}, L1-only moves {dl1:.3f}")
+
+    # (8) the ht skip's flat gain on the RAW embedding, i * emb, init 0. Five gates, and the last
+    #     two are the ones that matter: i=0 must be bit-identical to plain carry (strict
+    #     generalization), theta must not exist at all (the gain replaces it, it does not stack),
+    #     the skip must scale LINEARLY with the embedding (no norm hiding in there), i must be
+    #     live and per-layer, and -- because i=0 zeroes the whole product -- dL/di must be NONZERO
+    #     at init, or the arm is pinned at the inert point and every other gate here is vacuous.
+    _ht = dict(attn_res="3", attn_res_sites=1, attn_res_carry=True,
+               attn_res_carry_scale="raw", attn_res_emb_term=True,
+               attn_res_emb_site="ht", num_experts=6, special_pairs=0, use_xsa=True,
+               hybrid_layer_pattern=pattern, sliding_window=128, device="cpu",
+               dtype=torch.float32)
+    torch.manual_seed(0)
+    mh, _ = build_arm("bibo_min", **_ht)
+    torch.manual_seed(0)
+    mg, _ = build_arm("bibo_min", attn_res_emb_gain=True, **_ht)
+    mh.eval(); mg.eval()
+    mh.load_state_dict(ms.state_dict(), strict=False)
+    mg.load_state_dict(ms.state_dict(), strict=False)
+    gs = [(n, p) for n, p in mg.named_parameters() if "attn_res_emb_gain" in n]
+    assert len(gs) == NL - 1, f"expected one i per layer EXCEPT layer 0, got {len(gs)}"
+    assert not any("attn_res_emb_gain" in n for n, _ in mh.named_parameters()), \
+        "attn_res_emb_gain=False must create no parameter"
+    assert all(p.item() == 0.0 for _, p in gs), "i must init to exactly 0"
+    assert not any("attn_res_emb_theta" in n for n, _ in mg.named_parameters()), (
+        "the gain REPLACES the radial exponent -- theta must not be created at all, or the arm "
+        "is two coupled scalars again instead of one")
+    _th4 = [p.item() for n, p in mh.named_parameters() if "attn_res_emb_theta" in n]
+    assert all(t == -4.0 for t in _th4), f"the gainless ht arm must keep theta=-4, got {_th4}"
+    with torch.no_grad():
+        y_g0 = mg(input_ids=ids).logits
+    gz = (y_g0 - ys).abs().max().item()
+    assert gz == 0.0, f"i=0 is not bit-identical to plain carry ({gz:.2e}); not a generalization"
+    # the one that matters: i must be able to LEAVE zero
+    mg.zero_grad(set_to_none=True)
+    mg(input_ids=ids, labels=ids).loss.backward()
+    gg = [(n, p.grad.abs().max().item()) for n, p in mg.named_parameters()
+          if "attn_res_emb_gain" in n]
+    assert all(g > 0.0 for _, g in gg), (
+        f"dL/di is zero at init -- i can never leave 0 and the whole arm is inert: {gg}")
+    mg.zero_grad(set_to_none=True)
+    # NO NORM: HT feeds input_layernorm, so the pre-hook input IS HT. HT(i=1) - HT(i=0) is exactly
+    # the skip, everything else being identical between the two passes -- and it must come out as
+    # the RAW embedding. A unit-norm skip would give constant per-token rms instead; that is the
+    # whole point of this arm, and a stray .rsqrt() would sail past every other gate here.
+    _cap = {}
+    _h = mg.model.layers[1].input_layernorm.register_forward_pre_hook(
+        lambda m, inp: _cap.__setitem__("ht", inp[0].detach().clone()))
+    with torch.no_grad():
+        for _, p in gs:
+            p.fill_(0.0)
+        mg(input_ids=ids)
+        _ht0 = _cap["ht"]
+        for _, p in gs:
+            p.fill_(1.0)
+        mg(input_ids=ids)
+        _skip = _cap["ht"] - _ht0
+        _raw = mg.model.embed_tokens(ids)
+    _h.remove()
+    _err = (_skip - _raw).abs().max().item() / _raw.abs().max().item()
+    assert _err < 1e-5, (f"skip at i=1 is not the raw embedding (rel err {_err:.2e}) -- something "
+                         f"is still normalising it")
+    _tok_rms = _skip.float().square().mean(-1).sqrt()
+    _spread = (_tok_rms.max() / _tok_rms.min()).item()
+    assert _spread > 1.05, (f"per-token skip rms is flat (max/min {_spread:.3f}) -- that is a "
+                            f"normed skip, not i*emb")
+    with torch.no_grad():
+        for _, p in gs:
+            p.fill_(3.0)
+        y_g1 = mg(input_ids=ids).logits
+    gl = (y_g1 - y_g0).abs().max().item()
+    assert gl > 1e-2, f"setting i changed nothing ({gl:.2e}) -- the gain is dead plumbing"
+    with torch.no_grad():
+        for _, p in gs:
+            p.fill_(0.0)
+        dict(mg.named_parameters())["model.layers.1.attn_res_emb_gain"].fill_(3.0)
+        y_gl1 = mg(input_ids=ids).logits
+    gl1 = (y_gl1 - y_g0).abs().max().item()
+    assert gl1 > 1e-2, f"layer-1 i alone changed nothing ({gl1:.2e}) -- i is not per-layer"
+    print(f"  [8] ht gain i*emb: {len(gs)} i (no L0), init 0, no theta; i=0 identical to carry "
+          f"({gz:.1e}), skip==raw emb (rel {_err:.1e}, per-token rms spread {_spread:.2f}x), "
+          f"min|dL/di|={min(g for _, g in gg):.2e}, i=3 moves {gl:.3f}, L1-only {gl1:.3f}")
     print("PASS")
 
 

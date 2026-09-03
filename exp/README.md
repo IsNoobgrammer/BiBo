@@ -135,3 +135,53 @@ python -m ablate.common.train \
   --typed_attn_res_fast_slow_memory \
   --typed_attn_res_innovation_write
 ```
+
+## Training diagnostics and the current baseline
+
+The `some_mhc` branch includes the training stack from baseline revision
+`51a2469`: packed Parquet input, held-out validation, global NoPE/local full
+RoPE, per-layer expert overrides, bf16 residual streams, and per-layer router
+and parameter/gradient diagnostics.
+
+Typed reads require `--attn_res_sites 2`. They replace the baseline's one-site
+carry path; leave `--attn_res_carry false`, `--attn_res_carry_per_dim false`, and
+`--attn_res_carry_scale none`. Incompatible carry, embedding-skip, sparse-read,
+and non-softmax options raise instead of silently doing nothing. Typed scores,
+controllers, and aggregation remain fp32 under bf16 autocast.
+
+With W&B enabled, `train/` contains loss, gradient norm, learning rate, throughput,
+and memory; `val/` contains the fixed held-out loss. `interp/typed/` records:
+
+- Per-layer attention/MLP reads and the final output read: probability mass for
+  each residual type, candidate entropy, output RMS, and canonical, thought,
+  fast-memory, and slow-memory RMS.
+- Per-layer learned fast/slow decay, innovation strength, controller RMS, and
+  type biases; `interp/typed_*` also contains aggregate min/mean/max values.
+- Actual slow-write gain and the RMS of raw, filtered, and removed memory writes.
+
+Type IDs are `0=full block`, `1=archived block memory`, `2=current prefix`,
+`3=thought`, `4=current/fast memory`, and `5=slow memory`. Type mass sums to one;
+absent candidates have zero mass. Forward diagnostics sample the last training
+microbatch of each logged optimizer step and are disabled before validation.
+Captured values are detached scalars, so logging retains no activation graphs.
+`grad/norm/*` and `params/norm/*` retain the training harness's per-tensor
+health metrics. `report_ckpt` rebuilds the typed flags and layer-0 expert override
+from the saved result configuration for strict checkpoint loading.
+
+For a 100-step smoke, use `--max_steps 100 --log_every 10 --val_every 20
+--val_start 20 --final_report false` with a distinct `--run_tag`. This compresses
+the warmup and cosine schedule into 100 steps, exercising the peak learning rate;
+it is a functional test rather than a prefix of a 2,000-step learning curve.
+Keep the full run's data, seed, sequence length, and effective batch fixed. Extra
+states and two read sites increase activation memory, so reduce microbatch size
+and increase gradient accumulation together if needed.
+
+Verified on 2026-09-03 with PyTorch 2.11.0+cu130 on an RTX PRO 6000 Blackwell:
+155 pytest checks passed, followed by 100 real-data training steps at batch 32,
+grad accumulation 8, sequence length 1024, and seed 2026. All 11 history rows
+were finite; validation ran at steps 20/40/60/80/99. Final training loss was
+6.009633, final 20-step running loss 6.000733, and held-out loss 6.1989984512.
+Strict checkpoint reload reproduced that held-out loss exactly. Peak allocated
+memory was 56.8 GB and steady throughput about 67.7k tokens/s. These smoke
+numbers validate execution and logging; they do not establish an improvement
+over the 2,000-step baseline.
