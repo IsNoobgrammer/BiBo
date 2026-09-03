@@ -151,6 +151,53 @@ def _router_corr(model):
     return sum(vals) / len(vals) if vals else 0.0
 
 
+@torch.no_grad()
+def _typed_memory_stats(model):
+    """Learned depth timescales and innovation strength for typed-memory runs."""
+    fast, slow, innovation, controller_rms = [], [], [], []
+    result = {}
+    for module_name, module in model.named_modules():
+        prefix = f"train/typed/{module_name.removeprefix('model.').replace('layers.', 'layer_')}"
+        for name, value in (getattr(module, "_typed_diagnostics", None) or {}).items():
+            result[f"{prefix}/{name}"] = value.item()
+        # Disable capture before validation; only detached training-forward scalars are kept.
+        if getattr(module, "use_typed_attn_res", False):
+            module._typed_diagnostics = None
+        for name, value in module.named_parameters(recurse=False):
+            if "_res_type_controller" in name:
+                result[f"{prefix}/{name}_rms"] = value.detach().float().square().mean().sqrt().item()
+            elif "_res_type_bias" in name:
+                for type_id, bias in enumerate(value.detach().float()):
+                    result[f"{prefix}/{name}_{type_id}"] = bias.item()
+        if hasattr(module, "typed_attn_res_fast_decay_logit"):
+            f = module.typed_attn_res_fast_decay_logit.detach().float().sigmoid()
+            gap = module.typed_attn_res_slow_decay_gap_logit.detach().float().sigmoid()
+            fast.append(f)
+            slow.append(f + (1.0 - f) * gap)
+            result[f"{prefix}/fast_decay"] = f.item()
+            result[f"{prefix}/slow_decay"] = slow[-1].item()
+            controller_rms.append(
+                module.typed_attn_res_slow_write_controller.detach().float().square().mean().sqrt()
+            )
+        if hasattr(module, "typed_attn_res_innovation_logit"):
+            innovation.append(
+                module.typed_attn_res_innovation_logit.detach().float().sigmoid()
+            )
+            result[f"{prefix}/innovation_alpha"] = innovation[-1].item()
+    for name, values in (
+        ("typed_fast_decay", fast),
+        ("typed_slow_decay", slow),
+        ("typed_innovation_alpha", innovation),
+        ("typed_slow_write_controller_rms", controller_rms),
+    ):
+        if values:
+            stacked = torch.stack(values)
+            result[f"train/{name}_mean"] = stacked.mean().item()
+            result[f"train/{name}_min"] = stacked.min().item()
+            result[f"train/{name}_max"] = stacked.max().item()
+    return result
+
+
 def _save_hf_ckpt(model, tokenizer, out_dir):
     """Write a reload-ready bf16 HF checkpoint (config.json + safetensors + tokenizer) to out_dir. Runs on
     the MAIN thread between steps (fast). Casts only the big matrices (ndim>=2: linears, embeddings, expert
@@ -288,6 +335,20 @@ def main():
     ap.add_argument("--attn_res_sites", type=int, choices=[1, 2], default=2)
     # sites=1 only: MLP reads (site-1 mix + attn_output) instead of the raw prefix sum.
     ap.add_argument("--attn_res_carry", type=_bool, default=False)
+    # Typed thought/memory extension (exp/ only): keep attention and MLP contributions as
+    # distinct candidates and add a token-conditioned type score to each AttnRes read.
+    ap.add_argument("--typed_attn_res", action="store_true")
+    # Archive one memory-only state per completed block in addition to the canonical block state.
+    ap.add_argument("--typed_attn_res_long_memory", type=_bool, default=True)
+    # Relative initial prior of each extra typed candidate versus a canonical K3 candidate.
+    ap.add_argument("--typed_attn_res_extra_init", type=float, default=0.01)
+    # Two depth timescales: fast memory resets at block boundaries; slow memory persists.
+    ap.add_argument("--typed_attn_res_fast_slow_memory", action="store_true")
+    ap.add_argument("--typed_attn_res_fast_decay_init", type=float, default=0.5)
+    ap.add_argument("--typed_attn_res_slow_decay_init", type=float, default=0.95)
+    # Store the part of each MLP output not already parallel to the current thought stream.
+    ap.add_argument("--typed_attn_res_innovation_write", action="store_true")
+    ap.add_argument("--typed_attn_res_innovation_init", type=float, default=0.01)
     # Keep the residual stream in the layer-input dtype (fp32 under autocast, as the
     # standard-residual control does) so AttnRes is the ONLY difference from the baseline.
     ap.add_argument("--attn_res_fp32_stream", type=_bool, default=False)
@@ -633,6 +694,14 @@ def main():
                            intermediate_size=args.dense_inter,
                            attn_res=args.attn_res, attn_res_sites=args.attn_res_sites,
                            attn_res_carry=args.attn_res_carry,
+                           use_typed_attn_res=args.typed_attn_res,
+                           typed_attn_res_long_memory=args.typed_attn_res_long_memory,
+                           typed_attn_res_extra_init=args.typed_attn_res_extra_init,
+                           use_typed_attn_res_fast_slow_memory=args.typed_attn_res_fast_slow_memory,
+                           typed_attn_res_fast_decay_init=args.typed_attn_res_fast_decay_init,
+                           typed_attn_res_slow_decay_init=args.typed_attn_res_slow_decay_init,
+                           use_typed_attn_res_innovation_write=args.typed_attn_res_innovation_write,
+                           typed_attn_res_innovation_init=args.typed_attn_res_innovation_init,
                            attn_res_fp32_stream=args.attn_res_fp32_stream,
                            attn_res_carry_scale=args.attn_res_carry_scale,
                            attn_res_emb_term=args.attn_res_emb_term,
@@ -753,6 +822,16 @@ def main():
                 + (f"s{args.attn_res_sites}" if args.attn_res != "off"
                    and args.attn_res_sites != 2 else "")
                 + ("c" if args.attn_res != "off" and args.attn_res_carry else "")
+                + ("_typed" if args.typed_attn_res else "")
+                + ("-nolm" if args.typed_attn_res
+                   and not args.typed_attn_res_long_memory else "")
+                + (f"-x{args.typed_attn_res_extra_init:g}" if args.typed_attn_res
+                   and args.typed_attn_res_extra_init != 0.01 else "")
+                + (f"-fs{args.typed_attn_res_fast_decay_init:g}"
+                   f"-{args.typed_attn_res_slow_decay_init:g}"
+                   if args.typed_attn_res_fast_slow_memory else "")
+                + (f"-iw{args.typed_attn_res_innovation_init:g}"
+                   if args.typed_attn_res_innovation_write else "")
                 + ("f32s" if args.attn_res != "off" and args.attn_res_fp32_stream else "")
                 + (f"cs{args.attn_res_carry_scale}" if args.attn_res != "off"
                    and args.attn_res_carry_scale != "none" else "")
@@ -816,6 +895,7 @@ def main():
         wb = wandb.init(project=args.wandb_project, name=run_name,
                         settings=wandb.Settings(console="wrap"),
                         config={**vars(args), "total_steps": total_steps,
+                                "typed_ar_impl": os.environ.get("BIBO_TYPED_AR_IMPL", "auto"),
                                 "params_total": total, "params_active": active})
 
     # async HF checkpoint push: save_pretrained locally (main thread), then upload_folder in the background.
@@ -886,6 +966,12 @@ def main():
         print(f"[optim] manas gamma tracks lr: {probe_gamma:g} held through warmup "
               f"({_gs_warm} steps), then law(lr_t) -> ~0 at the end of the cosine", flush=True)
     for step in range(total_steps):
+        if args.typed_attn_res:
+            for module in model.modules():
+                if getattr(module, "use_typed_attn_res", False):
+                    module._typed_diagnostics = (
+                        {} if step % args.log_every == 0 or step == total_steps - 1 else None
+                    )
         # The per-layer hooks fire only on steps that will actually be logged; every other step
         # pays nothing. One traced step per interval is plenty for a distribution over 64 experts.
         if plrouter is not None:
@@ -967,6 +1053,7 @@ def main():
             # full rejection. Reported in tanh units, not logits, because "off" has to be readable
             # at a glance -- an arm that never switches XSA on is a null, not a win.
             rt.update(patchmod.xsa_alpha_stats(model))
+            rt.update(_typed_memory_stats(model))
             # Per-tensor param and grad norms. The one that earns its keep is grad/norm_min: a
             # tensor whose gradient is 0.0 while training proceeds is INERT, and this repo has
             # shipped that bug twice (XSA alpha behind a passing parity test, ACT_CYCLE not
@@ -987,6 +1074,14 @@ def main():
                      if "train/xsa_a_mean" in rt else "")
                     )
             aS_s = xa_s
+            typed_s = ""
+            if "train/typed_fast_decay_mean" in rt:
+                typed_s += (
+                    f" memdecay={rt['train/typed_fast_decay_mean']:.3f}"
+                    f"/{rt['train/typed_slow_decay_mean']:.3f}"
+                )
+            if "train/typed_innovation_alpha_mean" in rt:
+                typed_s += f" innov={rt['train/typed_innovation_alpha_mean']:.3f}"
             cs_s = ""
             # cs = the learnable carry coefficient, reported as 2*sigmoid(theta) because that is
             # what multiplies attn_output. Init is exactly 1.0, so a cs pinned at 1.000 across
@@ -1170,7 +1265,7 @@ def main():
                                        not in ("en", "hi")) + "]" if val_batches else "")
             print(f"  step {step}/{total_steps} loss={lv:.4f} run{len(_loss_hist)}={lv_run:.4f} |g|={gn:.3f} lr={lr:.2e} tok={toks/1e6:.1f}M "
                   f"ms/step={ms_per_step:.0f} tps={tps/1e3:.1f}k mfu={mfu:.1f}% mem={mem:.1f}G "
-                  f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{val_s}{rt_s}{aS_s}"
+                  f"xcorr={ecorr:.4f} rcorr={rcorr:.4f}{val_s}{rt_s}{aS_s}{typed_s}"
                   f"{f' wd={cur_wd:.4f}' if wd_sched is not None else ''}"
                   # clean = loss at RESTORED theta; probe = how much of `loss` is the probe sitting
                   # downhill. Under muon probe is ~0 by construction (nothing to restore).

@@ -137,10 +137,29 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          attn_res_score="softmax", attn_res_topk=0,
                          attn_res_carry_per_dim=False,
                          attn_res_carry_gate="none", attn_res_emb_per_dim=False,
-                         bf16_residual_stream=False, bf16_moe_out=False):
+                         bf16_residual_stream=False, bf16_moe_out=False,
+                         use_typed_attn_res=False,
+                         typed_attn_res_long_memory=True,
+                         typed_attn_res_extra_init=0.01,
+                         use_typed_attn_res_fast_slow_memory=False,
+                         typed_attn_res_fast_decay_init=0.5,
+                         typed_attn_res_slow_decay_init=0.95,
+                         use_typed_attn_res_innovation_write=False,
+                         typed_attn_res_innovation_init=0.01):
     # attn_res: "off" = stable src model. Anything else routes to exp/ (Kimi K3 Attention
     # Residuals): "control" builds exp's model with residuals DISABLED, an int is the block size
     # in decoder layers (1 = per-layer / Full AttnRes, 3 = one block per [G,S,S]).
+    if (
+        use_typed_attn_res_fast_slow_memory
+        or use_typed_attn_res_innovation_write
+    ) and not use_typed_attn_res:
+        raise ValueError(
+            "typed fast/slow memory and innovation writes require use_typed_attn_res"
+        )
+    if use_typed_attn_res and attn_res in ("off", "control"):
+        raise ValueError(
+            "use_typed_attn_res requires an enabled integer attn_res block size"
+        )
     if attn_res == "off":
         if attn_res_topk:
             raise NotImplementedError(
@@ -163,6 +182,14 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
         extra = {"attn_res_block_size": None if attn_res == "control" else int(attn_res),
                  "attn_res_sites": attn_res_sites,
                  "attn_res_carry": attn_res_carry,
+                 "use_typed_attn_res": use_typed_attn_res,
+                 "typed_attn_res_long_memory": typed_attn_res_long_memory,
+                 "typed_attn_res_extra_init": typed_attn_res_extra_init,
+                 "use_typed_attn_res_fast_slow_memory": use_typed_attn_res_fast_slow_memory,
+                 "typed_attn_res_fast_decay_init": typed_attn_res_fast_decay_init,
+                 "typed_attn_res_slow_decay_init": typed_attn_res_slow_decay_init,
+                 "use_typed_attn_res_innovation_write": use_typed_attn_res_innovation_write,
+                 "typed_attn_res_innovation_init": typed_attn_res_innovation_init,
                  "attn_res_fp32_stream": attn_res_fp32_stream,
                  "attn_res_carry_scale": attn_res_carry_scale,
                  "attn_res_emb_term": attn_res_emb_term,

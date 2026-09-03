@@ -83,7 +83,7 @@ existed — `pkill` found nothing and the GPU sat at 3 MiB the whole time.
 bash "$E" --url "$U" <<'EOF'
 import subprocess
 print(subprocess.run("ls /home/marimo/work; nvidia-smi --query-gpu=memory.used --format=csv,noheader; "
-                     "ps -eo pid,etime,cmd | grep -E '[a]blate' | head", 
+                     "ps -eo pid,etime,cmd | grep -E '[a]blate' | head",
                      shell=True, capture_output=True, text=True).stdout)
 print("gate:", LAUNCH_TRAINING)      # a printed global is live; a replayed line is not
 EOF

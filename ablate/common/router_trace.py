@@ -174,5 +174,3 @@ class RouterTrace:
         for h in self._handles:
             h.remove()
         self._handles = []
-
-

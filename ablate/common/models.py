@@ -25,11 +25,26 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
               num_pos_identity_experts=None, num_neg_identity_experts=None,
               attn_res_carry_per_dim=False, attn_res_carry_gate="none",
               attn_res_emb_per_dim=False,
-              bf16_residual_stream=False, bf16_moe_out=False):
+              bf16_residual_stream=False, bf16_moe_out=False,
+              use_typed_attn_res=False,
+              typed_attn_res_long_memory=True,
+              typed_attn_res_extra_init=0.01,
+              use_typed_attn_res_fast_slow_memory=False,
+              typed_attn_res_fast_decay_init=0.5,
+              typed_attn_res_slow_decay_init=0.95,
+              use_typed_attn_res_innovation_write=False,
+              typed_attn_res_innovation_init=0.01):
     """arm in {'qwen','bibo_min'} -> (model, config). Params in `dtype` (fp32 master; bf16 via autocast).
     Balancing, each native: BiBo router-bias updates; Qwen Switch aux loss (aux_coef).
     PARAM MATCH: Qwen's num_experts is set to BiBo's GLU count, which is num_experts MINUS the
     param-free ±Identity specials -- see configs.glu_count."""
+    any_typed_feature = (
+        use_typed_attn_res
+        or use_typed_attn_res_fast_slow_memory
+        or use_typed_attn_res_innovation_write
+    )
+    if any_typed_feature and arm != "bibo_min":
+        raise ValueError("typed AttnRes is available only for the bibo_min arm")
     eff = patches.resolve_attn(attn_impl)
     n_total = num_experts or SHARED["num_experts"]
     n_glu = glu_count(n_total, special_pairs, pos_identity_expert, neg_identity_expert)
@@ -67,6 +82,14 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
                                    swa_qk_norm=swa_qk_norm, attn_res=attn_res,
                                    attn_res_sites=attn_res_sites,
                                    attn_res_carry=attn_res_carry,
+                                   use_typed_attn_res=use_typed_attn_res,
+                                   typed_attn_res_long_memory=typed_attn_res_long_memory,
+                                   typed_attn_res_extra_init=typed_attn_res_extra_init,
+                                   use_typed_attn_res_fast_slow_memory=use_typed_attn_res_fast_slow_memory,
+                                   typed_attn_res_fast_decay_init=typed_attn_res_fast_decay_init,
+                                   typed_attn_res_slow_decay_init=typed_attn_res_slow_decay_init,
+                                   use_typed_attn_res_innovation_write=use_typed_attn_res_innovation_write,
+                                   typed_attn_res_innovation_init=typed_attn_res_innovation_init,
                                    attn_res_fp32_stream=attn_res_fp32_stream,
                                    attn_res_carry_scale=attn_res_carry_scale,
                                    attn_res_emb_term=attn_res_emb_term,

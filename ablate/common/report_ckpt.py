@@ -26,6 +26,68 @@ from kernels.sm120.cross_entropy import fused_linear_cross_entropy
 DEV = "cuda"
 
 
+def _arch_kwargs(c):
+    """build_arm(**kwargs) reproducing the architecture a training run built from `c` = its saved
+    vars(args). Every key defaulted, so a result.json written before an axis existed still loads."""
+    pattern, window = resolve_swa(c.get("swa_pattern", "none"),
+                                  c.get("sliding_window", 128),
+                                  SHARED["num_hidden_layers"])
+    bias_factor = c.get("bias_update_factor", -1)
+    moe_overrides = {}
+    for spec in filter(None, (v.strip() for v in c.get("moe_override", "").split(","))):
+        layer, experts, top_k, width = map(int, spec.split(":"))
+        moe_overrides[layer] = dict(num_routed_experts=experts, num_experts_per_tok=top_k,
+                                    moe_intermediate_size=width)
+    return dict(
+        attn_res_fp32_stream=c.get("attn_res_fp32_stream", False),
+        attn_res_carry_scale=c.get("attn_res_carry_scale", "none"),
+        attn_res_emb_term=c.get("attn_res_emb_term", False),
+        attn_res_emb_scale=c.get("attn_res_emb_scale", "none"),
+        attn_res_emb_site=c.get("attn_res_emb_site", "mlp"),
+        attn_res_emb_gain=c.get("attn_res_emb_gain", False),
+        attn_res_score=c.get("attn_res_score", "softmax"),
+        attn_res_topk=c.get("attn_res_topk", 0),
+        num_pos_identity_experts=c.get("pos_identity_n"),
+        num_neg_identity_experts=c.get("neg_identity_n"),
+        attn_res_carry_per_dim=c.get("attn_res_carry_per_dim", False),
+        attn_res_carry_gate=c.get("attn_res_carry_gate", "none"),
+        attn_res_emb_per_dim=c.get("attn_res_emb_per_dim", False),
+        bf16_residual_stream=c.get("bf16_residual_stream", False),
+        bf16_moe_out=c.get("bf16_moe_out", False),
+        mlp_only_layers=(None if c.get("mlp_only_layers") is None else
+                         [] if str(c["mlp_only_layers"]).lower() == "none" else
+                         [int(v) for v in str(c["mlp_only_layers"]).split(",")]),
+        intermediate_size=c.get("dense_inter"),
+        moe_overrides=moe_overrides,
+        num_experts=c.get("experts") or None,
+        special_pairs=c.get("special_pairs", 0),
+        use_xsa=c.get("use_xsa", False),
+        xsa_alpha_init=c.get("xsa_alpha_init", 0.0),
+        pos_identity_expert=c.get("pos_identity_expert", True),
+        neg_identity_expert=c.get("neg_identity_expert", True),
+        top_k=(c.get("top_k") or None),
+        moe_intermediate_size=(c.get("moe_inter") or None),
+        num_shared_experts=c.get("n_shared", 0),
+        hybrid_layer_pattern=pattern,
+        sliding_window=window,
+        swa_qk_norm=c.get("swa_qk_norm", True),
+        attn_res=c.get("attn_res", "off"),
+        attn_res_sites=c.get("attn_res_sites", 2),
+        attn_res_carry=c.get("attn_res_carry", False),
+        use_typed_attn_res=c.get("typed_attn_res", False),
+        typed_attn_res_long_memory=c.get("typed_attn_res_long_memory", True),
+        typed_attn_res_extra_init=c.get("typed_attn_res_extra_init", 0.01),
+        use_typed_attn_res_fast_slow_memory=c.get("typed_attn_res_fast_slow_memory", False),
+        typed_attn_res_fast_decay_init=c.get("typed_attn_res_fast_decay_init", 0.5),
+        typed_attn_res_slow_decay_init=c.get("typed_attn_res_slow_decay_init", 0.95),
+        use_typed_attn_res_innovation_write=c.get("typed_attn_res_innovation_write", False),
+        typed_attn_res_innovation_init=c.get("typed_attn_res_innovation_init", 0.01),
+        bias_update_threshold=c.get("bias_update_threshold", 10240),
+        bias_update_factor=(None if bias_factor is not None and bias_factor < 0 else bias_factor),
+        aux_coef=c.get("aux_coef", 0.001),
+    )
+
+
 def load_from_result(result_json, device=DEV):
     """(model, cfg_namespace). Rebuilds the arm from the recorded config and loads the weights."""
     with open(result_json) as f:
@@ -42,42 +104,16 @@ def load_from_result(result_json, device=DEV):
     patch_list = [p.strip() for p in c.patches.split(",") if p.strip() and p.strip() != "ce"]
     patchmod.apply(patch_list)
 
-    n_total = c.experts or SHARED["num_experts"]
-    swa_pat, win = resolve_swa(c.swa_pattern, c.sliding_window, SHARED["num_hidden_layers"])
     model, _ = build_arm(
         c.arm, device=device, dtype=torch.float32, attn_impl=c.attn,
-        bias_update_threshold=c.bias_update_threshold,
-        bias_update_factor=(None if c.bias_update_factor < 0 else c.bias_update_factor),
-        aux_coef=c.aux_coef, num_experts=n_total, special_pairs=c.special_pairs,
-        use_xsa=c.use_xsa, xsa_alpha_init=c.xsa_alpha_init,
-        hybrid_layer_pattern=swa_pat, sliding_window=win, swa_qk_norm=c.swa_qk_norm,
-        attn_res=c.attn_res, attn_res_sites=c.attn_res_sites, attn_res_carry=c.attn_res_carry,
-        attn_res_fp32_stream=c.attn_res_fp32_stream, attn_res_carry_scale=c.attn_res_carry_scale,
-        attn_res_emb_term=c.attn_res_emb_term, attn_res_emb_scale=c.attn_res_emb_scale,
-        attn_res_emb_site=c.attn_res_emb_site, attn_res_emb_gain=c.attn_res_emb_gain,
-        attn_res_score=c.attn_res_score, attn_res_topk=c.attn_res_topk,
-        num_pos_identity_experts=c.pos_identity_n, num_neg_identity_experts=c.neg_identity_n,
-        attn_res_carry_per_dim=c.attn_res_carry_per_dim, attn_res_carry_gate=c.attn_res_carry_gate,
-        attn_res_emb_per_dim=c.attn_res_emb_per_dim,
-        bf16_residual_stream=c.bf16_residual_stream, bf16_moe_out=c.bf16_moe_out,
-        pos_identity_expert=c.pos_identity_expert, neg_identity_expert=c.neg_identity_expert,
-        top_k=(c.top_k or None), moe_intermediate_size=(c.moe_inter or None),
-        num_shared_experts=c.n_shared,
-        # The dense/MoE split and the dense width are part of the ARCHITECTURE, so a rebuild that
-        # ignores them silently builds a different model. strict=True then fails with missing
-        # mlp.gate_proj keys against an all-MoE checkpoint -- which is how this was found. Parsed
-        # the same way train.py parses the flag: None -> SHARED default, "none" -> every layer MoE.
-        mlp_only_layers=(None if getattr(c, "mlp_only_layers", None) is None else
-                         [] if str(c.mlp_only_layers).lower() == "none" else
-                         [int(v) for v in str(c.mlp_only_layers).split(",")]),
-        intermediate_size=getattr(c, "dense_inter", None))
+        **_arch_kwargs(vars(c)))
 
     sd = torch.load(ckpt, map_location=device)
     # strict=True on purpose: a silently-ignored missing key is a randomly-initialised tensor, and
     # the report would read as a genuine (bad) result rather than a loading bug.
     model.load_state_dict(sd, strict=True)
     model.eval()
-    total, _tr, active = count_params(model, top_k=c.top_k or None, num_experts=n_total)
+    total, _tr, active = count_params(model, top_k=c.top_k or None, num_experts=c.experts or SHARED["num_experts"])
     print(f"[report_ckpt] loaded {os.path.basename(ckpt)} | params total={total/1e6:.2f}M "
           f"active={active/1e6:.2f}M | patches={patch_list} act={c.act}/{c.radial_p}", flush=True)
     return model, c
