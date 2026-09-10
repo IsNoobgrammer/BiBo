@@ -37,9 +37,7 @@ import re
 
 import torch
 
-from ablate.common.data import split_shards
 from ablate.common.report_ckpt import load_from_result
-from ablate.common import validation as _val
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -94,22 +92,34 @@ def _entropy(p):
 
 
 @torch.no_grad()
-def _run(model, probe, dataset, seq_len, n_seqs, pad_id=0):
-    """(mean CE on the holdout at this length, per-layer router state)."""
-    hold = _val.build_holdout(dataset, seq_len, n_seqs, DEV)
-    assert hold is not None, "no held-out shard: this needs a local corpus directory"
-    x, y = hold[:, :-1], hold[:, 1:]
-    tot = ntok = 0.0
-    for i in range(0, x.shape[0], 2):                      # 2 seqs at a time: 4095 is heavy
-        xb, yb = x[i:i + 2], y[i:i + 2]
+def _run(model, probe, dataset, C, n_seqs, target_window=512, row_tokens=4096, pad_id=0, chunk=4):
+    """CE on the SAME targets with C tokens of context, plus the router state on those inputs.
+
+    This is `final_report.context_ablation` verbatim in construction, which matters: ctxabl is the
+    metric the whole extrapolation claim rests on, and it scores identical target tokens while
+    varying only the visible history. An earlier version of this probe scored DIFFERENT targets at
+    each length -- CE then falls with length for the trivial reason that later tokens have more
+    context, and it is not comparable to delta_ctx4095 at all.
+    """
+    from ablate.common.final_report import _holdout_rows
+    batch = _holdout_rows(dataset, row_tokens, n_seqs, DEV)
+    assert batch is not None, "no held-out shard: this needs a local corpus directory"
+    C = min(C, row_tokens - 1)
+    a = row_tokens - 1 - C
+    tot = cnt = 0.0
+    for i in range(0, batch.shape[0], chunk):
+        b = batch[i:i + chunk]
+        inp, tgt = b[:, a:a + C], b[:, a + 1:a + C + 1]
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=(DEV == "cuda")):
-            logits = model(xb).logits
-        m = (yb != pad_id)
+            logits = model(inp).logits
+        w = min(target_window, logits.shape[1])
         ce = torch.nn.functional.cross_entropy(
-            logits.float().reshape(-1, logits.shape[-1]), yb.reshape(-1), reduction="none")
-        tot += float((ce * m.reshape(-1)).sum())
-        ntok += float(m.sum())
-    return tot / max(ntok, 1), probe.take()
+            logits[:, -w:].float().reshape(-1, logits.shape[-1]),
+            tgt[:, -w:].reshape(-1), ignore_index=int(pad_id))
+        tot += float(ce) * b.shape[0] * w
+        cnt += b.shape[0] * w
+        del logits
+    return tot / max(cnt, 1), probe.take()
 
 
 def _compare(a, b, key):
@@ -127,7 +137,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("result")
     ap.add_argument("--lens", default="1024,2048,4095")
-    ap.add_argument("--seqs", type=int, default=8)
+    ap.add_argument("--seqs", type=int, default=32)   # ctxabl converges at 32 rows
     ap.add_argument("--dataset", default="/home/marimo/work/data/bibo_mix")
     ap.add_argument("--zero_bias", type=int, default=-1,
                     help="layer whose router bias to zero for the eval (-1 = leave it alone)")
