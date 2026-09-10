@@ -100,3 +100,29 @@ def test_per_layer_router_survives_mixed_geometry():
     # uniform is k/E, so the two layers share a scale on max_load_tokens but not on max_load
     assert m["train/router/layer_0/max_load_tokens"] > 0
     assert "train/router/load_map" in m
+
+
+def test_weight_hist_is_the_signal_when_every_expert_is_active():
+    """With k == E the load histogram is flat by construction, so weight is what carries info."""
+    import torch
+    from ablate.common.models import build_arm
+    from ablate.common.per_layer import PerLayerRouter
+
+    model, _ = build_arm("bibo_min", device="cpu", dtype=torch.float32, mlp_only_layers=[],
+                         num_experts=64, top_k=6, moe_overrides={
+                             0: {"num_routed_experts": 8, "num_experts_per_tok": 8,
+                                 "moe_intermediate_size": 576}})
+    plr = PerLayerRouter(model, 64, 6)
+    plr.enabled = True
+    with torch.no_grad():
+        model(torch.randint(0, 1000, (1, 64)))
+    m = plr.flush()
+    plr.close()
+
+    counts = m["train/router/layer_0/routing_hist"].histogram
+    assert len(set(counts)) == 1, "k == E: every expert selected on every token"
+    w = m["train/router/layer_0/weight_hist"].histogram
+    assert len(w) == 8 and abs(sum(w) - 1.0) < 1e-6, "weight shares must sum to 1"
+    assert len(m["train/router/layer_0/score_hist"].histogram) == 8
+    # weight entropy is defined and normalised; a flat ensemble sits near 1.0
+    assert 0.0 <= m["train/router/layer_0/weight_entropy"] <= 1.0 + 1e-9

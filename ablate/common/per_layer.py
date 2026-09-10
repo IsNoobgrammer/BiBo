@@ -9,7 +9,16 @@ entropy cannot show. Both of those are summary statistics of exactly the distrib
 
 WHAT IS LOGGED PER LAYER
 
-  routing_hist        expert load, one bin per expert. The picture.
+  routing_hist        expert load (selection COUNT), one bin per expert. The picture.
+  weight_hist         share of the total mixing weight each expert carried. Load says how often
+                      an expert was chosen; this says how much it was trusted once chosen, and
+                      with k == E (an all-active ensemble) it is the ONLY per-expert signal --
+                      the count histogram is flat by construction there.
+  score_hist          mean sigmoid(logit) per expert over EVERY token, selected or not. Affinity
+                      independent of the selection: an expert that scores high everywhere shows
+                      up here even if top-k never reaches it.
+  weight_over_load_max  max over experts of (weight share / count share). >1 means some expert
+                      punches above its selection rate.
   load_balancing_loss the Switch aux quantity, normalised so 1.0 == perfectly uniform.
                       DIAGNOSTIC ONLY -- never added to the objective. Balance here comes from
                       the router bias update, and that is the arrangement being measured.
@@ -98,9 +107,16 @@ class PerLayerRouter:
             E, k = mod.num_routed_experts, mod.top_k
             a = self.acc.setdefault(i, {"counts": torch.zeros(E, dtype=torch.float64),
                                         "p": torch.zeros(E, dtype=torch.float64),
+                                        "w": torch.zeros(E, dtype=torch.float64),
                                         "gap": 0.0, "z": 0.0, "n": 0, "E": E, "k": k})
             a["counts"] += torch.bincount(idx.reshape(-1).to("cpu"), minlength=E).double()
             a["p"] += scores.float().mean(0).to("cpu").double()
+            # Total MIXING WEIGHT per expert -- the normalised coefficient the MoE actually
+            # multiplies each expert output by, not the number of times it was picked. With
+            # k == E the counts are flat by construction and this is the only thing that varies.
+            wt = out[1].reshape(-1).float().to("cpu")
+            a["w"] += torch.bincount(idx.reshape(-1).to("cpu"), weights=wt,
+                                     minlength=E).double()
             if k < E:
                 tk = scores.topk(k + 1, dim=-1).values
                 a["gap"] += (tk[..., k - 1] - tk[..., k]).mean().item()
@@ -119,8 +135,9 @@ class PerLayerRouter:
             counts = a["counts"]
             tot = counts.sum().clamp_min(1)
             f = counts / tot                                   # fraction of assignments per expert
-            p = a["p"] / a["n"]
-            p = p / p.sum().clamp_min(1e-12)                   # normalised mean router mass
+            aff = a["p"] / a["n"]                              # mean sigmoid score per expert,
+            p = aff / aff.sum().clamp_min(1e-12)               # over ALL tokens, selected or not
+            w = a["w"] / a["w"].sum().clamp_min(1e-12)         # share of total mixing weight
             # Switch aux quantity, scaled so a uniform router reads exactly 1.0 -- the raw
             # E*sum(f*P) is 1.0 at uniform only for a softmax router, and ours is sigmoid.
             out[f"{pre}/load_balancing_loss"] = float(E * (f * p).sum())
@@ -140,9 +157,27 @@ class PerLayerRouter:
             if k < E:
                 out[f"{pre}/boundary_gap"] = a["gap"] / a["n"]
             out[f"{pre}/router_z_loss"] = a["z"] / a["n"]
-            h = _hist(counts.tolist(), E)
-            if h is not None:
-                out[f"{pre}/routing_hist"] = h
+            # AFFINITY vs CONTRIBUTION, deliberately two series.
+            #   score_hist   mean sigmoid(logit) per expert over EVERY token, whether or not it
+            #                was selected. This is affinity irrespective of the token mix: an
+            #                expert every token likes shows up here even if it is rarely picked.
+            #   weight_hist  share of the total mixing weight it actually carried. This is
+            #                contribution, and it is the only per-expert signal that survives
+            #                when k == E and the load histogram is flat by construction.
+            # Their RATIO is the interesting part: weight_over_load > 1 means an expert punches
+            # above its selection rate -- picked seldom, but trusted when it is.
+            out[f"{pre}/max_weight"] = float(w.max())
+            ent_w = float(-(w.clamp_min(1e-12) * w.clamp_min(1e-12).log()).sum())
+            out[f"{pre}/weight_entropy"] = ent_w / math.log(E)      # 1.0 = a flat average
+            out[f"{pre}/score_mean"] = float(aff.mean())
+            out[f"{pre}/score_max"] = float(aff.max())
+            out[f"{pre}/score_min"] = float(aff.min())
+            out[f"{pre}/weight_over_load_max"] = float((w / f.clamp_min(1e-12)).max())
+            for nm, vals in (("routing_hist", counts.tolist()), ("weight_hist", w.tolist()),
+                             ("score_hist", aff.tolist())):
+                h = _hist(vals, E)
+                if h is not None:
+                    out[f"{pre}/{nm}"] = h
             loads[i] = counts.tolist()
         if loads:
             m = load_map(loads)
