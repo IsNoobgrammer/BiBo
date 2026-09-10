@@ -43,6 +43,14 @@ def load_from_result(result_json, device=DEV):
     patchmod.apply(patch_list)
 
     n_total = c.experts or SHARED["num_experts"]
+    # Per-layer expert geometry, "L:E:k:w" (--moe_override). Without this an arm that gave layer 0
+    # a different expert count rebuilds at the DEFAULT geometry and load_state_dict(strict=True)
+    # rejects it -- which is the good outcome; the bad one would be a loader that quietly resized.
+    moe_over = {}
+    for spec in filter(None, (x.strip() for x in str(getattr(c, "moe_override", "") or "").split(","))):
+        L, E, k, w = (int(v) for v in spec.split(":"))
+        moe_over[L] = {"num_routed_experts": E, "num_experts_per_tok": k,
+                       "moe_intermediate_size": w}
     swa_pat, win = resolve_swa(c.swa_pattern, c.sliding_window, SHARED["num_hidden_layers"])
     model, _ = build_arm(
         c.arm, device=device, dtype=torch.float32, attn_impl=c.attn,
@@ -67,6 +75,7 @@ def load_from_result(result_json, device=DEV):
         # ignores them silently builds a different model. strict=True then fails with missing
         # mlp.gate_proj keys against an all-MoE checkpoint -- which is how this was found. Parsed
         # the same way train.py parses the flag: None -> SHARED default, "none" -> every layer MoE.
+        moe_overrides=moe_over,
         mlp_only_layers=(None if getattr(c, "mlp_only_layers", None) is None else
                          [] if str(c.mlp_only_layers).lower() == "none" else
                          [int(v) for v in str(c.mlp_only_layers).split(",")]),
