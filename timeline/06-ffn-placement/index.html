@@ -7,7 +7,10 @@
 <nav class="crumb"><a href="../index.html">&larr; timeline</a><span>06-ffn-placement</span></nav>
 <h1>06 - FFN placement: dense vs MoE end-layers</h1>
 <p><strong>Span</strong> Aug 15-25 2026 &middot; <code>bibo-dense-vs-moe-2k</code>, 7 runs.</p>
-<h2>Verdict: all-MoE SHIPPED-pending -- but the reason changed on the second seed</h2>
+<h2>Verdict: SUPERSEDED Sep 17 2026 -- layer 0 now runs an all-active ensemble</h2>
+<p><strong>Both headline claims in this page failed their seed controls.</strong> Read the update at the bottom
+first; the val ladder and the extrapolation separation are each contradicted by a control run
+added after the page was written.</p>
 <p><strong>Read the update at the bottom before quoting the 0.066.</strong> A second seed reversed the sign of the
 val gap. The result survives, on a different and much stronger metric: long-context extrapolation.</p>
 <p>The board config ran a dense FFN at layers 0 and 9 and a 64-expert top-6 MoE everywhere else. The
@@ -182,5 +185,84 @@ extrapolation, not 0.066 val.</p>
 <h2>Sources</h2>
 <p>Memory: <code>dense-moe-round</code>, <code>box-tps-drift</code>, <code>carry-is-flat</code>. Results:
 <code>ablate/certified_results/tps_probe_20260815.md</code>.</p>
+<hr />
+<h2>UPDATE 2, Sep 10-17 2026: the extrapolation claim failed too, and L0 changed</h2>
+<p><code>base-allmoe-s23</code> -- the control this round never had -- is all-MoE at a second seed:</p>
+<pre><code>all-MoE   delta_ctx4095  0.0411  0.0521  0.0537  |  **0.1932**  (seed 23)
+dense                    0.1364  0.1412  0.1513
+ensemble  (8x576 all-on) 0.1516  0.1629  0.1691
+</code></pre>
+<p><strong>all-MoE at seed 23 extrapolates worse than every dense and ensemble run.</strong> Its seed range on
+this metric, 0.041 to 0.193, is larger than the 0.098 effect Update 1 reported as "3 against 4
+with no overlap". That sentence is wrong as written. What is true: sparse L0 has a better MEAN
+(0.085 vs 0.161) and a much worse tail. <code>train</code> and <code>ctx1024</code> are seed-stable; only
+<code>delta_ctx4095</code> is unstable, and only for the sparse arm.</p>
+<h3>The adopted stack</h3>
+<p>Layer 0 now runs <strong>8 experts at width 576, all active</strong> -- the router produces mixing weights and
+makes no selection. <code>8 x 576 = 4608 = top_k * moe_inter</code>, so L0 costs the same per token as the
+sparse layer it replaces and 68.4M less in total. Layers 1-9 are unchanged 64-expert top-6 MoE.
+Encoded in <code>SHARED</code> and pinned by a test.</p>
+<div class="tablewrap"><table>
+<thead>
+<tr>
+<th></th>
+<th>all-MoE L0</th>
+<th>ensemble L0</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>train (2 seeds)</td>
+<td>3.5940</td>
+<td>3.5923</td>
+</tr>
+<tr>
+<td>ctx1024 (2 seeds)</td>
+<td>3.2586</td>
+<td><strong>3.2505</strong></td>
+</tr>
+<tr>
+<td>delta_ctx4095 mean</td>
+<td><strong>0.0850</strong></td>
+<td>0.1612</td>
+</tr>
+<tr>
+<td>delta_ctx4095 range</td>
+<td>0.152</td>
+<td><strong>0.0175</strong></td>
+</tr>
+<tr>
+<td>L0 params</td>
+<td>75.5M</td>
+<td><strong>7.08M</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>Consistency, size and a simpler entry layer, bought with worse expected long-context. A deliberate
+trade, not a free win -- revisit if long-context serving becomes the target.</p>
+<h3>What the checkpoints say about why</h3>
+<p><code>ablate/tools/length_probe.py</code> runs a frozen checkpoint at two context lengths using ctxabl's own
+construction (same targets, varying history):</p>
+<ul>
+<li><strong>L0 is the most length-sensitive router in the model</strong> -- weight TV distance 0.184 between
+  ctx1024 and ctx4095, against 0.016-0.046 everywhere else.</li>
+<li><strong>The ensemble's L0 does not move at all</strong> (weight TV 0.0030, load TV exactly 0). It is
+  functionally dense, which is why it matched dense-L0's extrapolation.</li>
+<li><strong>Zeroing L0's balancing bias changes nothing</strong> (0.1817 -&gt; 0.1799), killing the stale-bias
+  hypothesis.</li>
+</ul>
+<p>And the mechanism guess in Update 1 was backwards: seed 23 has a <em>healthy</em> L0 router (boundary gap
+0.112 vs seed 2026's 0.0026), the highest length sensitivity, and the worst extrapolation. Routing
+that SHIFTS under length change looks like the problem, not the cure. Untested.</p>
+<p><strong>Capacity explains none of it.</strong> L0 holds 75.5M params in both all-MoE (64x768 top-6) and coarse
+(32x1536 top-3), and those sit at opposite extremes: 0.054 and 0.757.</p>
+<h3>Two method lessons, both expensive</h3>
+<ol>
+<li><strong>Run the control before the conclusion.</strong> Three of this round's claims were written from arms
+   compared against a single-seed reference. Two did not survive the second seed.</li>
+<li><strong>A nondeterminism floor is not a seed floor.</strong> Two accidental same-seed repeats gave a 0.0004
+   train spread; the seed spread is 0.0043. Scoring a 0.0038 margin against the smaller one made
+   noise look like a result.</li>
+</ol>
 <footer>Generated from README.md &middot; BiBo ablation timeline</footer>
 </div>

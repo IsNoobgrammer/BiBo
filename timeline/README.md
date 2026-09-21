@@ -54,9 +54,10 @@ govern extrapolation; local rotary width is irrelevant to it. A dead dynamic-NTK
 silently rescaling the base at eval, making every pre-Aug-13 extrapolation number incomparable.
 
 ### [06 - FFN placement](06-ffn-placement/README.md)
-All-MoE beats dense end-layers on **long-context extrapolation** - `delta_ctx4095` 0.041-0.054 vs
-0.136-0.156, seven runs, no overlap - for 4.9% throughput. The val gap that originally carried this
-result **reversed sign on a second seed**; a two-sequence holdout could not hold a 0.03 effect.
+**Superseded.** Both headline claims failed their seed controls - the val gap reversed, and
+all-MoE's extrapolation advantage collapsed at seed 23 (0.0537 -> 0.1932, worse than every dense
+run). Layer 0 now runs an **all-active 8x576 ensemble**: a tie on train, marginally better at the
+trained length, 68.4M smaller, predictable long-context - at a worse long-context *mean*.
 
 ### [07 - Kernels and speed](07-kernels-and-speed/README.md)
 128.9k to 178.8k tps. Bit identity is the ship gate - a kernel that was *more accurate* than eager
@@ -103,6 +104,7 @@ rather than set up.
 | Aug 8-13 | `bibo-baseline-2k` | 16 | the 2000-step board: carry, rope, noise floor |
 | Aug 15 | `bibo-dense-vs-moe-2k` | 5 | dense vs MoE end-layers, and the carry interp |
 | Aug 25 | `bibo-dense-vs-moe-2k` | +2 | all-MoE and dense-L0 at a second seed, fully instrumented |
+| Aug 31 - Sep 10 | `bibo-dense-vs-moe-2k` | +4 | coarse and all-active L0 geometries; the missing seed controls |
 
 Every run indexed locally in [`_data/wandb.json`](_data/wandb.json) - W&B is the system of record,
 but boxes and results have been lost before.

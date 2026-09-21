@@ -66,9 +66,10 @@ carry turned out to be a flat direction: the whole 512-dim vector is replaceable
 govern extrapolation; local rotary width is irrelevant to it. A dead dynamic-NTK branch had been
 silently rescaling the base at eval, making every pre-Aug-13 extrapolation number incomparable.</p>
 <h3><a href="06-ffn-placement/README.md">06 - FFN placement</a></h3>
-<p>All-MoE beats dense end-layers on <strong>long-context extrapolation</strong> - <code>delta_ctx4095</code> 0.041-0.054 vs
-0.136-0.156, seven runs, no overlap - for 4.9% throughput. The val gap that originally carried this
-result <strong>reversed sign on a second seed</strong>; a two-sequence holdout could not hold a 0.03 effect.</p>
+<p><strong>Superseded.</strong> Both headline claims failed their seed controls - the val gap reversed, and
+all-MoE's extrapolation advantage collapsed at seed 23 (0.0537 -&gt; 0.1932, worse than every dense
+run). Layer 0 now runs an <strong>all-active 8x576 ensemble</strong>: a tie on train, marginally better at the
+trained length, 68.4M smaller, predictable long-context - at a worse long-context <em>mean</em>.</p>
 <h3><a href="07-kernels-and-speed/README.md">07 - Kernels and speed</a></h3>
 <p>128.9k to 178.8k tps. Bit identity is the ship gate - a kernel that was <em>more accurate</em> than eager
 cost real bpb. Microbenchmarks mispredicted one real cost by 13x in both directions.</p>
@@ -210,6 +211,12 @@ rather than set up.</p>
 <td><code>bibo-dense-vs-moe-2k</code></td>
 <td>+2</td>
 <td>all-MoE and dense-L0 at a second seed, fully instrumented</td>
+</tr>
+<tr>
+<td>Aug 31 - Sep 10</td>
+<td><code>bibo-dense-vs-moe-2k</code></td>
+<td>+4</td>
+<td>coarse and all-active L0 geometries; the missing seed controls</td>
 </tr>
 </tbody>
 </table></div>
