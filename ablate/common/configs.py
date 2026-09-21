@@ -27,7 +27,23 @@ SHARED = dict(
     num_experts=6,                # TOTAL routed experts (GLU + specials)
     num_experts_per_tok=2,
     max_position_embeddings=2048,
-    mlp_only_layers=[0, 9],
+    # ADOPTED Sep 17 2026. No dense FFN anywhere, and layer 0 runs an ALL-ACTIVE ensemble of 8
+    # experts at width 576 instead of a 64-expert top-6 router. 8*576 = 4608 = top_k*moe_inter, so
+    # L0 costs the same per token as the sparse layer it replaces and 68.4M less in total.
+    #
+    # WHAT THE DECISION BUYS, over 2 seeds each (see timeline/06-ffn-placement):
+    #   train      3.5923 vs 3.5940   a tie, inside both seed floors
+    #   ctx1024    3.2505 vs 3.2586   marginally better
+    #   L0 params  7.08M vs 75.5M     and no router at layer 0 at all
+    #   delta_ctx4095 range 0.0175 vs 0.152 -- PREDICTABLE, which sparse L0 is not
+    #
+    # WHAT IT COSTS, stated so nobody rediscovers it: MEAN delta_ctx4095 is worse, 0.1612 against
+    # 0.0850. Sparse L0 reads 0.041/0.052/0.054 on three seeds and 0.193 on a fourth; the ensemble
+    # reads 0.152-0.169 on all three of its runs. Better expected long-context, much worse tail,
+    # traded for consistency and size. Revisit if long-context serving becomes the target.
+    mlp_only_layers=[],
+    moe_overrides={0: {"num_routed_experts": 8, "num_experts_per_tok": 8,
+                       "moe_intermediate_size": 576}},
     rms_norm_eps=1e-6,
     rope_theta=10000.0,
     tie_word_embeddings=True,
@@ -193,7 +209,10 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
         num_experts_per_tok=(top_k or SHARED["num_experts_per_tok"]),
         max_position_embeddings=SHARED["max_position_embeddings"],
         mlp_only_layers=(SHARED["mlp_only_layers"] if mlp_only_layers is None else list(mlp_only_layers)),
-        moe_overrides=moe_overrides or {},
+        # None = take the board default; {} = explicitly no per-layer override. The two must stay
+        # distinguishable or the adopted L0 geometry is silently defeated by every caller that
+        # passes an empty dict.
+        moe_overrides=(SHARED["moe_overrides"] if moe_overrides is None else moe_overrides),
         rms_norm_eps=SHARED["rms_norm_eps"],
         rope_theta=(rope_theta if rope_theta is not None else SHARED["rope_theta"]),
         tie_word_embeddings=SHARED["tie_word_embeddings"], norm_topk_prob=SHARED["norm_topk_prob"],

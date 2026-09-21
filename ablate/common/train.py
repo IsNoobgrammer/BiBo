@@ -599,8 +599,12 @@ def main():
     _swa_pat, _win = resolve_swa(args.swa_pattern, args.sliding_window, SHARED["num_hidden_layers"])
     # None -> SHARED default [0, 9]; "none" -> [] (every layer MoE); else a comma list.
     # "0:32:3:1536" -> {0: {num_routed_experts: 32, num_experts_per_tok: 3, moe_intermediate_size: 1536}}
-    _moe_over = {}
+    # "" -> None -> the board default (an all-active L0). "none" -> {} -> no override at all.
+    # Same convention as --mlp_only_layers, deliberately.
+    _moe_over = None if not args.moe_override else {}
     for _spec in filter(None, (x.strip() for x in args.moe_override.split(","))):
+        if _spec.lower() == "none":
+            continue
         _L, _E, _k, _w = (int(x) for x in _spec.split(":"))
         _moe_over[_L] = {"num_routed_experts": _E, "num_experts_per_tok": _k,
                          "moe_intermediate_size": _w}
@@ -660,6 +664,13 @@ def main():
         assert _nxa, "--use_xsa but 0 modules carry xsa_alpha -- the arm would be silently inert"
         print(f"[xsa] learnable alpha on {_nxa} attn modules, init {args.xsa_alpha_init:g} "
               f"-> tanh = {math.tanh(args.xsa_alpha_init):.3f}", flush=True)
+    # Say what layer 0 ACTUALLY is. The board default is now an all-active ensemble there, and a
+    # default that never prints is one somebody will later attribute to the wrong config.
+    _l0 = getattr(getattr(model.model.layers[0], "mlp", None), "gate", None)
+    print(f"[ffn] layer 0 = " + ("dense FFN" if _l0 is None else
+          f"{_l0.num_routed_experts} experts top-{_l0.top_k}"
+          f"{' (ALL ACTIVE: no selection, router weights only)' if _l0.top_k == _l0.num_routed_experts else ''}"),
+          flush=True)
     total, trainable, active = count_params(model)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
     if not args.fused_res_add:

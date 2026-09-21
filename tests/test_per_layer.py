@@ -51,7 +51,10 @@ def test_moe_override_changes_the_built_layer(attn_res):
 
     kw = dict(device="cpu", dtype=torch.float32, mlp_only_layers=[], num_experts=64, top_k=6,
               attn_res=attn_res, attn_res_sites=1)
-    base, _ = build_arm("bibo_min", **kw)
+    # moe_overrides={} PINS the 64-expert stack. Passing nothing would pick up the board default,
+    # which is now an all-active L0 -- and the parity being asserted here is 32/3/1536 against
+    # 64/6/768, not against whatever the default happens to be this month.
+    base, _ = build_arm("bibo_min", moe_overrides={}, **kw)
     over, _ = build_arm("bibo_min", moe_overrides={
         0: {"num_routed_experts": 32, "num_experts_per_tok": 3, "moe_intermediate_size": 1536}}, **kw)
 
@@ -126,3 +129,24 @@ def test_weight_hist_is_the_signal_when_every_expert_is_active():
     assert len(m["train/router/layer_0/score_hist"].histogram) == 8
     # weight entropy is defined and normalised; a flat ensemble sits near 1.0
     assert 0.0 <= m["train/router/layer_0/weight_entropy"] <= 1.0 + 1e-9
+
+
+def test_adopted_board_default_is_ensemble_l0():
+    """The Sep 17 2026 decision, pinned: no dense layers, L0 all-active 8x576, MoE elsewhere.
+
+    A default nothing asserts is a default that drifts. This also guards the None-vs-{} contract:
+    None means "board default", {} means "no override", and collapsing them would silently undo
+    the adoption for every caller that passes an empty dict.
+    """
+    import torch
+    from ablate.common.configs import SHARED
+    from ablate.common.models import build_arm
+
+    assert SHARED["mlp_only_layers"] == []
+    assert SHARED["moe_overrides"][0] == {"num_routed_experts": 8, "num_experts_per_tok": 8,
+                                          "moe_intermediate_size": 576}
+    kw = dict(device="cpu", dtype=torch.float32, num_experts=64, top_k=6)
+    l0 = build_arm("bibo_min", **kw)[0].model.layers[0].mlp.gate
+    assert (l0.num_routed_experts, l0.top_k) == (8, 8), "L0 must be the all-active ensemble"
+    off = build_arm("bibo_min", moe_overrides={}, **kw)[0].model.layers[0].mlp.gate
+    assert (off.num_routed_experts, off.top_k) == (64, 6), "{} must DISABLE, not fall back"
