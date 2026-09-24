@@ -59,7 +59,8 @@ def build_optimizers(model, muon_lr=1e-2, adam_lr=3e-4, wd=0.1, momentum=0.95, n
                      xorth_warmup_steps=0, xorth_where="post", router_adamw=False,
                      act_scale_lr=None, cautious_decay=False, vec_matrices_adamw=False,
                      vec_adamw_group="default",
-                     optim="muon", probe_gamma=0.0, probe_rho_step=0.96, probe_rank=0, muon_wd=None):
+                     optim="muon", probe_gamma=0.0, probe_rho_step=0.96, probe_rank=0, muon_wd=None,
+                     ns_backend="auto"):
     from kernels.sm120.muon import FusedMuon   # Blackwell: gram-NS (self-gates to symmul/cuBLAS on small mats) + 8M knee
     stacks, mats, other = [], [], []
     n_router = 0
@@ -102,8 +103,9 @@ def build_optimizers(model, muon_lr=1e-2, adam_lr=3e-4, wd=0.1, momentum=0.95, n
         else:
             mats.append(p)                  # plain 2D weight matrices -> never whitened
     print(f"[optim] router projections: {n_router} -> {'AdamW' if router_adamw else 'Muon'}", flush=True)
-    # use_gram=False: gram-space NS needs restart placements tuned PER variant (the [4,5] winner was tuned
-    # for aurora), so every variant runs the same plain 8-step NS (symmul/cuBLAS) until each has its own.
+    # ns_backend="auto": per shape bucket, the fastest NS backend whose error stays within 1.05x cuBLAS's
+    # (kernels/sm120/ns_router.py; the decisions print as [ns-router] lines on step 1). Gram is
+    # rejected at BiBo's 512-wide shapes by that accuracy bar, so no per-variant restart tuning is needed.
     # variant (ABLATION AXIS): aurora (default) | normuon | polar | muown -- see kernels/muon/muon_scaling.py.
     # muon_scale "adam" = update RMS 0.2 so the AdamW lr band applies to every variant; ns_coeffs is a
     # NS_PRESETS name ("ns8" = 6 quintic + 2 finishing steps, the board default).
@@ -127,7 +129,7 @@ def build_optimizers(model, muon_lr=1e-2, adam_lr=3e-4, wd=0.1, momentum=0.95, n
     print(f"[optim] muon variant={variant} scale={muon_scale} ns={ns_coeffs if isinstance(ns_coeffs, str) else 'custom'} "
           f"wd={muon_wd:g} | adamw wd={wd:g}", flush=True)
     _mk = dict(lr=muon_lr, momentum=momentum, weight_decay=muon_wd, ns_coeffs=ns_coeffs, ns_dtype=ns_dtype,
-               use_gram=False, variant=variant, scale=muon_scale,
+               ns_backend=ns_backend, variant=variant, scale=muon_scale,
                cautious_decay=bool(cautious_decay), **_xo)
     # optim=manas: the SAME sm120 gram-NS Muon step (kernels.sm120.manas subclasses it cooperatively --
     # never import kernels.sm75.manas here, that would swap the NS backend along with the optimizer and
