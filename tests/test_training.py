@@ -96,3 +96,43 @@ def test_shortest_trainable_sequence_is_two_tokens():
     assert torch.isnan(m(one, labels=one).loss), "expected the empty-label-set NaN"
     two = tokens(1, 2)
     assert torch.isfinite(m(two, labels=two).loss)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(DEVICE != "cuda", reason="FusedMuon sm120 path needs CUDA")
+def test_muown_scale_mode_trains_and_pins_row_norms_to_g():
+    """--muon_scale_mode muown through the real builder: loss falls, and every Muon matrix keeps
+    ||W_i|| == g_i (the reparameterization is live, not silently falling back to plain Muon)."""
+    from ablate.common.optim import build_optimizers
+    torch.manual_seed(0)
+    m = make_model().to(DEVICE).train()
+    (muon, adamw), _, _ = build_optimizers(m, muon_lr=1e-2, adam_lr=3e-3, wd=0.1,
+                                           scale_mode="muown", muon_wd=0.0)
+    assert muon.param_groups[0]["weight_decay"] == 0.0 and adamw.param_groups[0]["weight_decay"] == 0.1
+    x = tokens(2, 16, seed=11).to(DEVICE)
+    losses = []
+    for _ in range(5):
+        loss = m(x, labels=x).loss
+        muon.zero_grad(); adamw.zero_grad()
+        loss.backward()
+        muon.step(); adamw.step()
+        losses.append(loss.item())
+    assert losses[-1] < losses[0], losses
+    checked = 0
+    for st in muon.state.values():
+        if "muown" not in st:
+            continue
+        g = st["muown"]["g"]
+        assert torch.isfinite(g).all()
+        checked += 1
+    assert checked > 0, "no muown state: the mode never engaged"
+    # g for a shape-bucket is stacked over its members in plan order; rebuild that stack and compare
+    pinned = 0
+    for plan in muon._plan_cache.values():
+        for bk in plan:
+            st = muon.state[bk["anchor"]]["muown"]
+            W = torch.cat([p.detach().float().reshape(n, bk["r"], bk["c"])
+                           for members, _s, _c in bk["chunks"] for p, _o, n in members])
+            assert torch.allclose(torch.linalg.vector_norm(W, dim=-1), st["g"], rtol=1e-4, atol=1e-6)
+            pinned += 1
+    assert pinned > 0

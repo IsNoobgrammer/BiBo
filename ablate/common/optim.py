@@ -63,7 +63,7 @@ def build_optimizers(model, muon_lr=1e-2, adam_lr=3e-4, wd=0.1, momentum=0.95, n
                      xorth_warmup_steps=0, xorth_where="post", router_adamw=False,
                      act_scale_lr=None, cautious_decay=False, vec_matrices_adamw=False,
                      vec_adamw_group="default",
-                     optim="muon", probe_gamma=0.0, probe_rho_step=0.96, probe_rank=0):
+                     optim="muon", probe_gamma=0.0, probe_rho_step=0.96, probe_rank=0, muon_wd=None):
     from kernels.sm120.muon import FusedMuon   # Blackwell: gram-NS (self-gates to symmul/cuBLAS on small mats) + 8M knee
     stacks, mats, other = [], [], []
     n_router = 0
@@ -125,7 +125,9 @@ def build_optimizers(model, muon_lr=1e-2, adam_lr=3e-4, wd=0.1, momentum=0.95, n
     # applies it to both. Passed explicitly so the run record always states which mode was used:
     # every baseline on the board predates this and is NON-cautious.
     print(f"[optim] cautious weight decay: {bool(cautious_decay)} (Muon only; AdamW standard)", flush=True)
-    _mk = dict(lr=muon_lr, momentum=momentum, weight_decay=wd, coeffs=NS8, ns_dtype=ns_dtype,
+    muon_wd = wd if muon_wd is None else muon_wd
+    print(f"[optim] muon scale_mode={scale_mode} wd={muon_wd:g} | adamw wd={wd:g}", flush=True)
+    _mk = dict(lr=muon_lr, momentum=momentum, weight_decay=muon_wd, coeffs=NS8, ns_dtype=ns_dtype,
                aurora_k=1, gram_restarts=[4, 5], scale_mode=scale_mode,
                cautious_decay=bool(cautious_decay), **_xo)
     # optim=manas: the SAME sm120 gram-NS Muon step (kernels.sm120.manas subclasses it cooperatively --
