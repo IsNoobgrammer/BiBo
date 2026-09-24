@@ -436,7 +436,7 @@ def main():
     ap.add_argument("--muon_variant", choices=["base", "normuon", "aurora", "muown"], default="aurora")
     ap.add_argument("--muon_scale", choices=["adam", "none"], default="adam")  # adam = update RMS 0.2 (AdamW lr band)
     ap.add_argument("--ns_coeffs", choices=["ns8", "dsv4", "quintic5", "pe8"], default="ns8")
-    ap.add_argument("--ns_backend", choices=["auto", "cublas", "epi", "symmul", "gram"], default="auto")
+    ap.add_argument("--ns_backend", choices=["auto", "cublas", "epi", "symepi", "symmul", "gram"], default="auto")
     # muown (arXiv 2605.10797) is not a row scaling: it reparameterizes every Muon matrix as
     # W = g * v/||v|| per row, Muon on v and Adam on g (same lr). Its claim is wd-insensitivity, so
     # its arm runs --muon_wd 0 while AdamW keeps --wd; parity vs the reference: triton-kernel-fused
