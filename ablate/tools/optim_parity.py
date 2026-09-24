@@ -124,3 +124,42 @@ def run(model, gen, loss_fn, amp, steps, wd, adam_lr):
     for name, rows in hist.items():
         print(f"   {name:<12} {rows[0][1]:.3e} -> {rows[-1][1]:.3e}   x{rows[-1][1] / max(rows[0][1], 1e-30):.1f}")
     print("[parity] DONE", flush=True)
+
+
+def run_free(model, gen, loss_fn, amp, steps, wd, adam_lr, grad_clip, build):
+    """FREE-RUNNING parity: copies of the model, each trained by its own optimizer on the SAME batches
+    (own forward/backward/clip/step, exactly like train.py). A and A2 are identical eager arms -- their
+    gap is the MoE-backward nondeterminism floor. A gap between A and a candidate that is far above the
+    A/A2 floor is a real difference in what training sees, which the shared-gradient harness above
+    cannot detect (its candidate weights are never read by a forward)."""
+    import copy
+    arms = [("A eager", dict(fused_tail=False, ns_backend="cublas")),
+            ("A2 eager", dict(fused_tail=False, ns_backend="cublas")),
+            ("B fused tail", dict(fused_tail=True, ns_backend="cublas")),
+            ("C auto+tail", dict(fused_tail=True, ns_backend="auto"))]
+    models = [model] + [copy.deepcopy(model) for _ in arms[1:]]
+    opts = [build(m, **kw) for m, (_, kw) in zip(models, arms)]
+    batches = [next(gen) for _ in range(steps)]
+    ref0 = [p.detach().clone() for p in models[0].parameters()]
+    print(f"[free] {len(arms)} model copies, {steps} steps, grad_clip {grad_clip}", flush=True)
+    for step, ids in enumerate(batches, 1):
+        row = []
+        for m, os_ in zip(models, opts):
+            for o in os_:
+                o.zero_grad(set_to_none=True)
+            with torch.enable_grad():
+                with amp:
+                    loss = loss_fn(m, ids)
+                loss.backward()
+            gn = torch.nn.utils.clip_grad_norm_(m.parameters(), grad_clip)
+            for o in os_:
+                o.step()
+            row.append((float(loss), float(gn)))
+        pa = list(models[0].parameters())
+        tot = torch.sqrt(sum(((p.float() - w.float()) ** 2).sum() for p, w in zip(pa, ref0)))
+        cells = []
+        for (name, _), m, (l, g) in zip(arms, models, row):
+            d = torch.sqrt(sum(((p.float() - q.float()) ** 2).sum() for p, q in zip(m.parameters(), pa)))
+            cells.append(f"{name}: loss {l:.4f} |g| {g:.3f} W-vs-A {float(d / tot):.2e}")
+        print(f"[free] step {step:>2}  " + "  |  ".join(cells), flush=True)
+    print("[free] DONE", flush=True)

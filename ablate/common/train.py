@@ -438,6 +438,7 @@ def main():
     ap.add_argument("--ns_coeffs", choices=["ns8", "dsv4", "quintic5", "pe8"], default="ns8")
     ap.add_argument("--ns_backend", choices=["auto", "cublas", "epi", "symepi", "symmul", "gram"], default="auto")
     ap.add_argument("--optim_parity_steps", type=int, default=0)  # >0: run ablate/tools/optim_parity.py instead of training
+    ap.add_argument("--optim_parity_mode", choices=["shared", "free"], default="shared")
     ap.add_argument("--muon_fused_tail", type=lambda s: s.lower() in ("1", "true", "yes"), default=True)  # one-pass pre/post-NS elementwise (bit-identical)
     # muown (arXiv 2605.10797) is not a row scaling: it reparameterizes every Muon matrix as
     # W = g * v/||v|| per row, Muon on v and Adam on g (same lr). Its claim is wd-insensitivity, so
@@ -896,11 +897,18 @@ def main():
           f"flops/token ~{flops_per_token/1e9:.2f} GFLOP", flush=True)
     model.train()
     if args.optim_parity_steps > 0:     # same model/patches/data/amp as training, then the parity harness
-        from ablate.tools.optim_parity import run as _parity
-        _parity(model, gen, lambda ids: _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
-                                            getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok,
-                                            pad_id=args.pad_id),
-                amp, args.optim_parity_steps, args.wd, args.adam_lr)
+        from ablate.tools.optim_parity import run as _parity, run_free as _parity_free
+        _lf = lambda m, ids: _ce(m, ids, use_fused_ce, aux_collector, args.aux_coef,
+                                 getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok, pad_id=args.pad_id)
+        if args.optim_parity_mode == "free":
+            _bk = dict(ns_dtype=dt, variant=args.muon_variant, muon_scale=args.muon_scale, ns_coeffs=args.ns_coeffs,
+                       router_adamw=(args.router_optim == "adamw"), act_scale_lr=args.act_scale_lr,
+                       vec_matrices_adamw=args.vec_matrices_adamw, vec_adamw_group=args.vec_adamw_group,
+                       cautious_decay=args.cautious_decay)
+            _parity_free(model, gen, _lf, amp, args.optim_parity_steps, args.wd, args.adam_lr, args.grad_clip,
+                         lambda m, **kw: build_optimizers(m, args.muon_lr, args.adam_lr, args.wd, **_bk, **kw)[0])
+        else:
+            _parity(model, gen, lambda ids: _lf(model, ids), amp, args.optim_parity_steps, args.wd, args.adam_lr)
         return
     t0 = time.time(); _last_t = t0; _last_tok = 0; _last_step = 0
     # Running loss over the last LOSS_WINDOW steps. The per-step `loss` is ONE global batch and
