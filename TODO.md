@@ -30,8 +30,8 @@
 23. [ ] attention sinks / register tokens
 24. [ ] untie word embeddings at scale
 25. [ ] expose hidden_size / num_hidden_layers as CLI flags (hardcoded in configs.py SHARED)
-26. [x] mlp_only_layers -- now a CLI flag (--mlp_only_layers), and the dense-vs-MoE round says
-        `none` wins by 0.066 val at matched active params. Still hardcoded as the SHARED default.
+26. [x] mlp_only_layers -- CLI flag, and SHARED default is now [] (no dense FFN anywhere). The old
+        "wins by 0.066 val" claim did NOT survive its seed control -- see timeline/06.
 27. [ ] max_position_embeddings = 2048 vs a 4096-packed corpus
 28. [ ] --hf_repo unused; two boxes died with their checkpoints
 
@@ -59,3 +59,29 @@ and Muon + Adam-for-vectors + wd 0.1.
         shared experts at 64 experts and dropped them; at 256 experts top-4 the calculus differs.
 35. [ ] SWA window size. Ours is 128, theirs 2048 with fewer full layers (27% vs our 40%). Window
         size has never been swept here.
+
+## from the L0 geometry round (Aug 31 - Sep 17 2026, bibo-dense-vs-moe-2k)
+
+36. [x] per-layer expert geometry -- `--moe_override L:E:k:w`, both model paths (src/ and exp/),
+        param counter and checkpoint loader aware of it.
+37. [x] L0 DECISION: all-active 8x576 ensemble, MoE 64/top-6 elsewhere. ADOPTED in SHARED and
+        pinned by a test. Tie on train, 68.4M smaller, predictable long-context -- but WORSE mean
+        delta_ctx4095 (0.161 vs 0.085). Revisit if 4k serving becomes the target.
+38. [ ] router z-loss coefficient. Top logits reach ~200 under a sigmoid gate, so the leading
+        experts are saturated and gradient-free. `router_z_loss_coef` is 0. Cheapest open lead.
+39. [ ] length-matched routing swap: feed 4095 of context but force L0 to its 1024-context expert
+        choices. If CE recovers, routing that SHIFTS with length is the extrapolation cost.
+        Checkpoint-only, no training. ablate/tools/length_probe.py is most of it.
+40. [ ] `--val_seqs 2` makes val/loss noise -- it swung 0.0455 across seeds on one config. Raise it
+        or drop it from the log line; rank on train loss + ctxabl (32 rows) meanwhile.
+41. [ ] sm120 norm-router asserts E is a power of two. Blocks E=6/12/24 geometries; either lift it
+        in the kernel or document it at the flag.
+42. [ ] per-layer router GRAD norm. grad/norm/* is RMS-pooled across layers, so "L0's router is not
+        learning" vs "not getting gradient" needed a local rebuild to tell apart.
+43. [ ] shared expert (#8/#34) is now the best candidate to win back long-context on top of the
+        adopted stack: a dense path every token sees, plus the sparse pool. `--n_shared 1`.
+
+Seed floors measured this round (2000-step board, per-stack, never transfer):
+  train 0.0016-0.0043 across seeds, 0.0004 same-seed nondeterminism
+  ctx1024 ~0.007 across seeds | delta_ctx4095 0.0175 (ensemble) but 0.152 (sparse L0 -- unstable)
+
