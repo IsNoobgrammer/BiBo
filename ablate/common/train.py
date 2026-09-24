@@ -433,7 +433,7 @@ def main():
     # and supersedes 'moe' on MoE layers. 'moe' stays in the list because the dense mlp_only_layers
     # and the Qwen arm still route through BiBoFusedExperts.forward.
     ap.add_argument("--patches", default="liger_norm,liger_rope,ce,moe,megakernel")
-    ap.add_argument("--muon_variant", choices=["polar", "normuon", "aurora", "muown"], default="aurora")
+    ap.add_argument("--muon_variant", choices=["base", "normuon", "aurora", "muown"], default="aurora")
     ap.add_argument("--muon_scale", choices=["adam", "none"], default="adam")  # adam = update RMS 0.2 (AdamW lr band)
     ap.add_argument("--ns_coeffs", choices=["ns8", "dsv4", "quintic5", "pe8"], default="ns8")
     # muown (arXiv 2605.10797) is not a row scaling: it reparameterizes every Muon matrix as

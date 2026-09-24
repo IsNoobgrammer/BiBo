@@ -102,7 +102,8 @@ def build_optimizers(model, muon_lr=1e-2, adam_lr=3e-4, wd=0.1, momentum=0.95, n
         else:
             mats.append(p)                  # plain 2D weight matrices -> never whitened
     print(f"[optim] router projections: {n_router} -> {'AdamW' if router_adamw else 'Muon'}", flush=True)
-    # gram_restarts=[4,5] = the NS8-schedule fp16 autotune winner (gram only activates for dim>=2048; harmless below)
+    # use_gram=False: gram-space NS needs restart placements tuned PER variant (the [4,5] winner was tuned
+    # for aurora), so every variant runs the same plain 8-step NS (symmul/cuBLAS) until each has its own.
     # variant (ABLATION AXIS): aurora (default) | normuon | polar | muown -- see kernels/muon/muon_scaling.py.
     # muon_scale "adam" = update RMS 0.2 so the AdamW lr band applies to every variant; ns_coeffs is a
     # NS_PRESETS name ("ns8" = 6 quintic + 2 finishing steps, the board default).
@@ -126,7 +127,7 @@ def build_optimizers(model, muon_lr=1e-2, adam_lr=3e-4, wd=0.1, momentum=0.95, n
     print(f"[optim] muon variant={variant} scale={muon_scale} ns={ns_coeffs if isinstance(ns_coeffs, str) else 'custom'} "
           f"wd={muon_wd:g} | adamw wd={wd:g}", flush=True)
     _mk = dict(lr=muon_lr, momentum=momentum, weight_decay=muon_wd, ns_coeffs=ns_coeffs, ns_dtype=ns_dtype,
-               gram_restarts=[4, 5], variant=variant, scale=muon_scale,
+               use_gram=False, variant=variant, scale=muon_scale,
                cautious_decay=bool(cautious_decay), **_xo)
     # optim=manas: the SAME sm120 gram-NS Muon step (kernels.sm120.manas subclasses it cooperatively --
     # never import kernels.sm75.manas here, that would swap the NS backend along with the optimizer and
