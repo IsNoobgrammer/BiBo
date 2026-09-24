@@ -437,6 +437,7 @@ def main():
     ap.add_argument("--muon_scale", choices=["adam", "none"], default="adam")  # adam = update RMS 0.2 (AdamW lr band)
     ap.add_argument("--ns_coeffs", choices=["ns8", "dsv4", "quintic5", "pe8"], default="ns8")
     ap.add_argument("--ns_backend", choices=["auto", "cublas", "epi", "symepi", "symmul", "gram"], default="auto")
+    ap.add_argument("--optim_parity_steps", type=int, default=0)  # >0: run ablate/tools/optim_parity.py instead of training
     ap.add_argument("--muon_fused_tail", type=lambda s: s.lower() in ("1", "true", "yes"), default=True)  # one-pass pre/post-NS elementwise (bit-identical)
     # muown (arXiv 2605.10797) is not a row scaling: it reparameterizes every Muon matrix as
     # W = g * v/||v|| per row, Muon on v and Adam on g (same lr). Its claim is wd-insensitivity, so
@@ -894,6 +895,13 @@ def main():
           f"({'set' if args.peak_tflops > 0 else 'measured GEMM'}); measured GEMM={measured_peak:.0f} | "
           f"flops/token ~{flops_per_token/1e9:.2f} GFLOP", flush=True)
     model.train()
+    if args.optim_parity_steps > 0:     # same model/patches/data/amp as training, then the parity harness
+        from ablate.tools.optim_parity import run as _parity
+        _parity(model, gen, lambda ids: _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
+                                            getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok,
+                                            pad_id=args.pad_id),
+                amp, args.optim_parity_steps, args.wd, args.adam_lr)
+        return
     t0 = time.time(); _last_t = t0; _last_tok = 0; _last_step = 0
     # Running loss over the last LOSS_WINDOW steps. The per-step `loss` is ONE global batch and
     # swings ~0.3 between adjacent steps, so reading a single step (least of all the last one) is
