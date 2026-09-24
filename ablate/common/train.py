@@ -433,8 +433,9 @@ def main():
     # and supersedes 'moe' on MoE layers. 'moe' stays in the list because the dense mlp_only_layers
     # and the Qwen arm still route through BiBoFusedExperts.forward.
     ap.add_argument("--patches", default="liger_norm,liger_rope,ce,moe,megakernel")
-    ap.add_argument("--muon_scale_mode", choices=["polar", "normuon", "aurora", "aurora_ema", "aurora_ema_v2", "muown"],
-                    default="aurora")  # post-NS row scaling; EMA variants: normuon / aurora_ema / aurora_ema_v2
+    ap.add_argument("--muon_variant", choices=["polar", "normuon", "aurora", "muown"], default="aurora")
+    ap.add_argument("--muon_scale", choices=["adam", "none"], default="adam")  # adam = update RMS 0.2 (AdamW lr band)
+    ap.add_argument("--ns_coeffs", choices=["ns8", "dsv4", "quintic5", "pe8"], default="ns8")
     # muown (arXiv 2605.10797) is not a row scaling: it reparameterizes every Muon matrix as
     # W = g * v/||v|| per row, Muon on v and Adam on g (same lr). Its claim is wd-insensitivity, so
     # its arm runs --muon_wd 0 while AdamW keeps --wd; parity vs the reference: triton-kernel-fused
@@ -708,7 +709,8 @@ def main():
     plrouter = (PerLayerRouter(model, _n_exp, args.top_k or SHARED["num_experts_per_tok"])
                 if (args.router_log and _n_exp >= 2) else None)
     opts, n_mat, n_oth = build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt,
-                                          scale_mode=args.muon_scale_mode, xorth_post=args.xorth_post,
+                                          variant=args.muon_variant, muon_scale=args.muon_scale,
+                                          ns_coeffs=args.ns_coeffs, xorth_post=args.xorth_post,
                                           muon_wd=args.muon_wd,
                                           xorth_gate_ref=args.xorth_gate_ref, xorth_ema=args.xorth_ema,
                                           xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where,
@@ -816,7 +818,9 @@ def main():
                 + (f"_k{args.top_k}" if args.top_k else "")
                 + (f"_sh{args.n_shared}" if args.n_shared else "")
                 + (f"_mi{args.moe_inter}" if args.moe_inter else "")
-                + (f"_{args.muon_scale_mode}" if args.muon_scale_mode != "aurora" else "")
+                + (f"_{args.muon_variant}" if args.muon_variant != "aurora" else "")
+                + (f"_sc{args.muon_scale}" if args.muon_scale != "adam" else "")
+                + (f"_{args.ns_coeffs}" if args.ns_coeffs != "ns8" else "")
                 + (f"_mwd{args.muon_wd:g}" if args.muon_wd is not None else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + ("" if args.norm_topk_prob else "_nontp")   # normalization is the default; mark when OFF

@@ -107,7 +107,7 @@ def test_muown_scale_mode_trains_and_pins_row_norms_to_g():
     torch.manual_seed(0)
     m = make_model().to(DEVICE).train()
     (muon, adamw), _, _ = build_optimizers(m, muon_lr=1e-2, adam_lr=3e-3, wd=0.1,
-                                           scale_mode="muown", muon_wd=0.0)
+                                           variant="muown", muon_wd=0.0)
     assert muon.param_groups[0]["weight_decay"] == 0.0 and adamw.param_groups[0]["weight_decay"] == 0.1
     x = tokens(2, 16, seed=11).to(DEVICE)
     losses = []
@@ -120,9 +120,9 @@ def test_muown_scale_mode_trains_and_pins_row_norms_to_g():
     assert losses[-1] < losses[0], losses
     checked = 0
     for st in muon.state.values():
-        if "muown" not in st:
+        if "variant" not in st:
             continue
-        g = st["muown"]["g"]
+        g = st["variant"]["g"]
         assert torch.isfinite(g).all()
         checked += 1
     assert checked > 0, "no muown state: the mode never engaged"
@@ -130,7 +130,7 @@ def test_muown_scale_mode_trains_and_pins_row_norms_to_g():
     pinned = 0
     for plan in muon._plan_cache.values():
         for bk in plan:
-            st = muon.state[bk["anchor"]]["muown"]
+            st = muon.state[bk["anchor"]]["variant"]
             W = torch.cat([p.detach().float().reshape(n, bk["r"], bk["c"])
                            for members, _s, _c in bk["chunks"] for p, _o, n in members])
             assert torch.allclose(torch.linalg.vector_norm(W, dim=-1), st["g"], rtol=1e-4, atol=1e-6)

@@ -1,4 +1,4 @@
-"""Optimizer builder: bf16-safe FusedMuon (NS8, aurora-K1) for 2D/3D matrices + AdamW for the rest.
+"""Optimizer builder: bf16-safe FusedMuon (ns8 preset, aurora) for 2D/3D matrices + AdamW for the rest.
 Identical for both arms. NEVER fp16 (see the fp16-divergence finding); ns_dtype defaults bf16.
 
 ═══════════════════════════════════════════════════════════════════════════════════════════════
@@ -54,12 +54,8 @@ only bites on the batched 3D path or when E > fan_in. Verifier: `src/.autoresear
 from . import _paths  # noqa: F401
 import torch
 
-_KJ, _PIN = (3.4445, -4.7750, 2.0315), (2.0, -1.5, 0.5)
-NS8 = (_KJ,) * 6 + (_PIN,) * 2
-
-
 def build_optimizers(model, muon_lr=1e-2, adam_lr=3e-4, wd=0.1, momentum=0.95, ns_dtype=torch.bfloat16,
-                     scale_mode="aurora", xorth_post=0.0, xorth_gate_ref=0.3, xorth_ema=0.95,
+                     variant="aurora", muon_scale="adam", ns_coeffs="ns8", xorth_post=0.0, xorth_gate_ref=0.3, xorth_ema=0.95,
                      xorth_warmup_steps=0, xorth_where="post", router_adamw=False,
                      act_scale_lr=None, cautious_decay=False, vec_matrices_adamw=False,
                      vec_adamw_group="default",
@@ -107,8 +103,9 @@ def build_optimizers(model, muon_lr=1e-2, adam_lr=3e-4, wd=0.1, momentum=0.95, n
             mats.append(p)                  # plain 2D weight matrices -> never whitened
     print(f"[optim] router projections: {n_router} -> {'AdamW' if router_adamw else 'Muon'}", flush=True)
     # gram_restarts=[4,5] = the NS8-schedule fp16 autotune winner (gram only activates for dim>=2048; harmless below)
-    # scale_mode = post-NS row scaling (ABLATION AXIS): aurora (default, no EMA) | normuon | aurora_ema |
-    # aurora_ema_v2 (the EMA variants keep a persistent per-row 2nd-moment buffer) | polar.
+    # variant (ABLATION AXIS): aurora (default) | normuon | polar | muown -- see kernels/muon/muon_scaling.py.
+    # muon_scale "adam" = update RMS 0.2 so the AdamW lr band applies to every variant; ns_coeffs is a
+    # NS_PRESETS name ("ns8" = 6 quintic + 2 finishing steps, the board default).
     # xorth_post = cross-expert whitening MAX strength (0=off); SCOPED to the 3D expert stacks only (2D=0), so
     # whitening acts exactly on the MoE experts. xorth_gate_ref = correlation gate (full whitening at off-diag
     # RMS >= this; below it ramps to ~0 so decorrelated experts are left alone; <=0 disables gate). xorth_ema =
@@ -126,9 +123,10 @@ def build_optimizers(model, muon_lr=1e-2, adam_lr=3e-4, wd=0.1, momentum=0.95, n
     # every baseline on the board predates this and is NON-cautious.
     print(f"[optim] cautious weight decay: {bool(cautious_decay)} (Muon only; AdamW standard)", flush=True)
     muon_wd = wd if muon_wd is None else muon_wd
-    print(f"[optim] muon scale_mode={scale_mode} wd={muon_wd:g} | adamw wd={wd:g}", flush=True)
-    _mk = dict(lr=muon_lr, momentum=momentum, weight_decay=muon_wd, coeffs=NS8, ns_dtype=ns_dtype,
-               aurora_k=1, gram_restarts=[4, 5], scale_mode=scale_mode,
+    print(f"[optim] muon variant={variant} scale={muon_scale} ns={ns_coeffs if isinstance(ns_coeffs, str) else 'custom'} "
+          f"wd={muon_wd:g} | adamw wd={wd:g}", flush=True)
+    _mk = dict(lr=muon_lr, momentum=momentum, weight_decay=muon_wd, ns_coeffs=ns_coeffs, ns_dtype=ns_dtype,
+               gram_restarts=[4, 5], variant=variant, scale=muon_scale,
                cautious_decay=bool(cautious_decay), **_xo)
     # optim=manas: the SAME sm120 gram-NS Muon step (kernels.sm120.manas subclasses it cooperatively --
     # never import kernels.sm75.manas here, that would swap the NS backend along with the optimizer and
