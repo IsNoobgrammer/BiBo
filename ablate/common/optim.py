@@ -60,7 +60,7 @@ def build_optimizers(model, muon_lr=1e-2, adam_lr=3e-4, wd=0.1, momentum=0.95, n
                      act_scale_lr=None, cautious_decay=False, vec_matrices_adamw=False,
                      vec_adamw_group="default",
                      optim="muon", probe_gamma=0.0, probe_rho_step=0.96, probe_rank=0, muon_wd=None,
-                     ns_backend="auto"):
+                     ns_backend="auto", fused_tail=True):
     from kernels.sm120.muon import FusedMuon   # Blackwell: gram-NS (self-gates to symmul/cuBLAS on small mats) + 8M knee
     stacks, mats, other = [], [], []
     n_router = 0
@@ -129,7 +129,7 @@ def build_optimizers(model, muon_lr=1e-2, adam_lr=3e-4, wd=0.1, momentum=0.95, n
     print(f"[optim] muon variant={variant} scale={muon_scale} ns={ns_coeffs if isinstance(ns_coeffs, str) else 'custom'} "
           f"wd={muon_wd:g} | adamw wd={wd:g}", flush=True)
     _mk = dict(lr=muon_lr, momentum=momentum, weight_decay=muon_wd, ns_coeffs=ns_coeffs, ns_dtype=ns_dtype,
-               ns_backend=ns_backend, variant=variant, scale=muon_scale,
+               ns_backend=ns_backend, fused_tail=fused_tail, variant=variant, scale=muon_scale,
                cautious_decay=bool(cautious_decay), **_xo)
     # optim=manas: the SAME sm120 gram-NS Muon step (kernels.sm120.manas subclasses it cooperatively --
     # never import kernels.sm75.manas here, that would swap the NS backend along with the optimizer and
