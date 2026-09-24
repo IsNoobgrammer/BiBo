@@ -163,3 +163,41 @@ def run_free(model, gen, loss_fn, amp, steps, wd, adam_lr, grad_clip, build):
             cells.append(f"{name}: loss {l:.4f} |g| {g:.3f} W-vs-A {float(d / tot):.2e}")
         print(f"[free] step {step:>2}  " + "  |  ".join(cells), flush=True)
     print("[free] DONE", flush=True)
+
+
+def run_isolate(model, gen, loss_fn, amp, grad_clip, build):
+    """Identical grads into an eager-tail model A and a fused-tail model B; then compare every param
+    bit-for-bit, then compare a forward on each. Pinpoints WHERE a free-running gap comes from."""
+    import copy
+    A, B = model, copy.deepcopy(model)
+    oa = build(A, fused_tail=False, ns_backend="cublas")
+    ob = build(B, fused_tail=True, ns_backend="cublas")
+    names = [n for n, _ in A.named_parameters()]
+    muon_ids = {id(p) for g in oa[0].param_groups for p in g["params"]}
+    for step in range(1, 4):
+        ids = next(gen)
+        for o in oa + ob:
+            o.zero_grad(set_to_none=True)
+        with torch.enable_grad():
+            with amp:
+                la = loss_fn(A, ids)
+            la.backward()
+        torch.nn.utils.clip_grad_norm_(A.parameters(), grad_clip)
+        for pa, pb in zip(A.parameters(), B.parameters()):
+            pb.grad = None if pa.grad is None else pa.grad.clone()
+        pre_eq = sum(torch.equal(pa, pb) for pa, pb in zip(A.parameters(), B.parameters()))
+        for o in oa + ob:
+            o.step()
+        diff = [(n, float((pa - pb).abs().max()), id(pa) in muon_ids, tuple(pa.shape), pa.is_contiguous(),
+                 pa.grad is not None and pa.grad.is_contiguous())
+                for n, pa, pb in zip(names, A.parameters(), B.parameters()) if not torch.equal(pa, pb)]
+        with torch.no_grad(), amp:
+            fa, fb = float(loss_fn(A, ids)), float(loss_fn(B, ids))
+        print(f"[isolate] step {step}: params equal BEFORE step {pre_eq}/{len(names)}; "
+              f"differing AFTER step {len(diff)}; forward on same batch A {fa:.6f} B {fb:.6f}", flush=True)
+        for d in diff[:12]:
+            print(f"    DIFF {d[0]:<60} max|d| {d[1]:.3e} muon={d[2]} shape={d[3]} p_contig={d[4]} g_contig={d[5]}",
+                  flush=True)
+        if diff:
+            break
+    print("[isolate] DONE", flush=True)

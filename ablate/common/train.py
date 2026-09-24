@@ -438,7 +438,7 @@ def main():
     ap.add_argument("--ns_coeffs", choices=["ns8", "dsv4", "quintic5", "pe8"], default="ns8")
     ap.add_argument("--ns_backend", choices=["auto", "cublas", "epi", "symepi", "symmul", "gram"], default="auto")
     ap.add_argument("--optim_parity_steps", type=int, default=0)  # >0: run ablate/tools/optim_parity.py instead of training
-    ap.add_argument("--optim_parity_mode", choices=["shared", "free"], default="shared")
+    ap.add_argument("--optim_parity_mode", choices=["shared", "free", "isolate"], default="shared")
     ap.add_argument("--muon_fused_tail", type=lambda s: s.lower() in ("1", "true", "yes"), default=True)  # one-pass pre/post-NS elementwise (bit-identical)
     # muown (arXiv 2605.10797) is not a row scaling: it reparameterizes every Muon matrix as
     # W = g * v/||v|| per row, Muon on v and Adam on g (same lr). Its claim is wd-insensitivity, so
@@ -900,13 +900,17 @@ def main():
         from ablate.tools.optim_parity import run as _parity, run_free as _parity_free
         _lf = lambda m, ids: _ce(m, ids, use_fused_ce, aux_collector, args.aux_coef,
                                  getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok, pad_id=args.pad_id)
-        if args.optim_parity_mode == "free":
+        if args.optim_parity_mode in ("free", "isolate"):
             _bk = dict(ns_dtype=dt, variant=args.muon_variant, muon_scale=args.muon_scale, ns_coeffs=args.ns_coeffs,
                        router_adamw=(args.router_optim == "adamw"), act_scale_lr=args.act_scale_lr,
                        vec_matrices_adamw=args.vec_matrices_adamw, vec_adamw_group=args.vec_adamw_group,
                        cautious_decay=args.cautious_decay)
-            _parity_free(model, gen, _lf, amp, args.optim_parity_steps, args.wd, args.adam_lr, args.grad_clip,
-                         lambda m, **kw: build_optimizers(m, args.muon_lr, args.adam_lr, args.wd, **_bk, **kw)[0])
+            _bo = lambda m, **kw: build_optimizers(m, args.muon_lr, args.adam_lr, args.wd, **_bk, **kw)[0]
+            if args.optim_parity_mode == "isolate":
+                from ablate.tools.optim_parity import run_isolate
+                run_isolate(model, gen, _lf, amp, args.grad_clip, _bo)
+            else:
+                _parity_free(model, gen, _lf, amp, args.optim_parity_steps, args.wd, args.adam_lr, args.grad_clip, _bo)
         else:
             _parity(model, gen, lambda ids: _lf(model, ids), amp, args.optim_parity_steps, args.wd, args.adam_lr)
         return
