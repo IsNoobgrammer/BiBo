@@ -26,6 +26,29 @@ def _site(e):
     return f"{e.cpu_parent.name if e.cpu_parent else '?'} @ ?"
 
 
+# kernel-name -> component, first match wins. Coarse on purpose: it answers "where do the ms go".
+COMPONENTS = (
+    ("moe gemm (Triton grouped)", ("_grouped_gemm", "_grouped_mm_kernel", "_gate_up_glu", "_grouped_wgrad")),
+    ("moe act row-ops (radial)", ("_glu_fwd_rowloop", "_glu_bwd_rowloop", "_glu_fwd", "_glu_bwd")),
+    ("router / megakernel", ("router", "_mk_", "topk", "megakernel")),
+    ("attention (flex/xsa/rope)", ("flex_attention", "flash", "xsa", "rope", "attn")),
+    ("fused CE", ("_grad_logits", "cross_entropy", "_ce_", "logsumexp")),
+    ("optimizer + foreach (clip, AdamW)", ("_bgemm_epi", "_bmmt", "_bssm", "_pre_kernel", "_post_kernel", "_norm_t", "multi_tensor_apply")),
+    ("dense cuBLAS/cutlass GEMM", ("cutlass", "gemm", "nvjet", "xmma", "sm90", "sm100")),
+    ("norms (liger)", ("rms_norm", "_layer_norm")),
+    ("copy / cast / memcpy", ("copy", "Memcpy", "Memset", "cast", "CatArray")),
+    ("elementwise / reduce / other", ("",)),
+)
+
+
+def component(name):
+    n = name.lower()
+    for label, keys in COMPONENTS:
+        if any(k.lower() in n for k in keys):
+            return label
+    return "elementwise / reduce / other"
+
+
 def report(prof, wall_ms, top=12):
     ev = [e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA and e.device_time_total > 0]
     iv = sorted((e.time_range.start, e.time_range.end, e.name) for e in ev)
@@ -43,6 +66,7 @@ def report(prof, wall_ms, top=12):
         busy += cur_e - cur_s
     span = (iv[-1][1] - iv[0][0]) / 1e3 if iv else 0.0
     busy /= 1e3
+    ev = [e for e in ev if not e.name.startswith(("Optimizer.", "ProfilerStep"))]   # annotations, not work
     kern = {}
     for e in ev:
         k = kern.setdefault(e.name, [0, 0.0]); k[0] += 1; k[1] += e.device_time_total / 1e3
@@ -66,6 +90,13 @@ def report(prof, wall_ms, top=12):
     print(f"[profile] host->GPU waits (stream/device/event sync) in the step: {sum(sy.values())}", flush=True)
     for (n, site), c in sy.most_common(25):
         print(f"[profile]   {c:5d}  {n:22s} {site[:150]}", flush=True)
+    comp = collections.defaultdict(lambda: [0, 0.0])
+    for n, (c, t) in kern.items():
+        k = comp[component(n)]; k[0] += c; k[1] += t
+    tot = sum(t for _, t in comp.values())
+    print(f"[profile] GPU time by component (sum {tot:.1f} ms; overlapping streams can exceed busy):", flush=True)
+    for label, (c, t) in sorted(comp.items(), key=lambda x: -x[1][1]):
+        print(f"[profile]   {t:8.2f} ms {100 * t / tot:5.1f}% {c:6d} ops  {label}", flush=True)
     print("[profile] top GPU ops by time (ms, count):", flush=True)
-    for n, (c, t) in sorted(kern.items(), key=lambda x: -x[1][1])[:top]:
+    for n, (c, t) in sorted(kern.items(), key=lambda x: -x[1][1])[:40]:
         print(f"[profile]   {t:8.2f} {c:6d}  {n[:100]}", flush=True)
