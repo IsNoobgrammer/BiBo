@@ -36,6 +36,10 @@ def _build(attn_res, sites, carry):
         hybrid_layer_pattern=swa_block_pattern(SHARED["num_hidden_layers"]),
         sliding_window=128, swa_qk_norm=True,
         attn_res=attn_res, attn_res_sites=sites, attn_res_carry=carry,
+        # board flags: bf16 stream, per-dim sigmoid carry, the 0:8:8:576 ensemble at L0
+        bf16_residual_stream=True, attn_res_carry_per_dim=carry,
+        attn_res_carry_scale="sigmoid" if carry else "none",
+        moe_overrides={0: {"num_routed_experts": 8, "num_experts_per_tok": 8, "moe_intermediate_size": 576}},
     )
     return model.train()
 
@@ -69,14 +73,14 @@ def _profile(model, ids, warmup, iters):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--batch", type=int, default=16)     # trainer micro-batch: 64 / grad_accum 4
+    ap.add_argument("--batch", type=int, default=64)     # trainer micro-batch (--batch 64 IS the micro-batch)
     ap.add_argument("--seq_len", type=int, default=1024)
     ap.add_argument("--warmup", type=int, default=5)
     ap.add_argument("--iters", type=int, default=8)
     ap.add_argument("--top", type=int, default=22)
     args = ap.parse_args()
 
-    patchmod.apply(["liger_norm", "liger_rope", "moe", "xsa"])
+    patchmod.apply(["liger_norm", "liger_rope", "moe", "megakernel", "xsa"])
     torch.manual_seed(0)
     ids = torch.randint(0, SHARED["vocab_size"], (args.batch, args.seq_len + 1), device=DEV)
 
