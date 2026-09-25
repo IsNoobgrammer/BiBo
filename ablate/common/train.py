@@ -553,8 +553,10 @@ def main():
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_project", default="polyglu-ablations")
     args = ap.parse_args()
-    from src.modeling.attn import full_attention as _fa_mod
-    _fa_mod.GLOBAL_FLEX = args.global_attn == "flex"
+    # the MODULE, not `from src.modeling.attn import full_attention`: the package re-exports the
+    # function under that name, and setting the flag on the function object silently did nothing
+    import importlib
+    importlib.import_module("src.modeling.attn.full_attention").GLOBAL_FLEX = args.global_attn == "flex"
     if args.deterministic:
         # cuBLAS reads this at handle creation, so it must be set before the first CUDA matmul.
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
