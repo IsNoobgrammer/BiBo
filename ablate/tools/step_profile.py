@@ -11,13 +11,19 @@ import torch
 
 # CPU-side calls that block the host until the GPU catches up. Each one drains the launch queue, so
 # everything launched after it starts with an empty GPU.
-SYNCS = ("aten::_local_scalar_dense", "cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaEventSynchronize",
-         "aten::nonzero", "cudaMemcpy")
+SYNCS = ("cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaEventSynchronize")
 
 
 def _site(e):
-    fr = [f for f in (e.stack or []) if any(k in f for k in ("ablate", "src/", "kernels/", "modeling"))]
-    return fr[0] if fr else ((e.stack or ["?"])[0])
+    """First BiBo/kernels frame of the op that issued this runtime call (walks up the CPU parents:
+    runtime events such as cudaStreamSynchronize carry no Python stack themselves)."""
+    p = e
+    while p is not None:
+        fr = [f for f in (p.stack or []) if any(k in f for k in ("ablate", "src/", "kernels/", "modeling"))]
+        if fr:
+            return f"{p.name} @ {fr[0]}"
+        p = p.cpu_parent
+    return f"{e.cpu_parent.name if e.cpu_parent else '?'} @ ?"
 
 
 def report(prof, wall_ms, top=12):
@@ -55,9 +61,11 @@ def report(prof, wall_ms, top=12):
     for e in prof.events():
         if e.device_type == torch.autograd.DeviceType.CPU and e.name in SYNCS:
             sy[(e.name, _site(e))] += 1
-    print(f"[profile] host syncs in the step: {sum(sy.values())}", flush=True)
-    for (n, site), c in sy.most_common(top):
-        print(f"[profile]   {c:5d}  {n:28s} {site[:110]}", flush=True)
+    mc = collections.Counter(e.name for e in ev if e.name.startswith("Memcpy"))
+    print(f"[profile] GPU copies: {dict(mc)}", flush=True)
+    print(f"[profile] host->GPU waits (stream/device/event sync) in the step: {sum(sy.values())}", flush=True)
+    for (n, site), c in sy.most_common(25):
+        print(f"[profile]   {c:5d}  {n:22s} {site[:150]}", flush=True)
     print("[profile] top GPU ops by time (ms, count):", flush=True)
     for n, (c, t) in sorted(kern.items(), key=lambda x: -x[1][1])[:top]:
         print(f"[profile]   {t:8.2f} {c:6d}  {n[:100]}", flush=True)
