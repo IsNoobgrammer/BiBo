@@ -16,6 +16,11 @@ from .full_attention import full_attention
 __all__ = ['BiBoAttention']
 
 
+# Route the training hot path through the fused attention kernel (set by ablate/common/train.py
+# --attn_kernel). False = the flex / SDPA flavour modules below.
+FUSED_ATTN = False
+
+
 class BiBoAttention(nn.Module):
     """GQA attention with learnable XSA and per-layer SWA/global dispatch."""
     def __init__(self, config: BiBoConfig, layer_idx: int, **kwargs):
@@ -62,6 +67,30 @@ class BiBoAttention(nn.Module):
         _qk_norm = (not self.is_swa) or getattr(config, "swa_qk_norm", True)
         self.q_norm = BiBoRMSNorm(self.head_dim, eps=config.rms_norm_eps) if _qk_norm else nn.Identity()
         self.k_norm = BiBoRMSNorm(self.head_dim, eps=config.rms_norm_eps) if _qk_norm else nn.Identity()
+        # Fixed scalar multipliers on q / k after the (optional) qk-norm; 1.0 = none. Some recipes
+        # scale the normed q/k instead of (or on top of) the 1/sqrt(d) softmax scale.
+        self.q_scale = float(getattr(config, "q_scale", 1.0))
+        self.k_scale = float(getattr(config, "k_scale", 1.0))
+
+    def _fused_forward(self, hidden_states, hidden_shape, input_shape, position_embeddings):
+        """Training hot path: qk-norm + RoPE (windowed layers) + attention + XSA in one Triton kernel
+        family (triton-kernel-fused kernels/sm120/attn_xsa.py), deterministic backward. q/k/v are
+        read straight from the projection views and the output comes back in the (B, S, H, D)
+        layout o_proj wants, so nothing is copied around attention."""
+        from kernels.sm120.attn_xsa import attn_xsa
+        q = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        k = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        norm = isinstance(self.q_norm, BiBoRMSNorm) or hasattr(self.q_norm, "weight")
+        cos, sin = position_embeddings if self.is_swa else (None, None)
+        z = attn_xsa(q, k, v, scale=self.scaling, window=self.sliding_window if self.is_swa else None,
+                     xsa=self.use_xsa, alpha=self.xsa_alpha,
+                     q_norm_w=self.q_norm.weight if norm else None,
+                     k_norm_w=self.k_norm.weight if norm else None,
+                     q_scale=self.q_scale, k_scale=self.k_scale,
+                     eps=getattr(self.q_norm, "variance_epsilon", getattr(self.q_norm, "eps", 1e-6)),
+                     cos=cos, sin=sin)
+        return self.o_proj(z.transpose(1, 2).reshape(*input_shape, -1)), None
 
     def forward(
         self,
@@ -76,8 +105,16 @@ class BiBoAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
+        if (FUSED_ATTN and self.training and hidden_states.is_cuda and past_key_value is None
+                and attention_mask is None and not output_attentions and self.attention_dropout == 0.0):
+            return self._fused_forward(hidden_states, hidden_shape, input_shape, position_embeddings)
+
         query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        if self.q_scale != 1.0:
+            query_states = query_states * self.q_scale
+        if self.k_scale != 1.0:
+            key_states = key_states * self.k_scale
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         # FIXED ARCHITECTURE: full RoPE on the sliding-window layers, NoPE on the full-attention

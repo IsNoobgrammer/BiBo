@@ -439,6 +439,9 @@ def main():
     ap.add_argument("--ns_backend", choices=["auto", "cublas", "epi", "symepi", "symmul", "gram"], default="auto")
     ap.add_argument("--prefetch", type=int, default=4)  # batches decoded ahead in a worker process; 0 = inline
     ap.add_argument("--profile_step", type=int, default=-1)  # >=0: profile that step, sync-audit the next (ablate/tools/step_profile.py), then exit
+    ap.add_argument("--attn_kernel", choices=["fused", "flex"], default="flex")  # fused = tkf attn_xsa (qk-norm+rope+attn+xsa, deterministic)
+    ap.add_argument("--q_scale", type=float, default=1.0)   # fixed multiplier on q after qk-norm
+    ap.add_argument("--k_scale", type=float, default=1.0)   # fixed multiplier on k after qk-norm
     ap.add_argument("--global_attn", choices=["flex", "sdpa"], default="flex")  # flex = bitwise-repeatable backward (SDPA flash accumulates dQ atomically)
     ap.add_argument("--deterministic", type=lambda v: v.lower() in ("1", "true", "yes"), default=False)  # strict torch determinism (incl. flash-attn bwd) + cuBLAS workspace config
     ap.add_argument("--determinism_check", type=int, default=0)  # >0: N repeated fwd/bwd of one batch, bitwise grad compare (ablate/tools/determinism.py), then exit
@@ -557,6 +560,7 @@ def main():
     # function under that name, and setting the flag on the function object silently did nothing
     import importlib
     importlib.import_module("src.modeling.attn.full_attention").GLOBAL_FLEX = args.global_attn == "flex"
+    importlib.import_module("src.modeling.attn.base").FUSED_ATTN = args.attn_kernel == "fused"
     if args.deterministic:
         # cuBLAS reads this at handle creation, so it must be set before the first CUDA matmul.
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -696,6 +700,11 @@ def main():
           f"{_l0.num_routed_experts} experts top-{_l0.top_k}"
           f"{' (ALL ACTIVE: no selection, router weights only)' if _l0.top_k == _l0.num_routed_experts else ''}"),
           flush=True)
+    if args.q_scale != 1.0 or args.k_scale != 1.0:     # a fixed hyperparameter, read by BOTH attention paths
+        for _m in model.modules():
+            if hasattr(_m, "q_scale") and hasattr(_m, "k_scale"):
+                _m.q_scale, _m.k_scale = args.q_scale, args.k_scale
+    print(f"[attn] kernel={args.attn_kernel} q_scale={args.q_scale} k_scale={args.k_scale}", flush=True)
     total, trainable, active = count_params(model)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
     if not args.fused_res_add:
