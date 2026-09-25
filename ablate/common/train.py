@@ -438,7 +438,7 @@ def main():
     ap.add_argument("--ns_coeffs", choices=["ns8", "dsv4", "quintic5", "pe8"], default="ns8")
     ap.add_argument("--ns_backend", choices=["auto", "cublas", "epi", "symepi", "symmul", "gram"], default="auto")
     ap.add_argument("--prefetch", type=int, default=4)  # batches decoded ahead in a worker process; 0 = inline
-    ap.add_argument("--profile_step", type=int, default=-1)  # >=0: profile that one step (ablate/tools/step_profile.py), then exit
+    ap.add_argument("--profile_step", type=int, default=-1)  # >=0: profile that step, sync-audit the next (ablate/tools/step_profile.py), then exit
     ap.add_argument("--optim_parity_steps", type=int, default=0)  # >0: run ablate/tools/optim_parity.py instead of training
     ap.add_argument("--optim_parity_mode", choices=["shared", "free", "isolate"], default="shared")
     ap.add_argument("--muon_fused_tail", type=lambda s: s.lower() in ("1", "true", "yes"), default=True)  # one-pass pre/post-NS elementwise (bit-identical)
@@ -944,6 +944,9 @@ def main():
         # pays nothing. One traced step per interval is plenty for a distribution over 64 experts.
         if plrouter is not None:
             plrouter.enabled = (step % args.log_every == 0 or step == total_steps - 1)
+        if step == args.profile_step + 1 and args.profile_step >= 0:   # the step AFTER the timed one
+            from ablate.tools.step_profile import sync_audit_start
+            sync_audit_start()
         if step == args.profile_step:
             torch.cuda.synchronize()
             _prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
@@ -999,6 +1002,9 @@ def main():
             _prof.__exit__(None, None, None)
             from ablate.tools.step_profile import report
             report(_prof, _wall)
+        if step == args.profile_step + 1 and args.profile_step >= 0:
+            from ablate.tools.step_profile import sync_audit_report
+            sync_audit_report()
             return
         if step % args.log_every == 0 or step == total_steps - 1:
             lv, gn = float(loss_val), float(gnorm)             # the ONLY host syncs of a step, log steps only

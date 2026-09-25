@@ -100,3 +100,29 @@ def report(prof, wall_ms, top=12):
     print("[profile] top GPU ops by time (ms, count):", flush=True)
     for n, (c, t) in sorted(kern.items(), key=lambda x: -x[1][1])[:40]:
         print(f"[profile]   {t:8.2f} {c:6d}  {n[:100]}", flush=True)
+
+
+_SITES = collections.Counter()
+
+
+def sync_audit_start():
+    """torch's sync debug mode warns on every host-device synchronization; record each warning's
+    call site (the innermost BiBo / kernels frames) instead of printing it."""
+    import traceback
+    import warnings
+
+    def _rec(message, category, filename, lineno, file=None, line=None):
+        fr = [f for f in traceback.extract_stack()[:-1]
+              if any(k in f.filename for k in ("ablate", "/src/", "kernels")) and "step_profile" not in f.filename]
+        _SITES[" <- ".join(f"{f.filename.split('/')[-1]}:{f.lineno} {f.name}" for f in fr[-3:][::-1]) or "?"] += 1
+
+    warnings.showwarning = _rec
+    warnings.simplefilter("always")
+    torch.cuda.set_sync_debug_mode("warn")
+
+
+def sync_audit_report():
+    torch.cuda.set_sync_debug_mode(0)
+    print(f"[sync] host syncs in one full step: {sum(_SITES.values())} (innermost frame first)", flush=True)
+    for site, c in _SITES.most_common(30):
+        print(f"[sync]   {c:5d}  {site[:200]}", flush=True)
