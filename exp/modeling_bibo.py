@@ -45,9 +45,20 @@ try:
     # triton-kernel-fused/parity_check/parity_attn_res.py, graded against FP32 eager at every
     # dtype -- the bf16 kernel matches bf16 eager's error to the digit on all three gradients.
     from kernels.sm120.attn_res import attn_res as _fused_ar
+    from kernels.sm120.attn_res import BlockStore as _BlockStore
     _HAS_FUSED_AR = True
 except Exception:                                   # no triton / no kernels checkout
     _HAS_FUSED_AR = False
+    _BlockStore = None
+
+# LIST mode: blocks live in a tkf BlockStore (read in place, grads accumulated in-kernel) instead of
+# a torch.cat'ed (T, n, H) tensor. BIBO_AR_LIST=0 forces the cat path. The model picks it only where
+# it is exact to do so -- see BiBoModel._ar_list_ok.
+_AR_LIST = os.environ.get("BIBO_AR_LIST", "1") != "0"
+
+
+def _n_blocks(block_residual):
+    return len(block_residual) if not torch.is_tensor(block_residual) else block_residual.shape[1]
 
 try:
     # Fused carry write: h = attn_read + c*attn_out + d*emb in ONE pass instead of one elementwise
@@ -172,6 +183,9 @@ def apply_attention_residual(
         raise ValueError(
             f"prefix_sum must have shape (tokens, hidden), got {tuple(prefix_sum.shape)}"
         )
+    if not torch.is_tensor(block_residual):            # tkf BlockStore (LIST mode)
+        score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
+        return block_residual.mix(prefix_sum, score_weight, norm.variance_epsilon, score_mode, topk)
     if block_residual.ndim != 3:
         raise ValueError(
             "block_residual must have shape (tokens, blocks, hidden), got "
@@ -503,7 +517,7 @@ class BiBoDecoderLayer(nn.Module):
             block_residual = hidden_states.new_zeros(
                 batch_size * seq_len, 0, hidden_size
             )
-        if block_residual.shape[1] > 0:
+        if _n_blocks(block_residual) > 0:
             hidden_states = apply_attention_residual(
                 prefix_sum.reshape(-1, hidden_size),
                 block_residual,
@@ -546,10 +560,13 @@ class BiBoDecoderLayer(nn.Module):
         # K3 measures block size in decoder layers. Layer zero is a boundary:
         # the embedding is stored, and the new partial block starts at attn_out.
         if self.layer_idx % self.attn_res_block_size == 0:
-            block_residual = torch.cat(
-                (block_residual, prefix_sum.reshape(-1, hidden_size).unsqueeze(1)),
-                dim=1,
-            )
+            if torch.is_tensor(block_residual):
+                block_residual = torch.cat(
+                    (block_residual, prefix_sum.reshape(-1, hidden_size).unsqueeze(1)),
+                    dim=1,
+                )
+            else:
+                block_residual.archive(prefix_sum.reshape(-1, hidden_size))   # in place, no copy
             prefix_sum = None
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -782,6 +799,15 @@ class BiBoModel(BiBoPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    def _ar_list_ok(self, hidden_states):
+        """LIST mode needs the fused kernel, one block dtype (the bf16 stream: otherwise block 0 is
+        the fp32 embedding next to bf16 prefix sums), no embedding term (it indexes
+        block_residual[:, 0]) and no gradient checkpointing (it re-runs layers with the tensor)."""
+        return (_AR_LIST and _HAS_FUSED_AR and _BlockStore is not None and hidden_states.is_cuda
+                and self.bf16_stream and not (self.gradient_checkpointing and self.training)
+                and all(getattr(L, "attn_res_emb_theta", None) is None
+                        and getattr(L, "attn_res_emb_gain", None) is None for L in self.layers))
+
     def _apply_output_attention_residual(
         self, hidden_states: torch.Tensor, block_residual: torch.Tensor
     ) -> torch.Tensor:
@@ -894,9 +920,9 @@ class BiBoModel(BiBoPreTrainedModel):
         all_self_attns = () if output_attentions else None
         block_residual = None
         if self.use_attn_residuals:
-            block_residual = hidden_states.new_zeros(
-                batch_size * seq_length, 0, self.config.hidden_size
-            )
+            block_residual = (_BlockStore() if self._ar_list_ok(hidden_states) else
+                              hidden_states.new_zeros(batch_size * seq_length, 0,
+                                                      self.config.hidden_size))
 
         for decoder_layer in self.layers:
             if output_hidden_states:
