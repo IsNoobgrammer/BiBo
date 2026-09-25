@@ -28,7 +28,7 @@ def _site(e):
 
 # kernel-name -> component, first match wins. Coarse on purpose: it answers "where do the ms go".
 COMPONENTS = (
-    ("moe gemm (Triton grouped)", ("_grouped_gemm", "_grouped_mm_kernel", "_gate_up_glu", "_grouped_wgrad")),
+    ("moe gemm (Triton grouped)", ("_grouped_gemm", "_grouped_mm_kernel", "_gate_up_glu", "_grouped_wgrad", "_wg_kernel", "_wg_reduce")),
     ("moe act row-ops (radial)", ("_glu_fwd_rowloop", "_glu_bwd_rowloop", "_glu_fwd", "_glu_bwd")),
     ("router / megakernel", ("router", "_mk_", "topk", "megakernel")),
     ("attn residual (depth mix + carry)", ("_attn_res_", "residual_add", "_fwd_kernel", "_bwd_kernel")),
