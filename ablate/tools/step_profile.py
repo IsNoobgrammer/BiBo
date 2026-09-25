@@ -101,6 +101,32 @@ def report(prof, wall_ms, top=12):
     print("[profile] top GPU ops by time (ms, count):", flush=True)
     for n, (c, t) in sorted(kern.items(), key=lambda x: -x[1][1])[:40]:
         print(f"[profile]   {t:8.2f} {c:6d}  {n[:100]}", flush=True)
+    # WHO launched the glue: each elementwise / copy / reduce kernel -> the first repo frame of its
+    # CPU op (forward) or the autograd node that ran it (backward). This is the waste map.
+    glue = collections.defaultdict(lambda: [0, 0.0])
+    for e in ev:
+        if component(e.name) in ("elementwise / reduce / other", "copy / cast / memcpy"):
+            k = glue[_origin(e)]; k[0] += 1; k[1] += e.device_time_total / 1e3
+    gt = sum(t for _, t in glue.values())
+    print(f"[profile] elementwise + copy kernels by origin ({gt:.1f} ms):", flush=True)
+    for o, (c, t) in sorted(glue.items(), key=lambda x: -x[1][1])[:45]:
+        print(f"[profile]   {t:8.2f} {c:6d}  {o[:170]}", flush=True)
+
+
+def _origin(e):
+    """'fwd <aten op> @ file:line' or 'bwd <autograd node> <aten op>' for a CUDA kernel event."""
+    op, p, node = None, e.cpu_parent, None
+    while p is not None:
+        if op is None and p.name.startswith("aten::"):
+            op = p.name
+        if p.name.startswith("autograd::engine::evaluate_function:"):
+            node = p.name.split(":", 4)[-1].strip()
+            break
+        fr = [f for f in (p.stack or []) if any(k in f for k in ("ablate", "src/", "kernels/", "exp/"))]
+        if fr:
+            return f"fwd {op or p.name} @ {fr[0]}"
+        p = p.cpu_parent
+    return f"bwd {node} {op or ''}" if node else f"? {op or e.name[:60]}"
 
 
 _SITES = collections.Counter()
