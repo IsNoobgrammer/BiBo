@@ -111,6 +111,26 @@ def token_batches(batch, seq_len, device, dataset=TRAIN_DATASET, synthetic=False
                     rows = []
 
 
+
+class _CpuStream(torch.utils.data.IterableDataset):
+    def __init__(self, kw):
+        self.kw = kw
+
+    def __iter__(self):
+        return token_batches(device="cpu", **self.kw)
+
+
+def prefetched_batches(batch, seq_len, device, depth=4, **kw):
+    """token_batches, decoded in ONE spawned worker process `depth` batches ahead, pinned, and
+    uploaded non-blocking. One worker keeps the exact inline order. The decode (Arrow -> Python
+    lists -> tensor, ~22 ms per 64x1025 batch on the gVisor box) then never holds the training
+    process's GIL or leaves the GPU waiting."""
+    dl = torch.utils.data.DataLoader(_CpuStream(dict(batch=batch, seq_len=seq_len, **kw)), batch_size=None,
+                                     num_workers=1, pin_memory=True, prefetch_factor=depth,
+                                     persistent_workers=True, multiprocessing_context="spawn")
+    for b in dl:
+        yield b.to(device, non_blocking=True)
+
 if __name__ == "__main__":
     # a 4096-token row at seq_len 1024 must yield 4 chunks covering ALL 4096 tokens, not 1
     c = _split(list(range(4096)), 1025, 1024, 0)

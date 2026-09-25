@@ -6,7 +6,18 @@ train.py profiles that one step (zero_grad .. optimizer/scheduler step), prints 
 exits. busy = union of all CUDA kernel/memcpy intervals; idle = step wall time - busy. Gaps are
 the idle stretches between consecutive GPU activity, attributed to the CPU op running before them.
 """
+import collections
 import torch
+
+# CPU-side calls that block the host until the GPU catches up. Each one drains the launch queue, so
+# everything launched after it starts with an empty GPU.
+SYNCS = ("aten::_local_scalar_dense", "cudaStreamSynchronize", "cudaDeviceSynchronize", "cudaEventSynchronize",
+         "aten::nonzero", "cudaMemcpy")
+
+
+def _site(e):
+    fr = [f for f in (e.stack or []) if any(k in f for k in ("ablate", "src/", "kernels/", "modeling"))]
+    return fr[0] if fr else ((e.stack or ["?"])[0])
 
 
 def report(prof, wall_ms, top=12):
@@ -40,6 +51,13 @@ def report(prof, wall_ms, top=12):
     print("[profile] largest gaps (ms, after -> before):", flush=True)
     for g, a, b in sorted(gaps, reverse=True)[:top]:
         print(f"[profile]   {g / 1e3:8.3f}  {str(a)[:60]} -> {str(b)[:60]}", flush=True)
+    sy = collections.Counter()
+    for e in prof.events():
+        if e.device_type == torch.autograd.DeviceType.CPU and e.name in SYNCS:
+            sy[(e.name, _site(e))] += 1
+    print(f"[profile] host syncs in the step: {sum(sy.values())}", flush=True)
+    for (n, site), c in sy.most_common(top):
+        print(f"[profile]   {c:5d}  {n:28s} {site[:110]}", flush=True)
     print("[profile] top GPU ops by time (ms, count):", flush=True)
     for n, (c, t) in sorted(kern.items(), key=lambda x: -x[1][1])[:top]:
         print(f"[profile]   {t:8.2f} {c:6d}  {n[:100]}", flush=True)

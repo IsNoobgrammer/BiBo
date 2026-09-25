@@ -19,7 +19,7 @@ from .configs import SHARED, glu_count, swa_block_pattern, hswa_windows, resolve
 from . import patches as patchmod
 from .optim import build_optimizers
 from .schedule import make_scheduler, make_wd_schedule
-from .data import token_batches, TRAIN_DATASET
+from .data import token_batches, prefetched_batches, TRAIN_DATASET
 # EVAL REMOVED Aug 7 2026. The whole ablate/common/eval package and evaluate.py are gone; runs log
 # train loss, grad norm and throughput only. Nothing here is comparable to any previous board.
 # Kept because the HF checkpoint push still needs a tokenizer to save alongside the weights.
@@ -437,6 +437,7 @@ def main():
     ap.add_argument("--muon_scale", choices=["adam", "none"], default="adam")  # adam = update RMS 0.2 (AdamW lr band)
     ap.add_argument("--ns_coeffs", choices=["ns8", "dsv4", "quintic5", "pe8"], default="ns8")
     ap.add_argument("--ns_backend", choices=["auto", "cublas", "epi", "symepi", "symmul", "gram"], default="auto")
+    ap.add_argument("--prefetch", type=int, default=4)  # batches decoded ahead in a worker process; 0 = inline
     ap.add_argument("--profile_step", type=int, default=-1)  # >=0: profile that one step (ablate/tools/step_profile.py), then exit
     ap.add_argument("--optim_parity_steps", type=int, default=0)  # >0: run ablate/tools/optim_parity.py instead of training
     ap.add_argument("--optim_parity_mode", choices=["shared", "free", "isolate"], default="shared")
@@ -886,9 +887,13 @@ def main():
           f"tok/step={tok_per_step} patches={patch_list} {args.precision} attn={args.attn} "
           f"muon_mats={n_mat} eval=REMOVED val={'on' if val_batches else 'off'}", flush=True)
 
-    gen = token_batches(args.batch, args.seq_len, DEV, dataset=args.dataset,
-                        synthetic=(args.data == "synthetic"), vocab=cfg.vocab_size, seed=args.seed,
-                        pad_id=0 if args.pad_id is None else int(args.pad_id))
+    # --prefetch N: the Python/Arrow batch decode runs in a worker process, N batches ahead, pinned
+    # and uploaded non-blocking (same batches, same order). 0 = decode inline on this thread.
+    _mk = prefetched_batches if (args.prefetch > 0 and args.data != "synthetic") else token_batches
+    gen = _mk(args.batch, args.seq_len, DEV, dataset=args.dataset,
+              synthetic=(args.data == "synthetic"), vocab=cfg.vocab_size, seed=args.seed,
+              pad_id=0 if args.pad_id is None else int(args.pad_id),
+              **({"depth": args.prefetch} if _mk is prefetched_batches else {}))
     # MFU denominator: measured achievable GEMM peak, or --peak_tflops (theoretical). FLOPs/token = 6N + attn.
     measured_peak = _measure_peak_tflops(DEV, dt)
     peak_tflops = args.peak_tflops if args.peak_tflops > 0 else measured_peak
@@ -942,13 +947,13 @@ def main():
         if step == args.profile_step:
             torch.cuda.synchronize()
             _prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                                       torch.profiler.ProfilerActivity.CUDA])
+                                                       torch.profiler.ProfilerActivity.CUDA], with_stack=True)
             _prof.__enter__(); _pt0 = time.perf_counter()
         for o in opts:
             o.zero_grad(set_to_none=True)
         if _gs_on and step >= _gs_warm:                      # once per STEP, never between micros
             _mns.probe_gamma = _gamma_law(opts[0].param_groups[0]["lr"])
-        loss_val = 0.0
+        loss_val = torch.zeros((), device=DEV)            # summed on the GPU: no host sync per micro
         for _ in range(args.grad_accum):                     # gradient accumulation -> global batch
             ids = next(gen)
             # MANAS: fwd/bwd run at theta + gamma*D (the probe), then vote() folds this micro's
@@ -961,7 +966,7 @@ def main():
                                pad_id=args.pad_id) / args.grad_accum
                 loss.backward()
             _vote()
-            loss_val += loss.item()
+            loss_val += loss.detach()
         _loss_hist.append(loss_val)
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) if args.grad_clip > 0 else \
             torch.sqrt(sum(p.grad.float().pow(2).sum() for p in model.parameters() if p.grad is not None))
@@ -996,8 +1001,8 @@ def main():
             report(_prof, _wall)
             return
         if step % args.log_every == 0 or step == total_steps - 1:
-            lv, gn = loss_val, float(gnorm)
-            lv_run = sum(_loss_hist) / len(_loss_hist)         # mean over the last LOSS_WINDOW steps
+            lv, gn = float(loss_val), float(gnorm)             # the ONLY host syncs of a step, log steps only
+            lv_run = float(torch.stack(list(_loss_hist)).mean())  # mean over the last LOSS_WINDOW steps
             lr = opts[0].param_groups[0]["lr"]
             toks = (step + 1) * tok_per_step
             _now = time.time(); _dt = _now - _last_t
@@ -1278,6 +1283,8 @@ def main():
     if hf_api is not None:                                  # final -> repo root so `from_pretrained(repo)` just works
         _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_final"))
         hf_futures.append(_push_hf_async(hf_api, args.hf_repo, _dir, "final", f"{run_name} final"))
+    loss_val = float(loss_val)
+    _loss_hist = deque((float(x) for x in _loss_hist), maxlen=LOSS_WINDOW)
     res = {"arm": args.arm, "seed": args.seed, "steps": total_steps, "tokens": total_steps * tok_per_step,
            "final_loss": loss_val, "final_loss_running": sum(_loss_hist) / len(_loss_hist), "params_total": total, "params_active": active,
            "ckpt": ckpt, "wall_s": time.time() - t0, "eval": None,
