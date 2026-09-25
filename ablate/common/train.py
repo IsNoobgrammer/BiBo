@@ -610,7 +610,7 @@ def main():
         _how = f"special_pairs={args.special_pairs}"
     print(f"[experts] {n_total} routed = {n_glu} GLU ({args.act}) + {_npos} +Identity "
           f"+ {_nneg} -Identity  ({_how})", flush=True)
-    assert "moe" in patch_list, "the fused-moe patch is required: eager experts are ~3x slower"
+    assert "moe" in patch_list or args.grad_audit, "the fused-moe patch is required: eager experts are ~3x slower"
     patchmod.RADIAL_P = args.radial_p
     patchmod.EXPERT_ACT = args.act
     assert args.act == "radial" or "moe" in patch_list, (

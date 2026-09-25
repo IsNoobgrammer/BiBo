@@ -43,11 +43,17 @@ def run(case, mode):
     out_all = {}
     for micro in range(2):
         g = torch.Generator(device=dev).manual_seed(10 + micro)
-        x = (torch.randn(N, H, device=dev, generator=g) * 0.5).requires_grad_()
+        # the model's layout: the MoE input is the bf16 stream and its upstream grad is bf16 too.
+        # The fp32 reference gets the SAME bf16-valued tensors upcast, so input quantization is
+        # shared and only the kernel arithmetic differs. (fp32 inputs made eager keep an fp32
+        # output / d_hidden while the kernel emits the stream dtype -- a dtype, not an accuracy,
+        # difference that read as 5-10%.)
+        xb = (torch.randn(N, H, device=dev, generator=g) * 0.5).to(torch.bfloat16)
+        x = (xb.float() if mode == "ref" else xb).detach().requires_grad_()
         sc = torch.sigmoid(torch.randn(N, E, device=dev, generator=g))
         w_, idx = sc.topk(K, dim=-1)
         wt = (w_ / w_.sum(-1, keepdim=True)).detach().requires_grad_()   # sum-norm, as the router
-        go = torch.randn(N, H, device=dev, generator=g)
+        go = torch.randn(N, H, device=dev, generator=g).to(torch.bfloat16)
         if mode == "prod":
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 y = moe_per_expert(x, idx, wt, m.gate_up_proj, m.down_proj,
@@ -57,7 +63,7 @@ def run(case, mode):
                 y = m(x, idx, wt)
         else:
             y = m(x, idx, wt)
-        y.float().backward(go)
+        y.backward(go.to(y.dtype))
         out_all[f"out[{micro}]"] = y.detach().float()
         out_all[f"d_hidden[{micro}]"] = x.grad.float()
         out_all[f"d_weights[{micro}]"] = wt.grad.float()
