@@ -976,6 +976,8 @@ class BiBoModel(BiBoPreTrainedModel):
             hidden_states = self._apply_output_attention_residual(
                 hidden_states, block_residual
             )
+            if not torch.is_tensor(block_residual):
+                block_residual.close()     # breaks the store <-> graph reference cycle (tkf BlockStore)
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:
