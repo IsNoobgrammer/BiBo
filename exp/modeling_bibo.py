@@ -58,6 +58,7 @@ try:
     # on the real dtype layout. So enabling it SHIFTS TRAINING NUMERICS (toward correct); an arm
     # run on it is not bit-comparable to one run without it.
     from kernels.sm120.residual_add import make_mlp_input as _fused_res_add
+    from kernels.sm120.residual_add import carry_update as _carry_update
     _HAS_FUSED_RES_ADD = True
 except Exception:
     _HAS_FUSED_RES_ADD = False
@@ -432,6 +433,17 @@ class BiBoDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return residual + hidden_states
 
+    def _fused_carry(self, attn_read, attn_output, prefix_sum):
+        """(mlp input, new prefix sum) via tkf carry_update. prefix_sum None = block boundary."""
+        _m, _scale = self.attn_res_carry_theta, self.attn_res_carry_scale
+        if _m is None:
+            _c, _mode, _csig = self.attn_res_carry_one, "none", False
+        else:
+            _mode = _CARRY_STREAM[_scale]
+            _csig = _scale in ("sigmoid", "sigmoid_rms")        # 2*sigmoid(theta), in-kernel
+            _c = _m if (_csig or _scale in ("raw", "unbounded", "rms")) else _CARRY_C[_scale](_m)
+        return _carry_update(attn_read, _c, attn_output, prefix_sum, _mode, _csig)
+
     def _attn_res_mlp_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.post_attention_layernorm(hidden_states)
         return self.mlp(hidden_states)
@@ -545,14 +557,25 @@ class BiBoDecoderLayer(nn.Module):
             cache_position=cache_position,
             output_attentions=output_attentions,
         )
-        if prefix_sum is None:
+        # ONE KERNEL for both consumers of attn_output at a plain carry site: the MLP input
+        # attn_read + c*attn_out (c = 2*sigmoid(theta) in-kernel) and the prefix sum + attn_out,
+        # backward folding both attn_out grads. Bitwise the unfused path
+        # (parity_check/parity_carry_update.py). Gated / emb / fp32-stream arms stay unfused.
+        _fuse_carry = (_HAS_FUSED_RES_ADD and attn_output.is_cuda and self.attn_res_sites != 2
+                       and self.attn_res_carry and self.attn_res_carry_gate is None
+                       and self.attn_res_emb_theta is None and not self.attn_res_fp32_stream)
+        if _fuse_carry:
+            hidden_states, prefix_sum = self._fused_carry(attn_read, attn_output, prefix_sum)
+        elif prefix_sum is None:
             # boundary layer: the stream restarts from attn_output alone
             prefix_sum = (attn_output.to(_stream_dtype) if self.attn_res_fp32_stream
                           else attn_output)
         else:
             prefix_sum = prefix_sum + attn_output
 
-        if self.attn_res_sites == 2:
+        if _fuse_carry:
+            pass
+        elif self.attn_res_sites == 2:
             hidden_states = apply_attention_residual(
                 prefix_sum.reshape(-1, hidden_size),
                 block_residual,
