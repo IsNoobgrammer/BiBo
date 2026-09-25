@@ -57,6 +57,23 @@ def localize(rec_a, rec_b, top=15):
 
 
 def run(model, gen, loss_fn, amp, repeats):
+    # DET_TORCH=1: torch flags every op it KNOWS is nondeterministic (warn_only, so the run goes on);
+    # each distinct warning is printed once with the first BiBo/kernels frame that called it.
+    import os
+    seen = {}
+    if os.environ.get("DET_TORCH") == "1":
+        import traceback
+        import warnings
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
+        def _rec(message, category, filename, lineno, file=None, line=None):
+            msg = str(message).split(". ")[0][:140]
+            if msg not in seen:
+                fr = [f for f in traceback.extract_stack()[:-1]
+                      if any(k in f.filename for k in ("ablate", "/src/", "kernels", "modeling", "exp/"))]
+                seen[msg] = f"{fr[-1].filename.split('/')[-1]}:{fr[-1].lineno} {fr[-1].name}" if fr else "?"
+        warnings.showwarning = _rec
+        warnings.simplefilter("always")
     ids = next(gen)
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     recs = []
@@ -101,4 +118,8 @@ def run(model, gen, loss_fn, amp, repeats):
         print(f"[det]   {c:4d}  {rel:.2e}  {key}", flush=True)
     if not rows:
         print("[det]   none -- backward is bit-deterministic for this batch", flush=True)
+    if seen:
+        print("[det] torch-flagged nondeterministic ops (first call site):", flush=True)
+        for msg, site in seen.items():
+            print(f"[det]   {site:45s} {msg}", flush=True)
     print("[det] DONE", flush=True)
