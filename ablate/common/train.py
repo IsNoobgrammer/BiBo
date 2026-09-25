@@ -439,6 +439,7 @@ def main():
     ap.add_argument("--ns_backend", choices=["auto", "cublas", "epi", "symepi", "symmul", "gram"], default="auto")
     ap.add_argument("--prefetch", type=int, default=4)  # batches decoded ahead in a worker process; 0 = inline
     ap.add_argument("--profile_step", type=int, default=-1)  # >=0: profile that step, sync-audit the next (ablate/tools/step_profile.py), then exit
+    ap.add_argument("--determinism_check", type=int, default=0)  # >0: N repeated fwd/bwd of one batch, bitwise grad compare (ablate/tools/determinism.py), then exit
     ap.add_argument("--optim_parity_steps", type=int, default=0)  # >0: run ablate/tools/optim_parity.py instead of training
     ap.add_argument("--optim_parity_mode", choices=["shared", "free", "isolate"], default="shared")
     ap.add_argument("--muon_fused_tail", type=lambda s: s.lower() in ("1", "true", "yes"), default=True)  # one-pass pre/post-NS elementwise (bit-identical)
@@ -902,6 +903,12 @@ def main():
           f"({'set' if args.peak_tflops > 0 else 'measured GEMM'}); measured GEMM={measured_peak:.0f} | "
           f"flops/token ~{flops_per_token/1e9:.2f} GFLOP", flush=True)
     model.train()
+    if args.determinism_check > 0:
+        from ablate.tools.determinism import run as _det
+        _det(model, gen, lambda ids: _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
+                                         getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok,
+                                         pad_id=args.pad_id), amp, args.determinism_check)
+        return
     if args.optim_parity_steps > 0:     # same model/patches/data/amp as training, then the parity harness
         from ablate.tools.optim_parity import run as _parity, run_free as _parity_free
         _lf = lambda m, ids: _ce(m, ids, use_fused_ce, aux_collector, args.aux_coef,

@@ -138,10 +138,11 @@ class BiBoMoELayer(nn.Module):
 
     @torch._dynamo.disable
     def _balance_step(self, top_k_indices, num_tokens):
-        current_tpe = torch.bincount(
-            rearrange(top_k_indices, 'b s k -> (b s k)'),
-            minlength=self.num_routed_experts
-        )
+        # scatter_add, not bincount: bincount reads max() back to the host to size its output,
+        # which drained the GPU once per MoE layer per micro-batch. Same exact integer counts.
+        _flat = rearrange(top_k_indices, 'b s k -> (b s k)')
+        current_tpe = torch.zeros(self.num_routed_experts, dtype=torch.long, device=_flat.device)
+        current_tpe.scatter_add_(0, _flat, torch.ones_like(_flat))
         self.accumulated_tpe += current_tpe.float()
         if self._update_every is None:
             self._update_every = max(1, round(self.bias_update_threshold / max(num_tokens, 1)))
