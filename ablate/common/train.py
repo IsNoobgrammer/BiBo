@@ -444,6 +444,7 @@ def main():
     ap.add_argument("--k_scale", type=float, default=1.0)   # fixed multiplier on k after qk-norm
     ap.add_argument("--global_attn", choices=["flex", "sdpa"], default="flex")  # flex = bitwise-repeatable backward (SDPA flash accumulates dQ atomically)
     ap.add_argument("--deterministic", type=lambda v: v.lower() in ("1", "true", "yes"), default=False)  # strict torch determinism (incl. flash-attn bwd) + cuBLAS workspace config
+    ap.add_argument("--grad_audit", default="")  # path: one fwd+bwd on the first batch, dump loss + every param grad + routing (ablate/tools/grad_audit.py), then exit
     ap.add_argument("--determinism_check", type=int, default=0)  # >0: N repeated fwd/bwd of one batch, bitwise grad compare (ablate/tools/determinism.py), then exit
     ap.add_argument("--optim_parity_steps", type=int, default=0)  # >0: run ablate/tools/optim_parity.py instead of training
     ap.add_argument("--optim_parity_mode", choices=["shared", "free", "isolate"], default="shared")
@@ -924,6 +925,13 @@ def main():
           f"({'set' if args.peak_tflops > 0 else 'measured GEMM'}); measured GEMM={measured_peak:.0f} | "
           f"flops/token ~{flops_per_token/1e9:.2f} GFLOP", flush=True)
     model.train()
+    if args.grad_audit:
+        from ablate.tools.grad_audit import dump as _audit
+        _audit(model, gen, lambda ids: _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
+                                           getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok,
+                                           pad_id=args.pad_id), amp, args.grad_audit,
+               kernels_off=not patch_list)
+        return
     if args.determinism_check > 0:
         from ablate.tools.determinism import run as _det
         _det(model, gen, lambda ids: _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
