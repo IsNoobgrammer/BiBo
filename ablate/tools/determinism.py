@@ -57,10 +57,13 @@ def localize(rec_a, rec_b, top=15):
 
 
 def run(model, gen, loss_fn, amp, repeats):
-    # DET_TORCH=1: torch flags every op it KNOWS is nondeterministic (warn_only, so the run goes on);
+    # DET_TORCH=2: strict torch deterministic mode. DET_TORCH=1: torch flags every op it KNOWS is nondeterministic (warn_only, so the run goes on);
     # each distinct warning is printed once with the first BiBo/kernels frame that called it.
     import os
     seen = {}
+    if os.environ.get("DET_TORCH") == "2":          # STRICT: deterministic kernels where torch has them
+        torch.use_deterministic_algorithms(True)    # (flash attention backward included); errors otherwise
+        print("[det] torch.use_deterministic_algorithms(True) -- strict", flush=True)
     if os.environ.get("DET_TORCH") == "1":
         import traceback
         import warnings
