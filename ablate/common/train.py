@@ -439,7 +439,7 @@ def main():
     ap.add_argument("--ns_backend", choices=["auto", "cublas", "epi", "symepi", "symmul", "gram"], default="auto")
     ap.add_argument("--prefetch", type=int, default=4)  # batches decoded ahead in a worker process; 0 = inline
     ap.add_argument("--profile_step", type=int, default=-1)  # >=0: profile that step, sync-audit the next (ablate/tools/step_profile.py), then exit
-    ap.add_argument("--attn_kernel", choices=["fused", "flex"], default="flex")  # fused = tkf attn_xsa (qk-norm+rope+attn+xsa, deterministic)
+    ap.add_argument("--attn_kernel", choices=["fused", "flex"], default="fused")  # fused = tkf attn_xsa (qk-norm+rope+attn+xsa, deterministic)
     ap.add_argument("--q_scale", type=float, default=1.0)   # fixed multiplier on q after qk-norm
     ap.add_argument("--k_scale", type=float, default=1.0)   # fixed multiplier on k after qk-norm
     ap.add_argument("--global_attn", choices=["flex", "sdpa"], default="flex")  # flex = bitwise-repeatable backward (SDPA flash accumulates dQ atomically)

@@ -31,6 +31,7 @@ COMPONENTS = (
     ("moe gemm (Triton grouped)", ("_grouped_gemm", "_grouped_mm_kernel", "_gate_up_glu", "_grouped_wgrad")),
     ("moe act row-ops (radial)", ("_glu_fwd_rowloop", "_glu_bwd_rowloop", "_glu_fwd", "_glu_bwd")),
     ("router / megakernel", ("router", "_mk_", "topk", "megakernel")),
+    ("attention (fused attn_xsa)", ("_attn_prep", "_attn_fwd", "_attn_bwd"),),
     ("attention (flex/xsa/rope)", ("flex_attention", "flash", "xsa", "rope", "attn")),
     ("fused CE", ("_grad_logits", "cross_entropy", "_ce_", "logsumexp")),
     ("optimizer + foreach (clip, AdamW)", ("_bgemm_epi", "_bmmt", "_bssm", "_pre_kernel", "_post_kernel", "_norm_t", "multi_tensor_apply")),
