@@ -8,8 +8,16 @@ prefill (is_causal is TOP-LEFT aligned — wrong with a cache; F9), or output_at
 """
 import torch.nn.functional as F
 from .utils import repeat_kv, causal_band_mask, padding_bias, eager_attention_forward
+from .swa import swa_attention
 
 __all__ = ['full_attention']
+
+# Training hot path through compiled FlexAttention (a causal band as wide as the sequence) instead
+# of SDPA flash. Flash's backward accumulates dQ with atomics, so it is the one op that made the
+# board's gradients differ run to run; flex computes dQ in its own pass and is bitwise repeatable.
+# Measured at B64 Hq4 Hkv2 S1024 D128: fwd+bwd 2.60 ms vs flash 2.10 (flash's own deterministic
+# mode: 3.72), i.e. ~+8 ms per board step. False = SDPA as before.
+GLOBAL_FLEX = True
 
 
 def full_attention(query, key, value, *, num_key_value_groups, scaling,
@@ -21,6 +29,10 @@ def full_attention(query, key, value, *, num_key_value_groups, scaling,
     dropout_p = dropout if training else 0.0
     need_mask = (output_attentions or padding_mask is not None
                  or (q_len > 1 and kv_len > q_len))
+    if not need_mask and GLOBAL_FLEX and training and q_len == kv_len and query.is_cuda:
+        return swa_attention(query, key, value, sliding_window=kv_len,
+                             num_key_value_groups=num_key_value_groups, scaling=scaling,
+                             dropout=dropout, training=training)
     if not need_mask:
         # Training (q_len==kv_len) and single-token decode — the hot path.
         attn_output = F.scaled_dot_product_attention(

@@ -439,6 +439,7 @@ def main():
     ap.add_argument("--ns_backend", choices=["auto", "cublas", "epi", "symepi", "symmul", "gram"], default="auto")
     ap.add_argument("--prefetch", type=int, default=4)  # batches decoded ahead in a worker process; 0 = inline
     ap.add_argument("--profile_step", type=int, default=-1)  # >=0: profile that step, sync-audit the next (ablate/tools/step_profile.py), then exit
+    ap.add_argument("--global_attn", choices=["flex", "sdpa"], default="flex")  # flex = bitwise-repeatable backward (SDPA flash accumulates dQ atomically)
     ap.add_argument("--deterministic", type=lambda v: v.lower() in ("1", "true", "yes"), default=False)  # strict torch determinism (incl. flash-attn bwd) + cuBLAS workspace config
     ap.add_argument("--determinism_check", type=int, default=0)  # >0: N repeated fwd/bwd of one batch, bitwise grad compare (ablate/tools/determinism.py), then exit
     ap.add_argument("--optim_parity_steps", type=int, default=0)  # >0: run ablate/tools/optim_parity.py instead of training
@@ -552,6 +553,8 @@ def main():
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_project", default="polyglu-ablations")
     args = ap.parse_args()
+    from src.modeling.attn import full_attention as _fa_mod
+    _fa_mod.GLOBAL_FLEX = args.global_attn == "flex"
     if args.deterministic:
         # cuBLAS reads this at handle creation, so it must be set before the first CUDA matmul.
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
