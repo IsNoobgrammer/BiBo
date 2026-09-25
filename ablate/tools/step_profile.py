@@ -31,6 +31,7 @@ COMPONENTS = (
     ("moe gemm (Triton grouped)", ("_grouped_gemm", "_grouped_mm_kernel", "_gate_up_glu", "_grouped_wgrad")),
     ("moe act row-ops (radial)", ("_glu_fwd_rowloop", "_glu_bwd_rowloop", "_glu_fwd", "_glu_bwd")),
     ("router / megakernel", ("router", "_mk_", "topk", "megakernel")),
+    ("attn residual (depth mix + carry)", ("_attn_res_", "residual_add", "_fwd_kernel", "_bwd_kernel")),
     ("attention (fused attn_xsa)", ("_attn_prep", "_attn_fwd", "_attn_bwd"),),
     ("attention (flex/xsa/rope)", ("flex_attention", "flash", "xsa", "rope", "attn")),
     ("fused CE", ("_grad_logits", "cross_entropy", "_ce_", "logsumexp")),
@@ -103,10 +104,14 @@ def report(prof, wall_ms, top=12):
         print(f"[profile]   {t:8.2f} {c:6d}  {n[:100]}", flush=True)
     # WHO launched the glue: each elementwise / copy / reduce kernel -> the first repo frame of its
     # CPU op (forward) or the autograd node that ran it (backward). This is the waste map.
+    # device events carry no CPU parent here, so walk the CPU ops and read the kernels each launched
     glue = collections.defaultdict(lambda: [0, 0.0])
-    for e in ev:
-        if component(e.name) in ("elementwise / reduce / other", "copy / cast / memcpy"):
-            k = glue[_origin(e)]; k[0] += 1; k[1] += e.device_time_total / 1e3
+    for e in prof.events():
+        if e.device_type != torch.autograd.DeviceType.CPU or not e.kernels:
+            continue
+        for kk in e.kernels:
+            if component(kk.name) in ("elementwise / reduce / other", "copy / cast / memcpy"):
+                k = glue[_origin(e) + " | " + kk.name[:40]]; k[0] += 1; k[1] += kk.duration / 1e3
     gt = sum(t for _, t in glue.values())
     print(f"[profile] elementwise + copy kernels by origin ({gt:.1f} ms):", flush=True)
     for o, (c, t) in sorted(glue.items(), key=lambda x: -x[1][1])[:45]:
@@ -114,8 +119,8 @@ def report(prof, wall_ms, top=12):
 
 
 def _origin(e):
-    """'fwd <aten op> @ file:line' or 'bwd <autograd node> <aten op>' for a CUDA kernel event."""
-    op, p, node = None, e.cpu_parent, None
+    """'fwd <aten op> @ file:line' or 'bwd <autograd node> <aten op>' for the CPU op that launched."""
+    op, p, node = None, e, None
     while p is not None:
         if op is None and p.name.startswith("aten::"):
             op = p.name

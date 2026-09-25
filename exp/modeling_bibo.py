@@ -14,6 +14,7 @@ Only the experimental package imports stable BiBo components. Nothing under
 ``src`` imports or probes ``exp``.
 """
 
+import os
 import contextlib
 import math
 from typing import Optional, Tuple, Union
@@ -62,6 +63,9 @@ try:
     _HAS_FUSED_RES_ADD = True
 except Exception:
     _HAS_FUSED_RES_ADD = False
+
+# BIBO_CARRY_FUSE=0 runs the carry site unfused (A/B and bitwise checks only).
+_CARRY_FUSE = os.environ.get("BIBO_CARRY_FUSE", "1") != "0"
 
 # attn_res_carry_scale -> the kernel's transform code for the attn_out multiplier. "none" has no
 # theta at all (c is a hard 1.0) and is handled by the caller, not here.
@@ -561,7 +565,7 @@ class BiBoDecoderLayer(nn.Module):
         # attn_read + c*attn_out (c = 2*sigmoid(theta) in-kernel) and the prefix sum + attn_out,
         # backward folding both attn_out grads. Bitwise the unfused path
         # (parity_check/parity_carry_update.py). Gated / emb / fp32-stream arms stay unfused.
-        _fuse_carry = (_HAS_FUSED_RES_ADD and attn_output.is_cuda and self.attn_res_sites != 2
+        _fuse_carry = (_CARRY_FUSE and _HAS_FUSED_RES_ADD and attn_output.is_cuda and self.attn_res_sites != 2
                        and self.attn_res_carry and self.attn_res_carry_gate is None
                        and self.attn_res_emb_theta is None and not self.attn_res_fp32_stream)
         if _fuse_carry:
