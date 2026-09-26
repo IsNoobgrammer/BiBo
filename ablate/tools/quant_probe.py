@@ -26,8 +26,19 @@ from ablate.common.report_ckpt import load_from_result
 from ablate.common import validation as _val
 from ablate.common.tensor_health import _group
 from kernels.sm120.cross_entropy import fused_linear_cross_entropy
+import kernels.sm75.moe as _moe
 
 SKIP = ("embed_tokens", "lm_head")
+
+
+@torch.no_grad()
+def _set(model, weights):
+    # p.copy_ (not p.data.copy_) so _version bumps, and drop the MoE bf16 cast cache: it is keyed
+    # on data_ptr + _version, so a later checkpoint at a freed address, or a .data write, would
+    # silently keep serving the OLD expert weights to the forward.
+    for n, p in _mats(model):
+        p.copy_(weights[n])
+    _moe._CAST_CACHE.clear()
 
 
 def _quant(w, kind):
@@ -104,6 +115,7 @@ def main():
     holdout = None
     summary = {}
     for rj in a.results:
+        _moe._CAST_CACHE.clear()
         model, c = load_from_result(rj)
         tag = c.run_tag or os.path.basename(rj)
         if holdout is None:
@@ -120,14 +132,16 @@ def main():
         for i, (r, mr, ck, mx) in sorted(acts.items()):
             print(f"  {i:5d} {r:10.3f} {mr:12.2f} {ck:12.1f} {mx:9.2f}")
         base = holdout_loss(model, holdout, amp)
+        import json
+        _fr = json.load(open(rj)).get("final_report", {})
+        print(f"  sanity: probe bf16 CE {base:.4f} | in-training final_report ctx1024 "
+              f"{_fr.get('ctxabl/ctx1024', float('nan')):.4f} (different text, should be close)", flush=True)
         orig = {n: p.detach().clone() for n, p in _mats(model)}
         res = {"bf16": base}
         for kind in ("int8_ch", "fp8_ch", "int4_g128"):
-            for n, p in _mats(model):
-                p.data.copy_(_quant(orig[n], kind))
+            _set(model, {n: _quant(w, kind) for n, w in orig.items()})
             res[kind] = holdout_loss(model, holdout, amp)
-            for n, p in _mats(model):
-                p.data.copy_(orig[n])
+            _set(model, orig)
         assert abs(holdout_loss(model, holdout, amp) - base) < 1e-6          # weights restored
         print("  held-out CE: " + "  ".join(f"{k}={v:.4f}" + ("" if k == "bf16" else f" ({v - base:+.4f})")
                                            for k, v in res.items()), flush=True)
