@@ -213,4 +213,4 @@ if __name__ == "__main__":
         assert wb_key(wb_key("interp/xsa_a_mean")) == "xsa/alpha_mean"    # idempotent
         print("wb_layout selftest ok")
     else:
-        print(build_workspace(a.entity, a.project, a.name).url)
+        print(build_workspace(a.entity, a.project, a.name).url.replace("\\", "/"))

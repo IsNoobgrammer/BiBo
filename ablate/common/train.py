@@ -886,14 +886,15 @@ def main():
                                             "rev-parse", "--short", "HEAD"], text=True).strip()
         except Exception:
             _tkf = None
+        _grp = args.wandb_group or args.run_tag or run_name   # also in config: panels group on config
         wb = wandb.init(project=args.wandb_project,
                         name=(f"{args.run_tag} s{args.seed}" if args.run_tag else run_name),
-                        group=args.wandb_group or args.run_tag or None,
+                        group=_grp,
                         tags=[args.muon_variant, f"seed{args.seed}"]
                              + ([f"switch{args.switch_variant_at}-{args.switch_variant}"]
                                 if args.switch_variant_at >= 0 else []),
                         settings=wandb.Settings(console="wrap"),
-                        config={**vars(args), "run_name": run_name, "tkf_commit": _tkf,
+                        config={**vars(args), "run_name": run_name, "group": _grp, "tkf_commit": _tkf,
                                 "total_steps": total_steps, "tokens_per_step": tok_per_step,
                                 "params_total": total, "params_active": active})
         define_metrics(wb)
