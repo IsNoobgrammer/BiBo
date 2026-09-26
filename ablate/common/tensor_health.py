@@ -55,3 +55,28 @@ def tensor_norms(model, grads=True):
     if gn:
         out["grad/norm_min_over_tensors"] = min(out[k] for k in out if k.startswith("grad/norm/"))
     return out
+
+
+@torch.no_grad()
+def snapshot_matrices(model):
+    """Copies of every >=2-D parameter, taken right before optimizer.step() on a log step."""
+    return {n: p.detach().clone() for n, p in model.named_parameters() if p.ndim >= 2}
+
+
+@torch.no_grad()
+def update_ratios(model, before):
+    """{'health/update_ratio/<group>': ||W_new - W_old|| / ||W_old||} for one optimizer step.
+
+    The EFFECTIVE step size. For a layer feeding a norm, lr alone does not say how far the weights
+    move -- lr / ||W|| does -- so two optimizers on the same lr schedule can run very different
+    effective schedules (aurora's weights grow ~2x after warmup, Muown pins them). RMS-combined
+    across layers like tensor_norms. One host sync for the whole model.
+    """
+    names = [n for n, _ in model.named_parameters() if n in before]
+    params = dict(model.named_parameters())
+    r = torch.stack([(params[n].detach().float() - before[n].float()).norm()
+                     / before[n].float().norm().clamp_min(1e-12) for n in names]).tolist()
+    acc = {}
+    for n, v in zip(names, r):
+        acc.setdefault(_group(n), []).append(v * v)
+    return {f"health/update_ratio/{g}": (sum(v) / len(v)) ** 0.5 for g, v in acc.items()}

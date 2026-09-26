@@ -152,6 +152,7 @@ def build_workspace(entity, project, name="BiBo board"):
         line("Smallest per-tensor grad norm (0 = inert tensor)", "health/grad_norm_min", log_y=True),
         line("Grad norm per tensor group", regex=r"health/grad_norm/.*", log_y=True),
         line("Param norm per tensor group", regex=r"health/param_norm/.*", log_y=True),
+        line("Effective step ||dW||/||W|| per group", regex=r"health/update_ratio/.*", log_y=True),
     ])
     router = sec("Router and MoE", [
         line("Balance entropy (1 = flat load)", "router/balance_entropy"),

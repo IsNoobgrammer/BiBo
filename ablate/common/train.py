@@ -26,7 +26,7 @@ from .data import token_batches, prefetched_batches, TRAIN_DATASET
 TOKENIZER = "fhai50032/QTK-81K"
 from .router_trace import RouterTrace   # training-stream router diagnostic; survived the purge
 from . import validation as _val        # frozen small batch, CE logged on the training log line
-from .tensor_health import tensor_norms
+from .tensor_health import tensor_norms, snapshot_matrices, update_ratios
 from .per_layer import PerLayerRouter, per_layer_params
 from .wb_layout import wb_keys, define_metrics   # every W&B key's section is decided there
 from kernels.sm120.cross_entropy import fused_linear_cross_entropy   # sm120 (Blackwell); CE byte-identical to sm75
@@ -1069,8 +1069,12 @@ def main():
             model.train()
         if wd_sched is not None:
             cur_wd = wd_sched(step)      # BEFORE o.step() so this step decays at the scheduled wd
+        _w0 = (snapshot_matrices(model)                  # log steps only: ~4 B/param copy, freed below
+               if (step % args.log_every == 0 or step == total_steps - 1) else None)
         for o in opts:
             o.step()
+        _upd = update_ratios(model, _w0) if _w0 is not None else {}
+        del _w0
         for s in scheds:
             s.step()
         if step == args.profile_step:
@@ -1121,6 +1125,7 @@ def main():
             # shipped that bug twice (XSA alpha behind a passing parity test, ACT_CYCLE not
             # reaching the eager path). Both were invisible in the loss for days.
             rt.update(tensor_norms(model))
+            rt.update(_upd)                  # ||dW||/||W|| of THIS step: the effective step size per group
             if plrouter is not None:
                 rt.update(plrouter.flush())
                 # OFF for the rest of this step. Validation and the extrapolation panels run their
