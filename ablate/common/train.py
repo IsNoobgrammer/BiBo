@@ -206,6 +206,31 @@ def _push_hf_async(api, repo, local_dir, path_in_repo, tag):
 
 
 @torch.no_grad()
+def _row_census(model, step):
+    """{'health/dead_rows_<thr>/<group>': count} + one console line naming the smallest row."""
+    from .tensor_health import _group
+    out, best = {}, (float("inf"), None)
+    for n, p in model.named_parameters():
+        if p.ndim < 2 or p.shape[-1] < 16:
+            continue
+        rn = p.detach().float().reshape(-1, p.shape[-1]).norm(dim=-1)
+        g = _group(n)
+        for thr in (1e-3, 1e-6, 1e-12):
+            k = f"health/dead_rows_{thr:g}/{g}"
+            out[k] = out.get(k, 0) + int((rn < thr).sum())
+        v, i = rn.min(0)
+        if v.item() < best[0]:
+            gr = (p.grad.detach().float().reshape(-1, p.shape[-1])[i].norm().item()
+                  if p.grad is not None else float("nan"))
+            e, r = divmod(int(i), p.shape[-2]) if p.ndim == 3 else (None, int(i))
+            best = (v.item(), f"{n}" + (f"[expert {e}]" if e is not None else "") + f"[row {r}] grad={gr:.3e}")
+    tot = {thr: sum(v for k, v in out.items() if k.startswith(f"health/dead_rows_{thr:g}/")) for thr in (1e-3, 1e-6, 1e-12)}
+    print(f"[census] step {step} rows<1e-3: {tot[1e-3]} <1e-6: {tot[1e-6]} <1e-12: {tot[1e-12]} | "
+          f"min row {best[0]:.3e} at {best[1]}", flush=True)
+    return out
+
+
+@torch.no_grad()
 def _nan_check(model, opts, step, loss, where):
     """--nan_check_from: one line of extremes per call; returns a report string on the first
     non-finite value (loss, a grad, a param, or Muown gain/v_norm state), else None."""
@@ -487,6 +512,9 @@ def main():
     # Debug: from this step on, sync every step, print loss / grad / Muown-state extremes, and stop
     # at the FIRST non-finite value naming where it appeared (loss, grads, or params after step).
     ap.add_argument("--nan_check_from", type=int, default=-1)
+    # Dead-row census: every N steps, per weight group, rows with norm < 1e-3 / 1e-6 / 1e-12, plus the
+    # smallest row in the model (tensor, expert, row, norm, grad norm). 0 = off.
+    ap.add_argument("--row_census_every", type=int, default=0)
     ap.add_argument("--switch_variant_at", type=int, default=-1)
     ap.add_argument("--switch_variant", default="muown")
     ap.add_argument("--switch_muon_wd", type=float, default=None)   # None = keep the current Muon wd   # Muon-group wd; None = same as --wd
@@ -1167,6 +1195,8 @@ def main():
             # reaching the eager path). Both were invisible in the loss for days.
             rt.update(tensor_norms(model))
             rt.update(_upd)                  # ||dW||/||W|| of THIS step: the effective step size per group
+            if args.row_census_every > 0 and step % args.row_census_every == 0:
+                rt.update(_row_census(model, step))
             if plrouter is not None:
                 rt.update(plrouter.flush())
                 # OFF for the rest of this step. Validation and the extrapolation panels run their
