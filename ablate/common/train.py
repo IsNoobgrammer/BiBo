@@ -205,6 +205,32 @@ def _push_hf_async(api, repo, local_dir, path_in_repo, tag):
 # callers were the eval and sampling call sites. Restore from git history if sampling comes back.
 
 
+@torch.no_grad()
+def _nan_check(model, opts, step, loss, where):
+    """--nan_check_from: one line of extremes per call; returns a report string on the first
+    non-finite value (loss, a grad, a param, or Muown gain/v_norm state), else None."""
+    bad = [] if math.isfinite(loss) else ["loss"]
+    for n, p in model.named_parameters():
+        if where == "pre-step" and p.grad is not None and not torch.isfinite(p.grad).all():
+            bad.append(f"grad:{n}")
+        if not torch.isfinite(p).all():
+            bad.append(f"param:{n}")
+    g_abs, vn_lo, vn_hi = [], [], []
+    for st in opts[0].state.values():
+        v = st.get("variant") if isinstance(st, dict) else None
+        if isinstance(v, dict) and torch.is_tensor(v.get("g")):
+            g_abs.append(v["g"].abs().min()); vn_lo.append(v["vn"].min()); vn_hi.append(v["vn"].max())
+            if not (torch.isfinite(v["g"]).all() and torch.isfinite(v["vn"]).all()):
+                bad.append("muown_state")
+    ext = ""
+    if g_abs:
+        ext = (f" min|g|={torch.stack(g_abs).min().item():.3e} vn=[{torch.stack(vn_lo).min().item():.3e},"
+               f"{torch.stack(vn_hi).max().item():.3e}]")
+    wmax = max(p.abs().max().item() for p in model.parameters())
+    print(f"[nan_check] step {step} {where} loss={loss:.4f} max|W|={wmax:.3e}{ext}", flush=True)
+    return (f"[nan_check] FIRST NON-FINITE at step {step} {where}: {bad[:12]}" if bad else None)
+
+
 def _interp(rt):
     """Move every diagnostic out of `train/` and into `interp/`.
 
@@ -458,6 +484,9 @@ def main():
     # MID-RUN VARIANT SWITCH (e.g. aurora -> muown). At step N the Muon optimizer is rebuilt with the
     # new variant (its state derived from the CURRENT weights, momentum fresh); AdamW, its state and
     # every lr schedule continue untouched.
+    # Debug: from this step on, sync every step, print loss / grad / Muown-state extremes, and stop
+    # at the FIRST non-finite value naming where it appeared (loss, grads, or params after step).
+    ap.add_argument("--nan_check_from", type=int, default=-1)
     ap.add_argument("--switch_variant_at", type=int, default=-1)
     ap.add_argument("--switch_variant", default="muown")
     ap.add_argument("--switch_muon_wd", type=float, default=None)   # None = keep the current Muon wd   # Muon-group wd; None = same as --wd
@@ -1073,12 +1102,20 @@ def main():
             model.train()
         if wd_sched is not None:
             cur_wd = wd_sched(step)      # BEFORE o.step() so this step decays at the scheduled wd
+        if 0 <= args.nan_check_from <= step:
+            _nc = _nan_check(model, opts, step, float(loss_val), "pre-step")
+            if _nc:
+                print(_nc, flush=True); return
         _w0 = (snapshot_matrices(model)                  # log steps only: ~4 B/param copy, freed below
                if (step % args.log_every == 0 or step == total_steps - 1) else None)
         for o in opts:
             o.step()
         _upd = update_ratios(model, _w0) if _w0 is not None else {}
         del _w0
+        if 0 <= args.nan_check_from <= step:
+            _nc = _nan_check(model, opts, step, float(loss_val), "post-step")
+            if _nc:
+                print(_nc, flush=True); return
         for s in scheds:
             s.step()
         if step == args.profile_step:
