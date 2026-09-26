@@ -26,7 +26,8 @@ from ablate.common.report_ckpt import load_from_result
 from ablate.common import validation as _val
 from ablate.common.tensor_health import _group
 from kernels.sm120.cross_entropy import fused_linear_cross_entropy
-import kernels.sm75.moe as _moe
+import importlib
+_moe = importlib.import_module("kernels.sm75.moe")   # the package re-exports a function named moe
 
 SKIP = ("embed_tokens", "lm_head")
 
