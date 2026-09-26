@@ -9,7 +9,8 @@ Per checkpoint:
   2. activation outliers per layer, residual stream after each decoder layer: rms, per-token
      max|x|/rms, channel kurtosis, and the largest single activation.
   3. fake-quant (weight-only, symmetric, round-to-nearest) held-out CE delta vs the bf16 baseline:
-     int8 per-channel, fp8-e4m3 per-channel, int4 group-128. Every weight matrix is quantized
+     int8 per-channel, fp8-e4m3 per-channel, int4 group-128 (group-64 where the input width
+     is not a multiple of 128: expert down_proj, in=576). Every weight matrix is quantized
      (attention, experts, router, attn-res projections); embed_tokens and lm_head stay full
      precision, as every deployment recipe does.
 
@@ -33,7 +34,8 @@ def _quant(w, kind):
     w32 = w.float()
     if kind == "int4_g128":
         *lead, n = w32.shape
-        g = w32.reshape(*lead, n // 128, 128)
+        gs = 128 if n % 128 == 0 else 64          # expert down_proj has in=576 = 9 x 64
+        g = w32.reshape(*lead, n // gs, gs)
         s = g.abs().amax(-1, keepdim=True).clamp_min(1e-12) / 7
         return (torch.round(g / s).clamp(-8, 7) * s).reshape(w32.shape)
     s = w32.abs().amax(-1, keepdim=True).clamp_min(1e-12)
