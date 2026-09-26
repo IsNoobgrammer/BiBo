@@ -4,7 +4,11 @@ import math
 import torch
 
 
-def wsd_lambda(total_steps, warmup_frac=0.05, decay_frac=0.20, final_frac=0.0):
+def wsd_lambda(total_steps, warmup_frac=0.05, decay_frac=0.20, final_frac=0.0,
+               decay_shape="linear", cycles=0, cycle_floor=0.1):
+    """cycles > 0 turns the stable phase into `cycles` smooth cosine waves peak -> cycle_floor -> peak
+    (no hard restarts), so the final decay still starts from the peak. decay_shape 'sqrt' is the
+    1 - sqrt(progress) cooldown (drops fast first, then flattens) instead of linear."""
     warm = max(int(total_steps * warmup_frac), 1)
     decay_start = int(total_steps * (1.0 - decay_frac))
 
@@ -12,9 +16,13 @@ def wsd_lambda(total_steps, warmup_frac=0.05, decay_frac=0.20, final_frac=0.0):
         if step < warm:
             return step / warm
         if step < decay_start:
-            return 1.0
+            if cycles <= 0:
+                return 1.0
+            ph = ((step - warm) / max(decay_start - warm, 1) * cycles) % 1.0
+            return cycle_floor + (1.0 - cycle_floor) * 0.5 * (1.0 + math.cos(2 * math.pi * ph))
         prog = (step - decay_start) / max(total_steps - decay_start, 1)
-        return final_frac + (1.0 - final_frac) * (1.0 - prog)
+        d = 1.0 - (math.sqrt(prog) if decay_shape == "sqrt" else prog)
+        return final_frac + (1.0 - final_frac) * d
     return f
 
 
@@ -68,12 +76,15 @@ def make_wd_schedule(optimizers, total_steps, wd_start, wd_end, warmup_frac=0.0)
     return step
 
 
-def make_scheduler(kind, optimizers, total_steps, warmup_frac=0.05, decay_frac=0.20, final_frac=0.0):
-    """kind in {'wsd','cosine'}. warmup_frac applies to both; decay_frac only to WSD."""
-    if kind == "wsd":
-        fn = wsd_lambda(total_steps, warmup_frac, decay_frac, final_frac)
+def make_scheduler(kind, optimizers, total_steps, warmup_frac=0.05, decay_frac=0.20, final_frac=0.0,
+                   decay_shape="linear", cycles=3, cycle_floor=0.1):
+    """kind in {'wsd','cosine','cyclic'}. warmup_frac applies to all; decay_frac / decay_shape to wsd
+    and cyclic; cyclic = wsd whose stable phase is `cycles` cosine waves down to cycle_floor."""
+    if kind in ("wsd", "cyclic"):
+        fn = wsd_lambda(total_steps, warmup_frac, decay_frac, final_frac, decay_shape,
+                        cycles if kind == "cyclic" else 0, cycle_floor)
     elif kind == "cosine":
         fn = cosine_lambda(total_steps, warmup_frac, final_frac)
     else:
-        raise ValueError(f"unknown scheduler {kind!r}; valid: wsd, cosine")
+        raise ValueError(f"unknown scheduler {kind!r}; valid: wsd, cosine, cyclic")
     return [torch.optim.lr_scheduler.LambdaLR(o, fn) for o in optimizers]

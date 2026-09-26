@@ -523,7 +523,10 @@ def main():
     # family is k*I' = const with E = 8k -- see the round config. 0 = off. Run tag _lat<d>.
     ap.add_argument("--wd_schedule", choices=["none", "rcos"], default="none")
     ap.add_argument("--wd_end", type=float, default=0.1)   # only used when --wd_schedule rcos
-    ap.add_argument("--scheduler", choices=["wsd", "cosine"], default="wsd")  # LR schedule shape
+    ap.add_argument("--scheduler", choices=["wsd", "cosine", "cyclic"], default="wsd")  # LR schedule shape
+    ap.add_argument("--decay_shape", choices=["linear", "sqrt"], default="linear")  # wsd/cyclic final decay
+    ap.add_argument("--cycles", type=int, default=3)            # cyclic: cosine waves in the stable phase
+    ap.add_argument("--cycle_floor", type=float, default=0.1)   # cyclic: trough lr as a fraction of peak
     ap.add_argument("--warmup_frac", type=float, default=0.05)   # both schedulers
     ap.add_argument("--decay_frac", type=float, default=0.20)    # WSD only: fraction of steps in the final decay
     ap.add_argument("--grad_clip", type=float, default=1.0)
@@ -771,7 +774,8 @@ def main():
 
     tok_per_step = args.batch * args.seq_len * args.grad_accum   # global batch
     total_steps = args.max_steps or (args.tokens // tok_per_step)
-    scheds = make_scheduler(args.scheduler, opts, total_steps, args.warmup_frac, args.decay_frac)
+    scheds = make_scheduler(args.scheduler, opts, total_steps, args.warmup_frac, args.decay_frac,
+                            decay_shape=args.decay_shape, cycles=args.cycles, cycle_floor=args.cycle_floor)
     if args.muon_wd is not None and args.wd_schedule == "rcos":
         raise ValueError("--muon_wd with --wd_schedule rcos: the schedule rewrites every group's wd")
     wd_sched = (make_wd_schedule(opts, total_steps, args.wd, args.wd_end)

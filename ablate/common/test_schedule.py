@@ -35,8 +35,23 @@ def test_final_frac_floor():
     print("OK: final_frac floor respected")
 
 
+def test_cyclic_and_sqrt():
+    T = 2000                                      # warm=200, decay_start=1600, 3 cycles of ~466.7 steps
+    f = wsd_lambda(T, 0.1, 0.2, cycles=3, cycle_floor=0.1)
+    assert abs(f(200) - 1.0) < 1e-9               # peak right after warmup
+    c = (1600 - 200) / 3
+    for k in range(3):                            # each trough hits the floor, each cycle ends at peak
+        assert abs(f(int(round(200 + c * (k + 0.5)))) - 0.1) < 1e-3
+    assert f(1599) > 0.99 and abs(f(1600) - 1.0) < 1e-9   # decay starts from the peak, no jump
+    assert abs(wsd_lambda(T, 0.1, 0.2)(1000) - 1.0) < 1e-9  # cycles=0 keeps the flat stable phase
+    g = wsd_lambda(T, 0.1, 0.2, decay_shape="sqrt")
+    assert abs(g(1700) - (1 - 0.25 ** 0.5)) < 1e-9 and g(1700) < wsd_lambda(T, 0.1, 0.2)(1700)
+    print("OK: cyclic troughs at floor, peak-to-peak; sqrt cooldown below linear")
+
+
 if __name__ == "__main__":
     test_wsd()
     test_cosine()
+    test_cyclic_and_sqrt()
     test_final_frac_floor()
     print("all self-checks passed")
