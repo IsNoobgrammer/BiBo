@@ -28,6 +28,7 @@ from .router_trace import RouterTrace   # training-stream router diagnostic; sur
 from . import validation as _val        # frozen small batch, CE logged on the training log line
 from .tensor_health import tensor_norms
 from .per_layer import PerLayerRouter, per_layer_params
+from .wb_layout import wb_keys, define_metrics   # every W&B key's section is decided there
 from kernels.sm120.cross_entropy import fused_linear_cross_entropy   # sm120 (Blackwell); CE byte-identical to sm75
 
 DEV = "cuda"
@@ -562,6 +563,8 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb_project", default="polyglu-ablations")
+    # group = the arm across seeds (the dashboard's seed-mean panels group on it); default run_tag
+    ap.add_argument("--wandb_group", default=None)
     args = ap.parse_args()
     # the MODULE, not `from src.modeling.attn import full_attention`: the package re-exports the
     # function under that name, and setting the flag on the function object silently did nothing
@@ -876,10 +879,24 @@ def main():
         # greedy AND sampled generation there on purpose -- W&B renders long text poorly in a table,
         # and the log is the readable place for it. Default "auto" can decline to capture when
         # stdout is already redirected, which is exactly how these runs are launched (nohup > log).
-        wb = wandb.init(project=args.wandb_project, name=run_name,
+        # display name is the short human one (tag + seed); the full encoded run_name is in config
+        import subprocess, kernels
+        try:
+            _tkf = subprocess.check_output(["git", "-C", os.path.dirname(kernels.__path__[0]),
+                                            "rev-parse", "--short", "HEAD"], text=True).strip()
+        except Exception:
+            _tkf = None
+        wb = wandb.init(project=args.wandb_project,
+                        name=(f"{args.run_tag} s{args.seed}" if args.run_tag else run_name),
+                        group=args.wandb_group or args.run_tag or None,
+                        tags=[args.muon_variant, f"seed{args.seed}"]
+                             + ([f"switch{args.switch_variant_at}-{args.switch_variant}"]
+                                if args.switch_variant_at >= 0 else []),
                         settings=wandb.Settings(console="wrap"),
-                        config={**vars(args), "total_steps": total_steps,
+                        config={**vars(args), "run_name": run_name, "tkf_commit": _tkf,
+                                "total_steps": total_steps, "tokens_per_step": tok_per_step,
                                 "params_total": total, "params_active": active})
+        define_metrics(wb)
 
     # async HF checkpoint push: save_pretrained locally (main thread), then upload_folder in the background.
     hf_api = hf_tok = None
@@ -1310,13 +1327,19 @@ def main():
                   + f" elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m"
                   f"{'' if fin else '  <<NON-FINITE>>'}", flush=True)
             if wb:
-                wb.log({"train/loss": lv, "train/grad_norm": gn, "train/lr": lr, "train/ms_per_step": ms_per_step,
+                wb.log(wb_keys({
+                        "train/loss": lv, "train/loss_smooth": lv_run, "train/grad_norm": gn, "train/lr": lr,
+                        "optim/lr_muon": opts[0].param_groups[0]["lr"],
+                        **({"optim/lr_adamw": opts[1].param_groups[0]["lr"]} if len(opts) > 1 else {}),
+                        "optim/wd_muon": opts[0].param_groups[0].get("weight_decay", 0.0),
+                        "optim/phase": int(0 <= args.switch_variant_at <= step),
+                        "train/ms_per_step": ms_per_step,
                         "train/tps": tps, "train/mfu": mfu, "train/mem_gb": mem, "train/elapsed_s": elapsed,
                         "train/expert_corr": ecorr, "train/router_corr": rcorr,
                         **({"train/loss_clean": loss_clean, "train/probe_gap": loss_clean - lv}
                            if loss_clean is not None else {}),
                         **({"train/probe_gamma": _mns.probe_gamma} if _mns is not None else {}),
-                        "tokens": toks, **_interp(rt), **val_flat}, step=step)
+                        "tokens": toks, **_interp(rt), **val_flat}), step=step)
         if args.ckpt_every and step > 0 and step % args.ckpt_every == 0:
             if hf_api is not None:
                 _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_step{step}"))

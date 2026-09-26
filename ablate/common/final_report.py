@@ -306,7 +306,8 @@ def run(model, tok, dataset, ce_fn, amp, device="cuda", wb=None, max_new=96, n_s
                 payload["samples"] = wandb.Table(
                     columns=["lang", "mode", "prompt", "completion",
                              "rep@1", "rep@4", "distinct1", "distinct3"], data=rows)
-            wb.log(payload)
+            from .wb_layout import wb_keys
+            wb.log(wb_keys(payload))
         except Exception as e:
             print(f"[final_report] W&B log FAILED: {type(e).__name__}: {e}", flush=True)
     return flat
