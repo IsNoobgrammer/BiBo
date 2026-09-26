@@ -453,7 +453,13 @@ def main():
     # W = g * v/||v|| per row, Muon on v and Adam on g (same lr). Its claim is wd-insensitivity, so
     # its arm runs --muon_wd 0 while AdamW keeps --wd; parity vs the reference: triton-kernel-fused
     # parity_check/parity_muown.py.
-    ap.add_argument("--muon_wd", type=float, default=None)   # Muon-group wd; None = same as --wd
+    ap.add_argument("--muon_wd", type=float, default=None)
+    # MID-RUN VARIANT SWITCH (e.g. aurora -> muown). At step N the Muon optimizer is rebuilt with the
+    # new variant (its state derived from the CURRENT weights, momentum fresh); AdamW, its state and
+    # every lr schedule continue untouched.
+    ap.add_argument("--switch_variant_at", type=int, default=-1)
+    ap.add_argument("--switch_variant", default="muown")
+    ap.add_argument("--switch_muon_wd", type=float, default=None)   # None = keep the current Muon wd   # Muon-group wd; None = same as --wd
     ap.add_argument("--xorth_post", type=float, default=0.0)       # cross-expert whitening MAX strength (0=off), scoped to MoE expert stacks
     ap.add_argument("--xorth_gate_ref", type=float, default=0.3)   # correlation gate: full whitening at off-diag RMS>=this; below it ramps to ~0; <=0 disables gate
     ap.add_argument("--xorth_ema", type=float, default=0.95)       # EMA decay of the persistent per-stack (E,E) gram
@@ -737,12 +743,13 @@ def main():
     # summary statistics of the very distribution the histogram shows.
     plrouter = (PerLayerRouter(model, _n_exp, args.top_k or SHARED["num_experts_per_tok"])
                 if (args.router_log and _n_exp >= 2) else None)
-    opts, n_mat, n_oth = build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt,
-                                          variant=args.muon_variant, muon_scale=args.muon_scale,
+    def _build_opts(variant, muon_wd):
+        return build_optimizers(model, args.muon_lr, args.adam_lr, args.wd, ns_dtype=dt,
+                                          variant=variant, muon_scale=args.muon_scale,
                                           ns_coeffs=args.ns_coeffs, ns_backend=args.ns_backend,
                                           fused_tail=args.muon_fused_tail,
                                           xorth_post=args.xorth_post,
-                                          muon_wd=args.muon_wd,
+                                          muon_wd=muon_wd,
                                           xorth_gate_ref=args.xorth_gate_ref, xorth_ema=args.xorth_ema,
                                           xorth_warmup_steps=args.xorth_warmup_steps, xorth_where=args.xorth_where,
                                           router_adamw=(args.router_optim == "adamw"),
@@ -753,6 +760,7 @@ def main():
                                           optim=args.optim, probe_gamma=probe_gamma,
                                           probe_rho_step=args.probe_rho_step,
                                           probe_rank=args.probe_rank)
+    opts, n_mat, n_oth = _build_opts(args.muon_variant, args.muon_wd)
     if args.compile:                                            # compile the transformer body only; the
         model.model = torch.compile(model.model)               # triton/liger kernels stay eager (compiler.disable)
         print(f"[{args.arm}_seed{args.seed}] torch.compile(model.model) on; fused CE + liger/moe/flash kernels stay eager",
@@ -988,6 +996,21 @@ def main():
             _prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                                        torch.profiler.ProfilerActivity.CUDA], with_stack=True)
             _prof.__enter__(); _pt0 = time.perf_counter()
+        if step == args.switch_variant_at:
+            _old = opts[0]
+            _new = _build_opts(args.switch_variant,
+                               args.muon_wd if args.switch_muon_wd is None else args.switch_muon_wd)[0][0]
+            assert len(_new.param_groups) == len(_old.param_groups)
+            for _gn, _go in zip(_new.param_groups, _old.param_groups):
+                assert [id(p) for p in _gn["params"]] == [id(p) for p in _go["params"]]
+                _gn["initial_lr"], _gn["lr"] = _go["initial_lr"], _go["lr"]     # the schedule continues
+            for _s in scheds:
+                if _s.optimizer is _old:
+                    _s.optimizer = _new
+            opts[0] = _new
+            print(f"[optim] step {step}: SWITCHED Muon variant -> {args.switch_variant} "
+                  f"(wd {_new.param_groups[0]['weight_decay']:g}, lr {_new.param_groups[0]['lr']:.3e}; "
+                  f"state from current weights, momentum fresh; AdamW unchanged)", flush=True)
         for o in opts:
             o.zero_grad(set_to_none=True)
         if _gs_on and step >= _gs_warm:                      # once per STEP, never between micros
