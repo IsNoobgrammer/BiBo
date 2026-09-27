@@ -1,4 +1,14 @@
-"""Multi-token prediction (MTP), depth 1 -- variant 1: one extra SWA decoder layer predicting t+2.
+"""Multi-token prediction (MTP), depth 1: one extra layer predicting t+2. Variants (--mtp_variant):
+
+    1  x -> AR read -> SWA attention -> fused carry -> MLP     (a full 11th SWA layer, below)
+    2  x -> SWA attention -> MLP                               plain pre-norm block, no AttnRes
+    3  x -> AR read -> MLP                                     no attention: s = x + Ens(norm AR(x, A))
+    4  x -> MLP                                                s = x + Ens(norm x)
+
+All share the input W_p[norm(lhs); norm(Emb(t+1))], the 8 x 576 all-active ensemble, the output
+norm and the tied lm_head. Unused sub-modules are deleted so params/FLOPs are honest.
+
+Variant 1 in detail:
 
     x_i   = W_p [ RMSNorm(lhs_i) ; RMSNorm(Emb(t_{i+1})) ]        lhs = final hidden state (post-norm)
     x     = BiBoDecoderLayer_L(x, archive)                          L = num_hidden_layers (an 11th layer)
@@ -39,20 +49,45 @@ def mtp_layer_config(config):
 
 
 class MTP(nn.Module):
-    def __init__(self, config, init_fn=None):
+    HAS_ATTN = {1: True, 2: True, 3: False, 4: False}
+
+    def __init__(self, config, variant=1, init_fn=None):
         super().__init__()
         from exp.modeling_bibo import BiBoDecoderLayer
+        assert variant in self.HAS_ATTN, f"--mtp_variant {variant}: valid 1-4"
+        self.variant = variant
         H, eps = config.hidden_size, config.rms_norm_eps
         self.norm_h = BiBoRMSNorm(H, eps=eps)
         self.norm_e = BiBoRMSNorm(H, eps=eps)
         self.proj = nn.Linear(2 * H, H, bias=False)
         cfg, idx = mtp_layer_config(config)
+        if variant == 2:
+            cfg.attn_res_block_size = None       # the layer takes its standard pre-norm residual path
         self.layer = BiBoDecoderLayer(cfg, idx)
+        if variant in (3, 4):                    # no attention sublayer
+            del self.layer.self_attn, self.layer.input_layernorm
+            self.layer.attn_res_carry_theta = None
+        if variant == 4:                         # no depth read either
+            del self.layer.self_attention_res_proj, self.layer.self_attention_res_norm
         self.norm_out = BiBoRMSNorm(H, eps=eps)
         if init_fn is not None:              # the model's own _init_weights, so this layer starts
             self.apply(init_fn)              # exactly like the main ones would
 
     def forward(self, lhs, e_next, position_embeddings, block_residual):
         x = self.proj(torch.cat([self.norm_h(lhs), self.norm_e(e_next).to(lhs.dtype)], dim=-1))
-        out = self.layer(x, position_embeddings=position_embeddings, block_residual=block_residual)
-        return self.norm_out(out[0])
+        L = self.layer
+        if self.variant == 1:
+            s = L(x, position_embeddings=position_embeddings, block_residual=block_residual)[0]
+        elif self.variant == 2:
+            s = L(x, position_embeddings=position_embeddings)[0]
+        else:
+            if self.variant == 3:
+                from exp.modeling_bibo import apply_attention_residual
+                B, S, H = x.shape
+                r = apply_attention_residual(x.reshape(-1, H), block_residual,
+                                             L.self_attention_res_proj, L.self_attention_res_norm,
+                                             L.attn_res_score_mode, L.attn_res_topk).reshape(B, S, H)
+            else:
+                r = x
+            s = x + L._attn_res_mlp_forward(r)   # post-attention norm + ensemble (megakernel-patched)
+        return self.norm_out(s)

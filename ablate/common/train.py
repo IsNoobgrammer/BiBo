@@ -537,6 +537,8 @@ def main():
     # MTP depth 1 (ablate/common/mtp.py): loss = CE(t+1) + mtp_weight * CE(t+2). 0 = off. Logged
     # train/val loss stay the MAIN head only, so MTP runs compare 1:1 with everything else.
     ap.add_argument("--mtp_weight", type=float, default=0.0)
+    # 1 AR+SWA+carry+MLP (full SWA layer) | 2 SWA+MLP | 3 AR+MLP | 4 MLP only -- see mtp.py
+    ap.add_argument("--mtp_variant", type=int, default=1)
     ap.add_argument("--switch_variant_at", type=int, default=-1)
     ap.add_argument("--switch_variant", default="muown")
     ap.add_argument("--switch_muon_wd", type=float, default=None)   # None = keep the current Muon wd   # Muon-group wd; None = same as --wd
@@ -799,8 +801,8 @@ def main():
     print(f"[attn] kernel={args.attn_kernel} q_scale={args.q_scale} k_scale={args.k_scale}", flush=True)
     if args.mtp_weight > 0:
         from .mtp import MTP
-        model.mtp = MTP(model.config, init_fn=model._init_weights).to(DEV)
-        print(f"[mtp] depth 1, weight {args.mtp_weight}: +{sum(p.numel() for p in model.mtp.parameters())/1e6:.2f}M "
+        model.mtp = MTP(model.config, variant=args.mtp_variant, init_fn=model._init_weights).to(DEV)
+        print(f"[mtp] depth 1, variant {args.mtp_variant}, weight {args.mtp_weight}: +{sum(p.numel() for p in model.mtp.parameters())/1e6:.2f}M "
               f"params, + one extra lm_head pass per token", flush=True)
     total, trainable, active = count_params(model)
     if getattr(model, "mtp", None) is not None:
@@ -1052,7 +1054,8 @@ def main():
     peak_tflops = args.peak_tflops if args.peak_tflops > 0 else measured_peak
     flops_per_token = 6 * active + 12 * cfg.num_hidden_layers * cfg.hidden_size * args.seq_len
     if args.mtp_weight > 0:   # its layer is already in `active`; add its attention and the 2nd vocab pass
-        flops_per_token += 6 * model.lm_head.weight.numel() + 12 * cfg.hidden_size * args.seq_len
+        flops_per_token += 6 * model.lm_head.weight.numel() + (
+            12 * cfg.hidden_size * args.seq_len if model.mtp.HAS_ATTN[args.mtp_variant] else 0)
     print(f"[{run_name}] MFU peak={peak_tflops:.0f} TFLOPS "
           f"({'set' if args.peak_tflops > 0 else 'measured GEMM'}); measured GEMM={measured_peak:.0f} | "
           f"flops/token ~{flops_per_token/1e9:.2f} GFLOP", flush=True)
@@ -1156,6 +1159,9 @@ def main():
             loss_val += _ce.last[0] / args.grad_accum             # MAIN head only (== loss when no MTP)
             if _ce.last[1] is not None:
                 loss_mtp_val += _ce.last[1] / args.grad_accum
+        if step == 0 and getattr(model, "mtp", None) is not None:   # dead-param check, once
+            _nog = [n for n, q in model.mtp.named_parameters() if q.grad is None]
+            print(f"[mtp] params with NO grad after step 0: {_nog or 'none'}", flush=True)
         _loss_hist.append(loss_val)
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) if args.grad_clip > 0 else \
             torch.sqrt(sum(p.grad.float().pow(2).sum() for p in model.parameters() if p.grad is not None))
