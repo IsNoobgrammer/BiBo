@@ -803,6 +803,12 @@ def main():
         print(f"[mtp] depth 1, weight {args.mtp_weight}: +{sum(p.numel() for p in model.mtp.parameters())/1e6:.2f}M "
               f"params, + one extra lm_head pass per token", flush=True)
     total, trainable, active = count_params(model)
+    if getattr(model, "mtp", None) is not None:
+        # count_params discounts every 3D expert stack by the GLOBAL top_k/E; the MTP ensemble is
+        # all-active (k == E), so add back what it discounted -- else FLOPs undercount MTP.
+        _k = cfg.num_experts_per_tok
+        active += int(sum(p.numel() * (1.0 - _k / p.shape[0]) for n, p in model.mtp.named_parameters()
+                          if p.ndim == 3 and p.shape[0] > _k))
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
     if not args.fused_res_add:
         import exp.modeling_bibo as _E
