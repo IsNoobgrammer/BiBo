@@ -59,7 +59,7 @@ class _QwenAuxCollector:
         self.logits = []
 
 
-def _ce(model, ids, use_fused, aux=None, aux_coef=0.0, num_experts=6, top_k=2, pad_id=None):
+def _ce(model, ids, use_fused, aux=None, aux_coef=0.0, num_experts=6, top_k=2, pad_id=None, mtp_w=0.0):
     """CE over next-token targets, with `pad_id` (from --pad_id) excluded from the loss.
 
     Default None = nothing is masked, which is correct for a PACKED corpus: it contains no padding,
@@ -86,6 +86,17 @@ def _ce(model, ids, use_fused, aux=None, aux_coef=0.0, num_experts=6, top_k=2, p
     if aux is not None and aux_coef > 0 and aux.logits:      # Qwen aux load-balancing loss
         from baseline.qwen3moe.modeling import load_balancing_loss_func
         loss = loss + aux_coef * load_balancing_loss_func(tuple(aux.logits), num_experts, top_k)
+    _ce.last = (loss.detach(), None)                         # (main CE, MTP CE) for logging
+    if mtp_w > 0 and getattr(model, "mtp", None) is not None and model.training:
+        # t_{i+2} from position i, given t_{i+1}; the last position has no t_{i+2} -> ignored
+        pe, br = model.model._mtp_cache
+        e_next = model.model.embed_tokens(ids[:, 1:])
+        x = model.mtp(h, e_next, pe, br)
+        tgt2 = torch.cat([ids[:, 2:], ids.new_full((ids.shape[0], 1), _ign)], 1).reshape(-1)
+        l2 = fused_linear_cross_entropy(x.reshape(-1, x.shape[-1]), model.lm_head.weight, tgt2,
+                                        ignore_index=_ign)
+        _ce.last = (loss.detach(), l2.detach())
+        loss = loss + mtp_w * l2
     return loss
 
 
@@ -523,6 +534,9 @@ def main():
     # Dead-row census: every N steps, per weight group, rows with norm < 1e-3 / 1e-6 / 1e-12, plus the
     # smallest row in the model (tensor, expert, row, norm, grad norm). 0 = off.
     ap.add_argument("--row_census_every", type=int, default=25)
+    # MTP depth 1 (ablate/common/mtp.py): loss = CE(t+1) + mtp_weight * CE(t+2). 0 = off. Logged
+    # train/val loss stay the MAIN head only, so MTP runs compare 1:1 with everything else.
+    ap.add_argument("--mtp_weight", type=float, default=0.0)
     ap.add_argument("--switch_variant_at", type=int, default=-1)
     ap.add_argument("--switch_variant", default="muown")
     ap.add_argument("--switch_muon_wd", type=float, default=None)   # None = keep the current Muon wd   # Muon-group wd; None = same as --wd
@@ -783,6 +797,11 @@ def main():
             if hasattr(_m, "q_scale") and hasattr(_m, "k_scale"):
                 _m.q_scale, _m.k_scale = args.q_scale, args.k_scale
     print(f"[attn] kernel={args.attn_kernel} q_scale={args.q_scale} k_scale={args.k_scale}", flush=True)
+    if args.mtp_weight > 0:
+        from .mtp import MTP
+        model.mtp = MTP(model.config, init_fn=model._init_weights).to(DEV)
+        print(f"[mtp] depth 1, weight {args.mtp_weight}: +{sum(p.numel() for p in model.mtp.parameters())/1e6:.2f}M "
+              f"params, + one extra lm_head pass per token", flush=True)
     total, trainable, active = count_params(model)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
     if not args.fused_res_add:
@@ -985,12 +1004,20 @@ def main():
     # FROZEN validation batches, built once. Failure is FATAL by design: a silently-skipped source
     # would leave the run logging a val number that means something different from every other run.
     val_batches = val_holdout = None
+    val_bpt = None
     val_every = args.log_every if args.val_every == 0 else args.val_every
     if args.val_every >= 0 and args.data == "real":
         from transformers import AutoTokenizer
         _vt = AutoTokenizer.from_pretrained(TOKENIZER)
         # TIER 1 -- val/loss, the ranking number: held-out shard of THIS corpus, in-distribution.
         val_holdout = _val.build_holdout(args.dataset, args.seq_len, args.val_seqs, DEV)
+        # BYTES per target token of this frozen holdout -> val/bpb = CE / (ln2 * bytes/token),
+        # the tokenizer-agnostic number. Same mask as the val CE (pad id 0 excluded).
+        _tg = val_holdout[:, 1:]
+        _mk = _tg != (0 if args.pad_id is None else int(args.pad_id))
+        val_bpt = (sum(len(_vt.decode(r[m].tolist()).encode("utf-8")) for r, m in zip(_tg, _mk))
+                   / max(int(_mk.sum()), 1))
+        print(f"[val] holdout {tuple(val_holdout.shape)} bytes/token {val_bpt:.3f}", flush=True)
         # TIER 2 -- val/ext/*, external instruction sources. Watched, never averaged into val/loss.
         # Separator is <|im_end|> (validation.SEP_ID), NOT eos: the val CE masks the pad id and
         # pad == eos == 0 here, so an eos separator would be deleted from the loss.
@@ -1017,6 +1044,8 @@ def main():
     measured_peak = _measure_peak_tflops(DEV, dt)
     peak_tflops = args.peak_tflops if args.peak_tflops > 0 else measured_peak
     flops_per_token = 6 * active + 12 * cfg.num_hidden_layers * cfg.hidden_size * args.seq_len
+    if args.mtp_weight > 0:   # its layer is already in `active`; add its attention and the 2nd vocab pass
+        flops_per_token += 6 * model.lm_head.weight.numel() + 12 * cfg.hidden_size * args.seq_len
     print(f"[{run_name}] MFU peak={peak_tflops:.0f} TFLOPS "
           f"({'set' if args.peak_tflops > 0 else 'measured GEMM'}); measured GEMM={measured_peak:.0f} | "
           f"flops/token ~{flops_per_token/1e9:.2f} GFLOP", flush=True)
@@ -1104,6 +1133,7 @@ def main():
         if _gs_on and step >= _gs_warm:                      # once per STEP, never between micros
             _mns.probe_gamma = _gamma_law(opts[0].param_groups[0]["lr"])
         loss_val = torch.zeros((), device=DEV)            # summed on the GPU: no host sync per micro
+        loss_mtp_val = torch.zeros((), device=DEV)
         for _ in range(args.grad_accum):                     # gradient accumulation -> global batch
             ids = next(gen)
             # MANAS: fwd/bwd run at theta + gamma*D (the probe), then vote() folds this micro's
@@ -1113,10 +1143,12 @@ def main():
                 with amp:
                     loss = _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
                                getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok,
-                               pad_id=args.pad_id) / args.grad_accum
+                               pad_id=args.pad_id, mtp_w=args.mtp_weight) / args.grad_accum
                 loss.backward()
             _vote()
-            loss_val += loss.detach()
+            loss_val += _ce.last[0] / args.grad_accum             # MAIN head only (== loss when no MTP)
+            if _ce.last[1] is not None:
+                loss_mtp_val += _ce.last[1] / args.grad_accum
         _loss_hist.append(loss_val)
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) if args.grad_clip > 0 else \
             torch.sqrt(sum(p.grad.float().pow(2).sum() for p in model.parameters() if p.grad is not None))
@@ -1395,6 +1427,8 @@ def main():
                 _vo, val_flat = _val.losses(model, val_holdout, val_batches,
                                             fused_linear_cross_entropy, amp,
                                             pad_id=0 if args.pad_id is None else int(args.pad_id))
+                if _vo is not None and val_bpt:
+                    val_flat["val/bpb"] = _vo / (math.log(2) * val_bpt)
                 # headline first and on its own; the external sources follow, tagged, so the two
                 # tiers can never be misread as one aggregate.
                 val_s = ("" if _vo is None else f" val={_vo:.4f}") + (
@@ -1415,6 +1449,8 @@ def main():
             if wb:
                 wb.log(wb_keys({
                         "train/loss": lv, "train/loss_smooth": lv_run, "train/grad_norm": gn, "train/lr": lr,
+                        "train/flops": flops_per_token * toks,
+                        **({"train/loss_mtp": float(loss_mtp_val)} if args.mtp_weight > 0 else {}),
                         "optim/lr_muon": opts[0].param_groups[0]["lr"],
                         **({"optim/lr_adamw": opts[1].param_groups[0]["lr"]} if len(opts) > 1 else {}),
                         "optim/wd_muon": opts[0].param_groups[0].get("weight_decay", 0.0),

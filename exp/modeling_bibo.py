@@ -946,6 +946,9 @@ class BiBoModel(BiBoPreTrainedModel):
             elif output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
+        # MTP (ablate/common/mtp.py) runs one extra layer after this model and needs the same
+        # RoPE tensors and the final block archive; handed over by reference, training only.
+        self._mtp_cache = (position_embeddings, block_residual) if self.training else None
         if self.use_attn_residuals:
             hidden_states = self._apply_output_attention_residual(
                 hidden_states, block_residual

@@ -28,6 +28,9 @@ _EXACT = {
     "train/loss_smooth": "core/loss_smooth",
     "val/loss": "core/val_loss",
     "train/grad_norm": "core/grad_norm",
+    "train/flops": "core/train_flops",
+    "train/loss_mtp": "core/loss_mtp",
+    "val/bpb": "core/val_bpb",
     "train/lr": "core/lr",
     "tokens": "core/tokens",
     "train/tps": "speed/tps",
@@ -119,6 +122,9 @@ def build_workspace(entity, project, name="BiBo board"):
         line("Grad norm (global, pre-clip)", "core/grad_norm", log_y=True),
         line("Learning rate (Muon / AdamW)", ["optim/lr_muon", "optim/lr_adamw"]),
         line("Throughput (tokens/s)", "speed/tps"),
+        line("Val BPB vs training FLOPs", "core/val_bpb", x="core/train_flops"),
+        line("Val loss vs training FLOPs", "core/val_loss", x="core/train_flops"),
+        line("MTP head loss (t+2)", "core/loss_mtp"),
     ], open_=True)
     seeds = sec("Seed mean +- range (grouped by run group)", [
         line("Train loss (20-step mean)", "core/loss_smooth", groupby="group",
