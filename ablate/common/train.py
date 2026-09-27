@@ -1013,11 +1013,12 @@ def main():
         val_holdout = _val.build_holdout(args.dataset, args.seq_len, args.val_seqs, DEV)
         # BYTES per target token of this frozen holdout -> val/bpb = CE / (ln2 * bytes/token),
         # the tokenizer-agnostic number. Same mask as the val CE (pad id 0 excluded).
-        _tg = val_holdout[:, 1:]
-        _mk = _tg != (0 if args.pad_id is None else int(args.pad_id))
-        val_bpt = (sum(len(_vt.decode(r[m].tolist()).encode("utf-8")) for r, m in zip(_tg, _mk))
-                   / max(int(_mk.sum()), 1))
-        print(f"[val] holdout {tuple(val_holdout.shape)} bytes/token {val_bpt:.3f}", flush=True)
+        if val_holdout is not None:           # None for a Hub-streamed dataset (no held-out shard)
+            _tg = val_holdout[:, 1:]
+            _mk = _tg != (0 if args.pad_id is None else int(args.pad_id))
+            val_bpt = (sum(len(_vt.decode(r[m].tolist()).encode("utf-8")) for r, m in zip(_tg, _mk))
+                       / max(int(_mk.sum()), 1))
+            print(f"[val] holdout {tuple(val_holdout.shape)} bytes/token {val_bpt:.3f}", flush=True)
         # TIER 2 -- val/ext/*, external instruction sources. Watched, never averaged into val/loss.
         # Separator is <|im_end|> (validation.SEP_ID), NOT eos: the val CE masks the pad id and
         # pad == eos == 0 here, so an eos separator would be deleted from the loss.
