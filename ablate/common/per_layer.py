@@ -151,6 +151,9 @@ class PerLayerRouter:
             # k/E (9.4% on the board config), so this is directly comparable across geometries.
             out[f"{pre}/max_load_tokens"] = float(f.max()) * k
             out[f"{pre}/dead_experts"] = int((counts == 0).sum())
+            # MaxVio (DeepSeek-V3's balance metric): busiest expert's load over the mean load, minus
+            # 1. 0 = perfectly balanced; 2.5 = the busiest expert gets 3.5x its fair share.
+            out[f"{pre}/maxvio"] = float(E * f.max() - 1.0)
             # Omitted, not zeroed, when k == E: there is no k/k+1 boundary in an all-active
             # ensemble, and a logged 0.0 reads as "perfectly tied" -- the strongest possible claim
             # about a quantity that does not exist.
@@ -184,6 +187,10 @@ class PerLayerRouter:
             if m is not None:
                 out["train/router/load_map"] = m
         self.acc = {}
+        mv = [v for k2, v in out.items() if k2.endswith("/maxvio")]
+        if mv:                                   # global view across MoE layers
+            out["train/router/maxvio_mean"] = sum(mv) / len(mv)
+            out["train/router/maxvio_max"] = max(mv)
         return out
 
     def close(self):

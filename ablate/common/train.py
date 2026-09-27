@@ -209,15 +209,20 @@ def _push_hf_async(api, repo, local_dir, path_in_repo, tag):
 def _row_census(model, step):
     """{'health/dead_rows_<thr>/<group>': count} + one console line naming the smallest row."""
     from .tensor_health import _group
-    out, best = {}, (float("inf"), None)
+    out, best, rel = {}, (float("inf"), None), {}
     for n, p in model.named_parameters():
-        if p.ndim < 2 or p.shape[-1] < 16:
+        if p.ndim < 2 or p.shape[-1] < 16 or "embed_tokens" in n:
             continue
         rn = p.detach().float().reshape(-1, p.shape[-1]).norm(dim=-1)
         g = _group(n)
         for thr in (1e-3, 1e-6, 1e-12):
             k = f"health/dead_rows_{thr:g}/{g}"
             out[k] = out.get(k, 0) + int((rn < thr).sum())
+        # RELATIVE: rows below 1% of their tensor's median row norm -- dead capacity whatever the
+        # absolute scale (aurora's rows are ~7x larger than muown's, so a fixed cutoff is unfair).
+        k = f"health/dead_rows_rel/{g}"
+        out[k] = out.get(k, 0) + int((rn < 0.01 * rn.median()).sum())
+        rel[g] = rel.get(g, 0) + rn.numel()
         v, i = rn.min(0)
         if v.item() < best[0]:
             gr = (p.grad.detach().float().reshape(-1, p.shape[-1])[i].norm().item()
@@ -225,7 +230,10 @@ def _row_census(model, step):
             e, r = divmod(int(i), p.shape[-2]) if p.ndim == 3 else (None, int(i))
             best = (v.item(), f"{n}" + (f"[expert {e}]" if e is not None else "") + f"[row {r}] grad={gr:.3e}")
     tot = {thr: sum(v for k, v in out.items() if k.startswith(f"health/dead_rows_{thr:g}/")) for thr in (1e-3, 1e-6, 1e-12)}
-    print(f"[census] step {step} rows<1e-3: {tot[1e-3]} <1e-6: {tot[1e-6]} <1e-12: {tot[1e-12]} | "
+    n_rel = sum(v for k, v in out.items() if k.startswith("health/dead_rows_rel/"))
+    out["health/dead_rows_rel_frac"] = n_rel / max(sum(rel.values()), 1)
+    print(f"[census] step {step} rows<1e-3: {tot[1e-3]} <1e-6: {tot[1e-6]} <1e-12: {tot[1e-12]} "
+          f"<1%median: {n_rel} ({100 * out['health/dead_rows_rel_frac']:.3f}%) | "
           f"min row {best[0]:.3e} at {best[1]}", flush=True)
     return out
 
@@ -514,7 +522,7 @@ def main():
     ap.add_argument("--nan_check_from", type=int, default=-1)
     # Dead-row census: every N steps, per weight group, rows with norm < 1e-3 / 1e-6 / 1e-12, plus the
     # smallest row in the model (tensor, expert, row, norm, grad norm). 0 = off.
-    ap.add_argument("--row_census_every", type=int, default=0)
+    ap.add_argument("--row_census_every", type=int, default=25)
     ap.add_argument("--switch_variant_at", type=int, default=-1)
     ap.add_argument("--switch_variant", default="muown")
     ap.add_argument("--switch_muon_wd", type=float, default=None)   # None = keep the current Muon wd   # Muon-group wd; None = same as --wd
@@ -956,6 +964,7 @@ def main():
                                 if args.switch_variant_at >= 0 else []),
                         settings=wandb.Settings(console="wrap"),
                         config={**vars(args), "run_name": run_name, "group": _grp, "tkf_commit": _tkf,
+                                "tkf_muown_gain_lr_mult": float(os.environ.get("TKF_MUOWN_GAIN_LR_MULT", "1.0")),
                                 "total_steps": total_steps, "tokens_per_step": tok_per_step,
                                 "params_total": total, "params_active": active})
         define_metrics(wb)

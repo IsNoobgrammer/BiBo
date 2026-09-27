@@ -150,11 +150,17 @@ def build_workspace(entity, project, name="BiBo board"):
     ])
     health = sec("Gradient and weight health", [
         line("Smallest per-tensor grad norm (0 = inert tensor)", "health/grad_norm_min", log_y=True),
+        line("Dead rows: fraction below 1% of median row norm", "health/dead_rows_rel_frac"),
+        line("Dead rows (<1% median) per group", regex=r"health/dead_rows_rel/.*"),
+        line("Rows below 1e-3 / 1e-6 / 1e-12 per group", regex=r"health/dead_rows_1e-.*|health/dead_rows_0.001/.*"),
         line("Grad norm per tensor group", regex=r"health/grad_norm/.*", log_y=True),
         line("Param norm per tensor group", regex=r"health/param_norm/.*", log_y=True),
         line("Effective step ||dW||/||W|| per group", regex=r"health/update_ratio/.*", log_y=True),
     ])
     router = sec("Router and MoE", [
+        line("MaxVio global (mean / max over MoE layers; 0 = balanced)", ["router/maxvio_mean", "router/maxvio_max"]),
+        line("MaxVio per layer", regex=r"router/layer_\d+/maxvio"),
+        line("Dead experts per layer (no tokens in the traced micro-batch)", regex=r"router/layer_\d+/dead_experts"),
         line("Balance entropy (1 = flat load)", "router/balance_entropy"),
         line("Routing entropy", "router/router_entropy"),
         line("Top-1 weight", "router/router_top1_weight"),
