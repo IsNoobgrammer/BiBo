@@ -235,6 +235,15 @@ def patch_megakernel():
                   "[megakernel] ENGAGED on MoE layers (fused norm + router + experts)", flush=True)
         return why is None
 
+    def _zero_bias(moe):
+        # all-active layers (top_k == E) have no balancing bias; the fused router kernel still takes
+        # one, so hand it a cached zeros vector (an input, not model state)
+        z = getattr(moe, "_mk_zero_bias", None)
+        if z is None or z.device != moe.gate.gate_proj.weight.device:
+            z = torch.zeros(moe.gate.num_routed_experts, device=moe.gate.gate_proj.weight.device)
+            moe._mk_zero_bias = z
+        return z
+
     def _mk_mlp(self, hidden_states):
         """norm + router + experts, fused. Returns the MoE output ONLY -- the residual add and any
         dtype casts belong to the caller, because the stable and AttnRes layers do them
@@ -246,7 +255,7 @@ def patch_megakernel():
         # load-bearing, not tidiness. 512x64 elements, so the copy is free.
         w = {"nw": self.post_attention_layernorm.weight,
              "rw": moe.gate.gate_proj.weight.t().contiguous(),
-             "bias": moe.gate.bias,
+             "bias": moe.gate.bias if moe.gate.bias is not None else _zero_bias(moe),
              "gu": moe.experts.gate_up_proj, "dn": moe.experts.down_proj}
         flat = hidden_states.reshape(b * s, h)
         # RouterTrace sets _probe_gap on the router when it wants the boundary gap; the fused
@@ -269,7 +278,7 @@ def patch_megakernel():
             _h(moe.gate, (hidden_states,), (idx.view(b, s, -1).long(), wgt.view(b, s, -1).float()))
         # the balancing bias is driven from these indices and mutated by .add_() outside the
         # optimizer; it must fire exactly once per forward, exactly as BiBoMoELayer.forward does it
-        if moe.training and moe.bias_update_factor > 0:
+        if moe.training and moe.bias_update_factor > 0 and moe.gate.bias is not None:
             tpe = moe._balance_step(idx.view(b, s, -1).long(), b * s)
             if tpe is not None:
                 moe.update_bias(tpe)

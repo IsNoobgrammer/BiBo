@@ -82,6 +82,10 @@ def load_from_result(result_json, device=DEV):
         intermediate_size=getattr(c, "dense_inter", None))
 
     sd = torch.load(ckpt, map_location=device)
+    # checkpoints from before all-active layers (top_k == E) lost their inert balancing bias still
+    # carry `...gate.bias` for them; drop exactly those keys so strict loading keeps meaning something
+    _own = model.state_dict()
+    sd = {k: v for k, v in sd.items() if not (k.endswith("gate.bias") and k not in _own)}
     # strict=True on purpose: a silently-ignored missing key is a randomly-initialised tensor, and
     # the report would read as a genuine (bad) result rather than a loading bug.
     model.load_state_dict(sd, strict=True)

@@ -136,7 +136,7 @@ class BiBoMoELayer(nn.Module):
 
     @torch.no_grad()
     def update_bias(self, tokens_per_expert: torch.Tensor):
-        if self.bias_update_factor <= 0:
+        if self.bias_update_factor <= 0 or self.gate.bias is None:
             return
         share = tokens_per_expert.detach().float()
         share = share / share.sum().clamp_min(1.0)
@@ -172,7 +172,7 @@ class BiBoMoELayer(nn.Module):
         top_k_indices, top_k_weights = self.gate(hidden_states)
 
         tokens_per_expert = None
-        if self.training and self.bias_update_factor > 0:
+        if self.training and self.bias_update_factor > 0 and self.gate.bias is not None:
             tokens_per_expert = self._balance_step(top_k_indices, num_tokens)
 
         flat_hidden = rearrange(hidden_states, 'b s h -> (b s) h')

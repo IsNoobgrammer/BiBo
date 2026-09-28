@@ -14,7 +14,11 @@ class BiBoMoERouter(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
 
-        self.bias = nn.Parameter(torch.zeros(self.num_routed_experts), requires_grad=False)
+        # Aux-free load-balancing bias: shifts WHICH experts win top-k, never the weights. With
+        # top_k == E (all-active ensemble: L0, the MTP layer) every expert is always selected, so it
+        # can have no effect -- it is not created there, and the balancer skips such layers.
+        self.bias = (nn.Parameter(torch.zeros(self.num_routed_experts), requires_grad=False)
+                     if self.top_k < self.num_routed_experts else None)
 
         self._probe_gap = False
         self.boundary_gap = None
@@ -35,7 +39,7 @@ class BiBoMoERouter(nn.Module):
                 _tk = scores.topk(self.top_k + 1, dim=-1).values
                 self.boundary_gap = (_tk[..., self.top_k - 1] - _tk[..., self.top_k]).mean()
 
-        selection_scores = scores + self.bias
+        selection_scores = scores if self.bias is None else scores + self.bias
         _, top_k_indices = torch.topk(selection_scores, self.top_k, dim=-1, sorted=False)
 
         top_k_weights = scores.gather(-1, top_k_indices)
