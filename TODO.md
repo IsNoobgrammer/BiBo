@@ -1,7 +1,7 @@
 # TODO
 
-1. [ ] MTP
-2. [ ] enchaning ce to be more effective ; maybe
+1. [x] MTP -- SETTLED Sep 28 2026 (not in use yet): depth 1, v1-noemb. See "MTP -- settled" below; runs in W&B `mtp-ablations`
+2. [x] enchaning ce to be more effective -- DONE Sep 28 2026: tkf ce_factored.py (factored softmax grad, 4 GB chunks) is the default, --ce_kernel
 3. [ ] fp8/4 training -- GATED on the optimizer round; full notes in "Quantized training" below
 4. [ ] ember for adamw and more memory saving
 5. [ ] gated attention
@@ -18,6 +18,48 @@
 14. [ ] trying out different tokenizer
 15. [ ] Online Shampoo optimizer maybe ?
 16. [ ] QK-Clip Muon
+
+## MTP -- settled (Sep 28 2026, W&B `ablations-tinycompany-ai/mtp-ablations`)
+
+Not used in training yet (`--mtp_weight` defaults to 0). When this is picked up again, start from here.
+
+**Chosen design: depth 1, v1-noemb** = `--mtp_weight 0.3` (the other flags are now the defaults:
+`--mtp_variant 1 --mtp_ffn ensemble --mtp_emb 0`). The head is one extra windowed layer after the
+trunk: `x = W_p norm(lhs)` (NO Emb(t+1) input) -> AttnRes read of the trunk's block archive -> SWA
+attention -> fused carry -> all-active 8 x 576 ensemble MLP -> norm -> tied lm_head -> CE vs t+2.
+Logged train/val loss is the main head only. Code: `ablate/common/mtp.py`, `_ce` in train.py
+(main + MTP heads go through ONE factored-CE call).
+
+Setup of every run: Muown gain-lr 0.1x, WSD, wd 0, 2000 steps x 262k tokens, board config.
+
+| arm | seed | big-holdout val (256 seqs, 262k tok) | train loss_smooth @2000 |
+|---|---|---|---|
+| base, no MTP (factored-CE twin, in bibo-aurora-vs-muown) | 23 | 3.3424 | 3.2735 |
+| v1 = AR+SWA+carry+ensemble, WITH Emb(t+1) | 23 | 3.3316 | 3.2604-3.2614 |
+| v1-dense (1 x 4608 FFN) | 23 | 3.3364 | 3.2648 |
+| **v1-noemb** | 23 | **3.3302** | **3.2582** |
+| v1 | 42069 | 3.3375 | 3.2691 |
+| **v1-noemb** | 42069 | **3.3306** | **3.2624** |
+
+2-seed means: noemb 3.3304 vs v1 3.3346 (-0.0042); noemb beats v1 on both seeds, on both big-holdout val
+and train. vs base (seed 23 only): -0.012 val. v2 (SWA+MLP, no AR) and v3 (AR+MLP, no attention)
+lost to v1 at seed 23 on 2-seq val/train (v1 3.5056 / v2 3.5253 / v3 3.5298 / base 3.5253).
+
+Why noemb wins (ablate/tools/mtp_probe.py on the final checkpoints, reproduced on both seeds):
+- the with-emb head SHORTCUTS through Emb(t+1): its MTP CE 3.69 -> 6.90 with Emb(t+1) zeroed, worse
+  than the noemb head's own 5.01. It predicts t+2 mostly from the embedding it is handed.
+- gradient at the trunk's last hidden state: same size in all arms (|MTP|/|main| ~0.23-0.25), but
+  cos(main, MTP) = +0.046 / +0.047 for noemb vs ~0 (-0.0003 / +0.0001) with emb; the with-emb
+  gradient goes mostly into the tied embedding matrix instead.
+- dense FFN: its output is ~sqrt(8) x the ensemble's (no router averaging) and dominates the head's
+  residual (mlp/read 3.7 vs 1.9 / 1.1), so the head leans on its own FFN, not the trunk
+  (ablate/tools/mtp_branch_norms.py). Its L10 carry c rises to ~1.12 only to keep attn/read ~0.55.
+
+Cost: MTP depth 1 at the current kernels = 182-183k tps vs 226-228k base (~20% slower); the MTP CE
+is a full extra vocab pass (~25 ms / 32k tokens / head with factored CE, linear in heads).
+
+Open when resumed: more seeds vs base (only seed 23 has a base twin); equal-FLOPs comparison
+(base trained ~25% longer); MTP weight sweep (only 0.3 tried); depth > 1 (the CE already takes N heads).
 
 ## suggestions
 

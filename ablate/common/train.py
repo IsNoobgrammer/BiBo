@@ -558,8 +558,10 @@ def main():
     ap.add_argument("--mtp_variant", type=int, default=1)
     # MTP layer MLP: ensemble (8 x 576 all-active) | dense (1 expert x 4608: same params + act)
     ap.add_argument("--mtp_ffn", choices=["ensemble", "dense"], default="ensemble")
-    # 1 = input W_p[norm(lhs); norm(Emb(t+1))] (DeepSeek-V3); 0 = W_p norm(lhs), no next-token embedding
-    ap.add_argument("--mtp_emb", type=int, default=1)
+    # 1 = input W_p[norm(lhs); norm(Emb(t+1))] (DeepSeek-V3); 0 = W_p norm(lhs), no next-token embedding.
+    # 0 is the SETTLED MTP design (Sep 28 2026, 2 seeds; see TODO.md "MTP -- settled"): the
+    # with-embedding head shortcuts through Emb(t+1) and sends little useful signal into the trunk.
+    ap.add_argument("--mtp_emb", type=int, default=0)
     ap.add_argument("--switch_variant_at", type=int, default=-1)
     ap.add_argument("--switch_variant", default="muown")
     ap.add_argument("--switch_muon_wd", type=float, default=None)   # None = keep the current Muon wd   # Muon-group wd; None = same as --wd
