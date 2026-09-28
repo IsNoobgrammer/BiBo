@@ -1,6 +1,11 @@
 """Final-checkpoint probe for the MTP arms: a big-holdout val and "does the head lean on Emb(t+1)?".
 
-    python -m ablate.tools.mtp_probe <result.json> [<result.json> ...] [--n_seqs 256]
+    python -m ablate.tools.mtp_probe <result.json> [<result.json> ...] [--n_seqs 256] [--push_wandb]
+
+--push_wandb writes the numbers into each run's W&B SUMMARY under probe/* (t1 = main-head top-1 on the
+next token, the learning-signal read; t2 = the MTP head's top-1 on the token after next and its greedy
+draft acceptance, the drafter read). The run is looked up in mtp-ablations first (MTP runs were moved
+there after training), then in the project its result.json recorded.
 
 For every checkpoint, on the SAME frozen holdout (n_seqs x 1024 tokens, pad id 0 masked):
   val      main-head CE (+ bpb), token-weighted -- the 2-seq training val, with 128x the tokens
@@ -22,6 +27,7 @@ training, not its average.
 """
 from ablate.common import _paths  # noqa: F401
 import argparse
+import json
 import math
 
 import torch
@@ -38,6 +44,30 @@ def ce_sum(x, W, tgt, pad):
     lg = (x.float() @ W.float().t())
     m = tgt != pad
     return F.cross_entropy(lg[m], tgt[m], reduction="sum"), int(m.sum())
+
+
+def push(res, row, n_seqs, n_tok):
+    import wandb
+    r = json.load(open(res))
+    rid = r.get("wandb_id")
+    if not rid:
+        print(f"[probe] no wandb_id in {res}, not pushed"); return
+    api = wandb.Api(timeout=60)
+    run = None
+    for proj in ("mtp-ablations", r.get("wandb_project")):
+        try:
+            run = api.run(f"{api.default_entity}/{proj}/{rid}"); break
+        except Exception:
+            continue
+    if run is None:
+        print(f"[probe] run {rid} not found, not pushed"); return
+    m = {"val": "val_bigholdout", "val_bpb": "val_bpb_bigholdout", "mtp": "mtp_ce", "mtp_e0": "mtp_ce_emb_zeroed",
+         "main_top1": "t1_top1", "d2_top1": "t2_top1", "spec_acc": "t2_accept", "spec_elig": "t2_eligible",
+         "g_cos": "grad_cos_main_mtp", "g_ratio": "grad_ratio_mtp_main"}
+    upd = {f"probe/{v}": row[k] for k, v in m.items() if k in row}
+    upd.update({"probe/n_seqs": n_seqs, "probe/n_tokens": n_tok})
+    run.summary.update(upd)
+    print(f"[probe] pushed {len(upd)} keys to {run.project}/{rid} ({run.name})", flush=True)
 
 
 def probe(res, hold, bpt, bs, mtp_w=0.3):
@@ -119,8 +149,8 @@ def main():
     ap.add_argument("results", nargs="+")
     ap.add_argument("--n_seqs", type=int, default=256)
     ap.add_argument("--bs", type=int, default=16)
+    ap.add_argument("--push_wandb", action="store_true")
     a = ap.parse_args()
-    import json
     c0 = json.load(open(a.results[0]))["config"]
     hold = _val.build_holdout(c0["dataset"], c0["seq_len"], a.n_seqs, DEV)
     from transformers import AutoTokenizer
@@ -129,7 +159,11 @@ def main():
     mk = tg != 0
     bpt = sum(len(tok.decode(r[m].tolist()).encode("utf-8")) for r, m in zip(tg, mk)) / int(mk.sum())
     print(f"[probe] holdout {tuple(hold.shape)}  {int(mk.sum())} scored tokens  {bpt:.3f} bytes/token", flush=True)
-    rows = [probe(r, hold, bpt, a.bs) for r in a.results]
+    rows = []
+    for r in a.results:
+        rows.append(probe(r, hold, bpt, a.bs))
+        if a.push_wandb:
+            push(r, rows[-1], a.n_seqs, int(mk.sum()))
     keys = ["val", "val_bpb", "mtp", "mtp_e0", "mtp_eP", "g_main_h", "g_mtp_h", "g_ratio", "g_cos", "g_mtp_emb",
             "main_top1", "d2_top1", "spec_elig", "spec_acc"]
     print("\n" + f"{'run':44s}" + "".join(f"{k:>11s}" for k in keys))
