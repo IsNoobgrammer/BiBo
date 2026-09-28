@@ -803,19 +803,19 @@ def main():
             if hasattr(_m, "q_scale") and hasattr(_m, "k_scale"):
                 _m.q_scale, _m.k_scale = args.q_scale, args.k_scale
     print(f"[attn] kernel={args.attn_kernel} q_scale={args.q_scale} k_scale={args.k_scale}", flush=True)
+    # Trunk counted BEFORE the MTP head exists: count_params applies the GLOBAL top_k/E to every 3D
+    # expert stack and cannot see the MTP layer's own override (it reported the 1-expert dense head
+    # at 6x its size). The head is all-active by construction, so it is added whole.
+    total, trainable, active = count_params(model)
     if args.mtp_weight > 0:
         from .mtp import MTP
         model.mtp = MTP(model.config, variant=args.mtp_variant, init_fn=model._init_weights,
                         ffn=args.mtp_ffn, use_emb=bool(args.mtp_emb)).to(DEV)
-        print(f"[mtp] depth 1, variant {args.mtp_variant}, weight {args.mtp_weight}: +{sum(p.numel() for p in model.mtp.parameters())/1e6:.2f}M "
-              f"params, + one extra lm_head pass per token", flush=True)
-    total, trainable, active = count_params(model)
-    if getattr(model, "mtp", None) is not None:
-        # count_params discounts every 3D expert stack by the GLOBAL top_k/E; the MTP ensemble is
-        # all-active (k == E), so add back what it discounted -- else FLOPs undercount MTP.
-        _k = cfg.num_experts_per_tok
-        active += int(sum(p.numel() * (1.0 - _k / p.shape[0]) for n, p in model.mtp.named_parameters()
-                          if p.ndim == 3 and p.shape[0] > _k))
+        _n = sum(p.numel() for p in model.mtp.parameters())
+        total, active = total + _n, active + _n
+        trainable += sum(p.numel() for p in model.mtp.parameters() if p.requires_grad)
+        print(f"[mtp] depth 1, variant {args.mtp_variant}, ffn {args.mtp_ffn}, emb {args.mtp_emb}, weight {args.mtp_weight}: "
+              f"+{_n/1e6:.2f}M params, + one extra lm_head pass per token", flush=True)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
     if not args.fused_res_add:
         import exp.modeling_bibo as _E
