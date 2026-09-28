@@ -552,8 +552,8 @@ def main():
     # MTP depth 1 (ablate/common/mtp.py): loss = CE(t+1) + mtp_weight * CE(t+2). 0 = off. Logged
     # train/val loss stay the MAIN head only, so MTP runs compare 1:1 with everything else.
     ap.add_argument("--mtp_weight", type=float, default=0.0)
-    ap.add_argument("--ce_kernel", choices=["factored", "chunked"], default="chunked",
-                    help="fused linear CE: chunked (sm75 kernel, default until the gate passes) or factored (ce_factored.py)")
+    ap.add_argument("--ce_kernel", choices=["factored", "chunked"], default="factored",
+                    help="fused linear CE: factored (ce_factored.py, 4 GB chunks; default since Sep 28 2026) or chunked (sm75 kernel, the pre-Sep-28 runs)")
     # 1 AR+SWA+carry+MLP (full SWA layer) | 2 SWA+MLP | 3 AR+MLP | 4 MLP only -- see mtp.py
     ap.add_argument("--mtp_variant", type=int, default=1)
     # MTP layer MLP: ensemble (8 x 576 all-active) | dense (1 expert x 4608: same params + act)
