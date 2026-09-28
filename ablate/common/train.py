@@ -562,6 +562,8 @@ def main():
     # 0 is the SETTLED MTP design (Sep 28 2026, 2 seeds; see TODO.md "MTP -- settled"): the
     # with-embedding head shortcuts through Emb(t+1) and sends little useful signal into the trunk.
     ap.add_argument("--mtp_emb", type=int, default=0)
+    # 0 (only with --mtp_emb 0): drop W_p, the head starts from norm(lhs). Default 1 until tested.
+    ap.add_argument("--mtp_proj", type=int, default=1)
     ap.add_argument("--switch_variant_at", type=int, default=-1)
     ap.add_argument("--switch_variant", default="muown")
     ap.add_argument("--switch_muon_wd", type=float, default=None)   # None = keep the current Muon wd   # Muon-group wd; None = same as --wd
@@ -831,12 +833,12 @@ def main():
     if args.mtp_weight > 0:
         from .mtp import MTP
         model.mtp = MTP(model.config, variant=args.mtp_variant, init_fn=model._init_weights,
-                        ffn=args.mtp_ffn, use_emb=bool(args.mtp_emb)).to(DEV)
+                        ffn=args.mtp_ffn, use_emb=bool(args.mtp_emb), use_proj=bool(args.mtp_proj)).to(DEV)
         model.model.mtp_handover = True                    # trunk hands RoPE + archive to the head
         _n = sum(p.numel() for p in model.mtp.parameters())
         total, active = total + _n, active + _n
         trainable += sum(p.numel() for p in model.mtp.parameters() if p.requires_grad)
-        print(f"[mtp] depth 1, variant {args.mtp_variant}, ffn {args.mtp_ffn}, emb {args.mtp_emb}, weight {args.mtp_weight}: "
+        print(f"[mtp] depth 1, variant {args.mtp_variant}, ffn {args.mtp_ffn}, emb {args.mtp_emb}, proj {args.mtp_proj}, weight {args.mtp_weight}: "
               f"+{_n/1e6:.2f}M params, + one extra lm_head pass per token", flush=True)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
     if not args.fused_res_add:

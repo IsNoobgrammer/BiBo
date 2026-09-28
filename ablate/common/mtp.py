@@ -56,7 +56,7 @@ def mtp_layer_config(config, ffn="ensemble"):
 class MTP(nn.Module):
     HAS_ATTN = {1: True, 2: True, 3: False, 4: False}
 
-    def __init__(self, config, variant=1, init_fn=None, ffn="ensemble", use_emb=True):
+    def __init__(self, config, variant=1, init_fn=None, ffn="ensemble", use_emb=True, use_proj=True):
         super().__init__()
         from exp.modeling_bibo import BiBoDecoderLayer
         assert variant in self.HAS_ATTN, f"--mtp_variant {variant}: valid 1-4"
@@ -65,7 +65,10 @@ class MTP(nn.Module):
         self.use_emb = bool(use_emb)       # False: x = W_p norm(lhs) -- t(i+1) is NOT given to the head
         self.norm_h = BiBoRMSNorm(H, eps=eps)
         self.norm_e = BiBoRMSNorm(H, eps=eps) if self.use_emb else None
-        self.proj = nn.Linear((2 if self.use_emb else 1) * H, H, bias=False)
+        # use_proj=False (only without the embedding): no W_p at all -- the head's residual stream
+        # starts from norm(lhs), exactly what the main head sees, and the layer learns the t+2 correction
+        assert use_proj or not self.use_emb, "W_p is required to merge [lhs; Emb(t+1)] (2H -> H)"
+        self.proj = nn.Linear((2 if self.use_emb else 1) * H, H, bias=False) if use_proj else None
         cfg, idx = mtp_layer_config(config, ffn)
         if variant == 2:
             cfg.attn_res_block_size = None       # the layer takes its standard pre-norm residual path
@@ -80,8 +83,12 @@ class MTP(nn.Module):
             self.apply(init_fn)              # exactly like the main ones would
 
     def forward(self, lhs, e_next, position_embeddings, block_residual):
-        x = self.proj(torch.cat([self.norm_h(lhs), self.norm_e(e_next).to(lhs.dtype)], dim=-1)
-                      if self.use_emb else self.norm_h(lhs))
+        if self.use_emb:
+            x = self.proj(torch.cat([self.norm_h(lhs), self.norm_e(e_next).to(lhs.dtype)], dim=-1))
+        else:
+            x = self.norm_h(lhs)
+            if self.proj is not None:
+                x = self.proj(x)
         L = self.layer
         if self.variant == 1:
             s = L(x, position_embeddings=position_embeddings, block_residual=block_residual)[0]

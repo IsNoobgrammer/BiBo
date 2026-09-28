@@ -85,7 +85,8 @@ def load_from_result(result_json, device=DEV):
         from .mtp import MTP
         model.mtp = MTP(model.config, variant=getattr(c, "mtp_variant", None) or 1,
                         ffn=getattr(c, "mtp_ffn", None) or "ensemble",
-                        use_emb=bool(1 if getattr(c, "mtp_emb", None) is None else c.mtp_emb)).to(device)
+                        use_emb=bool(1 if getattr(c, "mtp_emb", None) is None else c.mtp_emb),
+                        use_proj=bool(getattr(c, "mtp_proj", 1))).to(device)
         model.model.mtp_handover = True
     sd = torch.load(ckpt, map_location=device)
     # checkpoints from before all-active layers (top_k == E) lost their inert balancing bias still
