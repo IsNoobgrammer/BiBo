@@ -15,7 +15,6 @@ import torch.nn.functional as F
 from ablate.common.report_ckpt import load_from_result
 from ablate.common import validation as _val
 import ablate.tools.mtp_probe  # noqa: F401  (same loader path)
-from kernels.sm75 import moe as _moe
 
 DEV = "cuda"
 AMP = torch.autocast("cuda", dtype=torch.bfloat16)
@@ -23,7 +22,6 @@ rms = lambda t: t.float().pow(2).mean().sqrt().item()
 
 
 def run(res, hold):
-    _moe._CAST_CACHE.clear()
     model, c = load_from_result(res)
     rec = {}
     layers = list(model.model.layers) + ([model.mtp.layer] if getattr(model, "mtp", None) is not None else [])
@@ -45,17 +43,13 @@ def run(res, hold):
             mlp_out[i] = (rms(x), rms(y))
             return y
         L._fused_carry, L._attn_res_mlp_forward = carry, g
-    try:
-        with torch.no_grad(), AMP:
-            ids = hold
-            model.model.training = True
-            h = model.model(input_ids=ids[:, :-1], use_cache=False).last_hidden_state
-            model.model.training = False
-            if getattr(model, "mtp", None) is not None:
-                pe, br = model.model._mtp_cache
-                model.mtp(h, model.model.embed_tokens(ids[:, 1:]), pe, br)
-    finally:
-        pass
+    with torch.no_grad(), AMP:
+        model.model.training = True          # hand over RoPE + archive to the MTP head (top flag only)
+        h = model.model(input_ids=hold[:, :-1], use_cache=False).last_hidden_state
+        model.model.training = False
+        if getattr(model, "mtp", None) is not None:
+            pe, br = model.model._mtp_cache
+            model.mtp(h, model.model.embed_tokens(hold[:, 1:]), pe, br)
     out = []
     for i, r in sorted(rec.items()):
         mi, mo = mlp_out.get(i, (float("nan"), float("nan")))
