@@ -7,6 +7,11 @@ For every checkpoint, on the SAME frozen holdout (n_seqs x 1024 tokens, pad id 0
   mtp      the MTP head's CE vs t+2
   mtp_e0   same with Emb(t+1) replaced by zeros            (with-embedding heads only)
   mtp_eP   same with Emb(t+1) replaced by a shuffled token (with-embedding heads only)
+  spec     greedy self-speculative decoding with the MTP head as a 1-token drafter: the main head's
+           greedy token g1 at i, the head drafts d2 for i+2 (a with-emb head is fed Emb(g1), its own
+           prediction, as at inference), ACCEPTED if d2 == the main head's greedy token at i+1.
+           Counted only where the text equals the greedy choice (g1 == t_{i+1}), so teacher-forced
+           text == self-generated text and the rate is exact. Also d2's top-1 vs the true t+2.
   grads    at h = the trunk's final hidden state: |dCE1/dh|, |d(w*CE2)/dh|, cos(dCE1, dCE2), and
            |d(w*CE2)/dEmb(t+1)|  -- how much of the MTP gradient reaches the trunk vs the embedding
 
@@ -44,6 +49,7 @@ def probe(res, hold, bpt, bs, mtp_w=0.3):
     use_emb = has_mtp and model.mtp.use_emb
     acc = {k: [0.0, 0] for k in ("val", "mtp", "mtp_e0", "mtp_eP")}
     gstats = []
+    spec = [0, 0, 0, 0, 0]          # accepted, eligible, all positions, d2 == t+2, main top1 == t+1
     g = torch.Generator(device=DEV).manual_seed(0)
     for i in range(0, hold.shape[0], bs):
         ids = hold[i:i + bs]
@@ -68,6 +74,18 @@ def probe(res, hold, bpt, bs, mtp_w=0.3):
                     x = model.mtp(h, ev, pe, br)
                     s, n = ce_sum(x.reshape(-1, H), W, t2.reshape(-1), pad)
                     acc[k][0] += s.item(); acc[k][1] += n
+                # ---- speculative-decoding acceptance (greedy, 1 draft token)
+                Wb = W.to(h.dtype)
+                g1 = (h @ Wb.t()).argmax(-1)                                 # main greedy, (b, S)
+                xd = model.mtp(h, model.model.embed_tokens(g1) if use_emb else e, pe, br)
+                d2 = (xd @ Wb.t()).argmax(-1)                                # draft for i+2
+                ok = (g1[:, :-1] == t1[:, :-1]) & (t1[:, :-1] != pad) & (t2[:, :-1] != pad)
+                spec[0] += int(((d2[:, :-1] == g1[:, 1:]) & ok).sum())
+                spec[1] += int(ok.sum())
+                valid2 = (t2[:, :-1] != pad)
+                spec[2] += int(valid2.sum())
+                spec[3] += int(((d2[:, :-1] == t2[:, :-1]) & valid2).sum())
+                spec[4] += int(((g1 == t1) & (t1 != pad)).sum())
         if has_mtp and i < 4 * bs:                          # gradient probe on the first 4 slices
             with AMP:
                 hh = h.detach().float().requires_grad_(True)
@@ -85,6 +103,9 @@ def probe(res, hold, bpt, bs, mtp_w=0.3):
         if n:
             out[k] = s / n
     out["val_bpb"] = out["val"] / (math.log(2) * bpt)
+    if spec[1]:
+        out.update(spec_acc=spec[0] / spec[1], spec_elig=spec[1] / spec[2], d2_top1=spec[3] / spec[2],
+                   main_top1=spec[4] / spec[2])
     if gstats:
         m = [sum(x[j] for x in gstats) / len(gstats) for j in range(4)]
         out.update(g_main_h=m[0], g_mtp_h=m[1], g_cos=m[2], g_mtp_emb=m[3], g_ratio=m[1] / m[0])
@@ -109,7 +130,8 @@ def main():
     bpt = sum(len(tok.decode(r[m].tolist()).encode("utf-8")) for r, m in zip(tg, mk)) / int(mk.sum())
     print(f"[probe] holdout {tuple(hold.shape)}  {int(mk.sum())} scored tokens  {bpt:.3f} bytes/token", flush=True)
     rows = [probe(r, hold, bpt, a.bs) for r in a.results]
-    keys = ["val", "val_bpb", "mtp", "mtp_e0", "mtp_eP", "g_main_h", "g_mtp_h", "g_ratio", "g_cos", "g_mtp_emb"]
+    keys = ["val", "val_bpb", "mtp", "mtp_e0", "mtp_eP", "g_main_h", "g_mtp_h", "g_ratio", "g_cos", "g_mtp_emb",
+            "main_top1", "d2_top1", "spec_elig", "spec_acc"]
     print("\n" + f"{'run':44s}" + "".join(f"{k:>11s}" for k in keys))
     for r in rows:
         print(f"{r['tag'][-44:]:44s}" + "".join(f"{r[k]:11.4f}" if k in r else f"{'-':>11s}" for k in keys))
