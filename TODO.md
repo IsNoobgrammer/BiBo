@@ -67,7 +67,9 @@ uninformative here (the twin moves it by 0.011-0.020).
 Speculative decoding (greedy, head as a 1-token drafter, mtp_probe `spec_acc`): with-emb heads accept
 66.3-66.7% of drafts vs noemb 58.8-59.2% (w0.3) -- the one axis where Emb(t+1) wins (it follows the
 model's own chain; its d2 top-1 vs the TRUE t+2 is actually lower, 0.18 vs 0.21). Tokens per verify
-step 1.66 vs 1.59 (+4.7%). If MTP is ever kept for drafting, weigh this against noemb's training gain.
+step 1.66 vs 1.59 (+4.7%). DECIDED (user, Sep 28 2026): MTP is a TRAINING-signal device only; drafting
+goes to a dedicated drafter (e.g. DFlash, block-parallel drafting off the target's hidden states), so
+acceptance is NOT a criterion for the MTP head and noemb stands.
 
 Open when resumed: more seeds vs base (only seed 23 has a base twin); equal-FLOPs comparison
 (base trained ~25% longer); MTP weight sweep (only 0.3 tried); depth > 1 (the CE already takes N heads).
