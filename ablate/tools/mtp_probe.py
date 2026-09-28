@@ -79,7 +79,8 @@ def probe(res, hold, bpt, bs, mtp_w=0.3):
     use_emb = has_mtp and model.mtp.use_emb
     acc = {k: [0.0, 0] for k in ("val", "mtp", "mtp_e0", "mtp_eP")}
     gstats = []
-    spec = [0, 0, 0, 0, 0]          # accepted, eligible, all positions, d2 == t+2, main top1 == t+1
+    spec = [0, 0, 0, 0]             # accepted, eligible, all positions, d2 == t+2
+    top1 = [0, 0]                   # main top-1 == t+1, positions
     g = torch.Generator(device=DEV).manual_seed(0)
     for i in range(0, hold.shape[0], bs):
         ids = hold[i:i + bs]
@@ -93,6 +94,12 @@ def probe(res, hold, bpt, bs, mtp_w=0.3):
             H = h.shape[-1]
             s, n = ce_sum(h.reshape(-1, H), W, t1.reshape(-1), pad)
             acc["val"][0] += s.item(); acc["val"][1] += n
+            # t1: main-head top-1 on the next token -- for EVERY model, so MTP arms compare to the base
+            Wb = W.to(h.dtype)
+            g1 = (h @ Wb.t()).argmax(-1)                                     # main greedy, (b, S)
+            t1v = t1 != pad
+            top1[0] += int(((g1 == t1) & t1v).sum())
+            top1[1] += int(t1v.sum())
             if has_mtp:
                 e = model.model.embed_tokens(t1)
                 variants = {"mtp": e}
@@ -105,8 +112,6 @@ def probe(res, hold, bpt, bs, mtp_w=0.3):
                     s, n = ce_sum(x.reshape(-1, H), W, t2.reshape(-1), pad)
                     acc[k][0] += s.item(); acc[k][1] += n
                 # ---- speculative-decoding acceptance (greedy, 1 draft token)
-                Wb = W.to(h.dtype)
-                g1 = (h @ Wb.t()).argmax(-1)                                 # main greedy, (b, S)
                 xd = model.mtp(h, model.model.embed_tokens(g1) if use_emb else e, pe, br)
                 d2 = (xd @ Wb.t()).argmax(-1)                                # draft for i+2
                 ok = (g1[:, :-1] == t1[:, :-1]) & (t1[:, :-1] != pad) & (t2[:, :-1] != pad)
@@ -115,7 +120,6 @@ def probe(res, hold, bpt, bs, mtp_w=0.3):
                 valid2 = (t2[:, :-1] != pad)
                 spec[2] += int(valid2.sum())
                 spec[3] += int(((d2[:, :-1] == t2[:, :-1]) & valid2).sum())
-                spec[4] += int(((g1 == t1) & (t1 != pad)).sum())
         if has_mtp and i < 4 * bs:                          # gradient probe on the first 4 slices
             with AMP:
                 hh = h.detach().float().requires_grad_(True)
@@ -133,9 +137,9 @@ def probe(res, hold, bpt, bs, mtp_w=0.3):
         if n:
             out[k] = s / n
     out["val_bpb"] = out["val"] / (math.log(2) * bpt)
+    out["main_top1"] = top1[0] / max(top1[1], 1)
     if spec[1]:
-        out.update(spec_acc=spec[0] / spec[1], spec_elig=spec[1] / spec[2], d2_top1=spec[3] / spec[2],
-                   main_top1=spec[4] / spec[2])
+        out.update(spec_acc=spec[0] / spec[1], spec_elig=spec[1] / spec[2], d2_top1=spec[3] / spec[2])
     if gstats:
         m = [sum(x[j] for x in gstats) / len(gstats) for j in range(4)]
         out.update(g_main_h=m[0], g_mtp_h=m[1], g_cos=m[2], g_mtp_emb=m[3], g_ratio=m[1] / m[0])
