@@ -58,6 +58,17 @@ Why noemb wins (ablate/tools/mtp_probe.py on the final checkpoints, reproduced o
 Cost: MTP depth 1 at the current kernels = 182-183k tps vs 226-228k base (~20% slower); the MTP CE
 is a full extra vocab pass (~25 ms / 32k tokens / head with factored CE, linear in heads).
 
+MTP-weight sweep (seed 23, noemb, new kernels; big-holdout val / train loss_smooth @2000 / spec acceptance):
+w0.1 3.3319 / 3.2599 / 54.6% | w0.3 3.3294 / 3.2579 / 59.2% | w0.5 and noemb-noproj-w0.3 pending (k18/k19).
+w0.3 beats w0.1 on train at 41/41 log points after step 1000 (+0.0030 mean; same-config kernel-change
+twin differs by only 0.0001-0.0005) and on big-holdout val (-0.0025; twin 0.0008). 2-seq val is
+uninformative here (the twin moves it by 0.011-0.020).
+
+Speculative decoding (greedy, head as a 1-token drafter, mtp_probe `spec_acc`): with-emb heads accept
+66.3-66.7% of drafts vs noemb 58.8-59.2% (w0.3) -- the one axis where Emb(t+1) wins (it follows the
+model's own chain; its d2 top-1 vs the TRUE t+2 is actually lower, 0.18 vs 0.21). Tokens per verify
+step 1.66 vs 1.59 (+4.7%). If MTP is ever kept for drafting, weigh this against noemb's training gain.
+
 Open when resumed: more seeds vs base (only seed 23 has a base twin); equal-FLOPs comparison
 (base trained ~25% longer); MTP weight sweep (only 0.3 tried); depth > 1 (the CE already takes N heads).
 
