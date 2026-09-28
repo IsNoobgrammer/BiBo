@@ -53,7 +53,7 @@ def probe(res, hold, bpt, bs, mtp_w=0.3):
             model.model.training = True                     # hand over RoPE + archive (top flag only)
             h = model.model(input_ids=inp, use_cache=False).last_hidden_state
             model.model.training = False
-            pe, br = model.model._mtp_cache
+            pe, br = model.model._mtp_cache if has_mtp else (None, None)   # no head -> no handover
             H = h.shape[-1]
             s, n = ce_sum(h.reshape(-1, H), W, t1.reshape(-1), pad)
             acc["val"][0] += s.item(); acc["val"][1] += n
