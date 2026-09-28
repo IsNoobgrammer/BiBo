@@ -30,6 +30,12 @@ from .tensor_health import tensor_norms, snapshot_matrices, update_ratios
 from .per_layer import PerLayerRouter, per_layer_params
 from .wb_layout import wb_keys, define_metrics   # every W&B key's section is decided there
 from kernels.sm120.cross_entropy import fused_linear_cross_entropy   # sm120 (Blackwell); CE byte-identical to sm75
+from kernels.sm120 import ce_factored
+# --ce_kernel picks the fused linear CE used for train, val and final eval. "factored"
+# (kernels/sm120/ce_factored.py) stores exp(logits) and skips the grad pass: -21% CE time at H=512,
+# gh/gw closer to fp32, deterministic -- but NOT bit-identical to "chunked", so a switch is a
+# kernel-rewrite change for the noise floor. It also runs main + MTP heads in one call.
+FLCE = fused_linear_cross_entropy
 
 DEV = "cuda"
 _DT = {"bf16": torch.bfloat16, "fp32": torch.float32}
@@ -81,22 +87,31 @@ def _ce(model, ids, use_fused, aux=None, aux_coef=0.0, num_experts=6, top_k=2, p
     h = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
     sh = h.reshape(-1, h.shape[-1])
     _ign = -100 if pad_id is None else int(pad_id)
-    loss = (fused_linear_cross_entropy(sh, model.lm_head.weight, tgt, ignore_index=_ign) if use_fused
-            else torch.nn.functional.cross_entropy(model.lm_head(sh), tgt, ignore_index=_ign))
-    if aux is not None and aux_coef > 0 and aux.logits:      # Qwen aux load-balancing loss
-        from baseline.qwen3moe.modeling import load_balancing_loss_func
-        loss = loss + aux_coef * load_balancing_loss_func(tuple(aux.logits), num_experts, top_k)
-    _ce.last = (loss.detach(), None)                         # (main CE, MTP CE) for logging
+    x2 = tgt2 = None
     if mtp_w > 0 and getattr(model, "mtp", None) is not None and model.training:
         # t_{i+2} from position i, given t_{i+1}; the last position has no t_{i+2} -> ignored
         pe, br = model.model._mtp_cache
         e_next = model.model.embed_tokens(ids[:, 1:])
-        x = model.mtp(h, e_next, pe, br)
+        x2 = model.mtp(h, e_next, pe, br)
+        x2 = x2.reshape(-1, x2.shape[-1])
         tgt2 = torch.cat([ids[:, 2:], ids.new_full((ids.shape[0], 1), _ign)], 1).reshape(-1)
-        l2 = fused_linear_cross_entropy(x.reshape(-1, x.shape[-1]), model.lm_head.weight, tgt2,
-                                        ignore_index=_ign)
-        _ce.last = (loss.detach(), l2.detach())
-        loss = loss + mtp_w * l2
+    l2 = None
+    if use_fused and x2 is not None and FLCE is ce_factored.fused_linear_cross_entropy:
+        # both heads in ONE pass over the vocab
+        loss, (l1, l2) = ce_factored.fused_linear_cross_entropy_heads(
+            [sh, x2], model.lm_head.weight, [tgt, tgt2], [1.0, mtp_w], ignore_index=_ign)
+        main = l1
+    else:
+        main = loss = (FLCE(sh, model.lm_head.weight, tgt, ignore_index=_ign) if use_fused
+                       else torch.nn.functional.cross_entropy(model.lm_head(sh), tgt, ignore_index=_ign))
+        if x2 is not None:
+            l2 = FLCE(x2, model.lm_head.weight, tgt2, ignore_index=_ign)
+            loss = loss + mtp_w * l2
+    if aux is not None and aux_coef > 0 and aux.logits:      # Qwen aux load-balancing loss
+        from baseline.qwen3moe.modeling import load_balancing_loss_func
+        a = aux_coef * load_balancing_loss_func(tuple(aux.logits), num_experts, top_k)
+        loss, main = loss + a, main + a
+    _ce.last = (main.detach(), None if l2 is None else l2.detach())   # (main CE, MTP CE) for logging
     return loss
 
 
@@ -537,6 +552,8 @@ def main():
     # MTP depth 1 (ablate/common/mtp.py): loss = CE(t+1) + mtp_weight * CE(t+2). 0 = off. Logged
     # train/val loss stay the MAIN head only, so MTP runs compare 1:1 with everything else.
     ap.add_argument("--mtp_weight", type=float, default=0.0)
+    ap.add_argument("--ce_kernel", choices=["factored", "chunked"], default="chunked",
+                    help="fused linear CE: chunked (sm75 kernel, default until the gate passes) or factored (ce_factored.py)")
     # 1 AR+SWA+carry+MLP (full SWA layer) | 2 SWA+MLP | 3 AR+MLP | 4 MLP only -- see mtp.py
     ap.add_argument("--mtp_variant", type=int, default=1)
     # MTP layer MLP: ensemble (8 x 576 all-active) | dense (1 expert x 4608: same params + act)
@@ -670,6 +687,8 @@ def main():
     dt = _DT[args.precision]
     patch_list = [p.strip() for p in args.patches.split(",") if p.strip()]
     use_fused_ce = "ce" in patch_list
+    global FLCE
+    FLCE = ce_factored.fused_linear_cross_entropy if args.ce_kernel == "factored" else fused_linear_cross_entropy
     from . import configs as _cfgmod
     _cfgmod.SHARED["norm_topk_prob"] = "sum" if args.norm_topk_prob else False
     if not args.norm_topk_prob:
@@ -1443,7 +1462,7 @@ def main():
             if ((val_holdout is not None or val_batches) and step >= args.val_start
                     and (step % val_every == 0 or step == total_steps - 1)):
                 _vo, val_flat = _val.losses(model, val_holdout, val_batches,
-                                            fused_linear_cross_entropy, amp,
+                                            FLCE, amp,
                                             pad_id=0 if args.pad_id is None else int(args.pad_id))
                 if _vo is not None and val_bpt:
                     val_flat["val/bpb"] = _vo / (math.log(2) * val_bpt)
@@ -1503,7 +1522,7 @@ def main():
         try:
             _rt = _AT.from_pretrained(TOKENIZER)
             _lens = tuple(int(x) for x in str(args.extrap_lens).split(",") if x.strip())
-            final_flat = _fr.run(model, _rt, args.dataset, fused_linear_cross_entropy, amp,
+            final_flat = _fr.run(model, _rt, args.dataset, FLCE, amp,
                                  device=DEV, wb=wb, max_new=args.sample_tokens,
                                  n_seqs=args.val_seqs, lens=_lens)
         except Exception as _e:
