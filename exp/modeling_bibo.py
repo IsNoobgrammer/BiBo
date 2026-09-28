@@ -948,7 +948,10 @@ class BiBoModel(BiBoPreTrainedModel):
 
         # MTP (ablate/common/mtp.py) runs one extra layer after this model and needs the same
         # RoPE tensors and the final block archive; handed over by reference, training only.
-        self._mtp_cache = (position_embeddings, block_residual) if self.training else None
+        # Only when an MTP head is attached (mtp_handover, set where the head is built): with MTP
+        # off the trunk keeps no extra references and does no MTP work at all.
+        self._mtp_cache = ((position_embeddings, block_residual)
+                           if self.training and getattr(self, "mtp_handover", False) else None)
         if self.use_attn_residuals:
             hidden_states = self._apply_output_attention_residual(
                 hidden_states, block_residual

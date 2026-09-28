@@ -832,6 +832,7 @@ def main():
         from .mtp import MTP
         model.mtp = MTP(model.config, variant=args.mtp_variant, init_fn=model._init_weights,
                         ffn=args.mtp_ffn, use_emb=bool(args.mtp_emb)).to(DEV)
+        model.model.mtp_handover = True                    # trunk hands RoPE + archive to the head
         _n = sum(p.numel() for p in model.mtp.parameters())
         total, active = total + _n, active + _n
         trainable += sum(p.numel() for p in model.mtp.parameters() if p.requires_grad)
