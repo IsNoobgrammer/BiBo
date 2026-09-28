@@ -23,9 +23,18 @@
 
 Not used in training yet (`--mtp_weight` defaults to 0). When this is picked up again, start from here.
 
+**OPEN / AMBIGUOUS when resumed -- no proper conclusion reached, decide these first:**
+- **W_p or not** (`--mtp_proj`, default 0 since Sep 28 2026 on delete-first grounds, NOT a result).
+  Seed 23, w0.3: no-W_p val 3.3308 vs 3.3294, t1 0.3881 vs 0.3890, train 3.2584 vs 3.2579, t2 accept
+  59.1% vs 59.2%. Within ~2x the noise floor but marginally worse on every main-head metric. Needs a
+  2nd seed of no-W_p to settle. Speed and params are no factor (262k params, no measurable tps).
+- **Weight 0.3 or 0.1** (user: stick to one of these; 0.5 is out). 0.3 led at seed 23 (val -0.0025,
+  train 41/41 points), one seed only.
+- **Is MTP worth its ~20% tps at all**: needs an equal-wall-clock base (base run ~24% more steps).
+
 **Chosen design: depth 1, v1-noemb** = `--mtp_weight 0.3` (the other flags are now the defaults:
-`--mtp_variant 1 --mtp_ffn ensemble --mtp_emb 0`). The head is one extra windowed layer after the
-trunk: `x = W_p norm(lhs)` (NO Emb(t+1) input) -> AttnRes read of the trunk's block archive -> SWA
+`--mtp_variant 1 --mtp_ffn ensemble --mtp_emb 0 --mtp_proj 0`). The head is one extra windowed layer
+after the trunk: `x = norm(lhs)` (`W_p norm(lhs)` with `--mtp_proj 1`; NO Emb(t+1) input) -> AttnRes read of the trunk's block archive -> SWA
 attention -> fused carry -> all-active 8 x 576 ensemble MLP -> norm -> tied lm_head -> CE vs t+2.
 Logged train/val loss is the main head only. Code: `ablate/common/mtp.py`, `_ce` in train.py
 (main + MTP heads go through ONE factored-CE call).
@@ -59,7 +68,10 @@ Cost: MTP depth 1 at the current kernels = 182-183k tps vs 226-228k base (~20% s
 is a full extra vocab pass (~25 ms / 32k tokens / head with factored CE, linear in heads).
 
 MTP-weight sweep (seed 23, noemb, new kernels; big-holdout val / train loss_smooth @2000 / spec acceptance):
-w0.1 3.3319 / 3.2599 / 54.6% | w0.3 3.3294 / 3.2579 / 59.2% | w0.5 and noemb-noproj-w0.3 pending (k18/k19).
+w0.1 3.3319 / 3.2599 / 54.4% | w0.3 3.3294 / 3.2579 / 59.2% | w0.5 3.3401 / 3.2675 / 61.4% (hurts the
+main head: gives back ~80% of the MTP gain) | no-W_p w0.3 3.3308 / 3.2584 / 59.1%.
+t1 (main top-1, learning signal): base 0.3871, w0.1 0.3883, w0.3 0.3890, w0.5 0.3885, no-W_p 0.3881,
+v1-emb 0.3884. All probe numbers are in W&B summaries under `probe/*` (t1_top1, t2_top1, t2_accept).
 w0.3 beats w0.1 on train at 41/41 log points after step 1000 (+0.0030 mean; same-config kernel-change
 twin differs by only 0.0001-0.0005) and on big-holdout val (-0.0025; twin 0.0008). 2-seq val is
 uninformative here (the twin moves it by 0.011-0.020).
@@ -77,7 +89,7 @@ in-block acceptance decay + a confidence head / load-aware scheduler that trunca
 Our mtp_probe `spec_acc` (1-token greedy acceptance) is a ready baseline to compare drafters against.
 
 Open when resumed: more seeds vs base (only seed 23 has a base twin); equal-FLOPs comparison
-(base trained ~25% longer); MTP weight sweep (only 0.3 tried); depth > 1 (the CE already takes N heads).
+(base trained ~25% longer); W_p and 0.1-vs-0.3 (see OPEN above); depth > 1 (the CE already takes N heads).
 
 ## suggestions
 
