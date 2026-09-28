@@ -539,6 +539,10 @@ def main():
     ap.add_argument("--mtp_weight", type=float, default=0.0)
     # 1 AR+SWA+carry+MLP (full SWA layer) | 2 SWA+MLP | 3 AR+MLP | 4 MLP only -- see mtp.py
     ap.add_argument("--mtp_variant", type=int, default=1)
+    # MTP layer MLP: ensemble (8 x 576 all-active) | dense (1 expert x 4608: same params + act)
+    ap.add_argument("--mtp_ffn", choices=["ensemble", "dense"], default="ensemble")
+    # 1 = input W_p[norm(lhs); norm(Emb(t+1))] (DeepSeek-V3); 0 = W_p norm(lhs), no next-token embedding
+    ap.add_argument("--mtp_emb", type=int, default=1)
     ap.add_argument("--switch_variant_at", type=int, default=-1)
     ap.add_argument("--switch_variant", default="muown")
     ap.add_argument("--switch_muon_wd", type=float, default=None)   # None = keep the current Muon wd   # Muon-group wd; None = same as --wd
@@ -801,7 +805,8 @@ def main():
     print(f"[attn] kernel={args.attn_kernel} q_scale={args.q_scale} k_scale={args.k_scale}", flush=True)
     if args.mtp_weight > 0:
         from .mtp import MTP
-        model.mtp = MTP(model.config, variant=args.mtp_variant, init_fn=model._init_weights).to(DEV)
+        model.mtp = MTP(model.config, variant=args.mtp_variant, init_fn=model._init_weights,
+                        ffn=args.mtp_ffn, use_emb=bool(args.mtp_emb)).to(DEV)
         print(f"[mtp] depth 1, variant {args.mtp_variant}, weight {args.mtp_weight}: +{sum(p.numel() for p in model.mtp.parameters())/1e6:.2f}M "
               f"params, + one extra lm_head pass per token", flush=True)
     total, trainable, active = count_params(model)

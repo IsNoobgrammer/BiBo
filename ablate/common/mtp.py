@@ -30,8 +30,10 @@ import torch.nn as nn
 from src.modeling.norm import BiBoRMSNorm
 
 
-def mtp_layer_config(config):
-    """(config copy, layer_idx) for an extra windowed layer with the L0-style all-active ensemble."""
+def mtp_layer_config(config, ffn="ensemble"):
+    """(config copy, layer_idx) for an extra windowed layer. ffn: 'ensemble' = L0-style 8 x 576
+    all-active; 'dense' = ONE all-active expert of width 8*576 = 4608 -- a dense GLU FFN with the same
+    params AND the same radial-normsilu activation/kernel (BiBoMLP would also switch the act to SiLU)."""
     idx = config.num_hidden_layers
     cfg = copy.copy(config)
     pat = getattr(config, "hybrid_layer_pattern", None)
@@ -43,6 +45,9 @@ def mtp_layer_config(config):
     over = dict(getattr(config, "moe_overrides", None) or {})
     ens = dict(over.get(0) or {"num_routed_experts": 8, "num_experts_per_tok": 8, "moe_intermediate_size": 576})
     assert ens["num_experts_per_tok"] == ens["num_routed_experts"], "MTP MLP must be all-active"
+    if ffn == "dense":
+        ens = {"num_routed_experts": 1, "num_experts_per_tok": 1,
+               "moe_intermediate_size": ens["num_routed_experts"] * ens["moe_intermediate_size"]}
     over[idx] = ens
     cfg.moe_overrides = over
     return cfg, idx
@@ -51,16 +56,17 @@ def mtp_layer_config(config):
 class MTP(nn.Module):
     HAS_ATTN = {1: True, 2: True, 3: False, 4: False}
 
-    def __init__(self, config, variant=1, init_fn=None):
+    def __init__(self, config, variant=1, init_fn=None, ffn="ensemble", use_emb=True):
         super().__init__()
         from exp.modeling_bibo import BiBoDecoderLayer
         assert variant in self.HAS_ATTN, f"--mtp_variant {variant}: valid 1-4"
         self.variant = variant
         H, eps = config.hidden_size, config.rms_norm_eps
+        self.use_emb = bool(use_emb)       # False: x = W_p norm(lhs) -- t(i+1) is NOT given to the head
         self.norm_h = BiBoRMSNorm(H, eps=eps)
-        self.norm_e = BiBoRMSNorm(H, eps=eps)
-        self.proj = nn.Linear(2 * H, H, bias=False)
-        cfg, idx = mtp_layer_config(config)
+        self.norm_e = BiBoRMSNorm(H, eps=eps) if self.use_emb else None
+        self.proj = nn.Linear((2 if self.use_emb else 1) * H, H, bias=False)
+        cfg, idx = mtp_layer_config(config, ffn)
         if variant == 2:
             cfg.attn_res_block_size = None       # the layer takes its standard pre-norm residual path
         self.layer = BiBoDecoderLayer(cfg, idx)
@@ -74,7 +80,8 @@ class MTP(nn.Module):
             self.apply(init_fn)              # exactly like the main ones would
 
     def forward(self, lhs, e_next, position_embeddings, block_residual):
-        x = self.proj(torch.cat([self.norm_h(lhs), self.norm_e(e_next).to(lhs.dtype)], dim=-1))
+        x = self.proj(torch.cat([self.norm_h(lhs), self.norm_e(e_next).to(lhs.dtype)], dim=-1)
+                      if self.use_emb else self.norm_h(lhs))
         L = self.layer
         if self.variant == 1:
             s = L(x, position_embeddings=position_embeddings, block_residual=block_residual)[0]
