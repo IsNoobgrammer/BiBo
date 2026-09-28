@@ -70,6 +70,11 @@ model's own chain; its d2 top-1 vs the TRUE t+2 is actually lower, 0.18 vs 0.21)
 step 1.66 vs 1.59 (+4.7%). DECIDED (user, Sep 28 2026): MTP is a TRAINING-signal device only; drafting
 goes to a dedicated drafter (e.g. DFlash, block-parallel drafting off the target's hidden states), so
 acceptance is NOT a criterion for the MTP head and noemb stands.
+Drafter candidates for later: DFlash (block-diffusion drafter off the target's hidden states) and
+DSpark (DeepSeek, arXiv 2607.05147: parallel backbone drafts a whole block in one pass + a small serial
+low-rank MARKOV head that biases each draft token on the previous one, fixing parallel drafters'
+in-block acceptance decay + a confidence head / load-aware scheduler that truncates low-confidence tails).
+Our mtp_probe `spec_acc` (1-token greedy acceptance) is a ready baseline to compare drafters against.
 
 Open when resumed: more seeds vs base (only seed 23 has a base twin); equal-FLOPs comparison
 (base trained ~25% longer); MTP weight sweep (only 0.3 tried); depth > 1 (the CE already takes N heads).
