@@ -81,6 +81,11 @@ def load_from_result(result_json, device=DEV):
                          [int(v) for v in str(c.mlp_only_layers).split(",")]),
         intermediate_size=getattr(c, "dense_inter", None))
 
+    if (getattr(c, "mtp_weight", 0) or 0) > 0:          # the MTP head is in the checkpoint too
+        from .mtp import MTP
+        model.mtp = MTP(model.config, variant=getattr(c, "mtp_variant", None) or 1,
+                        ffn=getattr(c, "mtp_ffn", None) or "ensemble",
+                        use_emb=bool(1 if getattr(c, "mtp_emb", None) is None else c.mtp_emb)).to(device)
     sd = torch.load(ckpt, map_location=device)
     # checkpoints from before all-active layers (top_k == E) lost their inert balancing bias still
     # carry `...gate.bias` for them; drop exactly those keys so strict loading keeps meaning something
