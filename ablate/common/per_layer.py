@@ -143,7 +143,7 @@ class PerLayerRouter:
             out[f"{pre}/load_balancing_loss"] = float(E * (f * p).sum())
             ent = float(-(f.clamp_min(1e-12) * f.clamp_min(1e-12).log()).sum())
             out[f"{pre}/routing_entropy"] = ent
-            out[f"{pre}/balance_entropy"] = ent / math.log(E)   # 1.0 = perfectly balanced
+            out[f"{pre}/balance_entropy"] = ent / math.log(E) if E > 1 else 1.0   # 1.0 = balanced (E=1: trivially)
             out[f"{pre}/max_load"] = float(f.max())
             # Share of TOKENS the busiest expert sees, which is what max_load actually means once
             # you remember each token makes k assignments. 0.096 of assignments at k=6 is 58% of
@@ -171,7 +171,7 @@ class PerLayerRouter:
             # above its selection rate -- picked seldom, but trusted when it is.
             out[f"{pre}/max_weight"] = float(w.max())
             ent_w = float(-(w.clamp_min(1e-12) * w.clamp_min(1e-12).log()).sum())
-            out[f"{pre}/weight_entropy"] = ent_w / math.log(E)      # 1.0 = a flat average
+            out[f"{pre}/weight_entropy"] = ent_w / math.log(E) if E > 1 else 1.0      # 1.0 = a flat average
             out[f"{pre}/score_mean"] = float(aff.mean())
             out[f"{pre}/score_max"] = float(aff.max())
             out[f"{pre}/score_min"] = float(aff.min())
