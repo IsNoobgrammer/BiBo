@@ -1202,8 +1202,13 @@ def main():
             _mns.probe_gamma = _gamma_law(opts[0].param_groups[0]["lr"])
         loss_val = torch.zeros((), device=DEV)            # summed on the GPU: no host sync per micro
         loss_mtp_val = torch.zeros((), device=DEV)
-        for _ in range(args.grad_accum):                     # gradient accumulation -> global batch
+        _h8 = bool(args.moe_fp8) and (step % args.log_every == 0 or step == total_steps - 1)
+        _h8_logs, _h8_line = {}, ""
+        for _mi in range(args.grad_accum):                   # gradient accumulation -> global batch
             ids = next(gen)
+            if _h8 and _mi == 0:                              # fp8 health: first micro of a log step only
+                from ablate.common import fp8_health as _fh
+                _fh.start()
             # MANAS: fwd/bwd run at theta + gamma*D (the probe), then vote() folds this micro's
             # gradient direction into D. vote() MUST be outside the probe context (it raises
             # otherwise) and theta is restored exactly inside step(). Both are no-ops under muon.
@@ -1217,6 +1222,8 @@ def main():
                 loss.backward()
                 if _sp is not None:
                     _sp.mark("bwd_end")
+            if _h8 and _mi == 0:
+                _h8_logs, _h8_line = _fh.stop()
             _vote()
             loss_val += _ce.last[0] / args.grad_accum             # MAIN head only (== loss when no MTP)
             if _ce.last[1] is not None:
@@ -1331,6 +1338,9 @@ def main():
             # XSA alpha and radial p per layer, read straight off the parameters. The depth ramp
             # in p was only ever visible per layer, and the aggregate min/mean/max hid it.
             rt.update(per_layer_params(model))
+            rt.update(_h8_logs)
+            if _h8_line:
+                print(f"[{args.arm}_seed{args.seed}] step {step} {_h8_line}", flush=True)
             xa_s = ((f" xa={rt['train/xsa_a_mean']:+.3f}"
                      f"[{rt['train/xsa_a_min']:+.2f},{rt['train/xsa_a_max']:+.2f}]"
                      if "train/xsa_a_mean" in rt else "")

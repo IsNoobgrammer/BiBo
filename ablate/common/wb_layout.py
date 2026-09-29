@@ -67,7 +67,7 @@ _PREFIX = [
     ("train/", "misc/"),
 ]
 _KEEP = ("core/", "val/", "speed/", "optim/", "health/", "router/", "moe/", "xsa/", "attnres/",
-         "act/", "qk/", "typed/", "final/", "misc/")
+         "act/", "qk/", "fp8/", "typed/", "final/", "misc/")
 
 
 def wb_key(k):
@@ -200,6 +200,17 @@ def build_workspace(entity, project, name="BiBo board"):
         line("q gain mean per layer", regex=r"(misc/)?qk/layer_\d+/gq_mean"),
         line("k gain mean per layer", regex=r"(misc/)?qk/layer_\d+/gk_mean"),
     ])
+    fp8 = sec("FP8 health (--moe_fp8): per fp8 tensor, mean / max over layers", [
+        line("flush proxy: exact-zero % (max over layers)", regex=r"fp8/.*/zero_pct_max"),
+        line("subnormal % (max over layers)", regex=r"fp8/.*/subnormal_pct_max"),
+        line("weights: exact flush % vs fp32 master", regex=r"fp8/W_.*/flush_pct_(mean|max)"),
+        line("block max at 448 % (overflow is 0 by construction)", regex=r"fp8/.*/at_max_pct_max"),
+        line("scale exponent mean (drift = range growth)", regex=r"fp8/.*/scale_exp_mean_mean"),
+        line("scale exponent min / max", regex=r"fp8/.*/scale_exp_(min_min|max_max)"),
+        line("outliers: block max / rms p99", regex=r"fp8/.*/block_max_over_rms_p99_max"),
+        line("outliers: amax / rms", regex=r"fp8/.*/amax_over_rms_max"),
+        line("kurtosis", regex=r"fp8/.*/kurtosis_max", log_y=True),
+    ])
     final = sec("Final report", [
         line("Context ablation", regex=r"final/ctx/.*"),
         line("Degeneration", regex=r"final/degen/.*"),
@@ -208,7 +219,7 @@ def build_workspace(entity, project, name="BiBo board"):
 
     w = ws.Workspace(
         entity=entity, project=project, name=name,
-        sections=[overview, seeds, loss, speed, optim, health, router, per_layer, attn, act, qk,
+        sections=[overview, seeds, loss, speed, optim, health, router, per_layer, attn, act, qk, fp8,
                   final, misc],
         settings=ws.WorkspaceSettings(x_axis="Step", max_runs=20, group_by_prefix="first",
                                       tooltip_number_of_runs="all_runs"),
@@ -232,7 +243,8 @@ if __name__ == "__main__":
         assert wb_key("grad/norm/layers.self_attn.q_proj") == "health/grad_norm/layers.self_attn.q_proj"
         assert wb_key("val/ext/en") == "val/ext/en" and wb_key("core/lr") == "core/lr"
         assert wb_key("something_new") == "misc/something_new"
-        assert wb_key("interp/qk/layer_3/t_mean") == "qk/layer_3/t_mean"   # the key train.py actually sends
+        assert wb_key("interp/qk/layer_3/t_mean") == "qk/layer_3/t_mean"
+        assert wb_key("fp8/dGU_B6_in/zero_pct_max") == "fp8/dGU_B6_in/zero_pct_max"   # the key train.py actually sends
         assert wb_key(wb_key("interp/xsa_a_mean")) == "xsa/alpha_mean"    # idempotent
         print("wb_layout selftest ok")
     else:
