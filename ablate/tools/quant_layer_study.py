@@ -47,7 +47,9 @@ def emu(r, E, M, bias, maxv, ceil=False):
 
 ELEM = {"e4m3": (lambda r: r.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float(), 448.0, 2.0 ** -6),
         "e5m2": (lambda r: r.clamp(-57344.0, 57344.0).to(torch.float8_e5m2).float(), 57344.0, 2.0 ** -14),
-        "e3m4": (lambda r: emu(r, 3, 4, 3, 30.0), 30.0, 2.0 ** -2)}
+        "e3m4": (lambda r: emu(r, 3, 4, 3, 30.0), 30.0, 2.0 ** -2),
+        # FP4: 1 sign / 2 exp / 1 mantissa, bias 1 -> {0, .5, 1, 1.5, 2, 3, 4, 6}
+        "e2m1": (lambda r: emu(r, 2, 1, 1, 6.0), 6.0, 1.0)}
 SCALE8 = {"e5m2": (5, 2, 15, 57344.0), "e4m3": (4, 3, 7, 448.0)}
 
 STATS = {}
@@ -137,7 +139,8 @@ class QMM(torch.autograd.Function):
         ctx.save_for_backward(a, b)
         ctx.r, ctx.n = recipe, name
         h = recipe[3] if len(recipe) > 3 else 0
-        return fq(hadamard(a, 1, h), 1, recipe[:3], f"{name}.act") @ fq(hadamard(b, 1, h), 1, recipe[:3], f"{name}.W").t()
+        wr = recipe[4] if len(recipe) > 4 else recipe[:3]      # weights may use their own format (W4A8)
+        return fq(hadamard(a, 1, h), 1, recipe[:3], f"{name}.act") @ fq(hadamard(b, 1, h), 1, wr, f"{name}.W").t()
 
     @staticmethod
     def backward(ctx, dy):
@@ -145,9 +148,10 @@ class QMM(torch.autograd.Function):
         r, n = ctx.r, ctx.n
         dg, wg = ("B6", "B5") if n == "F1" else ("B3", "B2")
         h = r[3] if len(r) > 3 else 0
+        wr = r[4] if len(r) > 4 else r[:3]
         r = r[:3]
         H = lambda t, d: hadamard(t, d, h)
-        da = fq(H(dy, 1), 1, r, f"{dg}.grad") @ fq(H(b, 0), 0, r, f"{dg}.W^T")
+        da = fq(H(dy, 1), 1, r, f"{dg}.grad") @ fq(H(b, 0), 0, wr, f"{dg}.W^T")
         # wgrad reduces over TOKENS: rotate along tokens (NVIDIA's NVFP4 recipe puts its RHT exactly here)
         db = fq(H(dy, 0), 0, r, f"{wg}.grad^T").t() @ fq(H(a, 0), 0, r, f"{wg}.act^T")
         return da, db, None, None
@@ -227,6 +231,12 @@ def outliers(name, t):
           f"{100 * (a > 10 * rms).float().mean().item():8.4f} {100 * (a > 100 * rms).float().mean().item():8.5f} {rs}")
 
 
+MX4, NV4 = ("e2m1", "e8m0", 32), ("e2m1", "2L-e4m3", 16)
+RECIPES4 = [("bf16", None, 0), ("e4m3", "e8m0", 32),
+            ("e4m3", "e8m0", 32, 0, MX4), ("e4m3", "e8m0", 32, 0, NV4),            # W4A8 (QAT: 4-bit weights)
+            ("e4m3", "e8m0", 32, 32, MX4), ("e4m3", "e8m0", 32, 16, NV4),          # W4A8 + Hadamard
+            MX4, NV4,                                                              # W4A4
+            (*MX4, 32), (*NV4, 16)]                                                # W4A4 + Hadamard
 RECIPES = [("bf16", None, 0),
            ("e4m3", "e8m0", 32, 32), ("e4m3", "e8m0", 32, 128), ("e4m3", "e8m0", 128, 128),
            ("e4m3", "e8m0", 32), ("e4m3", "e8m0", 64), ("e4m3", "e8m0", 128),
@@ -240,6 +250,7 @@ def main():
     ap.add_argument("result")
     ap.add_argument("--layers", default="0,1,5,9")
     ap.add_argument("--n_seqs", type=int, default=8)
+    ap.add_argument("--four", action="store_true", help="the 4-bit grid (W4A8 / W4A4, MXFP4 / NVFP4, +-Hadamard)")
     a = ap.parse_args()
     c0 = json.load(open(a.result))["config"]
     model, c = load_from_result(a.result)
@@ -299,34 +310,41 @@ def main():
         print("\nPARITY: relative Frobenius error vs the fp32 chain (same routing)")
         keys = [k_ for k_ in ref if ref[k_] is not None]
         res, stats = {}, {}
-        for rc in RECIPES:
+        grid = RECIPES4 if a.four else RECIPES
+        for rc in grid:
             STATS.clear()
             out = run_layer(L, x0, gy, idx, rc)
             res[rc] = {k_: ((out[k_].float() - ref[k_].float()).norm() / ref[k_].float().norm()).item()
                        for k_ in keys if out[k_] is not None}
             stats[rc] = {t: tuple(100 * v / max(st[3], 1) for v in st[:3]) for t, st in STATS.items()}
             del out
-        name = lambda rc: rc[0] if rc[1] is None else f"{rc[0]} {rc[1]} {rc[2]}" + (f" +H{rc[3]}" if len(rc) > 3 else "")
+        def name(rc):
+            if rc[1] is None:
+                return rc[0]
+            fmt = lambda f: {"e2m1 e8m0 32": "MXFP4", "e2m1 2L-e4m3 16": "NVFP4", "e4m3 e8m0 32": "MXFP8"}.get(
+                f"{f[0]} {f[1]} {f[2]}", f"{f[0]} {f[1]} {f[2]}")
+            base = fmt(rc) if len(rc) < 5 else f"W:{fmt(rc[4])} A:{fmt(rc)}"
+            return base + (f" +H{rc[3]}" if len(rc) > 3 and rc[3] else "")
         short = {"fwd G (gate)": "G", "fwd U (up)": "U", "fwd act(G)*U": "act", "fwd O (down out)": "O",
                  "fwd y": "y", "bwd dO": "dO", "bwd d act-out": "d act", "bwd dG": "dG", "bwd dU": "dU",
                  "bwd d normed-x": "d hn", "bwd dx": "dx", "dW gate": "dW g", "dW up": "dW u",
                  "dW down": "dW d", "d theta": "d th", "d router": "d rtr", "d norm_w": "d nw"}
         print(f"   {'recipe':22s} " + " ".join(f"{short[k_]:>7s}" for k_ in keys))
-        for rc in RECIPES:
-            print(f"   {name(rc):22s} " + " ".join(f"{res[rc].get(k_, float('nan')):7.1e}" for k_ in keys))
+        for rc in grid:
+            print(f"   {name(rc):26s} " + " ".join(f"{res[rc].get(k_, float('nan')):7.1e}" for k_ in keys))
 
         print("\nUNDERFLOW / OVERFLOW per GEMM operand, % of non-zero values: flushed-to-0 / subnormal / saturated")
         tags = ["F1.act", "F1.W", "F3.act", "F3.W", "B3.grad", "B3.W^T", "B6.grad", "B6.W^T",
                 "B2.grad^T", "B2.act^T", "B5.grad^T", "B5.act^T"]
         print(f"   {'recipe':22s} " + " ".join(f"{t:>21s}" for t in tags))
-        for rc in RECIPES:
+        for rc in grid:
             if rc[1] is None:
                 continue
             cells = []
             for t in tags:
                 v = stats[rc].get(t)
                 cells.append(f"{v[0]:6.3f}/{v[1]:6.2f}/{v[2]:6.3f}" if v else f"{'-':>21s}")
-            print(f"   {name(rc):22s} " + " ".join(f"{c_:>21s}" for c_ in cells))
+            print(f"   {name(rc):26s} " + " ".join(f"{c_:>21s}" for c_ in cells))
     print("\nQUANT_LAYER_STUDY_DONE")
 
 
