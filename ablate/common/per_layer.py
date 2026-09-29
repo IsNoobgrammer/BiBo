@@ -233,6 +233,25 @@ def per_layer_params(model):
             out[f"{pre}/min"] = p.min().item()
             out[f"{pre}/max"] = p.max().item()
             out[f"{pre}/std"] = p.std().item() if p.numel() > 1 else 0.0
+        # QK-norm gains. After the per-head RMSNorm the logit is sum_i gq_i*gk_i*q^_i*k^_i/sqrt(d),
+        # so t = q_scale*k_scale*gq*gk is the per-dim attention TEMPERATURE multiplier (1 = stock).
+        at = getattr(layer, "self_attn", None)
+        gq = getattr(getattr(at, "q_norm", None), "weight", None)
+        gk = getattr(getattr(at, "k_norm", None), "weight", None)
+        if gq is not None and gk is not None:
+            gq, gk = gq.detach().float(), gk.detach().float()
+            t = gq * gk * float(getattr(at, "q_scale", 1.0)) * float(getattr(at, "k_scale", 1.0))
+            pre = f"train/qk/layer_{i}"
+            h = _hist(t.tolist(), t.numel())
+            if h is not None:
+                out[f"{pre}/t_hist"] = h
+            out.update({f"{pre}/gq_mean": gq.mean().item(), f"{pre}/gk_mean": gk.mean().item(),
+                        f"{pre}/t_mean": t.mean().item(), f"{pre}/t_min": t.min().item(),
+                        f"{pre}/t_max": t.max().item()})
+    ts = [v for k, v in out.items() if k.startswith("train/qk/layer_") and k.endswith("/t_mean")]
+    if ts:
+        out.update({"train/qk/t_mean": sum(ts) / len(ts), "train/qk/t_min_layer": min(ts),
+                    "train/qk/t_max_layer": max(ts)})
     return out
 
 

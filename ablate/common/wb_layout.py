@@ -60,13 +60,14 @@ _PREFIX = [
     ("interp/radial_p", "act/radial_p"),
     ("interp/act_alpha_", "act/theta_"),
     ("interp/typed/", "typed/"),
+    ("train/qk/", "qk/"),
     ("ctxabl/", "final/ctx/"),
     ("degen/", "final/degen/"),
     ("interp/", "misc/"),
     ("train/", "misc/"),
 ]
 _KEEP = ("core/", "val/", "speed/", "optim/", "health/", "router/", "moe/", "xsa/", "attnres/",
-         "act/", "typed/", "final/", "misc/")
+         "act/", "qk/", "typed/", "final/", "misc/")
 
 
 def wb_key(k):
@@ -191,6 +192,14 @@ def build_workspace(entity, project, name="BiBo board"):
         line("Radial p per layer", regex=r"act/radial_p/layer_\d+/mean"),
         line("Radial theta mean/min/max", regex=r"act/theta_.*"),
     ])
+    qk = sec("QK-norm gains (attention temperature t = gq*gk)", [
+        line("t mean over layers, lowest/highest layer", regex=r"qk/t_(mean|min_layer|max_layer)"),
+        line("t mean per layer", regex=r"qk/layer_\d+/t_mean"),
+        line("t max per layer", regex=r"qk/layer_\d+/t_max"),
+        line("t min per layer", regex=r"qk/layer_\d+/t_min"),
+        line("q gain mean per layer", regex=r"qk/layer_\d+/gq_mean"),
+        line("k gain mean per layer", regex=r"qk/layer_\d+/gk_mean"),
+    ])
     final = sec("Final report", [
         line("Context ablation", regex=r"final/ctx/.*"),
         line("Degeneration", regex=r"final/degen/.*"),
@@ -199,7 +208,7 @@ def build_workspace(entity, project, name="BiBo board"):
 
     w = ws.Workspace(
         entity=entity, project=project, name=name,
-        sections=[overview, seeds, loss, speed, optim, health, router, per_layer, attn, act,
+        sections=[overview, seeds, loss, speed, optim, health, router, per_layer, attn, act, qk,
                   final, misc],
         settings=ws.WorkspaceSettings(x_axis="Step", max_runs=20, group_by_prefix="first",
                                       tooltip_number_of_runs="all_runs"),
@@ -223,6 +232,7 @@ if __name__ == "__main__":
         assert wb_key("grad/norm/layers.self_attn.q_proj") == "health/grad_norm/layers.self_attn.q_proj"
         assert wb_key("val/ext/en") == "val/ext/en" and wb_key("core/lr") == "core/lr"
         assert wb_key("something_new") == "misc/something_new"
+        assert wb_key("train/qk/layer_3/t_mean") == "qk/layer_3/t_mean"
         assert wb_key(wb_key("interp/xsa_a_mean")) == "xsa/alpha_mean"    # idempotent
         print("wb_layout selftest ok")
     else:
