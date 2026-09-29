@@ -60,7 +60,7 @@ _PREFIX = [
     ("interp/radial_p", "act/radial_p"),
     ("interp/act_alpha_", "act/theta_"),
     ("interp/typed/", "typed/"),
-    ("train/qk/", "qk/"),
+    ("interp/qk/", "qk/"),     # train.py renames train/* -> interp/* before this map sees it
     ("ctxabl/", "final/ctx/"),
     ("degen/", "final/degen/"),
     ("interp/", "misc/"),
@@ -193,12 +193,12 @@ def build_workspace(entity, project, name="BiBo board"):
         line("Radial theta mean/min/max", regex=r"act/theta_.*"),
     ])
     qk = sec("QK-norm gains (attention temperature t = gq*gk)", [
-        line("t mean over layers, lowest/highest layer", regex=r"qk/t_(mean|min_layer|max_layer)"),
-        line("t mean per layer", regex=r"qk/layer_\d+/t_mean"),
-        line("t max per layer", regex=r"qk/layer_\d+/t_max"),
-        line("t min per layer", regex=r"qk/layer_\d+/t_min"),
-        line("q gain mean per layer", regex=r"qk/layer_\d+/gq_mean"),
-        line("k gain mean per layer", regex=r"qk/layer_\d+/gk_mean"),
+        line("t mean over layers, lowest/highest layer", regex=r"(misc/)?qk/t_(mean|min_layer|max_layer)"),
+        line("t mean per layer", regex=r"(misc/)?qk/layer_\d+/t_mean"),
+        line("t max per layer", regex=r"(misc/)?qk/layer_\d+/t_max"),
+        line("t min per layer", regex=r"(misc/)?qk/layer_\d+/t_min"),
+        line("q gain mean per layer", regex=r"(misc/)?qk/layer_\d+/gq_mean"),
+        line("k gain mean per layer", regex=r"(misc/)?qk/layer_\d+/gk_mean"),
     ])
     final = sec("Final report", [
         line("Context ablation", regex=r"final/ctx/.*"),
@@ -232,7 +232,7 @@ if __name__ == "__main__":
         assert wb_key("grad/norm/layers.self_attn.q_proj") == "health/grad_norm/layers.self_attn.q_proj"
         assert wb_key("val/ext/en") == "val/ext/en" and wb_key("core/lr") == "core/lr"
         assert wb_key("something_new") == "misc/something_new"
-        assert wb_key("train/qk/layer_3/t_mean") == "qk/layer_3/t_mean"
+        assert wb_key("interp/qk/layer_3/t_mean") == "qk/layer_3/t_mean"   # the key train.py actually sends
         assert wb_key(wb_key("interp/xsa_a_mean")) == "xsa/alpha_mean"    # idempotent
         print("wb_layout selftest ok")
     else:
