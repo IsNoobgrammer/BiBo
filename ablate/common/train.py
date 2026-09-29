@@ -522,6 +522,7 @@ def main():
     # and supersedes 'moe' on MoE layers. 'moe' stays in the list because the dense mlp_only_layers
     # and the Qwen arm still route through BiBoFusedExperts.forward.
     ap.add_argument("--patches", default="liger_norm,liger_rope,ce,moe,megakernel")
+    ap.add_argument("--moe_fp8", type=int, default=0, choices=(0, 1, 2))   # MXFP8 (W8A8) experts fwd+bwd: 1 ALL, 2 LEAN (needs megakernel)
     ap.add_argument("--muon_variant", choices=["base", "normuon", "aurora", "muown"], default="aurora")
     ap.add_argument("--muon_scale", choices=["adam", "none"], default="adam")  # adam = update RMS 0.2 (AdamW lr band)
     ap.add_argument("--ns_coeffs", choices=["ns8", "dsv4", "quintic5", "pe8"], default="ns8")
@@ -847,6 +848,20 @@ def main():
         print(f"[mtp] depth 1, variant {args.mtp_variant}, ffn {args.mtp_ffn}, emb {args.mtp_emb}, proj {args.mtp_proj}, weight {args.mtp_weight}: "
               f"+{_n/1e6:.2f}M params, + one extra lm_head pass per token", flush=True)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
+    if args.moe_fp8:
+        # MXFP8 (W8A8) expert GEMMs, fwd + bwd, every MoE layer incl. the L0 ensemble (tkf moe_fp8.py). The
+        # seam is the megakernel block, so the patch must be on -- without it the flag would be inert.
+        if "megakernel" not in patch_list:
+            raise SystemExit("--moe_fp8 needs --patches ...,megakernel (the fp8 path lives in megakernel_block)")
+        import importlib as _il
+        _il.import_module("kernels.sm120.megakernel.moe.block").FP8 = True
+        _m8 = _il.import_module("kernels.sm120.moe_fp8")
+        # 1 = ALL: GEMM inputs + GU, d_inter, eo, dx rows stored fp8 (fastest)
+        # 2 = LEAN: GEMM inputs + GU only (least extra error for most of the speed)
+        _all = args.moe_fp8 == 1
+        _m8.GU_FP8, _m8.DI_FP8, _m8.EO_FP8, _m8.DX8 = True, _all, _all, _all
+        print(f"[moe_fp8] MXFP8 experts ON, preset {'ALL' if _all else 'LEAN'} (GU {_m8.GU_FP8} d_inter {_m8.DI_FP8} "
+              f"eo {_m8.EO_FP8} dx {_m8.DX8}; e4m3, e8m0 per 32, fp32 accum; tkf kernels/sm120/moe_fp8.py)", flush=True)
     if not args.fused_res_add:
         import exp.modeling_bibo as _E
         _E._HAS_FUSED_RES_ADD = False
@@ -920,6 +935,7 @@ def main():
                 + (("_vecadamw" + ("act" if args.vec_adamw_group == "act" else ""))
                    if args.vec_matrices_adamw else "")
                 + ("_qkgainact" if args.qk_gain_group == "act" else "")
+                + ({1: "_fp8all", 2: "_fp8lean"}.get(args.moe_fp8, ""))
                 + ("_ptanh" if args.radial_p == "tanh" else "")
                 # XSA MUST be tagged: without it the xsa arm shares a run name with its own
                 # control and overwrites its _final.pt / _result.json. That happened once --
