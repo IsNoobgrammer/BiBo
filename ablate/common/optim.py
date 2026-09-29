@@ -58,7 +58,7 @@ def build_optimizers(model, muon_lr=1e-2, adam_lr=3e-4, wd=0.1, momentum=0.95, n
                      variant="aurora", muon_scale="adam", ns_coeffs="ns8", xorth_post=0.0, xorth_gate_ref=0.3, xorth_ema=0.95,
                      xorth_warmup_steps=0, xorth_where="post", router_adamw=False,
                      act_scale_lr=None, cautious_decay=False, vec_matrices_adamw=False,
-                     vec_adamw_group="default",
+                     vec_adamw_group="default", qk_gain_group="default",
                      optim="muon", probe_gamma=0.0, probe_rho_step=0.96, probe_rank=0, muon_wd=None,
                      ns_backend="auto", fused_tail=True):
     from kernels.sm120.muon import FusedMuon   # Blackwell: gram-NS (self-gates to symmul/cuBLAS on small mats) + 8M knee
@@ -167,7 +167,10 @@ def build_optimizers(model, muon_lr=1e-2, adam_lr=3e-4, wd=0.1, momentum=0.95, n
     _is_as = lambda n: ("radial_theta" in n or "xsa_alpha" in n
                         or "attn_res_carry_theta" in n or "attn_res_emb_theta" in n
                         or "attn_res_emb_gain" in n
-                        or (vec_adamw_group == "act" and "res_proj" in n))
+                        or (vec_adamw_group == "act" and "res_proj" in n)
+                        # q_norm/k_norm gains: gq*gk IS the per-dim attention temperature (the norm
+                        # erases every scale before it), so "act" frees it from lr 5e-4 + decay-to-0
+                        or (qk_gain_group == "act" and ("self_attn.q_norm" in n or "self_attn.k_norm" in n)))
     a_scale = [p for n, p in other if _is_as(n)]
     rest = [p for n, p in other if not _is_as(n)]
     if a_scale and act_scale_lr:

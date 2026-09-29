@@ -356,6 +356,9 @@ def main():
     # "act" = the act-scale group, lr act_scale_lr, wd 0 (step 0.054). Muon's is 0.0449, so the two
     # settings bracket it. Only meaningful with --vec_matrices_adamw true.
     ap.add_argument("--vec_adamw_group", choices=("default", "act"), default="default")
+    # q_norm/k_norm gains (1D, AdamW). "default" = lr adam_lr, wd wd (every run so far); "act" = the
+    # act-scale group, lr act_scale_lr, wd 0 -- the learnable-temperature arm of the QK-scale axis.
+    ap.add_argument("--qk_gain_group", choices=("default", "act"), default="default")
     # radial p parameterization. sigmoid = every result on the board; tanh additionally lets
     # p go NEGATIVE (gain r^p < 1, shrinking high-rms rows), which sigmoid cannot express.
     # Kernel act code 8 vs 10. Tag _ptanh.
@@ -885,6 +888,7 @@ def main():
                                           act_scale_lr=args.act_scale_lr,
                                           vec_matrices_adamw=args.vec_matrices_adamw,
                                           vec_adamw_group=args.vec_adamw_group,
+                                          qk_gain_group=args.qk_gain_group,
                                           cautious_decay=args.cautious_decay,
                                           optim=args.optim, probe_gamma=probe_gamma,
                                           probe_rho_step=args.probe_rho_step,
@@ -914,6 +918,7 @@ def main():
                 + (("_aS" + f"{args.act_scale_lr:g}") if args.act_scale_lr else "")
                 + (("_vecadamw" + ("act" if args.vec_adamw_group == "act" else ""))
                    if args.vec_matrices_adamw else "")
+                + ("_qkgainact" if args.qk_gain_group == "act" else "")
                 + ("_ptanh" if args.radial_p == "tanh" else "")
                 # XSA MUST be tagged: without it the xsa arm shares a run name with its own
                 # control and overwrites its _final.pt / _result.json. That happened once --
