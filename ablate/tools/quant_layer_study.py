@@ -73,7 +73,7 @@ def block_scale(amax, scale, emax):
 
 def fq(t, dim, recipe, tag):
     """Fake-quantize t in 1D blocks along `dim`; records flushed / subnormal / saturated counts."""
-    fmt, scale, blk = recipe
+    fmt, scale, blk = recipe[:3]
     if fmt == "fp32":
         return t
     if fmt == "bf16":
@@ -102,6 +102,32 @@ def fq(t, dim, recipe, tag):
     return y.movedim(-1, dim)
 
 
+_HAD = {}
+
+
+def hadamard(t, dim, n):
+    """Rotate t along `dim` in blocks of n by the normalized Sylvester Hadamard (orthogonal, so
+    applying it to BOTH operands along a GEMM's reduction dim leaves the product unchanged)."""
+    if not n:
+        return t
+    H = _HAD.get(n)
+    if H is None:
+        H = torch.ones(1, 1, device=DEV)
+        while H.shape[0] < n:
+            H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+        H = H / math.sqrt(n)
+        _HAD[n] = H
+    x = t.float().movedim(dim, -1)
+    K = x.shape[-1]
+    pad = (-K) % n
+    if pad:
+        x = F.pad(x, (0, pad))
+    # stays PADDED: both GEMM operands pad the same reduction dim with zeros, and cutting the padding
+    # back off after rotating would drop real mass (the rotation spreads it into the pad positions)
+    y = (x.reshape(*x.shape[:-1], -1, n) @ H).reshape(*x.shape)
+    return y.movedim(-1, dim)
+
+
 class QMM(torch.autograd.Function):
     """y = a @ b^T with a (m, K) activations, b (n, K) weights; every GEMM operand quantized along its
     own reduction dim. name = 'F1' or 'F3' (fwd); its dgrad / wgrad are tagged B6/B5 or B3/B2."""
@@ -110,15 +136,20 @@ class QMM(torch.autograd.Function):
     def forward(ctx, a, b, recipe, name):
         ctx.save_for_backward(a, b)
         ctx.r, ctx.n = recipe, name
-        return fq(a, 1, recipe, f"{name}.act") @ fq(b, 1, recipe, f"{name}.W").t()
+        h = recipe[3] if len(recipe) > 3 else 0
+        return fq(hadamard(a, 1, h), 1, recipe[:3], f"{name}.act") @ fq(hadamard(b, 1, h), 1, recipe[:3], f"{name}.W").t()
 
     @staticmethod
     def backward(ctx, dy):
         a, b = ctx.saved_tensors
         r, n = ctx.r, ctx.n
         dg, wg = ("B6", "B5") if n == "F1" else ("B3", "B2")
-        da = fq(dy, 1, r, f"{dg}.grad") @ fq(b, 0, r, f"{dg}.W^T")
-        db = fq(dy, 0, r, f"{wg}.grad^T").t() @ fq(a, 0, r, f"{wg}.act^T")
+        h = r[3] if len(r) > 3 else 0
+        r = r[:3]
+        H = lambda t, d: hadamard(t, d, h)
+        da = fq(H(dy, 1), 1, r, f"{dg}.grad") @ fq(H(b, 0), 0, r, f"{dg}.W^T")
+        # wgrad reduces over TOKENS: rotate along tokens (NVIDIA's NVFP4 recipe puts its RHT exactly here)
+        db = fq(H(dy, 0), 0, r, f"{wg}.grad^T").t() @ fq(H(a, 0), 0, r, f"{wg}.act^T")
         return da, db, None, None
 
 
@@ -197,6 +228,7 @@ def outliers(name, t):
 
 
 RECIPES = [("bf16", None, 0),
+           ("e4m3", "e8m0", 32, 32), ("e4m3", "e8m0", 32, 128), ("e4m3", "e8m0", 128, 128),
            ("e4m3", "e8m0", 32), ("e4m3", "e8m0", 64), ("e4m3", "e8m0", 128),
            ("e4m3", "fp32", 32), ("e4m3", "fp32", 128), ("e4m3", "bf16", 32),
            ("e4m3", "2L-e5m2", 32), ("e4m3", "2L-e4m3", 32), ("e4m3", "e5m2-only", 32),
@@ -274,7 +306,7 @@ def main():
                        for k_ in keys if out[k_] is not None}
             stats[rc] = {t: tuple(100 * v / max(st[3], 1) for v in st[:3]) for t, st in STATS.items()}
             del out
-        name = lambda rc: rc[0] if rc[1] is None else f"{rc[0]} {rc[1]} {rc[2]}"
+        name = lambda rc: rc[0] if rc[1] is None else f"{rc[0]} {rc[1]} {rc[2]}" + (f" +H{rc[3]}" if len(rc) > 3 else "")
         short = {"fwd G (gate)": "G", "fwd U (up)": "U", "fwd act(G)*U": "act", "fwd O (down out)": "O",
                  "fwd y": "y", "bwd dO": "dO", "bwd d act-out": "d act", "bwd dG": "dG", "bwd dU": "dU",
                  "bwd d normed-x": "d hn", "bwd dx": "dx", "dW gate": "dW g", "dW up": "dW u",
