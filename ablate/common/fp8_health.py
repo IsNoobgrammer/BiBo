@@ -19,6 +19,17 @@ def _mod():
     return _M8
 
 
+def enable(mode):
+    """MXFP8 (W8A8) expert GEMMs, fwd + bwd, on every routed MoE layer (tkf moe_fp8.py; L0 all-active stays
+    bf16). mode 1 = ALL: GEMM inputs + GU, d_inter, eo, dx rows stored fp8 (fastest); 2 = LEAN: GEMM inputs
+    + GU only; 0 = off. Shared by train.py and report_ckpt so a checkpoint is evaluated the way it trained."""
+    importlib.import_module("kernels.sm120.megakernel.moe.block").FP8 = bool(mode)
+    m, a = _mod(), mode == 1
+    m.GU_FP8, m.DI_FP8, m.EO_FP8, m.DX8 = True, a, a, a
+    return (f"MXFP8 experts {'ALL' if a else 'LEAN' if mode else 'OFF'} (GU {m.GU_FP8} d_inter {m.DI_FP8} "
+            f"eo {m.EO_FP8} dx {m.DX8}; e4m3, e8m0 per 32, fp32 accum)")
+
+
 def start():
     _mod().HEALTH = {}
 

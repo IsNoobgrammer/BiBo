@@ -41,6 +41,12 @@ def load_from_result(result_json, device=DEV):
     patchmod.EXPERT_ACT = c.act
     patch_list = [p.strip() for p in c.patches.split(",") if p.strip() and p.strip() != "ce"]
     patchmod.apply(patch_list)
+    # evaluate the experts the way they trained: an fp8 run's checkpoint through the bf16 kernel is a
+    # different model (the in-training val always ran fp8). BIBO_EVAL_FP8=0/1/2 overrides (bf16 / ALL / LEAN).
+    _f8 = int(os.environ.get("BIBO_EVAL_FP8", getattr(c, "moe_fp8", 0) or 0))
+    if _f8 or getattr(c, "moe_fp8", 0):
+        from . import fp8_health
+        print(f"[report_ckpt] {fp8_health.enable(_f8)}", flush=True)
 
     n_total = c.experts or SHARED["num_experts"]
     # Per-layer expert geometry, "L:E:k:w" (--moe_override). Without this an arm that gave layer 0
