@@ -527,6 +527,7 @@ def main():
     ap.add_argument("--ns_coeffs", choices=["ns8", "dsv4", "quintic5", "pe8"], default="ns8")
     ap.add_argument("--ns_backend", choices=["auto", "cublas", "epi", "symepi", "symmul", "gram"], default="auto")
     ap.add_argument("--prefetch", type=int, default=4)  # batches decoded ahead in a worker process; 0 = inline
+    ap.add_argument("--section_profile", type=int, default=-1)  # >=0: time that step by model section (ablate/tools/section_profile.py), then exit
     ap.add_argument("--profile_step", type=int, default=-1)  # >=0: profile that step, sync-audit the next (ablate/tools/step_profile.py), then exit
     ap.add_argument("--attn_kernel", choices=["fused", "flex"], default="fused")  # fused = tkf attn_xsa (qk-norm+rope+attn+xsa, deterministic)
     ap.add_argument("--q_scale", type=float, default=1.0)   # fixed multiplier on q after qk-norm
@@ -1174,6 +1175,11 @@ def main():
             print(f"[optim] step {step}: SWITCHED Muon variant -> {args.switch_variant} "
                   f"(wd {_new.param_groups[0]['weight_decay']:g}, lr {_new.param_groups[0]['lr']:.3e}; "
                   f"state from current weights, momentum fresh; AdamW unchanged)", flush=True)
+        _sp = None
+        if step == args.section_profile:
+            from ablate.tools.section_profile import SectionProfiler
+            _sp = SectionProfiler(model)
+            _sp.mark("step_start")
         for o in opts:
             o.zero_grad(set_to_none=True)
         if _gs_on and step >= _gs_warm:                      # once per STEP, never between micros
@@ -1190,7 +1196,11 @@ def main():
                     loss = _ce(model, ids, use_fused_ce, aux_collector, args.aux_coef,
                                getattr(cfg, "num_experts", 6), cfg.num_experts_per_tok,
                                pad_id=args.pad_id, mtp_w=args.mtp_weight) / args.grad_accum
+                if _sp is not None:
+                    _sp.mark("ce_end")
                 loss.backward()
+                if _sp is not None:
+                    _sp.mark("bwd_end")
             _vote()
             loss_val += _ce.last[0] / args.grad_accum             # MAIN head only (== loss when no MTP)
             if _ce.last[1] is not None:
@@ -1226,8 +1236,16 @@ def main():
                 print(_nc, flush=True); return
         _w0 = (snapshot_matrices(model)                  # log steps only: ~4 B/param copy, freed below
                if (step % args.log_every == 0 or step == total_steps - 1) else None)
+        if _sp is not None:
+            _sp.mark("opt_start")
         for o in opts:
             o.step()
+        if _sp is not None:
+            _sp.mark("step_end")
+            _sp.remove()
+            _sp.report({"fused CE | fwd": ("trunk_end", "ce_end"), "fused CE | bwd": ("ce_end", "trunk_bwd_start"),
+                        "optimizer step": ("opt_start", "step_end")})
+            return
         _upd = update_ratios(model, _w0) if _w0 is not None else {}
         del _w0
         if 0 <= args.nan_check_from <= step:
