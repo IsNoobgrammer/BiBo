@@ -178,7 +178,7 @@ def _router_corr(model):
     return sum(vals) / len(vals) if vals else 0.0
 
 
-def _save_hf_ckpt(model, tokenizer, out_dir):
+def _save_hf_ckpt(model, tokenizer, out_dir, args=None):
     """Write a reload-ready bf16 HF checkpoint (config.json + safetensors + tokenizer) to out_dir. Runs on
     the MAIN thread between steps (fast). Casts only the big matrices (ndim>=2: linears, embeddings, expert
     stacks) to bf16 in a fresh state-dict COPY — the live fp32 master weights are untouched (casting them in
@@ -203,6 +203,9 @@ def _save_hf_ckpt(model, tokenizer, out_dir):
         if orig is not None:
             model.model = compiled
     tokenizer.save_pretrained(out_dir)
+    if args is not None:    # the full flag set, so interp tools can rebuild the arm (patches, act, fp8) from Hub
+        with open(os.path.join(out_dir, "train_args.json"), "w") as f:
+            json.dump(vars(args), f, indent=1, default=str)
     return out_dir
 
 
@@ -1555,7 +1558,7 @@ def main():
                         "tokens": toks, **_interp(rt), **val_flat}), step=step)
         if args.ckpt_every and step > 0 and step % args.ckpt_every == 0:
             if hf_api is not None:
-                _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_step{step}"))
+                _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_step{step}"), args)
                 hf_futures.append(_push_hf_async(hf_api, args.hf_repo, _dir, f"step{step}",
                                                  f"{run_name} step{step}"))
             else:
@@ -1582,7 +1585,7 @@ def main():
         except Exception as _e:
             print(f"[{run_name}] final report FAILED: {type(_e).__name__}: {_e}", flush=True)
     if hf_api is not None:                                  # final -> repo root so `from_pretrained(repo)` just works
-        _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_final"))
+        _dir = _save_hf_ckpt(model, hf_tok, os.path.join(out_dir, f"{run_name}_final"), args)
         hf_futures.append(_push_hf_async(hf_api, args.hf_repo, _dir, "final", f"{run_name} final"))
     loss_val = float(loss_val)
     _loss_hist = deque((float(x) for x in _loss_hist), maxlen=LOSS_WINDOW)
