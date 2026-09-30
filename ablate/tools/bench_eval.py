@@ -35,12 +35,14 @@ def _hs_pre(t):
     return t.replace("  ", " ")
 
 
-def tasks(limit):
+def tasks(limit, only=None):
     from datasets import load_dataset
     L = (lambda ds: ds.select(range(min(limit, len(ds))))) if limit else (lambda ds: ds)
     out = {}
 
     def add(name, fn):
+        if only and name not in only:
+            return
         try:
             out[name] = fn()
         except Exception as e:                       # a dataset that will not load is reported, not fatal
@@ -93,7 +95,7 @@ def tasks(limit):
     def belebele(lang):
         def f():
             r = []
-            for d in L(load_dataset("facebook/belebele", split=lang)):
+            for d in L(load_dataset("facebook/belebele", lang, split="test")):
                 ctx = (f"P: {d['flores_passage']}\nQ: {d['question'].strip()}\nA: {d['mc_answer1']}\n"
                        f"B: {d['mc_answer2']}\nC: {d['mc_answer3']}\nD: {d['mc_answer4']}\nAnswer:")
                 r.append(("mc", ctx, [" A", " B", " C", " D"], int(d["correct_answer_num"]) - 1))
@@ -226,6 +228,7 @@ def main():
     ap.add_argument("--samples_only", action="store_true")
     ap.add_argument("--no_samples", action="store_true")
     ap.add_argument("--shots", default="0,5")
+    ap.add_argument("--tasks", default="")          # comma list; empty = all
     ap.add_argument("--json", default=None)
     a = ap.parse_args()
     from transformers import AutoTokenizer
@@ -239,7 +242,7 @@ def main():
         return
     sc = Scorer(model, tok, bs=a.bs)
     out = {}
-    T = tasks(a.limit)
+    T = tasks(a.limit, set(filter(None, a.tasks.split(","))))
     for k in (int(v) for v in a.shots.split(",")):
         print(f"\n==== {k}-shot: {a.repo}/{a.sub}\n{'task':16s} {'n':>6s} {'acc':>7s} {'acc_norm':>9s}")
         for name, items in T.items():
