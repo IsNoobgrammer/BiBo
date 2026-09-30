@@ -278,6 +278,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="")            # a BiBo --hf_repo checkpoint repo
     ap.add_argument("--hf_model", default="")        # OR any transformers causal LM id (reference models)
+    ap.add_argument("--dtype", default="bfloat16")   # reference models: fp16-trained ones (Pythia) may need float32
     ap.add_argument("--trust_remote_code", action="store_true")   # custom-code Hub models (read the code first)
     ap.add_argument("--tokens", type=float, default=0)  # reference models: pretraining tokens, for the board
     ap.add_argument("--sub", default="")
@@ -293,7 +294,7 @@ def main():
     if a.hf_model:
         from transformers import AutoModelForCausalLM
         rc = a.trust_remote_code
-        model = AutoModelForCausalLM.from_pretrained(a.hf_model, torch_dtype=torch.bfloat16,
+        model = AutoModelForCausalLM.from_pretrained(a.hf_model, torch_dtype=getattr(torch, a.dtype),
                                                      trust_remote_code=rc).to(DEV).eval()
         tok = AutoTokenizer.from_pretrained(a.hf_model, trust_remote_code=rc)
         a.no_samples = True
@@ -315,7 +316,7 @@ def main():
             acc, accn, n = sc.run(items, shots=k)
             out[f"{name}_{k}shot"] = {"acc": acc, "acc_norm": accn, "n": n}
             print(f"{name:16s} {n:6d} {acc:7.2f} {accn:9.2f}", flush=True)
-    name = f"{a.hf_model.split('/')[-1]}__hf" if a.hf_model else f"{a.repo.split('/')[-1]}__{a.sub or 'final'}"
+    name = (f"{a.hf_model.split('/')[-1]}__hf" + ("" if a.dtype == "bfloat16" else f"_{a.dtype}")) if a.hf_model else f"{a.repo.split('/')[-1]}__{a.sub or 'final'}"
     path = a.json or os.path.join(os.path.dirname(__file__), "results", f"{name}.json")
     old = json.load(open(path)) if os.path.exists(path) else {}
     if a.hf_model:
