@@ -278,6 +278,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="")            # a BiBo --hf_repo checkpoint repo
     ap.add_argument("--hf_model", default="")        # OR any transformers causal LM id (reference models)
+    ap.add_argument("--trust_remote_code", action="store_true")   # custom-code Hub models (read the code first)
     ap.add_argument("--tokens", type=float, default=0)  # reference models: pretraining tokens, for the board
     ap.add_argument("--sub", default="")
     ap.add_argument("--limit", type=int, default=0)
@@ -291,8 +292,10 @@ def main():
     from transformers import AutoTokenizer
     if a.hf_model:
         from transformers import AutoModelForCausalLM
-        model = AutoModelForCausalLM.from_pretrained(a.hf_model, torch_dtype=torch.bfloat16).to(DEV).eval()
-        tok = AutoTokenizer.from_pretrained(a.hf_model)
+        rc = a.trust_remote_code
+        model = AutoModelForCausalLM.from_pretrained(a.hf_model, torch_dtype=torch.bfloat16,
+                                                     trust_remote_code=rc).to(DEV).eval()
+        tok = AutoTokenizer.from_pretrained(a.hf_model, trust_remote_code=rc)
         a.no_samples = True
     else:
         model, cfg = load_from_hub(a.repo, a.sub)
