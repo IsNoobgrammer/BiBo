@@ -11,8 +11,10 @@ import glob
 import json
 import os
 
-METRIC = {"hellaswag": "acc_norm", "arc_easy": "acc", "piqa": "acc_norm", "winogrande": "acc",
-          "lambada": "acc", "belebele_eng": "acc", "xstorycloze_hi": "acc_norm", "belebele_hin": "acc"}
+METRIC = {"hellaswag": "acc_norm", "arc_easy": "acc", "arc_challenge": "acc_norm", "piqa": "acc_norm",
+          "winogrande": "acc", "lambada": "acc", "belebele_eng": "acc",
+          "xstorycloze_hi": "acc_norm", "indiccopa_hi": "acc", "xnli_hi": "acc", "arc_challenge_hi": "acc_norm",
+          "belebele_hin": "acc", "mmlu_hi": "acc"}
 HERE = os.path.dirname(__file__)
 
 

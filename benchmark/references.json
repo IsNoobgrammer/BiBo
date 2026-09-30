@@ -1,13 +1,87 @@
 {
  "_note": "APPROXIMATE published lm-eval-harness 0-shot scores, quoted from memory of the model papers / Open LLM tables, NOT rerun through benchmark/eval.py. Replace with a rerun (python -m benchmark.eval on the HF model) before citing a gap under ~2 points.",
- "gpt2-small (124M, WebText)": {"tokens": null, "scores": {
-   "hellaswag_0shot": {"acc_norm": 31.1}, "arc_easy_0shot": {"acc": 43.8}, "piqa_0shot": {"acc_norm": 62.9},
-   "winogrande_0shot": {"acc": 51.6}, "lambada_0shot": {"acc": 32.6}}},
- "pythia-160m (300B tok)": {"tokens": 300e9, "scores": {
-   "hellaswag_0shot": {"acc_norm": 30.3}, "arc_easy_0shot": {"acc": 43.8}, "piqa_0shot": {"acc_norm": 62.4},
-   "winogrande_0shot": {"acc": 51.3}, "lambada_0shot": {"acc": 32.8}}},
- "chance": {"tokens": null, "scores": {
-   "hellaswag_0shot": {"acc_norm": 25}, "arc_easy_0shot": {"acc": 25}, "piqa_0shot": {"acc_norm": 50},
-   "winogrande_0shot": {"acc": 50}, "lambada_0shot": {"acc": 0}, "xstorycloze_hi_0shot": {"acc_norm": 50},
-   "belebele_eng_0shot": {"acc": 25}, "belebele_hin_0shot": {"acc": 25}}}
+ "gpt2-small (124M, WebText)": {
+  "tokens": null,
+  "scores": {
+   "hellaswag_0shot": {
+    "acc_norm": 31.1
+   },
+   "arc_easy_0shot": {
+    "acc": 43.8
+   },
+   "piqa_0shot": {
+    "acc_norm": 62.9
+   },
+   "winogrande_0shot": {
+    "acc": 51.6
+   },
+   "lambada_0shot": {
+    "acc": 32.6
+   }
+  }
+ },
+ "pythia-160m (300B tok)": {
+  "tokens": 300000000000.0,
+  "scores": {
+   "hellaswag_0shot": {
+    "acc_norm": 30.3
+   },
+   "arc_easy_0shot": {
+    "acc": 43.8
+   },
+   "piqa_0shot": {
+    "acc_norm": 62.4
+   },
+   "winogrande_0shot": {
+    "acc": 51.3
+   },
+   "lambada_0shot": {
+    "acc": 32.8
+   }
+  }
+ },
+ "chance": {
+  "tokens": null,
+  "scores": {
+   "hellaswag_0shot": {
+    "acc_norm": 25
+   },
+   "arc_easy_0shot": {
+    "acc": 25
+   },
+   "piqa_0shot": {
+    "acc_norm": 50
+   },
+   "winogrande_0shot": {
+    "acc": 50
+   },
+   "lambada_0shot": {
+    "acc": 0
+   },
+   "xstorycloze_hi_0shot": {
+    "acc_norm": 50
+   },
+   "belebele_eng_0shot": {
+    "acc": 25
+   },
+   "belebele_hin_0shot": {
+    "acc": 25
+   },
+   "arc_challenge_0shot": {
+    "acc_norm": 25
+   },
+   "indiccopa_hi_0shot": {
+    "acc": 50
+   },
+   "xnli_hi_0shot": {
+    "acc": 33.3
+   },
+   "arc_challenge_hi_0shot": {
+    "acc_norm": 25
+   },
+   "mmlu_hi_0shot": {
+    "acc": 25
+   }
+  }
+ }
 }

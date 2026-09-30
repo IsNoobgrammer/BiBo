@@ -107,21 +107,69 @@ def tasks(limit, only=None):
             return r
         return f
 
+    def arc_challenge():
+        r = []
+        for d in L(load_dataset("allenai/ai2_arc", "ARC-Challenge", split="test")):
+            labs = d["choices"]["label"]
+            r.append(("mc", f"Question: {d['question']}\nAnswer:", [" " + t for t in d["choices"]["text"]],
+                      labs.index(d["answerKey"])))
+        return r
+
+    def xnli_hi():
+        # lm-eval xnli_hi: "<premise>, सही? हाँ|इसलिए|नहीं, <hypothesis>", whole sentence scored
+        r, words = [], ["हाँ", "इसलिए", "नहीं"]
+        for d in L(load_dataset("facebook/xnli", "hi", split="test")):
+            r.append(("mc", "", [f"{d['premise']}, सही? {w}, {d['hypothesis']}" for w in words], int(d["label"])))
+        return r
+
+    def mmlu_hi():
+        # OpenAI MMMLU (professional human translation of MMLU test), Hindi
+        r = []
+        for d in L(load_dataset("openai/MMMLU", "HI_IN", split="test")):
+            ctx = f"{d['Question'].strip()}\nA. {d['A']}\nB. {d['B']}\nC. {d['C']}\nD. {d['D']}\nउत्तर:"
+            r.append(("mc", ctx, [" A", " B", " C", " D"], "ABCD".index(d["Answer"])))
+        return r
+
+    def indiccopa_hi():
+        r = []
+        for d in L(load_dataset("ai4bharat/IndicCOPA", "translation-hi", split="test")):
+            conn = " क्योंकि" if d["question"] == "cause" else " इसलिए"
+            ctx = d["premise"].strip().rstrip("।.") + conn
+            r.append(("mc", ctx, [" " + d["choice1"], " " + d["choice2"]], int(d["label"])))
+        return r
+
+    def arc_challenge_hi():
+        r = []
+        for d in L(load_dataset("sarvamai/arc-challenge-indic", "hi", split="test")):
+            labs = d["choices"]["label"]
+            r.append(("mc", f"प्रश्न: {d['question']}\nउत्तर:", [" " + t for t in d["choices"]["text"]],
+                      labs.index(d["answerKey"])))
+        return r
+
     add("hellaswag", hellaswag)
     add("arc_easy", arc_easy)
     add("piqa", piqa)
     add("winogrande", winogrande)
     add("lambada", lambada)
     add("belebele_eng", belebele("eng_Latn"))
+    add("arc_challenge", arc_challenge)
     add("xstorycloze_hi", xstory_hi)
     add("belebele_hin", belebele("hin_Deva"))
+    add("xnli_hi", xnli_hi)
+    add("indiccopa_hi", indiccopa_hi)
+    add("arc_challenge_hi", arc_challenge_hi)
+    add("mmlu_hi", mmlu_hi)
     return out
 
 
 class Scorer:
-    def __init__(self, model, tok, max_len=1024, bs=32):
-        self.m, self.tok, self.max_len, self.bs = model, tok, max_len, bs
-        self.W = model.lm_head.weight
+    def __init__(self, model, tok, max_len=1024, bs=32, hf=False):
+        """hf=False: a BiBo checkpoint (trunk hidden @ tied lm_head, documents start with <|im_end|>).
+        hf=True: any transformers causal LM; the prefix is its BOS (else EOS) -- lm-eval's convention."""
+        self.m, self.tok, self.max_len, self.bs, self.hf = model, tok, max_len, bs, hf
+        self.W = None if hf else model.lm_head.weight
+        b = tok.bos_token_id if tok.bos_token_id is not None else tok.eos_token_id
+        self.prefix = ([b] if b is not None else []) if hf else [SEP]
 
     def enc(self, s):
         return self.tok.encode(s, add_special_tokens=False)
@@ -131,7 +179,7 @@ class Scorer:
         """[(context str, continuation str)] -> [(sum logp, all-greedy bool, n bytes)]."""
         items = []
         for c, x in pairs:
-            ci, xi = [SEP] + self.enc(c), self.enc(x)
+            ci, xi = self.prefix + self.enc(c), self.enc(x)
             ids = (ci + xi)[-self.max_len:]
             items.append((ids, len(xi), len(x.encode("utf-8"))))
         order = sorted(range(len(items)), key=lambda i: -len(items[i][0]))
@@ -145,11 +193,13 @@ class Scorer:
                 batch[r, :len(items[i][0])] = torch.tensor(items[i][0])
             batch = batch.to(DEV)
             with AMP:
-                h = self.m.model(input_ids=batch, use_cache=False).last_hidden_state
+                h = (self.m(input_ids=batch).logits if self.hf else
+                     self.m.model(input_ids=batch, use_cache=False).last_hidden_state)
             for r, i in enumerate(idx):
                 ids, n, nb = items[i]
                 s = len(ids) - n
-                lg = F.log_softmax(h[r, s - 1:len(ids) - 1].float() @ self.W.float().t(), -1)
+                z = h[r, s - 1:len(ids) - 1].float()
+                lg = F.log_softmax(z if self.hf else z @ self.W.float().t(), -1)
                 tgt = batch[r, s:len(ids)]
                 lp = lg.gather(-1, tgt[:, None]).sum().item()
                 res[i] = (lp, bool((lg.argmax(-1) == tgt).all()), nb)
@@ -226,7 +276,9 @@ def samples(model, tok, n_new=80, temp=0.8, topk=50, seed=0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", required=True)
+    ap.add_argument("--repo", default="")            # a BiBo --hf_repo checkpoint repo
+    ap.add_argument("--hf_model", default="")        # OR any transformers causal LM id (reference models)
+    ap.add_argument("--tokens", type=float, default=0)  # reference models: pretraining tokens, for the board
     ap.add_argument("--sub", default="")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--bs", type=int, default=32)
@@ -237,15 +289,21 @@ def main():
     ap.add_argument("--json", default=None)          # default benchmark/results/<repo>__<sub>.json
     a = ap.parse_args()
     from transformers import AutoTokenizer
-    model, cfg = load_from_hub(a.repo, a.sub)
-    model.eval()
-    tok = AutoTokenizer.from_pretrained("fhai50032/QTK-81K")
+    if a.hf_model:
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(a.hf_model, torch_dtype=torch.bfloat16).to(DEV).eval()
+        tok = AutoTokenizer.from_pretrained(a.hf_model)
+        a.no_samples = True
+    else:
+        model, cfg = load_from_hub(a.repo, a.sub)
+        model.eval()
+        tok = AutoTokenizer.from_pretrained("fhai50032/QTK-81K")
     if not a.no_samples:
         print(f"\n==== samples: {a.repo}/{a.sub}")
         samples(model, tok)
     if a.samples_only:
         return
-    sc = Scorer(model, tok, bs=a.bs)
+    sc = Scorer(model, tok, bs=a.bs, hf=bool(a.hf_model))
     out = {}
     T = tasks(a.limit, set(filter(None, a.tasks.split(","))))
     for k in (int(v) for v in a.shots.split(",")):
@@ -254,9 +312,15 @@ def main():
             acc, accn, n = sc.run(items, shots=k)
             out[f"{name}_{k}shot"] = {"acc": acc, "acc_norm": accn, "n": n}
             print(f"{name:16s} {n:6d} {acc:7.2f} {accn:9.2f}", flush=True)
-    path = a.json or os.path.join(os.path.dirname(__file__), "results",
-                                  f"{a.repo.split('/')[-1]}__{a.sub or 'final'}.json")
+    name = f"{a.hf_model.split('/')[-1]}__hf" if a.hf_model else f"{a.repo.split('/')[-1]}__{a.sub or 'final'}"
+    path = a.json or os.path.join(os.path.dirname(__file__), "results", f"{name}.json")
     old = json.load(open(path)) if os.path.exists(path) else {}
+    if a.hf_model:
+        meta = {"repo": a.hf_model, "sub": "hf", "run_tag": a.hf_model, "tokens": a.tokens or None,
+                "params": sum(p.numel() for p in model.parameters())}
+        json.dump({"meta": meta, "scores": {**old.get("scores", {}), **out}}, open(path, "w"), indent=1)
+        print(f"wrote {path}")
+        return
     step = int(a.sub[4:]) if a.sub.startswith("step") else int(cfg.max_steps)
     tok_step = cfg.batch * cfg.grad_accum * cfg.seq_len
     meta = {"repo": a.repo, "sub": a.sub or "final", "run_tag": cfg.run_tag, "step": step,
