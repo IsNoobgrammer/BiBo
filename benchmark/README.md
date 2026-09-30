@@ -1,8 +1,8 @@
 # benchmark
 
 Downstream benchmarks for big runs. A run that passes `--hf_repo <repo> --ckpt_every N` to
-`ablate.common.train` pushes `step<N>/` folders (weights + `train_args.json`) and a final checkpoint at the
-repo root; everything here loads from those, so any checkpoint can be benchmarked long after the box died.
+`ablate.common.train` pushes `step<N>/` folders (weights + `train_args.json`) and a `final/` folder (use `--sub final`);
+everything here loads from those, so any checkpoint can be benchmarked long after the box died.
 
     # on the box (HF_TOKEN in the env for a private repo); ~10 min for the full set at 150M active
     python -m benchmark.eval --repo fhai50032/bibo-base-1b-6k-s23 --sub step4000
