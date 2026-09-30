@@ -49,7 +49,7 @@
   },
   "xstorycloze_hi_0shot": {
    "acc": 52.8788881535407,
-   "acc_norm": 55.6585043017869,
+   "acc_norm": 55.7246856386499,
    "n": 1511
   },
   "belebele_hin_0shot": {
@@ -109,7 +109,7 @@
   },
   "xstorycloze_hi_5shot": {
    "acc": 52.08471211118464,
-   "acc_norm": 54.86432825943084,
+   "acc_norm": 54.731965585704835,
    "n": 1511
   },
   "belebele_hin_5shot": {
