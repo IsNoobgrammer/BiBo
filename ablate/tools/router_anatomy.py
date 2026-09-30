@@ -32,6 +32,7 @@ def probe(model, hold):
 
     def mk(i, layer):
         g, ln = layer.mlp.gate, layer.post_attention_layernorm
+        @torch.autocast("cuda", enabled=False)     # the forward runs under bf16 autocast; the probe must not
         def hook(mod, args):
             x = args[0].reshape(-1, args[0].shape[-1]).float()
             z = F.rms_norm(x, (x.shape[-1],), ln.weight.float(), eps=ln.variance_epsilon) @ g.gate_proj.weight.float().t()
