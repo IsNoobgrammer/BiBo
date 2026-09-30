@@ -112,6 +112,32 @@ def load_from_result(result_json, device=DEV):
     return model, c
 
 
+
+def load_from_hub(repo, subfolder="", device=DEV, cache_dir=None):
+    """(model, cfg) from a train.py --hf_repo checkpoint: <repo>/<subfolder>/ holds model.safetensors +
+    train_args.json (the full flag set). Converts to the .pt + result.json pair load_from_result expects,
+    so the rebuild (patches, act, fp8, geometry) goes through exactly one code path. save_pretrained drops
+    the tied lm_head.weight; it is restored from the embedding so strict loading still means something."""
+    from huggingface_hub import snapshot_download
+    from safetensors.torch import load_file
+    pat = [f"{subfolder}/*"] if subfolder else None
+    root = snapshot_download(repo, allow_patterns=pat, cache_dir=cache_dir)
+    d = os.path.join(root, subfolder) if subfolder else root
+    with open(os.path.join(d, "train_args.json")) as f:
+        args = json.load(f)
+    pt = os.path.join(d, "state_dict.pt")
+    if not os.path.exists(pt):
+        sd = {}
+        for fn in sorted(os.listdir(d)):
+            if fn.endswith(".safetensors"):
+                sd.update(load_file(os.path.join(d, fn)))
+        sd.setdefault("lm_head.weight", sd["model.embed_tokens.weight"])
+        torch.save(sd, pt)
+    rj = os.path.join(d, "hub_result.json")
+    with open(rj, "w") as f:
+        json.dump({"config": args, "ckpt": pt}, f)
+    return load_from_result(rj, device=device)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("result_json")
