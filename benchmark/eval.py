@@ -1,7 +1,11 @@
 """Zero- and few-shot benchmarks + text samples for a --hf_repo checkpoint (English and Hindi).
 
-    python -m ablate.tools.bench_eval --repo fhai50032/bibo-base-1b-6k-s23 --sub step4000 [--limit N]
-    python -m ablate.tools.bench_eval --repo ... --sub step3000 --samples_only
+    python -m benchmark.eval --repo fhai50032/bibo-base-1b-6k-s23 --sub step4000 [--limit N] [--tasks a,b]
+    python -m benchmark.eval --repo ... --sub step3000 --samples_only
+    python -m benchmark.board                     # every saved result next to the reference models
+
+Results MERGE into benchmark/results/<repo name>__<sub or final>.json (a later --tasks run adds its tasks
+to the same file), with the run's geometry and token count, so benchmark/board.py can rank everything.
 
 Scoring follows lm-evaluation-harness zero-shot conventions so the numbers sit next to published tables:
 multiple choice = sum log p(continuation | context); `acc` picks the max raw log-likelihood, `acc_norm`
@@ -16,6 +20,7 @@ Chance: 25 / 25 / 50 / 50 / 0 / 25 | 50 / 25.
 from ablate.common import _paths  # noqa: F401
 import argparse
 import json
+import os
 import re
 
 import torch
@@ -229,7 +234,7 @@ def main():
     ap.add_argument("--no_samples", action="store_true")
     ap.add_argument("--shots", default="0,5")
     ap.add_argument("--tasks", default="")          # comma list; empty = all
-    ap.add_argument("--json", default=None)
+    ap.add_argument("--json", default=None)          # default benchmark/results/<repo>__<sub>.json
     a = ap.parse_args()
     from transformers import AutoTokenizer
     model, cfg = load_from_hub(a.repo, a.sub)
@@ -249,8 +254,16 @@ def main():
             acc, accn, n = sc.run(items, shots=k)
             out[f"{name}_{k}shot"] = {"acc": acc, "acc_norm": accn, "n": n}
             print(f"{name:16s} {n:6d} {acc:7.2f} {accn:9.2f}", flush=True)
-    if a.json:
-        json.dump(out, open(a.json, "w"), indent=1)
+    path = a.json or os.path.join(os.path.dirname(__file__), "results",
+                                  f"{a.repo.split('/')[-1]}__{a.sub or 'final'}.json")
+    old = json.load(open(path)) if os.path.exists(path) else {}
+    step = int(a.sub[4:]) if a.sub.startswith("step") else int(cfg.max_steps)
+    tok_step = cfg.batch * cfg.grad_accum * cfg.seq_len
+    meta = {"repo": a.repo, "sub": a.sub or "final", "run_tag": cfg.run_tag, "step": step,
+            "tokens": step * tok_step, "hidden": getattr(cfg, "hidden", 0) or 512, "experts": cfg.experts,
+            "top_k": cfg.top_k, "moe_inter": cfg.moe_inter, "moe_fp8": getattr(cfg, "moe_fp8", 0)}
+    json.dump({"meta": meta, "scores": {**old.get("scores", {}), **out}}, open(path, "w"), indent=1)
+    print(f"wrote {path}")
 
 
 if __name__ == "__main__":
