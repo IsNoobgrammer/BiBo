@@ -172,14 +172,29 @@ class Scorer:
         self.prefix = ([b] if b is not None else []) if hf else [SEP]
 
     def enc(self, s):
-        return self.tok.encode(s, add_special_tokens=False)
+        ids = self.tok.encode(s, add_special_tokens=False)
+        # some tokenizers (Nandi, SentencePiece Llama-likes) add BOS even with add_special_tokens=False
+        return ids[1:] if ids and self.hf and ids[0] == self.tok.bos_token_id else ids
+
+    def pair(self, c, x):
+        """lm-eval's _encode_pair: trailing context spaces move to the continuation, then encode the JOINT
+        string and split at the context length -- encoding the continuation alone breaks tokenizers that add
+        a prefix space / BOS per call (Nandi scored LAMBADA 0.00 that way)."""
+        n = len(c) - len(c.rstrip(" "))
+        if n:
+            c, x = c[:-n], c[-n:] + x
+        ci, whole = self.enc(c), self.enc(c + x)
+        if whole[:len(ci)] != ci:                    # context tokens changed at the join: fall back
+            return ci, self.enc(x)
+        return ci, whole[len(ci):]
 
     @torch.no_grad()
     def loglik(self, pairs):
         """[(context str, continuation str)] -> [(sum logp, all-greedy bool, n bytes)]."""
         items = []
         for c, x in pairs:
-            ci, xi = self.prefix + self.enc(c), self.enc(x)
+            ci, xi = self.pair(c, x)
+            ci = self.prefix + ci
             ids = (ci + xi)[-self.max_len:]
             items.append((ids, len(xi), len(x.encode("utf-8"))))
         order = sorted(range(len(items)), key=lambda i: -len(items[i][0]))
@@ -192,9 +207,11 @@ class Scorer:
             for r, i in enumerate(idx):
                 batch[r, :len(items[i][0])] = torch.tensor(items[i][0])
             batch = batch.to(DEV)
-            with AMP:
-                h = (self.m(input_ids=batch).logits if self.hf else
-                     self.m.model(input_ids=batch, use_cache=False).last_hidden_state)
+            if self.hf:                               # reference models run in their own --dtype, no autocast
+                h = self.m(input_ids=batch).logits    # (Pythia is fp16-trained; bf16 autocast degraded it)
+            else:
+                with AMP:
+                    h = self.m.model(input_ids=batch, use_cache=False).last_hidden_state
             for r, i in enumerate(idx):
                 ids, n, nb = items[i]
                 s = len(ids) - n
