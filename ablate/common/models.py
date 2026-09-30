@@ -25,7 +25,8 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
               num_pos_identity_experts=None, num_neg_identity_experts=None,
               attn_res_carry_per_dim=False, attn_res_carry_gate="none",
               attn_res_emb_per_dim=False,
-              bf16_residual_stream=False, bf16_moe_out=False):
+              bf16_residual_stream=False, bf16_moe_out=False,
+              hidden_size=None, num_heads=None, kv_heads=None):
     """arm in {'qwen','bibo_min'} -> (model, config). Params in `dtype` (fp32 master; bf16 via autocast).
     Balancing, each native: BiBo router-bias updates; Qwen Switch aux loss (aux_coef).
     PARAM MATCH: Qwen's num_experts is set to BiBo's GLU count, which is num_experts MINUS the
@@ -37,6 +38,8 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
         raise ValueError(f"{n_total} routed experts minus {special_pairs} special pair(s) leaves "
                          f"{n_glu} GLU experts; raise --experts or lower --special_pairs")
     if arm == "qwen":
+        if hidden_size or num_heads or kv_heads:
+            raise NotImplementedError("--hidden/--heads/--kv_heads are bibo_min only")
         from baseline.qwen3moe.modeling import Qwen3MoeForCausalLM
         cfg = make_qwen_config(eff, aux_coef=aux_coef, num_experts=n_glu,
                                mlp_only_layers=mlp_only_layers)
@@ -81,7 +84,8 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
                                    attn_res_carry_gate=attn_res_carry_gate,
                                    attn_res_emb_per_dim=attn_res_emb_per_dim,
                                    bf16_residual_stream=bf16_residual_stream,
-                                   bf16_moe_out=bf16_moe_out)
+                                   bf16_moe_out=bf16_moe_out,
+                                   hidden_size=hidden_size, num_heads=num_heads, kv_heads=kv_heads)
         model = BiBoForCausalLM(cfg)
         if eff.startswith("flash"):
             patches.patch_bibo_flash()

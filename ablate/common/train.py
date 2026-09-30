@@ -512,6 +512,9 @@ def main():
     # survives. Pairs with --norm_topk_prob 0: let the router weights run unbounded, then pin the
     # branch magnitude here instead. Tag _mon-<v>
     ap.add_argument("--top_k", type=int, default=0)                # 0 = SHARED (2). Raising it WITHOUT --moe_inter multiplies active expert FLOPs by the same factor. Tag _k<n>
+    ap.add_argument("--hidden", type=int, default=0)               # 0 = SHARED (512). Tag _h<n>
+    ap.add_argument("--heads", type=int, default=0)                # 0 = SHARED (4); head_dim = hidden // heads. Tag _nh<n>
+    ap.add_argument("--kv_heads", type=int, default=0)             # 0 = SHARED (2). Tag _kv<n>
     ap.add_argument("--moe_inter", type=int, default=0)            # 0 = SHARED (768). Halve it when doubling top_k to hold compute constant. Tag _mi<n>
     ap.add_argument("--bias_update_threshold", type=int, default=10240)           # tokens between bias updates (if bias)
     ap.add_argument("--bias_update_factor", type=float, default=-1.0)             # <0 = config default, which is MODE-DEPENDENT (prop 0.4, sign 0.001) because u means different things; 0 = balancing off
@@ -812,6 +815,7 @@ def main():
                            pos_identity_expert=args.pos_identity_expert,
                            neg_identity_expert=args.neg_identity_expert,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
+                           hidden_size=(args.hidden or None), num_heads=(args.heads or None), kv_heads=(args.kv_heads or None),
                            num_shared_experts=args.n_shared)
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
     if args.use_xsa:
@@ -1000,6 +1004,8 @@ def main():
                 + (f"_u{args.bias_update_factor:g}" if args.bias_update_factor >= 0 else "")
                 + (f"_k{args.top_k}" if args.top_k else "")
                 + (f"_sh{args.n_shared}" if args.n_shared else "")
+                + (f"_h{args.hidden}" if args.hidden else "") + (f"_nh{args.heads}" if args.heads else "")
+                + (f"_kv{args.kv_heads}" if args.kv_heads else "")
                 + (f"_mi{args.moe_inter}" if args.moe_inter else "")
                 + (f"_{args.muon_variant}" if args.muon_variant != "aurora" else "")
                 + (f"_sc{args.muon_scale}" if args.muon_scale != "adam" else "")

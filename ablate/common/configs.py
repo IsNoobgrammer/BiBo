@@ -153,7 +153,8 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          attn_res_score="softmax", attn_res_topk=0,
                          attn_res_carry_per_dim=False,
                          attn_res_carry_gate="none", attn_res_emb_per_dim=False,
-                         bf16_residual_stream=False, bf16_moe_out=False):
+                         bf16_residual_stream=False, bf16_moe_out=False,
+                         hidden_size=None, num_heads=None, kv_heads=None):
     # attn_res: "off" = stable src model. Anything else routes to exp/ (Kimi K3 Attention
     # Residuals): "control" builds exp's model with residuals DISABLED, an int is the block size
     # in decoder layers (1 = per-layer / Full AttnRes, 3 = one block per [G,S,S]).
@@ -199,10 +200,12 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
         **extra,
         bias_update_threshold=bias_update_threshold,
         bias_update_factor=bias_update_factor,      # None -> BiBoConfig default (0.4, proportional)
-        vocab_size=SHARED["vocab_size"], hidden_size=SHARED["hidden_size"],
+        # hidden / heads / kv heads: None = SHARED (512 / 4 / 2); head_dim = hidden // heads
+        vocab_size=SHARED["vocab_size"], hidden_size=(hidden_size or SHARED["hidden_size"]),
         intermediate_size=(intermediate_size or SHARED["intermediate_size"]),
         num_hidden_layers=SHARED["num_hidden_layers"],
-        num_attention_heads=SHARED["num_attention_heads"], num_key_value_heads=SHARED["num_key_value_heads"],
+        num_attention_heads=(num_heads or SHARED["num_attention_heads"]),
+        num_key_value_heads=(kv_heads or SHARED["num_key_value_heads"]),
         # Raising top_k WITHOUT shrinking moe_intermediate_size multiplies active expert FLOPs by the
         # same factor -- pass both to hold compute constant.
         moe_intermediate_size=(moe_intermediate_size or SHARED["moe_intermediate_size"]),
