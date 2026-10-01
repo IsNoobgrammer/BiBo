@@ -22,6 +22,13 @@ import torch
 # less than rho x the top half are pushed, so the router keeps its ranking (a temperature flattens all
 # tokens alike). Collected per routed layer on the fused path while grad is on; train.py sums + clears it.
 RANK_AUX = {"rho": 0.0, "acc": []}
+# Routing-VARIANCE loss (arxiv 2505.22323 L_v, train.py --route_var_coef). The paper's s_ij sums to 1 over experts; ours
+# are sigmoid scores, so p_ij = s_ij / sum_j s_ij over ALL E experts (unbiased scores, router temperature applied),
+# rescaled q = E * p (uniform routing = 1 everywhere, so the value does not shrink with E). Per expert, the variance of q
+# over this micro-batch's tokens; L_v = -mean_j Var_i(q_ij): MAXIMISING it makes each expert's scores discriminative
+# (high for its tokens, low for the rest). The opposite direction of RANK_AUX. hn is recomputed from the DETACHED
+# residual, so the gradient reaches ONLY the router weight (the fused kernel is untouched). Load stays with the bias.
+ROUTE_VAR = {"coef": 0.0, "acc": []}
 
 try:
     _nc = torch.compiler.disable
@@ -284,6 +291,15 @@ def patch_megakernel():
             ws = wgt.float().reshape(-1, k).sort(-1, descending=True).values      # differentiable
             half = k // 2                      # NOT `h`: h is the hidden size used by out.view(b, s, h) below
             RANK_AUX["acc"].append(torch.relu(RANK_AUX["rho"] * ws[:, :half].sum(-1) - ws[:, half:].sum(-1)).mean())
+        if ROUTE_VAR["coef"] > 0 and torch.is_grad_enabled() and k < moe.gate.num_routed_experts:
+            ln = self.post_attention_layernorm
+            with torch.autocast("cuda", enabled=False):
+                hn16 = torch.nn.functional.rms_norm(flat.detach().float(), (h,), ln.weight.detach().float(),
+                                                    eps=ln.variance_epsilon).to(torch.bfloat16)
+                z = (hn16 @ moe.gate.gate_proj.weight.to(torch.bfloat16).t()).float() / getattr(moe.gate, "temperature", 1.0)
+                sc = torch.sigmoid(z)
+                q = sc * (sc.shape[-1] / sc.sum(-1, keepdim=True))
+                ROUTE_VAR["acc"].append(-q.var(0, unbiased=False).mean())
         if gap is not None:
             moe.gate.boundary_gap = gap.mean()
         for _h in moe.gate._forward_hooks.values():
