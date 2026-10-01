@@ -17,7 +17,7 @@ import argparse
 import torch
 import torch.nn.functional as F
 
-from ablate.common.report_ckpt import load_from_hub
+from ablate.common.report_ckpt import load_from_hub, load_from_result
 from ablate.common import validation as _val
 
 DEV = "cuda"
@@ -65,19 +65,22 @@ def probe(model, hold):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", required=True)
+    ap.add_argument("--repo", default="")
     ap.add_argument("--subs", default="step1000,step3000,final")
+    ap.add_argument("--result", default="")          # OR local ..._result.json checkpoints, comma list
     ap.add_argument("--seqs", type=int, default=16)
     a = ap.parse_args()
     hold = None
-    for sub in a.subs.split(","):
-        model, cfg = load_from_hub(a.repo, sub)
+    srcs = [("result", p) for p in a.result.split(",") if p] or [("hub", s) for s in a.subs.split(",")]
+    for kind, sub in srcs:
+        model, cfg = load_from_result(sub) if kind == "result" else load_from_hub(a.repo, sub)
         model.eval()
         if hold is None:
             hold = _val.build_holdout(cfg.dataset, 1024, a.seqs, DEV)   # the run's own held-out (last) shard
         R = probe(model, hold)
         k = len(next(iter(R.values()))["w"])
-        print(f"\n==== {a.repo}/{sub}  ({a.seqs} x 1024 holdout tokens; top-{k})")
+        name = f"{cfg.run_tag} E={cfg.experts}" if kind == "result" else f"{a.repo}/{sub}"
+        print(f"\n==== {name}  ({a.seqs} x 1024 holdout tokens; top-{k})")
         print(f"{'L':>3} {'logit mean':>10} {'std':>6} {'p99':>6} {'max':>6} {'top1':>6} {'sat%':>6}  "
               + " ".join(f"w@{r + 1:<3}" for r in range(k)) + f" {'k<.02%':>7} {'k<.05%':>7}")
         for i, r in R.items():
