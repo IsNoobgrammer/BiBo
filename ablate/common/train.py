@@ -531,7 +531,7 @@ def main():
     ap.add_argument("--moe_fp8", type=int, default=0, choices=(0, 1, 2))   # MXFP8 (W8A8) experts fwd+bwd: 1 ALL, 2 LEAN (needs megakernel)
     ap.add_argument("--muon_variant", choices=["base", "normuon", "aurora", "muown"], default="aurora")
     ap.add_argument("--muon_scale", choices=["adam", "none"], default="adam")  # adam = update RMS 0.2 (AdamW lr band)
-    ap.add_argument("--ns_coeffs", choices=["ns8", "dsv4", "quintic5", "pe8"], default="ns8")
+    ap.add_argument("--ns_coeffs", choices=["ns6", "ns8", "dsv4", "quintic5", "pe8"], default="ns8")
     ap.add_argument("--ns_backend", choices=["auto", "cublas", "epi", "symepi", "symmul", "gram"], default="auto")
     ap.add_argument("--prefetch", type=int, default=4)  # batches decoded ahead in a worker process; 0 = inline
     ap.add_argument("--section_profile", type=int, default=-1)  # >=0: time that step by model section (ablate/tools/section_profile.py), then exit
