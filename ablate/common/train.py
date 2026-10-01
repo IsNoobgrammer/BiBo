@@ -111,6 +111,12 @@ def _ce(model, ids, use_fused, aux=None, aux_coef=0.0, num_experts=6, top_k=2, p
         from baseline.qwen3moe.modeling import load_balancing_loss_func
         a = aux_coef * load_balancing_loss_func(tuple(aux.logits), num_experts, top_k)
         loss, main = loss + a, main + a
+    from . import patches as _pm
+    if _pm.RANK_AUX["acc"]:                                   # rank-balance aux (fused path), CE `main` stays pure
+        ra = torch.stack(_pm.RANK_AUX["acc"]).sum()
+        _pm.RANK_AUX["acc"] = []
+        loss = loss + getattr(_ce, "rank_coef", 0.0) * ra
+        _ce.rank_aux = ra.detach()
     _ce.last = (main.detach(), None if l2 is None else l2.detach())   # (main CE, MTP CE) for logging
     return loss
 
@@ -515,6 +521,8 @@ def main():
     # survives. Pairs with --norm_topk_prob 0: let the router weights run unbounded, then pin the
     # branch magnitude here instead. Tag _mon-<v>
     ap.add_argument("--top_k", type=int, default=0)                # 0 = SHARED (2). Raising it WITHOUT --moe_inter multiplies active expert FLOPs by the same factor. Tag _k<n>
+    ap.add_argument("--rank_aux_rho", type=float, default=0.0)   # rank-balance aux: penalise relu(rho*top-half - bottom-half) of each token's sorted top-k weights. 0 = off. Tag _rax<rho>c<coef>
+    ap.add_argument("--rank_aux_coef", type=float, default=0.0)  # lambda on the rank-balance aux (summed over routed layers)
     ap.add_argument("--router_temp", type=float, default=1.0)    # router logits /= T before the sigmoid (T=2 won Jul 27). Tag _T<v>
     ap.add_argument("--hidden", type=int, default=0)               # 0 = SHARED (512). Tag _h<n>
     ap.add_argument("--heads", type=int, default=0)                # 0 = SHARED (4); head_dim = hidden // heads. Tag _nh<n>
@@ -857,6 +865,11 @@ def main():
         print(f"[mtp] depth 1, variant {args.mtp_variant}, ffn {args.mtp_ffn}, emb {args.mtp_emb}, proj {args.mtp_proj}, weight {args.mtp_weight}: "
               f"+{_n/1e6:.2f}M params, + one extra lm_head pass per token", flush=True)
     patchmod.apply([p for p in patch_list if p != "ce"])              # ce handled in _ce()
+    if args.rank_aux_rho > 0:
+        if "megakernel" not in patch_list or args.rank_aux_coef <= 0:
+            raise SystemExit("--rank_aux_rho needs --rank_aux_coef > 0 and the megakernel patch (collected on the fused path)")
+        patchmod.RANK_AUX["rho"] = args.rank_aux_rho
+        _ce.rank_coef = args.rank_aux_coef
     if args.moe_fp8:
         # the seam is the megakernel block, so the patch must be on -- without it the flag would be inert
         if "megakernel" not in patch_list:
@@ -1010,6 +1023,7 @@ def main():
                 + (f"_k{args.top_k}" if args.top_k else "")
                 + (f"_sh{args.n_shared}" if args.n_shared else "")
                 + (f"_T{args.router_temp:g}" if args.router_temp != 1.0 else "")
+                + (f"_rax{args.rank_aux_rho:g}c{args.rank_aux_coef:g}" if args.rank_aux_rho > 0 else "")
                 + (f"_h{args.hidden}" if args.hidden else "") + (f"_nh{args.heads}" if args.heads else "")
                 + (f"_kv{args.kv_heads}" if args.kv_heads else "")
                 + (f"_mi{args.moe_inter}" if args.moe_inter else "")
@@ -1553,6 +1567,7 @@ def main():
                         "optim/wd_muon": opts[0].param_groups[0].get("weight_decay", 0.0),
                         "optim/phase": int(0 <= args.switch_variant_at <= step),
                         "train/ms_per_step": ms_per_step,
+                        **({"train/rank_aux": float(_ce.rank_aux)} if hasattr(_ce, "rank_aux") else {}),
                         "train/tps": tps, "train/mfu": mfu, "train/mem_gb": mem, "train/elapsed_s": elapsed,
                         "train/expert_corr": ecorr, "train/router_corr": rcorr,
                         **({"train/loss_clean": loss_clean, "train/probe_gap": loss_clean - lv}

@@ -17,6 +17,12 @@ from . import _paths  # noqa: F401
 import os
 import torch
 
+# Rank-balance aux loss (train.py --rank_aux_rho / --rank_aux_coef). Per token, sort the k normalised routing
+# weights; penalise relu(rho * sum(top half) - sum(bottom half)): only tokens whose low-rank experts carry
+# less than rho x the top half are pushed, so the router keeps its ranking (a temperature flattens all
+# tokens alike). Collected per routed layer on the fused path while grad is on; train.py sums + clears it.
+RANK_AUX = {"rho": 0.0, "acc": []}
+
 try:
     _nc = torch.compiler.disable
 except AttributeError:
@@ -273,6 +279,11 @@ def patch_megakernel():
         # `bal` is how expert collapse gets noticed, so losing it quietly is the expensive failure.
         for _h in moe.experts._forward_pre_hooks.values():
             _h(moe.experts, (flat, idx.long(), wgt))
+        k = moe.gate.top_k
+        if RANK_AUX["rho"] > 0 and torch.is_grad_enabled() and k < moe.gate.num_routed_experts:
+            ws = wgt.float().reshape(-1, k).sort(-1, descending=True).values      # differentiable
+            h = k // 2
+            RANK_AUX["acc"].append(torch.relu(RANK_AUX["rho"] * ws[:, :h].sum(-1) - ws[:, h:].sum(-1)).mean())
         if gap is not None:
             moe.gate.boundary_gap = gap.mean()
         for _h in moe.gate._forward_hooks.values():
