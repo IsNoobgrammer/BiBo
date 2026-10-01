@@ -16,7 +16,7 @@ from ablate.common import patches as P
 from ablate.common.configs import resolve_swa
 
 
-def main(rho=0.5):
+def main(rho=1.0):   # at init routing is near-uniform, so rho=0.5 is inactive (aux 0); rho=1 always bites
     pat, win = resolve_swa("block3", 128, 10)
     torch.manual_seed(0)
     m, _ = build_arm("bibo_min", device="cuda", num_experts=64, top_k=6, hybrid_layer_pattern=pat, sliding_window=win,
