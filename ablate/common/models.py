@@ -26,7 +26,7 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
               attn_res_carry_per_dim=False, attn_res_carry_gate="none",
               attn_res_emb_per_dim=False,
               bf16_residual_stream=False, bf16_moe_out=False,
-              hidden_size=None, num_heads=None, kv_heads=None, router_temperature=1.0):
+              hidden_size=None, num_heads=None, kv_heads=None):
     """arm in {'qwen','bibo_min'} -> (model, config). Params in `dtype` (fp32 master; bf16 via autocast).
     Balancing, each native: BiBo router-bias updates; Qwen Switch aux loss (aux_coef).
     PARAM MATCH: Qwen's num_experts is set to BiBo's GLU count, which is num_experts MINUS the
@@ -85,8 +85,7 @@ def build_arm(arm, device="cuda", dtype=torch.float32, attn_impl="sdpa",
                                    attn_res_emb_per_dim=attn_res_emb_per_dim,
                                    bf16_residual_stream=bf16_residual_stream,
                                    bf16_moe_out=bf16_moe_out,
-                                   hidden_size=hidden_size, num_heads=num_heads, kv_heads=kv_heads,
-                                   router_temperature=router_temperature)
+                                   hidden_size=hidden_size, num_heads=num_heads, kv_heads=kv_heads)
         model = BiBoForCausalLM(cfg)
         if eff.startswith("flash"):
             patches.patch_bibo_flash()

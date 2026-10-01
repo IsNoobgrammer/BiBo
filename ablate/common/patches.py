@@ -17,19 +17,6 @@ from . import _paths  # noqa: F401
 import os
 import torch
 
-# Rank-balance aux loss (train.py --rank_aux_rho / --rank_aux_coef). Per token, sort the k normalised routing
-# weights; penalise relu(rho * sum(top half) - sum(bottom half)): only tokens whose low-rank experts carry
-# less than rho x the top half are pushed, so the router keeps its ranking (a temperature flattens all
-# tokens alike). Collected per routed layer on the fused path while grad is on; train.py sums + clears it.
-RANK_AUX = {"rho": 0.0, "acc": []}
-# Routing-VARIANCE loss (arxiv 2505.22323 L_v, train.py --route_var_coef). The paper's s_ij sums to 1 over experts; ours
-# are sigmoid scores, so p_ij = s_ij / sum_j s_ij over ALL E experts (unbiased scores, router temperature applied),
-# rescaled q = E * p (uniform routing = 1 everywhere, so the value does not shrink with E). Per expert, the variance of q
-# over this micro-batch's tokens; L_v = -mean_j Var_i(q_ij): MAXIMISING it makes each expert's scores discriminative
-# (high for its tokens, low for the rest). The opposite direction of RANK_AUX. hn is recomputed from the DETACHED
-# residual, so the gradient reaches ONLY the router weight (the fused kernel is untouched). Load stays with the bias.
-ROUTE_VAR = {"coef": 0.0, "acc": []}
-
 try:
     _nc = torch.compiler.disable
 except AttributeError:
@@ -267,8 +254,7 @@ def patch_megakernel():
         # no stride arguments, so a transposed VIEW would be silently misread -- .contiguous() is
         # load-bearing, not tidiness. 512x64 elements, so the copy is free.
         w = {"nw": self.post_attention_layernorm.weight,
-             "rw": (moe.gate.gate_proj.weight if getattr(moe.gate, "temperature", 1.0) == 1.0 else
-                    moe.gate.gate_proj.weight / moe.gate.temperature).t().contiguous(),   # router temperature
+             "rw": moe.gate.gate_proj.weight.t().contiguous(),
              "bias": moe.gate.bias if moe.gate.bias is not None else _zero_bias(moe),
              "gu": moe.experts.gate_up_proj, "dn": moe.experts.down_proj}
         flat = hidden_states.reshape(b * s, h)
@@ -286,20 +272,6 @@ def patch_megakernel():
         # `bal` is how expert collapse gets noticed, so losing it quietly is the expensive failure.
         for _h in moe.experts._forward_pre_hooks.values():
             _h(moe.experts, (flat, idx.long(), wgt))
-        k = moe.gate.top_k
-        if RANK_AUX["rho"] > 0 and torch.is_grad_enabled() and k < moe.gate.num_routed_experts:
-            ws = wgt.float().reshape(-1, k).sort(-1, descending=True).values      # differentiable
-            half = k // 2                      # NOT `h`: h is the hidden size used by out.view(b, s, h) below
-            RANK_AUX["acc"].append(torch.relu(RANK_AUX["rho"] * ws[:, :half].sum(-1) - ws[:, half:].sum(-1)).mean())
-        if ROUTE_VAR["coef"] > 0 and torch.is_grad_enabled() and k < moe.gate.num_routed_experts:
-            ln = self.post_attention_layernorm
-            with torch.autocast("cuda", enabled=False):
-                hn16 = torch.nn.functional.rms_norm(flat.detach().float(), (h,), ln.weight.detach().float(),
-                                                    eps=ln.variance_epsilon).to(torch.bfloat16)
-                z = (hn16 @ moe.gate.gate_proj.weight.to(torch.bfloat16).t()).float() / getattr(moe.gate, "temperature", 1.0)
-                sc = torch.sigmoid(z)
-                q = sc * (sc.shape[-1] / sc.sum(-1, keepdim=True))
-                ROUTE_VAR["acc"].append(-q.var(0, unbiased=False).mean())
         if gap is not None:
             moe.gate.boundary_gap = gap.mean()
         for _h in moe.gate._forward_hooks.values():

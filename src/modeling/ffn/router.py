@@ -21,17 +21,13 @@ class BiBoMoERouter(nn.Module):
                      if self.top_k < self.num_routed_experts else None)
 
         self._probe_gap = False
-        # logits /= T before the sigmoid (T > 1 flattens the top-k weights). Not absorbable by the router
-        # weight: Muon pins its spectral norm. The balancing bias is added to SCORES, so T leaves it alone.
-        self.temperature = float(getattr(config, 'router_temperature', 1.0) or 1.0)
         self.boundary_gap = None
 
         self.gate_proj = nn.Linear(config.hidden_size, self.num_routed_experts, bias=False)
         nn.init.normal_(self.gate_proj.weight, mean=0.0, std=config.initializer_range)
 
     def router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        z = self.gate_proj(rearrange(hidden_states, 'b s h -> (b s) h')).float()
-        return z / self.temperature if self.temperature != 1.0 else z
+        return self.gate_proj(rearrange(hidden_states, 'b s h -> (b s) h')).float()
 
     def forward(self, hidden_states: torch.Tensor):
         batch_size, seq_len, hidden_dim = hidden_states.shape
