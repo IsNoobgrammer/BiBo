@@ -282,8 +282,8 @@ def patch_megakernel():
         k = moe.gate.top_k
         if RANK_AUX["rho"] > 0 and torch.is_grad_enabled() and k < moe.gate.num_routed_experts:
             ws = wgt.float().reshape(-1, k).sort(-1, descending=True).values      # differentiable
-            h = k // 2
-            RANK_AUX["acc"].append(torch.relu(RANK_AUX["rho"] * ws[:, :h].sum(-1) - ws[:, h:].sum(-1)).mean())
+            half = k // 2                      # NOT `h`: h is the hidden size used by out.view(b, s, h) below
+            RANK_AUX["acc"].append(torch.relu(RANK_AUX["rho"] * ws[:, :half].sum(-1) - ws[:, half:].sum(-1)).mean())
         if gap is not None:
             moe.gate.boundary_gap = gap.mean()
         for _h in moe.gate._forward_hooks.values():
