@@ -254,7 +254,8 @@ def patch_megakernel():
         # no stride arguments, so a transposed VIEW would be silently misread -- .contiguous() is
         # load-bearing, not tidiness. 512x64 elements, so the copy is free.
         w = {"nw": self.post_attention_layernorm.weight,
-             "rw": moe.gate.gate_proj.weight.t().contiguous(),
+             "rw": (moe.gate.gate_proj.weight if getattr(moe.gate, "temperature", 1.0) == 1.0 else
+                    moe.gate.gate_proj.weight / moe.gate.temperature).t().contiguous(),   # router temperature
              "bias": moe.gate.bias if moe.gate.bias is not None else _zero_bias(moe),
              "gu": moe.experts.gate_up_proj, "dn": moe.experts.down_proj}
         flat = hidden_states.reshape(b * s, h)

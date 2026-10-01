@@ -515,6 +515,7 @@ def main():
     # survives. Pairs with --norm_topk_prob 0: let the router weights run unbounded, then pin the
     # branch magnitude here instead. Tag _mon-<v>
     ap.add_argument("--top_k", type=int, default=0)                # 0 = SHARED (2). Raising it WITHOUT --moe_inter multiplies active expert FLOPs by the same factor. Tag _k<n>
+    ap.add_argument("--router_temp", type=float, default=1.0)    # router logits /= T before the sigmoid (T=2 won Jul 27). Tag _T<v>
     ap.add_argument("--hidden", type=int, default=0)               # 0 = SHARED (512). Tag _h<n>
     ap.add_argument("--heads", type=int, default=0)                # 0 = SHARED (4); head_dim = hidden // heads. Tag _nh<n>
     ap.add_argument("--kv_heads", type=int, default=0)             # 0 = SHARED (2). Tag _kv<n>
@@ -819,6 +820,7 @@ def main():
                            neg_identity_expert=args.neg_identity_expert,
                            top_k=(args.top_k or None), moe_intermediate_size=(args.moe_inter or None),
                            hidden_size=(args.hidden or None), num_heads=(args.heads or None), kv_heads=(args.kv_heads or None),
+                           router_temperature=args.router_temp,
                            num_shared_experts=args.n_shared)
     aux_collector = _QwenAuxCollector(model) if (args.arm == "qwen" and args.aux_coef > 0) else None
     if args.use_xsa:
@@ -1007,6 +1009,7 @@ def main():
                 + (f"_u{args.bias_update_factor:g}" if args.bias_update_factor >= 0 else "")
                 + (f"_k{args.top_k}" if args.top_k else "")
                 + (f"_sh{args.n_shared}" if args.n_shared else "")
+                + (f"_T{args.router_temp:g}" if args.router_temp != 1.0 else "")
                 + (f"_h{args.hidden}" if args.hidden else "") + (f"_nh{args.heads}" if args.heads else "")
                 + (f"_kv{args.kv_heads}" if args.kv_heads else "")
                 + (f"_mi{args.moe_inter}" if args.moe_inter else "")

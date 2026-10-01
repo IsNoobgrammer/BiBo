@@ -154,7 +154,7 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
                          attn_res_carry_per_dim=False,
                          attn_res_carry_gate="none", attn_res_emb_per_dim=False,
                          bf16_residual_stream=False, bf16_moe_out=False,
-                         hidden_size=None, num_heads=None, kv_heads=None):
+                         hidden_size=None, num_heads=None, kv_heads=None, router_temperature=1.0):
     # attn_res: "off" = stable src model. Anything else routes to exp/ (Kimi K3 Attention
     # Residuals): "control" builds exp's model with residuals DISABLED, an int is the block size
     # in decoder layers (1 = per-layer / Full AttnRes, 3 = one block per [G,S,S]).
@@ -198,6 +198,7 @@ def make_bibo_min_config(bias_update_threshold=10240, bias_update_factor=None,
         extra['num_neg_identity_experts'] = num_neg_identity_experts
     return BiBoConfig(
         **extra,
+        router_temperature=router_temperature,
         bias_update_threshold=bias_update_threshold,
         bias_update_factor=bias_update_factor,      # None -> BiBoConfig default (0.4, proportional)
         # hidden / heads / kv heads: None = SHARED (512 / 4 / 2); head_dim = hidden // heads

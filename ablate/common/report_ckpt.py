@@ -77,7 +77,7 @@ def load_from_result(result_json, device=DEV):
         pos_identity_expert=c.pos_identity_expert, neg_identity_expert=c.neg_identity_expert,
         top_k=(c.top_k or None), moe_intermediate_size=(c.moe_inter or None),
         hidden_size=(getattr(c, "hidden", 0) or None), num_heads=(getattr(c, "heads", 0) or None),
-        kv_heads=(getattr(c, "kv_heads", 0) or None),
+        kv_heads=(getattr(c, "kv_heads", 0) or None), router_temperature=float(getattr(c, "router_temp", 1.0) or 1.0),
         num_shared_experts=c.n_shared,
         # The dense/MoE split and the dense width are part of the ARCHITECTURE, so a rebuild that
         # ignores them silently builds a different model. strict=True then fails with missing
