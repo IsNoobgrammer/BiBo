@@ -1343,6 +1343,12 @@ def main():
             # shipped that bug twice (XSA alpha behind a passing parity test, ACT_CYCLE not
             # reaching the eager path). Both were invisible in the loss for days.
             rt.update(tensor_norms(model))
+            # PER-LAYER router grad norm (TODO #42): grad/norm/* pools all layers' routers, so "L9's router gets no
+            # gradient" vs "is not learning" needed a rebuild to tell apart. Non-finite shows up as nan/inf here.
+            for _li, _ly in enumerate(model.model.layers):
+                _gw = getattr(getattr(getattr(_ly, "mlp", None), "gate", None), "gate_proj", None)
+                if _gw is not None and _gw.weight.grad is not None:
+                    rt[f"train/router/layer_{_li}/grad_norm"] = float(_gw.weight.grad.float().norm())
             rt.update(_upd)                  # ||dW||/||W|| of THIS step: the effective step size per group
             if args.row_census_every > 0 and step % args.row_census_every == 0:
                 rt.update(_row_census(model, step))
