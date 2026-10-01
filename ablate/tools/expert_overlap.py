@@ -95,7 +95,16 @@ def probe(model, hold, seed=0):
         hn = F.rms_norm(x, (x.shape[-1],), ln.weight.float(), eps=ln.variance_epsilon)
         w, order = w.sort(-1, descending=True)
         idx = idx.gather(1, order)
-        sel = overlap(expert_outputs(ex, hn, idx), w)
+        O = expert_outputs(ex, hn, idx)
+        if not rows:                       # SELFCHECK: the recomputed outputs must reproduce the model's own experts
+            n = 512
+            with AMP:
+                ref = ex(hn[:n].to(torch.bfloat16), idx[:n], w[:n]).float()
+            mine = (w[:n, :, None] * O[:n]).sum(1)
+            rel = ((mine - ref).norm() / ref.norm()).item()
+            print(f"[selfcheck L{i}] recomputed sum_r w_r o_r vs model experts: rel err {rel:.2e}", flush=True)
+            assert rel < 5e-2, "recomputed expert outputs do not match the model -- metrics would be meaningless"
+        sel = overlap(O, w)
         # k random experts NOT in the token's selection
         sc = torch.rand(idx.shape[0], E, device=DEV, generator=g0).scatter_(1, idx, -1.0)
         ridx = sc.topk(k, -1).indices
