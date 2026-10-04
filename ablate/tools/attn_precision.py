@@ -82,6 +82,8 @@ def main():
     for sub in a.subs.split(","):
         model, cfg = load_from_hub(a.repo, sub)
         model.train()                                   # the fused attention path is the training path
+        import src.modeling.attn.base as _ab
+        _ab.FUSED_ATTN = True                           # train.py sets this; off by default
         if hold is None:
             hold = _val.build_holdout(cfg.dataset, 1024, a.seqs, DEV)
         cap, orig = [], AX.attn_xsa
