@@ -537,6 +537,7 @@ def main():
     ap.add_argument("--section_profile", type=int, default=-1)  # >=0: time that step by model section (ablate/tools/section_profile.py), then exit
     ap.add_argument("--profile_step", type=int, default=-1)  # >=0: profile that step, sync-audit the next (ablate/tools/step_profile.py), then exit
     ap.add_argument("--attn_kernel", choices=["fused", "flex"], default="fused")  # fused = tkf attn_xsa (qk-norm+rope+attn+xsa, deterministic)
+    ap.add_argument("--attn_ds_prec", choices=["bf16", "tf32", "split", "gproj"], default="bf16")  # attn_xsa backward dS precision (tkf attn_xsa.DS_PREC); gproj = GProj row-sum fix. Tag _ds<x>
     ap.add_argument("--q_scale", type=float, default=1.0)   # fixed multiplier on q after qk-norm
     ap.add_argument("--k_scale", type=float, default=1.0)   # fixed multiplier on k after qk-norm
     ap.add_argument("--global_attn", choices=["flex", "sdpa"], default="flex")  # flex = bitwise-repeatable backward (SDPA flash accumulates dQ atomically)
@@ -693,6 +694,10 @@ def main():
     import importlib
     importlib.import_module("src.modeling.attn.full_attention").GLOBAL_FLEX = args.global_attn == "flex"
     importlib.import_module("src.modeling.attn.base").FUSED_ATTN = args.attn_kernel == "fused"
+    if args.attn_ds_prec != "bf16":
+        if args.attn_kernel != "fused":
+            raise SystemExit("--attn_ds_prec applies to the fused attn_xsa kernel only")
+        importlib.import_module("kernels.sm120.attn_xsa").DS_PREC = args.attn_ds_prec
     if args.deterministic:
         # cuBLAS reads this at handle creation, so it must be set before the first CUDA matmul.
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -1013,6 +1018,7 @@ def main():
                 + (f"_{args.muon_variant}" if args.muon_variant != "aurora" else "")
                 + (f"_sc{args.muon_scale}" if args.muon_scale != "adam" else "")
                 + (f"_{args.ns_coeffs}" if args.ns_coeffs != "ns8" else "")
+                + (f"_ds{args.attn_ds_prec}" if args.attn_ds_prec != "bf16" else "")
                 + (f"_mwd{args.muon_wd:g}" if args.muon_wd is not None else "")
                 + (f"_xo{args.xorth_post:g}{args.xorth_where}" if args.xorth_post > 0 else "")
                 + ("" if args.norm_topk_prob else "_nontp")   # normalization is the default; mark when OFF
