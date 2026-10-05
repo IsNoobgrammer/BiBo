@@ -1,5 +1,11 @@
 # TODO
 
+> **PAUSED Oct 5 2026 (pivot to voice / ASR / TTS, see `voice/`).** On resume, START HERE:
+> **0. [ ] HIGHEST PRIORITY: high-quality-data annealing in the WSD decay phase** (#58). Keep the stable phase as
+> is; swap the 20% decay to ~50% high-quality hi/en (Hindi Wikipedia, textbook-style, math/code) + ~50% general;
+> one 2000-step run vs the reference base1b-s23 (3.3248), judge on big-holdout AND the benchmark/ suite.
+> Then the scaling check (#56) and distillation (#63a).
+
 1. [x] MTP -- SETTLED Sep 28 2026 (not in use yet): depth 1, v1-noemb. See "MTP -- settled" below; runs in W&B `mtp-ablations`
 2. [x] enchaning ce to be more effective -- DONE Sep 28 2026: tkf ce_factored.py (factored softmax grad, 4 GB chunks) is the default, --ce_kernel
 3. [ ] fp8/4 training -- GATED on the optimizer round; full notes in "Quantized training" below
