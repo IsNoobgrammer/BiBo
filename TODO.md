@@ -237,3 +237,23 @@ Known recipes against accumulation (verify before building on them):
 54. [ ] candidate model-side fixes if drift appears: SwiGLU-style clamp on the down_proj input,
         up-shift (act(gate)*(up+1)), Hadamard on down_proj input only (the one tailed tensor).
 
+
+## From the Oct 5 2026 review (ledger: docs/experiment-ledger.mdx)
+
+55. [ ] PARKED: token-wise per-channel rescaling (arxiv 2601.22966 GatedNorm). Our carry c = 2*sigmoid(theta) is
+    per-channel but STATIC; nothing on the attention branch is per-token AND per-channel. Run
+    `ablate/tools/outlier_probe.py` on the 6k ckpt first (residual sinks / mass on key 0), then 2k A/B
+    `--attn_res_carry_gate diag` vs per-dim carry (the self-gated carry: full-W arm killed Aug 6, diag never ran),
+    then a rank-16 GatedNorm if diag wins. Pairs with gated attention (#5) and the FP4 round (#3).
+56. [ ] Scaling check before the long run: 3-size compute-optimal ladder on the board recipe -- which wins survive
+    scale (radial's gap shrank 3.6x 524M -> 1B); doubles as the muP / LR-transfer data (#18).
+57. [ ] Re-check the costliest 2k-step decisions at ~10k steps (fp8 ALL, e64 vs e128, Muown, ns6).
+58. [ ] Data: quality filtering + dedup, hi/en ratio (#21), math/code share, and HIGH-QUALITY ANNEALING in the WSD
+    decay phase (MiniCPM / OLMo 2 recipe).
+59. [ ] Long-context phase at the end of training on the 4096-packed corpus (#20, #27).
+60. [ ] Critical batch size / tokens-per-step vs LR (262k/step was picked on throughput).
+61. [ ] Tail / EMA weight averaging over the last ~300 steps (ANVIL's biggest speedrun win; no arch change).
+62. [ ] ANVIL twin-rail momentum (fast 0.85 + slow 0.98 rails, blended, then NS) on muown.
+63. [ ] Auxiliary objectives beyond NTP: (a) logit / top-k distillation from a stronger hi/en teacher (Qwen, Sarvam)
+    -- the biggest known lever at 144M active; (b) next-concept / latent prediction (CoCoMix, JEPA-style, LCM);
+    (c) MTP's three open questions (see "MTP -- settled").
