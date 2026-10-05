@@ -1,0 +1,254 @@
+---
+title: BiBo experiment ledger
+description: Every architecture, optimizer, kernel and precision axis tested on BiBo (May - Oct 2026), its verdict, and the W&B project and runs that hold the evidence.
+---
+
+# BiBo experiment ledger
+
+Every axis tested on BiBo from May to October 2026: what was asked, what it settled, and where the
+evidence lives. 40 W&B projects, about 1,060 runs, all under the
+[`ablations-tinycompany-ai`](https://wandb.ai/ablations-tinycompany-ai) entity.
+
+- Verdicts and numbers before mid-September have a long-form write-up in [`timeline/`](../timeline/README.md),
+  one topic per folder. This page is the index across all of it, plus everything after it.
+- Open items are in [`TODO.md`](../TODO.md); the "Still to do" section below is the short list.
+- Link formats: project `https://wandb.ai/ablations-tinycompany-ai/PROJECT`, run
+  `https://wandb.ai/ablations-tinycompany-ai/PROJECT/runs/RUN_ID`.
+
+## How to read it
+
+| Verdict | Means |
+|---|---|
+| **SHIPPED** | in the current board's default flags |
+| **CLOSED NEGATIVE** | measured and rejected; code may survive behind a flag |
+| **TIE / PARKED** | nothing cleared the noise floor |
+| **OPEN** | not tested yet, or tested without a conclusion |
+
+**Noise floors are per stack and never transfer.** On the current 1B board (2000 steps,
+big-holdout val, 256 x 1024 tokens) the seed-to-seed spread is about **0.023** (seed 23: 3.3248,
+seed 42069: 3.3477, same flags). Same-seed reruns are bitwise identical, so paired same-seed
+gaps are much tighter than that. Gaps quoted on one seed are marked *(1 seed)*.
+
+## The current board
+
+The architecture all recent results are measured on. W&B project
+[`bibo-base-1b`](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b).
+
+| Part | Setting |
+|---|---|
+| Size | 965.5M total, 144.5M active (102.5M active non-embedding), tied embeddings |
+| Trunk | hidden 512, 10 layers, 4 query / 2 KV heads, head dim 128 |
+| Attention | layer pattern block3: global at L0, L3, L6, L9, sliding window 128 elsewhere; QK-norm with learned per-dim gains; XSA with learnable per-head alpha (init 0); fused `attn_xsa` kernel |
+| Positions | global layers NoPE, window layers full RoPE |
+| Residual | AttnRes block 3, 1 site, per-dim carry with sigmoid scale; bf16 residual stream |
+| FFN | L0: all-active ensemble 8 x 768; L1-L9: 64 routed experts, top-6, width 1024 |
+| Experts | radial NormSiLU activation; MXFP8 (W8A8) expert GEMMs (`--moe_fp8 1`), L0 stays bf16 |
+| Router | sigmoid scores, aux-loss-free bias balancing, top-k weights sum-normalised, Muon on the router |
+| Optimizer | Muown (Muon variant, muon wd 0, gain lr x0.1), muon lr 1e-2, AdamW 5e-4 for vectors / embeddings, WSD schedule (10% warmup, 20% decay), Newton-Schulz ns8 |
+| Loss | factored-softmax fused CE (`--ce_kernel`), no MTP, no auxiliary losses |
+| Recipe | seq 1024 x batch 64 x accum 4 = 262k tokens / step; about 211-218k tps, 44.7 GB on an RTX PRO 6000 |
+
+Key runs:
+
+| Run | Big-holdout val | Link |
+|---|---|---|
+| `base1b-s23`, 2000 steps (the reference) | 3.3248 | [i3o84hxc](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/i3o84hxc) |
+| `base1b-6k-s23`, 6000 steps / 1.57B tokens, checkpoints on HF `fhai50032/bibo-base-1b-6k-s23` | 3.0534 | [bz2n3oqz](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/bz2n3oqz) |
+| `w1024e64-bf16ctl-s23`, bitwise rerun of the reference on Oct 4 | 3.3248 | [78jpuk18](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/78jpuk18) |
+| `w1024e64-ns8-s42069`, second-seed reference | 3.3477 | [v7bmdm4f](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/v7bmdm4f) |
+
+Downstream benchmarks of the 6k checkpoint (English and Hindi, 0- and 5-shot, against GPT-2,
+Pythia, SmolLM2, Qwen2.5, Sarvam, Nandi): [`benchmark/`](../benchmark/README.md).
+
+---
+
+## 1. Quantization and numeric precision
+
+| Tested | Verdict | Numbers | Evidence |
+|---|---|---|---|
+| 8-bit viability (first look, May) | historical | predates loss logging | [`8bit-test`](https://wandb.ai/ablations-tinycompany-ai/8bit-test) |
+| PTQ formats on trained checkpoints: MXFP8, MXFP4, NVFP4, int4 g128, W4A16 / W4A8 / W4A4 | measured, not adopted | MXFP8 W+A about free (+0.0024); NVFP4 beats MXFP4 by about 35%; W4A8 NVFP4 +0.021 is the pick if 4-bit comes | offline tools (`quant_probe`, `quant_probe_experts`), no W&B project |
+| **W8A8 MXFP8 expert training** (e4m3, e8m0 per 32) | **SHIPPED** (`--moe_fp8 1`, L0 bf16) | 1.145x tps; beats bf16 at equal wall-clock by 0.040 big-holdout (3.3435 vs 3.3839); flat 35 GB after the tile-map cache leak fix | [`moe-fp8`](https://wandb.ai/ablations-tinycompany-ai/moe-fp8): [fp8all e6cn6xt6](https://wandb.ai/ablations-tinycompany-ai/moe-fp8/runs/e6cn6xt6), [bf16 yym0w4ow](https://wandb.ai/ablations-tinycompany-ai/moe-fp8/runs/yym0w4ow), [bf16 equal-time j7m5ye33](https://wandb.ai/ablations-tinycompany-ai/moe-fp8/runs/j7m5ye33), [fp8lean 8niy4lm3](https://wandb.ai/ablations-tinycompany-ai/moe-fp8/runs/8niy4lm3) |
+| fp8 "lean" (fewer fp8 GEMMs) vs "all" | ALL shipped | lean 3.3402 vs all 3.3435 at equal steps; ALL wins at equal time | same project |
+| FP4 / NVFP4 **training** | **OPEN** | only PTQ measured | `TODO.md` #3, #48-54 |
+| bf16 residual stream vs fp32 | **SHIPPED** bf16 | | [`bibo-attnres-v2`](https://wandb.ai/ablations-tinycompany-ai/bibo-attnres-v2) (`bf16_residual_stream`, `attn_res_fp32_stream`) |
+| fp16 training | probed at toy scale only | fused CE clean (no divergence over 200 steps); NS gram restart for fp16 at iterations 4, 5 | memory note "BiBo fp16 divergence"; no dedicated project |
+| Attention backward precision (GProj / KohakuFA bug class) | **TIE**, bf16 kept | real-model dQ error 0.5-0.8% (logits 6-15 under QK-norm); GProj A/B: seed 23 3.3227 vs 3.3248, seed 42069 3.3482 vs 3.3477, -1.4% tps | [gproj s23 iszuotoz](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/iszuotoz), [gproj s42069 2q7lqveu](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/2q7lqveu), control [78jpuk18](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/78jpuk18); `--attn_ds_prec`; KohakuFA bugs 1+2 fix on tkf branch `attn-softmax-precision` (unmerged, +0.14% step) |
+
+## 2. Kernels and speed
+
+Long form: [`timeline/07-kernels-and-speed`](../timeline/07-kernels-and-speed/README.md). Kernels
+live in the `triton-kernel-fused` repo; correctness is gated by its `parity_check/` suite, not W&B.
+
+| Tested | Verdict | Numbers | Evidence |
+|---|---|---|---|
+| Fused Triton MoE GEMM + GLU (6 alternatives rejected) | **SHIPPED** | 128.9k to 148.9k tps at 64 experts | `bibo-bench` era; timeline 07 |
+| MoE megakernel (fused norm + router + experts) | **SHIPPED**, default | | timeline 07 |
+| MoE kernel round 2 (tile order, wgrad, L0 cuBLAS) | **SHIPPED** | +7.9% (207.5k to 223.8k) | memory note "MoE kernel round 2" |
+| Grouped wgrad, host-sync removal | **SHIPPED** | 180.0k to 195.5k, syncs 89 to 1 | memory note "Grouped wgrad" |
+| Fused attention `attn_xsa` (qk-norm + RoPE + attention + XSA, deterministic) vs flex / SDPA | **SHIPPED**, default | 178.6k tps; beats flash at 1k and under | memory note "Fused attention" |
+| XSA fused kernel | **SHIPPED** | XSA cost 8.9% to 1.3% of the step | [`bibo-xsa-524m`](https://wandb.ai/ablations-tinycompany-ai/bibo-xsa-524m) |
+| Factored-softmax fused CE | **SHIPPED** (`--ce_kernel`) | 1.0-1.35x vs chunked; val 3.7x | [mtp1-cefact gg2xe8nd](https://wandb.ai/ablations-tinycompany-ai/mtp-ablations/runs/gg2xe8nd), [cefact-det vp50ezim](https://wandb.ai/ablations-tinycompany-ai/bibo-aurora-vs-muown/runs/vp50ezim) |
+| Muon NS: symmetric-matmul, gram-space, per-shape NS router | **SHIPPED** (sm120) | 1.4-1.5x, then 1.22x step | timeline 01 / 07 |
+| Bitwise run-to-run determinism | **SHIPPED** | float atomics replaced by fixed-order sums; confirmed again Oct 4 (control rerun matched 3.3248 exactly) | `--determinism_check`; [78jpuk18](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/78jpuk18) vs [i3o84hxc](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/i3o84hxc) |
+| Sequence / batch layout (1024 vs 2048, batch 16-128, accum 1-8) | measured | at equal tokens 1024 beats 2048 by 1-2.5%; 1024 x 64 x 4 picked | tps probes, no W&B |
+
+## 3. Attention
+
+Long form: [`timeline/04-attention`](../timeline/04-attention/README.md).
+
+| Tested | Verdict | Numbers | Evidence |
+|---|---|---|---|
+| Global vs sliding-window mix (block3 pattern, window 128), hybrid window sizes 128 / 512 | **SHIPPED** block3 w128 | | [`bibo-xsa-524m`](https://wandb.ai/ablations-tinycompany-ai/bibo-xsa-524m) (`swa_pattern`, `sliding_window`, HSWA arms) |
+| XSA (exclusive self-attention) with learnable per-head alpha, init 0 | **SHIPPED** | beat fixed full-strength XSA by 20x the floor | `bibo-xsa-524m` (`use_xsa`, `xsa_alpha`, `xsa_alpha_init`) |
+| SSMax, attention sink on window layers, no QK-norm on window layers | tested; none in the default (SSMax code removed) | | `bibo-xsa-524m` (`use_ssmax`, `swa_sink`, `swa_qk_norm`) |
+| QK-norm gains: default vs a faster "act" gain group | **CLOSED**, default kept | act +0.0039 *(1 seed)*; gains learn per-layer temperatures (L6 1.35, L0 0.84) | [`qk-norm-scaling-check`](https://wandb.ai/ablations-tinycompany-ai/qk-norm-scaling-check): [control pni6jit6](https://wandb.ai/ablations-tinycompany-ai/qk-norm-scaling-check/runs/pni6jit6), [act 0kyc6vfu](https://wandb.ai/ablations-tinycompany-ai/qk-norm-scaling-check/runs/0kyc6vfu) |
+| Attention residuals (Kimi K3 AttnRes): blocks, sites, carry, per-dim carry, carry scale (raw / sigmoid / tanh), embedding term, gates, top-k scoring | **PARKED**; default b3s1 + per-dim carry picked on 1.5% tps, not quality | every matched comparison under the 0.0217 floor of its stack | [`bibo-attnres`](https://wandb.ai/ablations-tinycompany-ai/bibo-attnres) (30), [`bibo-attnres-v2`](https://wandb.ai/ablations-tinycompany-ai/bibo-attnres-v2) (23), [`bibo-attnres-1b`](https://wandb.ai/ablations-tinycompany-ai/bibo-attnres-1b) (4), [`bibo-clean-v1`](https://wandb.ai/ablations-tinycompany-ai/bibo-clean-v1), [`bibo-baseline-2k`](https://wandb.ai/ablations-tinycompany-ai/bibo-baseline-2k) |
+| AttnRes pseudo-query routing (learned (1, H) queries) | the effect is the learning rate, geometry unproven | 0.569 vs 0.579 cluster | timeline 04 |
+| Typed attention residuals / mHC (manifold hyper-connections) | tested, no recorded verdict | smoke runs + 1 full run | [`bibo-ideas`](https://wandb.ai/ablations-tinycompany-ai/bibo-ideas) (`typed_attn_res_*`, `mhc-*` runs) |
+| Gated attention, differential attention, MLA, hybrid linear attention, attention sinks / register tokens | **OPEN** | | `TODO.md` #5, #6, #17, #19, #23 |
+
+## 4. Positional encoding
+
+Long form: [`timeline/05-positional-encoding`](../timeline/05-positional-encoding/README.md).
+
+| Tested | Verdict | Numbers | Evidence |
+|---|---|---|---|
+| Global NoPE / partial / full RoPE x local partial / full RoPE (4 arms) | **SHIPPED** global NoPE + local full RoPE, then hard-coded | global layers govern extrapolation; local rotary width irrelevant to it | [`bibo-baseline-2k`](https://wandb.ai/ablations-tinycompany-ai/bibo-baseline-2k): [NoPE + full jicx3bff](https://wandb.ai/ablations-tinycompany-ai/bibo-baseline-2k/runs/jicx3bff), [NoPE + partial hg6hggbl](https://wandb.ai/ablations-tinycompany-ai/bibo-baseline-2k/runs/hg6hggbl), [full + full 6201drjc](https://wandb.ai/ablations-tinycompany-ai/bibo-baseline-2k/runs/6201drjc), [partial + partial w5jdh0rz](https://wandb.ai/ablations-tinycompany-ai/bibo-baseline-2k/runs/w5jdh0rz) |
+| Dead dynamic-NTK branch rescaling RoPE at eval | bug, removed | every pre-Aug-13 extrapolation number incomparable | timeline 05 |
+| Better RoPE theta, partial RoPE on window layers | **OPEN** | | `TODO.md` #10-12 |
+
+## 5. Norm and embedding placement
+
+| Tested | Verdict | Numbers | Evidence |
+|---|---|---|---|
+| Embedding term into the AttnRes depth mix (site, gain, per-dim, scale) | PARKED with AttnRes | | `bibo-attnres` / `-v2` (`attn_res_emb_*`) |
+| RMS-norm on the MoE block output (3 variants) | **CLOSED NEGATIVE** | about 0.010 bpb worse in all 3 | memory note "MoE output norm" (project not recorded; `moe_out_norm` key in [`bibo-act-1b`](https://wandb.ai/ablations-tinycompany-ai/bibo-act-1b)) |
+| Router input norm | **CLOSED NEGATIVE** | per-token norm killed by icv 0.0004 | [`BiBo-Router`](https://wandb.ai/ablations-tinycompany-ai/BiBo-Router) (`router_norm`) |
+| LatentMoE (experts in a d=256 latent, norm before / after) | **CLOSED NEGATIVE** at 137M | 0.07-0.14 train loss worse | `bibo-specials-conv` (`latent_norm`, `moe_latent_dim`) |
+| Tied vs untied embeddings | tied kept | not ablated at scale | `TODO.md` #24 (**OPEN**) |
+
+## 6. FFN placement and MoE geometry
+
+Long form: [`timeline/06-ffn-placement`](../timeline/06-ffn-placement/README.md).
+
+| Tested | Verdict | Numbers | Evidence |
+|---|---|---|---|
+| Dense vs MoE at L0 and L9 (active-param matched) | superseded | monotone on seed 42069, failed its seed controls | [`bibo-dense-vs-moe-2k`](https://wandb.ai/ablations-tinycompany-ai/bibo-dense-vs-moe-2k) (13 runs) |
+| L0 geometry: coarse experts and all-active ensemble | **SHIPPED** all-active ensemble at L0 | train tie, 68.4M smaller, predictable long context | same project (`moe_override` runs, Aug 31 - Sep 10) |
+| Expert count and width: 64 vs 128 experts x width 768 vs 1024 | **SHIPPED** w1024e64; e128 parked on speed | big-holdout w768e64 3.3435, w768e128 3.3359, w1024e64 3.3248, w1024e128 3.3033; tps 251.9k / 223.8k / 211.9k / 187.3k | [`bibo-base-1b`](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b): [w768e128 mmohw1o6](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/mmohw1o6), [w1024e128 s92o5gym](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/s92o5gym), [w768e64 wrsmay8b](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/wrsmay8b) |
+| Hidden 1024 (3.77B total) | parked | fits only at batch 32 x accum 16 (78.4k tps, 77.7 GB) | tps probe, no run |
+| top-k 8 vs 6 at inference; top-k depth dense / 6 / 4 | **CLOSED NEGATIVE** | +0.00264 bpb; .6646 / .6727 / .6828 | timeline 02 |
+| Shared expert at scale | **OPEN** | | `TODO.md` #8, #34, #43 |
+
+## 7. Router and auxiliary losses
+
+Long form: [`timeline/02-moe-routing`](../timeline/02-moe-routing/README.md).
+
+| Tested | Verdict | Numbers | Evidence |
+|---|---|---|---|
+| Aux-free bias balancing vs Qwen-style aux loss | **SHIPPED** aux-free | load entropy 0.9996, no aux loss | [`bibo-qwen-ablate`](https://wandb.ai/ablations-tinycompany-ai/bibo-qwen-ablate) (`aux_coef`, `load_balance`, `bias_update_*`) |
+| Router gate shape (sigmoid / softmax variants), router log, routed scaling | **CLOSED** | no variant separated | [`BiBo-Router`](https://wandb.ai/ablations-tinycompany-ai/BiBo-Router), [`polyglu-ablations-XL`](https://wandb.ai/ablations-tinycompany-ai/polyglu-ablations-XL) |
+| Router temperature | **CLOSED** | Jul: interior optimum T=2 (k=4 stack); Oct: T=2 +0.0025 worse on the 1B board *(1 seed, run died at step 1550)* | [`bibo-specials-conv`](https://wandb.ai/ablations-tinycompany-ai/bibo-specials-conv), [T2 8mo6h5ul](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/8mo6h5ul) |
+| Signed +/- identity experts, zero experts, conv router, GLU token budget | **CLOSED NEGATIVE** (-Identity harmful twice) | 5.9-11.1% worse under AttnRes | `bibo-specials-conv` (176 runs), `bibo-attnres-v2` (`neg_identity_*`) |
+| Router logit blow-out / z-loss | **not needed** | max logit 7-10, under 0.34% saturated | `ablate/tools/router_anatomy.py` on the 6k checkpoints |
+| Rank-balance aux loss (bottom-3 vs top-3 weights), lambda 0.01 / 0.05 / 0.1 | **CLOSED NEGATIVE**, code removed | +0.0034 / +0.0047 / +0.0069, monotone; flattened routing, raised expert-output redundancy | [0.01 sbfw2rxu](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/sbfw2rxu), [0.05 lulv31ma](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/lulv31ma), [0.1 povyvzox](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/povyvzox) |
+| Routing-variance loss L_v (arxiv 2505.22323), gamma 0.001 | **CLOSED NEGATIVE**, code removed | +0.022 big-holdout, steady gap; the paper only claims LoRA-benchmark gains | [4nqjmhba](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/4nqjmhba) |
+| Expert-output overlap, language specialisation (probes, not training) | measured | selected experts' cosine 0.10-0.19 (random 0.02-0.06); hi/en expert-usage JS 0.29-0.6 by layer | `ablate/tools/expert_overlap.py`, `lang_probe.py` |
+| Router noaux_tc / grouped top-k, decayed router noise | **OPEN** | | `TODO.md` #7, #22 |
+
+## 8. Expert activation
+
+Long form: [`timeline/03-expert-activation`](../timeline/03-expert-activation/README.md).
+
+| Tested | Verdict | Numbers | Evidence |
+|---|---|---|---|
+| SiLU, ReLU2, SiTU, NormSiLU, NormReLU, NormSiTU, PolyGLU mixes, learnable scales | normed activations beat SiLU | | [`polyglu-ablations`](https://wandb.ai/ablations-tinycompany-ai/polyglu-ablations), [`-large`](https://wandb.ai/ablations-tinycompany-ai/polyglu-ablations-large), [`-XL`](https://wandb.ai/ablations-tinycompany-ai/polyglu-ablations-XL) |
+| Radial NormSiLU (per-expert exponent p) | **SHIPPED** | wins bpb at 1B but the gap shrank 3.6x from 524M; axis saturated at about 0.6767 | [`bibo-act-1b`](https://wandb.ai/ablations-tinycompany-ai/bibo-act-1b), `bibo-specials-conv` (`act*`), `bibo-baseline-2k` (radial vs silu arms) |
+| Activation tails, gamma / scale inits, scale lr | settled (`act_scale_lr 0.01`) | | `bibo-specials-conv` |
+
+## 9. Optimizers, schedules and Newton-Schulz
+
+Long form: [`timeline/01-optimizer`](../timeline/01-optimizer/README.md).
+
+| Tested | Verdict | Numbers | Evidence |
+|---|---|---|---|
+| Muon vs AdamW | **SHIPPED** Muon | about 2x AdamW at matched steps | [`bibo-qwen-ablate-optimizer`](https://wandb.ai/ablations-tinycompany-ai/bibo-qwen-ablate-optimizer) |
+| Manas (probe-lookahead optimizer) | champion +0.0255 vs Muon on toys; BiBo arms inconclusive | | [`bibo-manas-2k`](https://wandb.ai/ablations-tinycompany-ai/bibo-manas-2k), [`-3way`](https://wandb.ai/ablations-tinycompany-ai/bibo-manas-3way), [`-ladder`](https://wandb.ai/ablations-tinycompany-ai/bibo-manas-ladder), `bibo-qwen-ablate-optimizer` |
+| Muon LR | 3e-3 won on the old stack; current board runs 1e-2 | 4.3 sigma over 1e-2 at the time | [`bibo-lr-sweep`](https://wandb.ai/ablations-tinycompany-ai/bibo-lr-sweep) |
+| Aurora vs Muown vs NorMuon; mid-run switch; Muown gain lr | **SHIPPED** Muown, gain lr x0.1 | WSD: aurora 3.3009, normuon 3.3045, muown 3.2760, glr0.1 3.2715 (train) | [`bibo-aurora-vs-muown`](https://wandb.ai/ablations-tinycompany-ai/bibo-aurora-vs-muown): [muown-wsd-glr0.1 1i4cacpd](https://wandb.ai/ablations-tinycompany-ai/bibo-aurora-vs-muown/runs/1i4cacpd), [aurora-wsd m90z89do](https://wandb.ai/ablations-tinycompany-ai/bibo-aurora-vs-muown/runs/m90z89do), [normuon-wsd 6rxm4816](https://wandb.ai/ablations-tinycompany-ai/bibo-aurora-vs-muown/runs/6rxm4816) |
+| NorMuon on the 1B board | **CLOSED NEGATIVE** | +0.038 big-holdout; gap peaks +0.10 at step 1600 | [claoq6fj](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/claoq6fj) vs [dnt5cbmz](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/dnt5cbmz) |
+| LR schedule: cosine vs WSD vs cyclic | **SHIPPED** WSD | WSD flipped muown from losing to winning; cyclic worst (3.3728) | `bibo-aurora-vs-muown` (`scheduler`, `cycles`) |
+| Weight decay, cautious decay | muon wd dominant on toys; Muown runs wd 0 (wd above 0 collapses channels) | | timeline 01; memory note "Muown switch" |
+| NS coefficients on toys (ns6 / ns8 / kappa / dither) | **CLOSED**, tie at matched wd | | timeline 01 (toy harness, no W&B) |
+| NS step count on the 1B board: ns6 / ns8 / ns10 | ns6 ties ns8, 1.3% faster; ns10 buys nothing | ns6-ns8: +0.0031 (s23), -0.0048 (s42069); ns10 -0.0024 (s23) | [ns6 s23 ft07231f](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/ft07231f), [ns6 s42069 wprd6gc7](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/wprd6gc7), [ns10 s23 4ud3dthp](https://wandb.ai/ablations-tinycompany-ai/bibo-base-1b/runs/4ud3dthp) |
+| NS schedule zoo (11 schedules: KJ quintic5, ns6/8/10, Polar Express 5 / 8, Jiacheng You 6, CANS 4 / 7 / 9, ANVIL 6) on MNIST-1D, plus pre-training proxies | ns6 / ns8 best; most-exact schedules worst; no proxy predicts final loss | best-lr test: ns6 .0491, ns8 .0494 ... pe8 .0566, ns10 .0580 | [`ns-zoo-mnist1d-v5-wsd`](https://wandb.ai/ablations-tinycompany-ai/ns-zoo-mnist1d-v5-wsd) is the valid run; `-v1` to `-v4-big` are superseded (pe8 NaN, overfitting, constant-lr spikes) |
+| ANVIL twin-rail momentum, tail weight averaging, QK-Clip, online Shampoo, muP | **OPEN** | | `TODO.md` #15, #16, #18 |
+
+## 10. Multi-token prediction
+
+| Tested | Verdict | Numbers | Evidence |
+|---|---|---|---|
+| MTP depth 1 / 2 / 3, dense vs ensemble FFN, with / without embedding, with / without W_p, weight 0.1 / 0.3 / 0.5 | **SETTLED, not in use**: depth 1, v1-noemb, weight 0.3 or 0.1 | noemb 3.3304 vs v1 3.3346 (2-seed mean); 0.5 gives back most of the gain | [`mtp-ablations`](https://wandb.ai/ablations-tinycompany-ai/mtp-ablations): [noemb s23 gom8ssx8](https://wandb.ai/ablations-tinycompany-ai/mtp-ablations/runs/gom8ssx8), [noemb s42069 do2ad9ae](https://wandb.ai/ablations-tinycompany-ai/mtp-ablations/runs/do2ad9ae), [w0.3 2bt3dhdj](https://wandb.ai/ablations-tinycompany-ai/mtp-ablations/runs/2bt3dhdj) |
+| Still ambiguous | **OPEN** | W_p vs none; 0.3 vs 0.1; MTP vs an equal-wall-clock base (MTP is about 20% slower) | `TODO.md` "MTP -- settled" |
+
+## 11. Data, tokenizer and baselines
+
+Long form: [`timeline/08-data-and-tokenizer`](../timeline/08-data-and-tokenizer/README.md).
+
+| Tested | Verdict | Evidence |
+|---|---|---|
+| Gigatoken tokenizer path (10.1x over HF, 0 mismatches over 3200 documents) | **SHIPPED** | timeline 08 |
+| bip2 corpus was padded (15.93% of tokens), not packed | fixed (`--pad_id 0`), then replaced | timeline 08 |
+| FineWeb hi35 / en65 4096-packed corpus | **SHIPPED** | HF `fhai50032/BiBo_corpus-4096-packed-qtk-2.05M-hi35-en65` |
+| BiBo vs Qwen3MoE, param-matched | BiBo-min adopted | [`bibo-qwen-ablate`](https://wandb.ai/ablations-tinycompany-ai/bibo-qwen-ablate), [`bibo-vs-qwen`](https://wandb.ai/ablations-tinycompany-ai/bibo-vs-qwen), [`bibo-benchmark`](https://wandb.ai/ablations-tinycompany-ai/bibo-benchmark), [`bibo-long-context`](https://wandb.ai/ablations-tinycompany-ai/bibo-long-context) |
+| Early broad sweep and sustained benchmarking (May-June) | historical, no readable loss key | [`bibo-ablation`](https://wandb.ai/ablations-tinycompany-ai/bibo-ablation) (51), [`bibo-bench`](https://wandb.ai/ablations-tinycompany-ai/bibo-bench) (86) |
+| Data mix ratio, other tokenizers, training at seq 4096 | **OPEN** | `TODO.md` #14, #20, #21 |
+
+## 12. Interpretability and diagnostics
+
+| Probe | Finding | Evidence |
+|---|---|---|
+| Per-layer interp of a fully instrumented run | attention type organises everything; routers saturated on the old stack; expert identity churns | [`bibo-perlayer-smoke`](https://wandb.ai/ablations-tinycompany-ai/bibo-perlayer-smoke), `bibo-dense-vs-moe-2k`; [`timeline/10-per-layer-interp`](../timeline/10-per-layer-interp/README.md) |
+| Router anatomy on the 6k run | no logit blow-out; routing sharpens over training; 6th expert weight about 0.045 | `ablate/tools/router_anatomy.py` |
+| Attention logits and mean-key ratio on real activations | max logit 6-15, mean-key ratio under 1, not growing | `ablate/tools/attn_precision.py` |
+| Loss-curve extrapolation of the 6k run | stable-phase fit L = 2.928 + 187.6 t^-0.791 | memory / conversation notes |
+
+## Not tracked in W&B
+
+- `latentsig-med-triage-router` (Qwen3-4B QLoRA, May 29-30): a separate fine-tuning task, not BiBo.
+- Toy optimizer harnesses (OLM, MNIST, MNIST-1D before the NS zoo), kernel microbenchmarks and
+  parity tests: results live in the round notes and `triton-kernel-fused/parity_check/`.
+
+---
+
+## Still to do
+
+Grouped by what they would change. Numbers refer to `TODO.md`.
+
+**Precision and speed**
+- FP4 / NVFP4 training of the experts: QAT harness first, then W4A8 / W4A4 arms (#3, #48-54).
+- Adopt ns6 as the board default: tied ns8 on 2 seeds and MNIST-1D, 1.3% faster (decision pending).
+- KohakuFA bugs 1+2 fix: merge if QK-norm is dropped or logits exceed about 1e4.
+
+**Attention**
+- Gated attention (#5), differential attention (#6), MLA (#17), hybrid linear attention (#19),
+  attention sinks / register tokens (#23), SWA window size (#35).
+
+**MoE**
+- Shared expert at scale (#8, #34, #43); router noaux_tc / grouped top-k (#22); decayed router noise (#7).
+- 128 experts at width 1024 won on loss (-0.0215) but is 12% slower: revisit for the long run.
+
+**Optimizer**
+- QK-Clip / MuonClip (#16), online Shampoo (#15), muP (#18).
+- ANVIL-style twin-rail momentum and tail weight averaging (not yet in `TODO.md`).
+- NorMuon learning-rate bracket, if NorMuon is to get a fair second look.
+
+**MTP**
+- The three ambiguities: W_p, weight 0.3 vs 0.1, equal-wall-clock comparison.
+
+**Data and scale**
+- Data mix ratio (#21), tokenizer (#14), training at seq 4096 (#20), untied embeddings (#24),
+  max_position_embeddings 2048 vs the 4096-packed corpus (#27).
+- The long run itself: about 30k steps, after the architecture freeze.
+- Per-domain bpb (#32).
