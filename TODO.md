@@ -1,12 +1,11 @@
 # TODO
 
 > **PAUSED Oct 5 2026 (pivot to voice / ASR / TTS, see `voice/`).** On resume, START HERE:
-> **0. [ ] HIGHEST PRIORITY: high-quality-data annealing in the WSD decay phase** (#58). Keep the stable phase as
-> is; swap the 20% decay to ~50% high-quality hi/en (Hindi Wikipedia, textbook-style, math/code) + ~50% general;
-> one 2000-step run vs the reference base1b-s23 (3.3248), judge on big-holdout AND the benchmark/ suite.
-> Then the scaling check (#56) and distillation (#63a).
+> Order on resume: ARCHITECTURE first (1, plus the other open architecture items: #55 GatedNorm / self-gated carry,
+> #5 gated attention, #56 scaling check, #57 long-horizon recheck), freeze it, THEN data (2). Data experiments must
+> run on the frozen architecture so their results stay valid.
 >
-> **0b. [ ] HIGH PRIORITY: attention-only / FFN-reallocation ablation** (Cactus "Simple Attention Networks",
+> **1. [ ] FIRST: attention-only / FFN-reallocation ablation** (architecture, before any data work) (Cactus "Simple Attention Networks",
 > arxiv 2607.18363, cactuscompute.com/blog/simple-attention-networks). Their result: at MATCHED PARAMS (24M:
 > 20-layer attention-only vs 4-layer SwiGLU) the attention-only model trails by only 0.0055 nats at 105B tokens
 > (gap shrinking 0.046 @5B -> 0.019 @30B), but at matched depth (+0.470) and matched FLOPs (+0.263) the FFN model
@@ -17,6 +16,12 @@
 > layers with attention-only layers and spend the freed active params / FLOPs on depth (more attention layers),
 > at matched ACTIVE params and at matched TOTAL params; (c) per-token-type val split (knowledge-heavy vs
 > context-derivable tokens) to see where any loss moves. 2k steps, 2 seeds, vs base1b-s23.
+>
+> **2. [ ] Then: high-quality-data annealing in the WSD decay phase** (#58) -- ONLY AFTER the architecture is frozen,
+> so the data-mix / data-quality results are measured on the final architecture and stay valid. Keep the stable phase as
+> is; swap the 20% decay to ~50% high-quality hi/en (Hindi Wikipedia, textbook-style, math/code) + ~50% general;
+> one 2000-step run vs the reference base1b-s23 (3.3248), judge on big-holdout AND the benchmark/ suite.
+> Then distillation (#63a) and the rest of the data items (#58, #59).
 
 1. [x] MTP -- SETTLED Sep 28 2026 (not in use yet): depth 1, v1-noemb. See "MTP -- settled" below; runs in W&B `mtp-ablations`
 2. [x] enchaning ce to be more effective -- DONE Sep 28 2026: tkf ce_factored.py (factored softmax grad, 4 GB chunks) is the default, --ce_kernel
