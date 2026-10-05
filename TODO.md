@@ -5,6 +5,18 @@
 > is; swap the 20% decay to ~50% high-quality hi/en (Hindi Wikipedia, textbook-style, math/code) + ~50% general;
 > one 2000-step run vs the reference base1b-s23 (3.3248), judge on big-holdout AND the benchmark/ suite.
 > Then the scaling check (#56) and distillation (#63a).
+>
+> **0b. [ ] HIGH PRIORITY: attention-only / FFN-reallocation ablation** (Cactus "Simple Attention Networks",
+> arxiv 2607.18363, cactuscompute.com/blog/simple-attention-networks). Their result: at MATCHED PARAMS (24M:
+> 20-layer attention-only vs 4-layer SwiGLU) the attention-only model trails by only 0.0055 nats at 105B tokens
+> (gap shrinking 0.046 @5B -> 0.019 @30B), but at matched depth (+0.470) and matched FLOPs (+0.263) the FFN model
+> wins big; the attention-only deficit sits on QUERY tokens (knowledge from weights), it LEADS on reasoning/answer
+> tokens; post-attention sandwich norm -0.009; scalar residual gates neutral; QK-norm load-bearing. Their trade
+> (params scarce, FLOPs cheap) is the OPPOSITE of our MoE trade (params cheap per FLOP), so the question for BiBo:
+> (a) cheap side ablations first -- post-attention (sandwich) norm on attention output; (b) replace k of the 9 MoE
+> layers with attention-only layers and spend the freed active params / FLOPs on depth (more attention layers),
+> at matched ACTIVE params and at matched TOTAL params; (c) per-token-type val split (knowledge-heavy vs
+> context-derivable tokens) to see where any loss moves. 2k steps, 2 seeds, vs base1b-s23.
 
 1. [x] MTP -- SETTLED Sep 28 2026 (not in use yet): depth 1, v1-noemb. See "MTP -- settled" below; runs in W&B `mtp-ablations`
 2. [x] enchaning ce to be more effective -- DONE Sep 28 2026: tkf ce_factored.py (factored softmax grad, 4 GB chunks) is the default, --ce_kernel
