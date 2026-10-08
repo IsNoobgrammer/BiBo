@@ -24,10 +24,12 @@ for att in 0 1 6 13; do
       model_path=$NEMO dataset_manifest=$M/meeting.jsonl output_path=$out batch_size=1 \
       "att_context_size=[70,$att]" decoder_type=$dec > $M/$RUN.la$att.$dec.log 2>&1 || { echo "FAILED la$att $dec"; tail -5 $M/$RUN.la$att.$dec.log; continue; }
     $P - <<EOF
-import json, sys
+import glob, json, sys
 sys.path.insert(0, "voice/asr")
 from score import normalize, wer
-rows = {r["audio_filepath"].rsplit("/", 1)[-1]: r for r in map(json.loads, open("$out", encoding="utf-8"))}
+# NeMo's streaming script treats output_path as a DIRECTORY and writes streaming_out_*.json in manifest order
+order = [json.loads(l)["audio_filepath"].rsplit("/", 1)[-1] for l in open("$M/meeting.jsonl")]
+rows = dict(zip(order, map(json.loads, open(glob.glob("$out/*.json")[0], encoding="utf-8"))))
 res = []
 for wav, ref in (("c2m.wav", "ref2m.txt"), ("clip16k.wav", "reference.txt")):
     rw, hw = normalize(open("$M/" + ref, encoding="utf-8").read()), normalize(rows[wav].get("pred_text", ""))
