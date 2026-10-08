@@ -47,7 +47,8 @@ def main():
     ap.add_argument("--steps", type=int, default=30)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--lhotse_sec", type=float, default=0, help="> 0: Lhotse duration-bucketed batches of this many audio seconds")
-    ap.add_argument("--compile", choices=["none", "default", "ro"], default="none", help="torch.compile the encoder (ro = reduce-overhead / CUDA graphs)")
+    ap.add_argument("--compile", choices=["none", "default", "ro", "layers"], default="none",
+                    help="torch.compile the whole encoder (default / ro = CUDA graphs) or each conformer layer (layers)")
     a = ap.parse_args()
     import nemo.collections.asr as nemo_asr
     from omegaconf import open_dict
@@ -64,7 +65,13 @@ def main():
             cfg.batch_duration, cfg.batch_size, cfg.shuffle_buffer_size = a.lhotse_sec, None, 10000
     m.setup_training_data(cfg)
     m = m.cuda().train()
-    if a.compile != "none":
+    if a.compile == "layers":
+        # whole-encoder compile graph-breaks (random lookahead pick, NeMo's Triton subsampling) and then recompiles
+        # for every new length; the 17 conformer layers have no breaks and share one dynamic-shape graph
+        torch._dynamo.config.cache_size_limit = 64
+        for i, layer in enumerate(m.encoder.layers):
+            m.encoder.layers[i] = torch.compile(layer, dynamic=True)
+    elif a.compile != "none":
         m.encoder = torch.compile(m.encoder, mode="reduce-overhead" if a.compile == "ro" else None, dynamic=True)
     opt = torch.optim.AdamW(m.parameters(), lr=1e-4)
     m._optimizer = opt                                            # training_step logs its lr
