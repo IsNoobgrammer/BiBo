@@ -51,7 +51,7 @@ def numo_ok(r):
 # hours = unique hours to take (None = all); repeat = train copies (copy 1+ augmented, prep_train.py)
 # EN per variant ~400: [emilia + nptel pools: nptel50 = emilia ~200 + nptel 50, nptel150 = emilia 100 + nptel ~150]
 #   + ami windows ~80 + spotify + phone + voxpopuli 20 + people's speech 15 + svarah ~9 (x3) + medical ~8 (x2) + phone (x2)
-# HI 600: indicvoices 300 + numo 120 + vaani 100 + kathbath 50 + hinglish 20 (x3) + lahaja ~11 (x3)
+# HI 600: indicvoices 300 + numo 120 + vaani 100 + kathbath 50 + hinglish 20 (x2) + lahaja ~11 (x3)
 SOURCES = [
     # --- English pools for the two variants ---
     dict(name="emilia", repo="MrDragonFox/EN_Emilia_Yodas_616h", rev="main", prefix="data/train-", audio="audio",
@@ -88,7 +88,7 @@ SOURCES = [
     dict(name="kathbath_hi", repo="ai4bharat/Kathbath", rev="main", prefix="hindi/train-", audio="audio_filepath",
          text="text", lang="hi", hours=50, frac=0.5, speaker=lambda r: str(r["speaker_id"])),
     dict(name="hinglish", repo="agarwalayushi/hinglish", rev="main", prefix="data/train-", audio="audio", text="text",
-         lang="hi", hours=20, frac=0.05, repeat=3, speaker=lambda r: r["source"]),  # spoken tutorials (= MUCS)
+         lang="hi", hours=20, frac=0.05, repeat=2, speaker=lambda r: r["source"]),  # spoken tutorials (= MUCS)
     dict(name="lahaja", repo="ai4bharat/Lahaja", rev="main", prefix="data/test-", audio="audio_filepath", text="text",
          lang="hi", hours=None, frac=1.0, repeat=3, speaker=lambda r: str(r["sp_id"])),
 ]
