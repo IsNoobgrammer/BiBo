@@ -71,8 +71,10 @@ def build(src, out, scale, seed):
                     continue
                 p = os.path.join(adir, f"{n:07d}.flac")
                 sf.write(p, x, sr)
-                man.write(json.dumps({"audio_filepath": p, "duration": round(dur, 3), "text": text, "lang": lang,
-                                      "source": name}, ensure_ascii=False) + "\n")
+                row = {"audio_filepath": p, "duration": round(dur, 3), "text": text, "lang": lang, "source": name}
+                if "scenario" in r:
+                    row["scenario"] = r["scenario"]
+                man.write(json.dumps(row, ensure_ascii=False) + "\n")
                 total += dur
                 n += 1
                 if total >= budget:
