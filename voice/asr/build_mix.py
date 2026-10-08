@@ -97,8 +97,19 @@ SPEAKER_COLS = {"native_place_district", "gender", "age-group", "id", "speaker_i
                 "speaker_name", "file_id", "filename"}
 
 
+def hf(fn, *args, **kw):
+    """Every HF call retries on 429: a 1000 h build makes thousands of requests and the Hub rate-limits bursts."""
+    for attempt in range(40):
+        try:
+            return fn(*args, **kw)
+        except Exception as e:
+            if "429" not in str(e) or attempt == 39:
+                raise
+            time.sleep(min(30 * (attempt + 1), 300))
+
+
 def shard_rows(src, path, rng):
-    local = hf_hub_download(src["repo"], path, repo_type="dataset", revision=src["rev"])
+    local = hf(hf_hub_download, src["repo"], path, repo_type="dataset", revision=src["rev"])
     names = set(pq.read_schema(local).names)
     want = ({src["audio"], src["text"]} | (SPEAKER_COLS & names) | (set(src.get("extra", {}).values()) & names)
             | (set(src.get("cols", [])) & names))
@@ -109,14 +120,7 @@ def shard_rows(src, path, rng):
 
 def spotify_rows():
     """SALT-NLP/spotify_podcast_ASR: .ogg clips + metadata.csv (human transcription per clip)."""
-    for attempt in range(30):                     # 1,690 small files: HF rate-limits (429) bursts of per-file requests
-        try:
-            d = snapshot_download("SALT-NLP/spotify_podcast_ASR", repo_type="dataset", max_workers=2)
-            break
-        except Exception as e:
-            if "429" not in str(e) or attempt == 29:
-                raise
-            time.sleep(60)
+    d = hf(snapshot_download, "SALT-NLP/spotify_podcast_ASR", repo_type="dataset", max_workers=2)  # 1,690 small files
     rows = []
     for r in csv.DictReader(open(os.path.join(d, "metadata.csv"), encoding="utf-8")):
         p = os.path.join(d, r["file_name"])
@@ -135,7 +139,7 @@ def build(src, out, scale, seed):
         src = {**src, "audio": "audio", "text": "transcription"}
         shards = [lambda: spotify_rows()]
     else:
-        files = sorted(f for f in HfApi().list_repo_files(src["repo"], repo_type="dataset", revision=src["rev"])
+        files = sorted(f for f in hf(HfApi().list_repo_files, src["repo"], repo_type="dataset", revision=src["rev"])
                        if f.startswith(src["prefix"]) and f.endswith(".parquet"))
         random.Random(seed).shuffle(files)
         shards = [(lambda f=f, i=i: shard_rows(src, f, random.Random(seed + i))) for i, f in enumerate(files)]
