@@ -12,6 +12,9 @@ import argparse
 import json
 import os
 import sys
+
+# batch shapes change every step (Lhotse buckets): growable segments instead of cudaFree + re-malloc stalls
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import time
 
 import lightning.pytorch as pl
@@ -118,6 +121,7 @@ def main():
     ap.add_argument("--compile_layers", action="store_true")
     ap.add_argument("--fused_joint", action="store_true", help="tkf fused joint + RNN-T loss (voice/asr/fused_joint.py)")
     ap.add_argument("--no_hf", action="store_true", help="A/B and smoke runs: no HF checkpoint pull / push")
+    ap.add_argument("--bf16_master", action="store_true", help="bf16 model + fp32 master weights, no autocast")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--project", default="bibo-asr")
     a = ap.parse_args()
@@ -157,6 +161,9 @@ def main():
     if a.fused_joint:
         import fused_joint
         fused_joint.enable(m)
+    if a.bf16_master:
+        import bf16_master
+        bf16_master.to_bf16(m)
 
     ckpt_dir = os.path.join(a.out, a.run)
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -169,8 +176,8 @@ def main():
         hf_sync.push(a.run, tok_dir=a.tok, wandb_id=logger.experiment.id, block=True)
     define_metrics(logger.experiment)
     trainer = pl.Trainer(
-        devices=1, accelerator="gpu", precision="bf16-mixed", max_steps=max_steps, max_epochs=-1,
-        limit_train_batches=eval_steps, num_sanity_val_steps=0, gradient_clip_val=1.0, log_every_n_steps=50,
+        devices=1, accelerator="gpu", precision="32-true" if a.bf16_master else "bf16-mixed", max_steps=max_steps, max_epochs=-1,
+        limit_train_batches=eval_steps, num_sanity_val_steps=0, gradient_clip_val=None if a.bf16_master else 1.0, log_every_n_steps=50,
         use_distributed_sampler=False, logger=logger, enable_checkpointing=True, benchmark=False,
         callbacks=[AudioMeter(), ValAggregate(a.val), LearningRateMonitor("step"),
                    ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer_all", mode="min", save_top_k=2,
@@ -180,6 +187,8 @@ def main():
     m.setup_optimization(OmegaConf.create({
         "name": "adamw", "lr": a.lr, "betas": [0.9, 0.98], "weight_decay": 1e-3,
         "sched": {"name": "CosineAnnealing", "warmup_steps": a.warmup, "min_lr": 1e-5, "max_steps": max_steps}}))
+    if a.bf16_master:
+        bf16_master.wrap(m._optimizer, clip=1.0)                    # clips on the fp32 masters
     print(f"[run] {a.run}: max_steps {max_steps}, eval every {eval_steps} steps (~{a.eval_hours} h), "
           f"batch {a.batch_sec} s, val {[os.path.basename(v) for v in a.val]}", flush=True)
     print(f"[run] resume from {resume}", flush=True)
