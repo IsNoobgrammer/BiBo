@@ -35,6 +35,9 @@ SOURCES = [
          text="text", lang="en", hours=80, frac=0.25, speaker=lambda r: r["id"].rsplit("_", 1)[0]),
     dict(name="voxpopuli", repo="facebook/voxpopuli", rev=CONV, prefix="en/train/", audio="audio", text="raw_text",
          lang="en", hours=10, frac=0.25, speaker=lambda r: r["speaker_id"]),
+    dict(name="nptel", repo="skbose/indian-english-nptel-v0", rev="main", prefix="data/train-", audio="audio",
+         text="transcription_normalised", lang="en", hours=220, frac=0.1,
+         speaker=lambda r: r["speaker_name"]),                               # Indian-English lectures, lecturer = speaker
     dict(name="ami_ihm", repo="edinburghcstr/ami", rev=CONV, prefix="ihm/train/", audio="audio", text="text", lang="en",
          hours=65, frac=1.0, speaker=lambda r: r["speaker_id"],          # whole meetings: real turns for <spk> windows
          extra={"meeting": "meeting_id", "begin": "begin_time"}),
@@ -52,7 +55,7 @@ SOURCES = [
          lang="hi", hours=None, frac=1.0, repeat=3, speaker=lambda r: str(r["sp_id"])),  # Hindi from non-native speakers
 ]
 MIN_S, MAX_S = 1.0, 30.0
-SPEAKER_COLS = {"native_place_district", "gender", "age-group", "id", "speaker_id", "file_name", "source", "sp_id"}
+SPEAKER_COLS = {"native_place_district", "gender", "age-group", "id", "speaker_id", "file_name", "source", "sp_id", "speaker_name"}
 
 
 def shard_rows(src, path, rng):
