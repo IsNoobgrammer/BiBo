@@ -5,6 +5,8 @@
 set -euo pipefail
 W=/home/marimo/work; A=$W/asr; R=$A/run0; P=/tmp/uv-venv/bin/python   # the env NeMo was installed into
 cd $W/BiBo && git log --oneline -1
+# NeMo's RNNT loss JIT-compiles numba CUDA kernels: needs libnvvm (numba-cuda cu13 wheels); numba-cuda 0.30 breaks on numpy>=2.4
+uv pip install -q --python $P "numba-cuda[cu13]" "numpy<2.4"
 
 $P voice/asr/prep_train.py --mix $A/mix100 --out $R
 
