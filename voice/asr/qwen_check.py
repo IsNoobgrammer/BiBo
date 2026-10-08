@@ -75,9 +75,6 @@ def main():
             print(f"  scenario {sc}: n={len(sub)} corpusWER={100 * e / max(sum(len(normalize(r['text'])) for r in sub), 1):.1f}%", flush=True)
         for r in sorted(rows, key=lambda r: -r["wer"])[:3]:
             print(f"  WORST wer={r['wer']:.2f} {os.path.basename(r['audio_filepath'])}\n    ref: {r['text'][:160]}\n    qwen: {r['qwen_text'][:160]}", flush=True)
-        if not a.per_source:
-            with open(os.path.join(a.mix, f"{src}_clean.jsonl"), "w", encoding="utf-8") as fo:
-                fo.writelines(json.dumps({k: v for k, v in r.items() if k != "qwen_text"}, ensure_ascii=False) + "\n" for r in keep)
 
 
 if __name__ == "__main__":
