@@ -1,4 +1,4 @@
-"""Pack a build_mix.py output into parquet shards and push them to an HF dataset (private unless --public).
+"""Pack a build_mix.py output into parquet shards and push them to an HF dataset (PUBLIC unless --private: HF private storage is capped).
 
     python voice/asr/push_mix.py --mix /home/marimo/work/asr/mix1000 --lang hi --repo fhai50032/asr-hindi
     python voice/asr/push_mix.py --mix /home/marimo/work/asr/mix1000 --lang en --repo fhai50032/asr-english
@@ -59,7 +59,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mix", required=True)
     ap.add_argument("--repo", required=True)
-    ap.add_argument("--public", action="store_true")
+    ap.add_argument("--private", action="store_true")
     ap.add_argument("--lang", choices=["hi", "en"], required=True, help="one language per repo")
     a = ap.parse_args()
     repeat = {s["name"]: s.get("repeat", 1) for s in SOURCES}
@@ -132,7 +132,7 @@ sets: models trained on this cannot report their official numbers.
 """
     open(os.path.join(out, "README.md"), "w", encoding="utf-8").write(card)
     api = HfApi()
-    api.create_repo(a.repo, repo_type="dataset", private=not a.public, exist_ok=True)
+    api.create_repo(a.repo, repo_type="dataset", private=a.private, exist_ok=True)
     api.upload_large_folder(repo_id=a.repo, repo_type="dataset", folder_path=out)
     print(f"PUSHED https://huggingface.co/datasets/{a.repo}", {v: round(hrs(gs), 1) for v, gs in configs.items()},
           flush=True)
