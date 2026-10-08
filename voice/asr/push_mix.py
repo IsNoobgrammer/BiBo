@@ -1,6 +1,9 @@
 """Pack a build_mix.py output into parquet shards and push them to an HF dataset (private unless --public).
 
-    python voice/asr/push_mix.py --mix /home/marimo/work/asr/mix1000 --repo fhai50032/asr-en-hi-1000h
+    python voice/asr/push_mix.py --mix /home/marimo/work/asr/mix1000 --lang hi --repo fhai50032/asr-hindi
+    python voice/asr/push_mix.py --mix /home/marimo/work/asr/mix1000 --lang en --repo fhai50032/asr-english
+One language per repo. Hindi: one default config (data/shared). English: the groups + configs below.
+Set HF_XET_HIGH_PERFORMANCE=1 for faster Xet transfers.
 
 Unique audio, stored ONCE, in groups; the card defines one config per English variant (prep_train.VARIANTS):
     data/shared/        every source except the emilia / nptel pools (all Hindi, AMI, Spotify, phone, ...)
@@ -55,6 +58,7 @@ def main():
     ap.add_argument("--mix", required=True)
     ap.add_argument("--repo", required=True)
     ap.add_argument("--public", action="store_true")
+    ap.add_argument("--lang", choices=["hi", "en"], required=True, help="one language per repo")
     a = ap.parse_args()
     repeat = {s["name"]: s.get("repeat", 1) for s in SOURCES}
     windows_only = {s["name"] for s in SOURCES if s.get("windows_only")}
@@ -63,16 +67,18 @@ def main():
         if man.endswith("_raw.jsonl"):
             continue
         rows = [json.loads(l) for l in open(man, encoding="utf-8")]
-        if rows:
+        if rows and rows[0]["lang"] == a.lang:
             rows_by_src[rows[0]["source"]] = rows
     grp = groups(rows_by_src)
-    out = os.path.join(a.mix, "hf")
+    out = os.path.join(a.mix, f"hf_{a.lang}")
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(os.path.join(out, "manifests"))
     for src in rows_by_src:
         shutil.copy(os.path.join(a.mix, f"{src}.jsonl"), os.path.join(out, "manifests", f"{src}.jsonl"))
     meta = {b"huggingface": json.dumps({"info": {"features": FEATURES}}).encode()}
     for g, rows in grp.items():
+        if not rows:
+            continue
         random.Random(23).shuffle(rows)
         os.makedirs(os.path.join(out, "data", g), exist_ok=True)
         n = (len(rows) + ROWS_PER_SHARD - 1) // ROWS_PER_SHARD
@@ -87,28 +93,29 @@ def main():
                            os.path.join(out, "data", g, f"train-{k:05d}.parquet"))
         print(f"group {g}: {len(rows)} rows, {sum(r['duration'] for r in rows) / 3600:.1f} h, {n} shards", flush=True)
     hrs = lambda gs: sum(r["duration"] for g in gs for r in grp[g]) / 3600
+    configs = GROUPS if a.lang == "en" else {"default": ["shared"]}
     table = "\n".join(f"| {src} | {rows[0]['lang']} | {sum(r['duration'] for r in rows) / 3600:.1f} | {len(rows)} | "
                       f"x{repeat.get(src, 1)}{' (meeting windows only)' if src in windows_only else ''} |"
                       for src, rows in sorted(rows_by_src.items()))
     cfg = "\n".join(f"- config_name: {v}\n  data_files:\n" + "\n".join(f"  - data/{g}/*.parquet" for g in gs)
-                    for v, gs in GROUPS.items())
+                    for v, gs in configs.items())
     card = f"""---
 license: other
-language: [en, hi]
+language: [{a.lang}]
 task_categories: [automatic-speech-recognition]
 configs:
 {cfg}
 ---
 # {a.repo.split('/')[-1]}
 
-English + Hindi ASR audio (16 kHz FLAC), built by BiBo `voice/asr/build_mix.py`. Bad rows were REMOVED, never
+{"Hindi" if a.lang == "hi" else "English"} ASR audio (16 kHz FLAC), one half of the BiBo voice 1000 h mix (600 h
+Hindi / 400 h English), built by BiBo `voice/asr/build_mix.py`. Bad rows were REMOVED, never
 relabelled: Emilia keeps rows whose two independent transcripts agree (<= 5% WER) with audio quality PQ >= 6.5; Numo
 keeps its own WER <= 6% and synthetic-speech score <= 0.2; NPTEL drops rows a Qwen3-ASR pass scores above 50% WER
 (misaligned subtitles, confirmed by Gemini on a sample). Text keeps each source's original casing / markup; the training
 normalisation is in `voice/asr/prep_train.py`.
 
-Two configs (English variants, Hindi identical): **nptel50** {hrs(GROUPS['nptel50']):.1f} h, **nptel150**
-{hrs(GROUPS['nptel150']):.1f} h.
+Configs: {", ".join(f"**{v}** {hrs(gs):.1f} h" for v, gs in configs.items())}.
 
 | source | lang | hours | rows | train use |
 |---|---|---|---|---|
@@ -125,8 +132,8 @@ sets: models trained on this cannot report their official numbers.
     api = HfApi()
     api.create_repo(a.repo, repo_type="dataset", private=not a.public, exist_ok=True)
     api.upload_large_folder(repo_id=a.repo, repo_type="dataset", folder_path=out)
-    print(f"PUSHED https://huggingface.co/datasets/{a.repo}  nptel50 {hrs(GROUPS['nptel50']):.1f} h  "
-          f"nptel150 {hrs(GROUPS['nptel150']):.1f} h", flush=True)
+    print(f"PUSHED https://huggingface.co/datasets/{a.repo}", {v: round(hrs(gs), 1) for v, gs in configs.items()},
+          flush=True)
 
 
 if __name__ == "__main__":
