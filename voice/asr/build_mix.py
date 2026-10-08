@@ -1,5 +1,6 @@
 """60/40 English/Hindi ASR training mix from ungated HF sets (parquet conversions, no `datasets` dependency).
 
+    python voice/asr/build_mix.py --out /home/marimo/work/asr/mix100 --scale 0.1 --frac 0.25     # ~100 h after the Qwen filter
     python voice/asr/build_mix.py --out /home/marimo/work/asr/mix [--scale 1.0] [--only voxpopuli]
 
 Writes <out>/audio/<source>/<n>.flac (16 kHz mono) and <out>/<source>.jsonl manifests (NeMo style: audio_filepath,
@@ -82,12 +83,15 @@ def build(src, out, scale, seed):
 
 
 def main():
+    global FRAC
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--scale", type=float, default=1.0, help="multiply every hour budget (0.01 = smoke test)")
     ap.add_argument("--only", default="", help="comma list of source names")
     ap.add_argument("--seed", type=int, default=23)
+    ap.add_argument("--frac", type=float, default=FRAC, help="share of each shard kept (lower = more recordings per hour)")
     a = ap.parse_args()
+    FRAC = a.frac
     srcs = [s for s in SOURCES if not a.only or s[0] in a.only.split(",")]
     res = [build(s, a.out, a.scale, a.seed) for s in srcs]
     hrs = {"en": 0.0, "hi": 0.0}
