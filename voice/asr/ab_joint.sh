@@ -12,7 +12,8 @@ for arm in ${ARMS:-nemo nemo2 fused}; do
   $P voice/asr/train_asr.py --run ab-$arm --out $A/exp_ab --project bibo-asr-ab --no_hf --seed 23 \
     --init $R/../exp/run1/run1.nemo --train $R/train.jsonl --tok $R/tok/tokenizer_spe_bpe_v4096 \
     --val $E/fleurs_en.jsonl --total_hours 100 --eval_hours 100000 --warmup 100 \
-    $(case $arm in fused*) echo --fused_joint;; esac) $(case $arm in *bf16*) echo --bf16_master;; esac) \n    > $A/exp_ab_$arm.log 2>&1
+    $(case $arm in fused*) echo --fused_joint;; esac) $(case $arm in *bf16*) echo --bf16_master;; esac) \
+    > $A/exp_ab_$arm.log 2>&1
   echo "ARM_END $arm $?"
 done
 echo AB_DONE
