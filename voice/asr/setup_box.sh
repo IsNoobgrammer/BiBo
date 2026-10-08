@@ -9,7 +9,7 @@ mkdir -p $W/asr && cd $W
 [ -d NeMo ] || git clone -q --depth 1 https://github.com/NVIDIA/NeMo.git
 # reuse the box's CUDA torch from system site-packages instead of downloading another one
 [ -x $V/bin/python ] || uv venv -q --system-site-packages --python "$(command -v python3)" $V
-uv pip install -q --python $V/bin/python -e "$W/NeMo[asr]"
+uv pip install -q --python $V/bin/python -e "$W/NeMo[asr]" "transformers>=4.53,<5"   # else uv backtracks to 4.12 (tokenizers build fails on py3.13)
 # NeMo's RNNT loss JIT-compiles numba CUDA kernels: needs libnvvm (numba-cuda cu13 wheels); numba-cuda 0.30 breaks on numpy>=2.4
 uv pip install -q --python $V/bin/python "numba-cuda[cu13]" "numpy<2.4" pyarrow soundfile huggingface_hub
 $V/bin/python -c "import torch, nemo.collections.asr, numba.cuda; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'nemo ok')"
