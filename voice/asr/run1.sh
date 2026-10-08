@@ -22,7 +22,7 @@ $P $W/NeMo/examples/asr/speech_to_text_finetune.py \
   model.train_ds.manifest_filepath=$R/train.jsonl model.train_ds.batch_size=64 model.train_ds.max_duration=30 \
   "model.validation_ds.manifest_filepath=[$R/val_en.jsonl,$R/val_hi.jsonl]" model.validation_ds.batch_size=64 \
   model.optim.lr=5e-4 model.optim.sched.warmup_steps=1000 model.optim.sched.min_lr=1e-5 \
-  trainer.devices=1 trainer.max_epochs=20 trainer.precision=bf16-mixed trainer.strategy=auto \
+  trainer.devices=1 trainer.max_epochs=12 trainer.precision=bf16-mixed trainer.strategy=auto \
   exp_manager.exp_dir=$R/exp exp_manager.name=run1 \
   exp_manager.create_wandb_logger=true exp_manager.wandb_logger_kwargs.project=bibo-asr exp_manager.wandb_logger_kwargs.name=run1 \
   exp_manager.checkpoint_callback_params.save_top_k=2
