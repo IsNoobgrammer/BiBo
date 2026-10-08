@@ -80,24 +80,27 @@ def _check():
     alen = torch.full((B,), T * 1280, device="cuda") - torch.randint(0, T * 640, (B,), device="cuda")
     y = torch.randint(5, m.tokenizer.vocab_size, (B, U), device="cuda")
     ylen = torch.randint(U // 2, U + 1, (B,), device="cuda")
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        enc0, elen = m.forward(input_signal=audio, input_signal_length=alen)
+        dec0, _, _ = m.decoder(targets=y, target_length=ylen)
+    enc0, dec0 = enc0.detach(), dec0.detach()
     res = {}
-    for name in ("nemo", "fused"):
+    for name in ("nemo", "nemo again", "fused"):                     # identical inputs: only the joint differs
         if name == "fused":
             enable(m)
         m.zero_grad()
+        enc, dec = enc0.clone().requires_grad_(), dec0.clone().requires_grad_()
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            enc, elen = m.forward(input_signal=audio, input_signal_length=alen)
-            dec, _, _ = m.decoder(targets=y, target_length=ylen)
             loss, _, _, _ = m.joint(encoder_outputs=enc, decoder_outputs=dec, encoder_lengths=elen, transcripts=y,
                                     transcript_lengths=ylen)
         loss.backward()
-        gw = m.joint.joint_net[-1].weight.grad.float().clone()
-        genc = m.encoder.layers[-1].feed_forward2.linear2.weight.grad.float().clone()
-        res[name] = (loss.item(), gw, genc)
+        res[name] = (loss.item(), m.joint.joint_net[-1].weight.grad.float().clone(), enc.grad.float(), dec.grad.float())
         print(f"  {name}: loss {loss.item():.6f}", flush=True)
-    (l0, w0, e0), (l1, w1, e1) = res["nemo"], res["fused"]
     rel = lambda a, b: ((a - b).norm() / b.norm()).item()
-    print(f"loss rel {abs(l1 - l0) / abs(l0):.2e}  dW_joint rel {rel(w1, w0):.2e}  dW_enc_last rel {rel(e1, e0):.2e}")
+    for other in ("nemo again", "fused"):
+        a, b = res[other], res["nemo"]
+        print(f"{other} vs nemo: loss rel {abs(a[0] - b[0]) / abs(b[0]):.2e}  dW_joint {rel(a[1], b[1]):.2e}  "
+              f"d_enc {rel(a[2], b[2]):.2e}  d_dec {rel(a[3], b[3]):.2e}", flush=True)
 
 
 if __name__ == "__main__" and "--check" in sys.argv:
