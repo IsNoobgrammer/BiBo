@@ -17,6 +17,7 @@ import json
 import os
 import random
 import sys
+import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
@@ -108,7 +109,14 @@ def shard_rows(src, path, rng):
 
 def spotify_rows():
     """SALT-NLP/spotify_podcast_ASR: .ogg clips + metadata.csv (human transcription per clip)."""
-    d = snapshot_download("SALT-NLP/spotify_podcast_ASR", repo_type="dataset")
+    for attempt in range(30):                     # 1,690 small files: HF rate-limits (429) bursts of per-file requests
+        try:
+            d = snapshot_download("SALT-NLP/spotify_podcast_ASR", repo_type="dataset", max_workers=2)
+            break
+        except Exception as e:
+            if "429" not in str(e) or attempt == 29:
+                raise
+            time.sleep(60)
     rows = []
     for r in csv.DictReader(open(os.path.join(d, "metadata.csv"), encoding="utf-8")):
         p = os.path.join(d, r["file_name"])
@@ -193,9 +201,16 @@ def main():
     a = ap.parse_args()
     srcs = [s for s in SOURCES if not a.only or s["name"] in a.only.split(",")]
     hrs = defaultdict(float)
+    failed = []
     for s in srcs:
-        hrs[s["lang"]] += build(s, a.out, a.scale, a.seed)
-    print("BUILT unique hours", {k: f"{v:.1f} h" for k, v in hrs.items()}, flush=True)
+        try:
+            hrs[s["lang"]] += build(s, a.out, a.scale, a.seed)
+        except Exception as e:                          # one source failing must not stop the others
+            failed.append(s["name"])
+            print(f"SOURCE FAILED {s['name']}: {type(e).__name__} {str(e)[:200]}", flush=True)
+    print("BUILT unique hours", {k: f"{v:.1f} h" for k, v in hrs.items()}, "failed:", failed, flush=True)
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
