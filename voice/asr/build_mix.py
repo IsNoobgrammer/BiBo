@@ -48,10 +48,10 @@ def numo_ok(r):
     return float(r.get("wer") or 1) <= 0.06 and float(r.get("synthetic_suspicion_score") or 1) <= 0.2
 
 
-# hours = unique hours to take (None = all); repeat = train copies (copy 1+ augmented, prep_train.py)
+# hours = unique hours to take (None = all); every source x1 here (repeat = train copies, copy 1+ augmented in prep_train.py: set it for post-training)
 # EN per variant ~400: [emilia + nptel pools: nptel50 = emilia ~200 + nptel 50, nptel150 = emilia 100 + nptel ~150]
-#   + ami windows ~80 + spotify + phone + voxpopuli 20 + people's speech 15 + svarah ~9 (x3) + medical ~8 (x2) + phone (x2)
-# HI 600: indicvoices 300 + numo 120 + vaani 100 + kathbath 50 + hinglish 20 (x2) + lahaja ~11 (x3)
+#   + ami windows ~80 + spotify + phone + voxpopuli 20 + people's speech 15 + svarah ~9 + medical ~8 + phone
+# HI 600: indicvoices 300 + numo 120 + vaani 100 + kathbath 50 + hinglish 20 + lahaja ~11
 SOURCES = [
     # --- English pools for the two variants ---
     dict(name="emilia", repo="MrDragonFox/EN_Emilia_Yodas_616h", rev="main", prefix="data/train-", audio="audio",
@@ -66,16 +66,16 @@ SOURCES = [
     dict(name="spotify", loader="spotify", repo="SALT-NLP/spotify_podcast_ASR", lang="en", hours=None, max_s=60,
          speaker=lambda r: r["filename"]),                                  # human verbatim podcast talk, 2-3 speakers
     dict(name="phone", repo="sawradip/phone-asr-data", rev="main", prefix="data/", audio="audio", text="transcription",
-         lang="en", hours=None, frac=1.0, repeat=2, speaker=lambda r: r["filename"].split("-")[0]),  # phone chat, "yeah"s
+         lang="en", hours=None, frac=1.0, speaker=lambda r: r["filename"].split("-")[0]),  # phone chat, "yeah"s
     dict(name="voxpopuli", repo="facebook/voxpopuli", rev=CONV, prefix="en/train/", audio="audio", text="raw_text",
          lang="en", hours=20, frac=0.25, speaker=lambda r: r["speaker_id"]),
     dict(name="peoples_speech", repo="MLCommons/peoples_speech", rev=CONV, prefix="clean/train/", audio="audio",
          text="text", lang="en", hours=15, frac=0.1, speaker=lambda r: r["id"].rsplit("_", 1)[0]),
     dict(name="svarah", repo="ai4bharat/Svarah", rev="main", prefix="data/test-", audio="audio_filepath", text="text",
-         lang="en", hours=None, frac=1.0, repeat=3,
+         lang="en", hours=None, frac=1.0,
          speaker=lambda r: f"{r.get('native_place_district')}|{r.get('gender')}|{r.get('age-group')}"),
     dict(name="medical", repo="yashtiwari/PaulMooney-Medical-ASR-Data", rev="main", prefix="data/", audio="path",
-         text="sentence", lang="en", hours=None, frac=1.0, repeat=2, speaker=lambda r: str(r["speaker_id"])),
+         text="sentence", lang="en", hours=None, frac=1.0, speaker=lambda r: str(r["speaker_id"])),
     # --- Hindi ---
     dict(name="indicvoices_hi", repo="ai4bharat/IndicVoices", rev="main", prefix="hindi/train-", audio="audio_filepath",
          text="text", lang="hi", hours=300, frac=1.0, speaker=lambda r: r["speaker_id"], extra={"scenario": "scenario"},
@@ -88,9 +88,9 @@ SOURCES = [
     dict(name="kathbath_hi", repo="ai4bharat/Kathbath", rev="main", prefix="hindi/train-", audio="audio_filepath",
          text="text", lang="hi", hours=50, frac=0.5, speaker=lambda r: str(r["speaker_id"])),
     dict(name="hinglish", repo="agarwalayushi/hinglish", rev="main", prefix="data/train-", audio="audio", text="text",
-         lang="hi", hours=20, frac=0.05, repeat=2, speaker=lambda r: r["source"]),  # spoken tutorials (= MUCS)
+         lang="hi", hours=20, frac=0.05, speaker=lambda r: r["source"]),  # spoken tutorials (= MUCS)
     dict(name="lahaja", repo="ai4bharat/Lahaja", rev="main", prefix="data/test-", audio="audio_filepath", text="text",
-         lang="hi", hours=None, frac=1.0, repeat=3, speaker=lambda r: str(r["sp_id"])),
+         lang="hi", hours=None, frac=1.0, speaker=lambda r: str(r["sp_id"])),
 ]
 MIN_S, MAX_S = 1.0, 30.0
 SPEAKER_COLS = {"native_place_district", "gender", "age-group", "id", "speaker_id", "file_name", "source", "sp_id",
