@@ -73,12 +73,16 @@ def _sim_window(pools, rng):
     for k in range(n_spk):
         pool = pools[k % len(pools)]
         spk.append((pool, rng.choice(list(pool))))
-    pieces, t, last = [], 0.0, None
+    pieces, t, last, used = [], 0.0, None, set()
     for _ in range(12):
         choices = [s for s in range(n_spk) if s != last]
         s = rng.choice(choices)
         pool, name = spk[s]
-        for r in rng.sample(pool[name], min(rng.choice([1, 1, 2]), len(pool[name]))):
+        left = [r for r in pool[name] if r["audio_filepath"] not in used]   # never repeat an utterance in a window
+        if not left:
+            return pieces
+        for r in rng.sample(left, min(rng.choice([1, 1, 2]), len(left))):
+            used.add(r["audio_filepath"])
             if t + r["duration"] > MAX_S:
                 return pieces
             gap = -rng.uniform(0, 0.4) if (pieces and rng.random() < 0.1) else rng.uniform(0.1, 0.8)
