@@ -117,6 +117,8 @@ def main():
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--compile_layers", action="store_true")
     ap.add_argument("--fused_joint", action="store_true", help="tkf fused joint + RNN-T loss (voice/asr/fused_joint.py)")
+    ap.add_argument("--no_hf", action="store_true", help="A/B and smoke runs: no HF checkpoint pull / push")
+    ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--project", default="bibo-asr")
     a = ap.parse_args()
 
@@ -125,8 +127,13 @@ def main():
     eval_steps = int(a.eval_hours * 3600 / a.batch_sec)
     max_steps = int(a.total_hours * 3600 / a.batch_sec)
 
-    m = nemo_asr.models.ASRModel.from_pretrained(a.init)
-    m.change_vocabulary(new_tokenizer_dir=a.tok, new_tokenizer_type="bpe")
+    if a.seed is not None:
+        pl.seed_everything(a.seed)
+    if a.init.endswith(".nemo"):                       # a trained run (same vocabulary): A/B arms start identical
+        m = nemo_asr.models.ASRModel.restore_from(a.init)
+    else:
+        m = nemo_asr.models.ASRModel.from_pretrained(a.init)
+        m.change_vocabulary(new_tokenizer_dir=a.tok, new_tokenizer_type="bpe")
 
     tr = OmegaConf.create(OmegaConf.to_container(m.cfg.train_ds))
     with open_dict(tr):
@@ -154,11 +161,12 @@ def main():
     ckpt_dir = os.path.join(a.out, a.run)
     os.makedirs(ckpt_dir, exist_ok=True)
     # resume: local last.ckpt, else the one in the HF repo (fresh box); the W&B run continues under the same id
-    _, hf_ckpt, wid = hf_sync.pull(a.run, os.path.dirname(a.out))
+    _, hf_ckpt, wid = (None, None, None) if a.no_hf else hf_sync.pull(a.run, os.path.dirname(a.out))
     resume = os.path.join(ckpt_dir, "last.ckpt") if os.path.exists(os.path.join(ckpt_dir, "last.ckpt")) else hf_ckpt
     logger = RemapLogger(project=a.project, name=a.run, save_dir=ckpt_dir, id=wid, resume="allow",
                          config={**vars(a), "eval_steps": eval_steps, "max_steps": max_steps})
-    hf_sync.push(a.run, tok_dir=a.tok, wandb_id=logger.experiment.id, block=True)
+    if not a.no_hf:
+        hf_sync.push(a.run, tok_dir=a.tok, wandb_id=logger.experiment.id, block=True)
     define_metrics(logger.experiment)
     trainer = pl.Trainer(
         devices=1, accelerator="gpu", precision="bf16-mixed", max_steps=max_steps, max_epochs=-1,
@@ -167,7 +175,7 @@ def main():
         callbacks=[AudioMeter(), ValAggregate(a.val), LearningRateMonitor("step"),
                    ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer_all", mode="min", save_top_k=2,
                                    save_last=True, filename="{step}-{val_wer_all:.4f}", save_on_train_epoch_end=False),
-                   HFSync(a.run, ckpt_dir)])
+                   *([] if a.no_hf else [HFSync(a.run, ckpt_dir)])])
     m.set_trainer(trainer)
     m.setup_optimization(OmegaConf.create({
         "name": "adamw", "lr": a.lr, "betas": [0.9, 0.98], "weight_decay": 1e-3,
