@@ -160,15 +160,20 @@ code{font-size:12px;color:var(--muted)}
 const LANE_NAMES={emilia:"Emilia (very good only)",nptel2:"NPTEL (raw, before clean-up)",hindi:"Hindi lane",english:"English lane"};
 const esc=s=>String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 function pill(st){if(st===null||st===undefined)return '<span class="pill run">running</span>';return st==="0"?'<span class="pill ok">done</span>':'<span class="pill bad">failed ('+esc(st)+')</span>';}
+const HIST={};let LAST=null,AT=0;
+function rate(s){const h=HIST[s.source]||[];const [t0,h0]=h[0]||[],[t1,h1]=h[h.length-1]||[];if(!(t1-t0>=60000))return ' &middot; rate in ~1 min';const r=(h1-h0)/((t1-t0)/60000);
+ if(!(r>0))return s.finished?'':' &middot; <b>stalled</b>';const eta=s.budget&&!s.finished?(s.budget-s.h)/r:null;
+ return ' &middot; <b>'+(r*60).toFixed(1)+' h/hr</b>'+(eta!==null?' &middot; ETA '+(eta>=60?(eta/60).toFixed(1)+' h':Math.round(eta)+' min'):'');}
 function srcRow(s){const b=s.budget;const pct=b?Math.min(100,100*s.h/b):(s.finished?100:null);
  const bar=pct===null?'<div class="bar"><i style="width:100%;opacity:.35"></i></div>':'<div class="bar"><i class="'+(pct>=99.5||s.finished?'full':'')+'" style="width:'+pct.toFixed(1)+'%"></i></div>';
  return '<div class="row"><div class="name" title="'+esc(s.source)+'">'+esc(s.source)+'</div>'+bar+
- '<div class="sub">'+s.h.toFixed(1)+' / '+(b?b+' h':'all')+' &middot; '+s.utts.toLocaleString()+' rows &middot; '+s.dropped.toLocaleString()+' dropped &middot; '+s.skipped.toLocaleString()+' skipped '+(s.extra?'&middot; '+esc(s.extra):'')+'</div></div>';}
+ '<div class="sub">'+s.h.toFixed(1)+' / '+(b?b+' h':'all')+' &middot; '+s.utts.toLocaleString()+' rows &middot; '+s.dropped.toLocaleString()+' dropped &middot; '+s.skipped.toLocaleString()+' skipped '+(s.extra?'&middot; '+esc(s.extra):'')+rate(s)+'</div></div>';}
 async function tick(){let d;try{d=await (await fetch('/api')).json();}catch(e){document.getElementById('meta').textContent='dashboard server not reachable';return;}
  const al=document.getElementById('alert');
  if(d.err){al.style.display='block';al.textContent='Box not answering: '+d.err+(d.age?' (last good data '+Math.round(d.age)+' s ago)':'');}else al.style.display='none';
  const b=d.data;if(!b){document.getElementById('meta').textContent='waiting for first data...';return;}
- document.getElementById('meta').textContent='box time '+b.time+' · updated '+Math.round(d.age)+' s ago · output '+b.disk+(b.gpu?' · GPU '+b.gpu.util+'% / '+(b.gpu.mem/1024).toFixed(1)+' GB':'');
+ AT=Date.now()-(d.age||0)*1000;if(b.time!==LAST){LAST=b.time;for(const l of Object.values(b.lanes))for(const s of l.sources){const h=HIST[s.source]=HIST[s.source]||[];h.push([AT,s.h]);while(h.length>1&&AT-h[0][0]>600000)h.shift();}}
+ document.getElementById('meta').innerHTML='box time '+b.time+' · updated <span id=age></span> s ago · output '+b.disk+(b.gpu?' · GPU '+b.gpu.util+'% / '+(b.gpu.mem/1024).toFixed(1)+' GB':'');
  const q=b.qwen;const qp=q.total?Math.min(100,100*q.scored/q.total):0;
  const qst=q.kept?'<span class="pill ok">done</span>':(q.running?'<span class="pill run">scoring</span>':(q.status&&q.status!=="0"?'<span class="pill bad">failed</span>':'<span class="pill wait">waits for NPTEL build</span>'));
  let top='<div class="card"><h2>NPTEL clean-up (Qwen, drop rows &gt; 25% WER)'+qst+'</h2><div class="row"><div class="name">scored</div><div class="bar"><i class="'+(q.kept?'full':'')+'" style="width:'+(q.kept?100:qp).toFixed(1)+'%"></i></div><div class="sub">'+q.scored.toLocaleString()+' / '+(q.total||'?').toLocaleString()+' rows</div></div>'+
@@ -181,7 +186,7 @@ async function tick(){let d;try{d=await (await fetch('/api')).json();}catch(e){d
  let html='';for(const [lane,l] of Object.entries(b.lanes)){const tot=l.sources.reduce((a,s)=>a+s.h,0);
   html+='<div class="card"><h2>'+esc(LANE_NAMES[lane]||lane)+' <span>'+'<span class="meta" style="margin-right:8px">'+tot.toFixed(1)+' h</span>'+pill(l.status)+'</span></h2>'+l.sources.map(srcRow).join('')+(l.errors.length?'<div class="err">'+l.errors.map(esc).join('<br>')+'</div>':'')+'</div>';}
  document.getElementById('lanes').innerHTML=html;}
-tick();setInterval(tick,10000);
+tick();setInterval(tick,5000);setInterval(()=>{const e=document.getElementById('age');if(e&&AT)e.textContent=Math.round((Date.now()-AT)/1000);},1000);
 </script></body></html>"""
 
 
@@ -189,7 +194,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--box", required=True)
     ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--every", type=int, default=30)
+    ap.add_argument("--every", type=int, default=10)
     a = ap.parse_args()
     box = Box(a.box, a.every)
     threading.Thread(target=box.loop, daemon=True).start()
