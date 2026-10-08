@@ -1,0 +1,39 @@
+#!/bin/bash
+# Score a trained run on the internal meeting clips (EVAL ONLY: never train on them, never push them) as a TRUE stream
+# (NeMo cache-aware streaming loop, the way RT Captions would run it), at every lookahead, with both heads.
+# Same scorer + normalizer as the teacher / Nemotron baselines in voice/README.md.
+#   bash voice/asr/eval_meeting.sh run1         (waits for exp/run1/run1.nemo)
+set -uo pipefail
+RUN=${1:-run1}
+W=/home/marimo/work; A=$W/asr; M=$A/eval_meeting; P=/home/marimo/asrenv/bin/python
+NEMO=$A/exp/$RUN/$RUN.nemo
+until [ -f "$NEMO" ]; do sleep 30; done
+sleep 20                                         # let save_to finish writing
+cd $W/BiBo && git log --oneline -1
+$P - <<EOF
+import json, soundfile as sf
+with open("$M/meeting.jsonl", "w") as f:
+    for wav in ("c2m.wav", "clip16k.wav"):
+        x, sr = sf.read("$M/" + wav)
+        f.write(json.dumps({"audio_filepath": "$M/" + wav, "duration": len(x) / sr, "text": ""}) + "\n")
+EOF
+for att in 0 1 6 13; do
+  for dec in rnnt ctc; do
+    out=$M/$RUN.la$att.$dec.jsonl
+    $P $W/NeMo/examples/asr/asr_cache_aware_streaming/speech_to_text_cache_aware_streaming_infer.py \
+      model_path=$NEMO dataset_manifest=$M/meeting.jsonl output_path=$out batch_size=1 \
+      "att_context_size=[70,$att]" decoder_type=$dec > $M/$RUN.la$att.$dec.log 2>&1 || { echo "FAILED la$att $dec"; tail -5 $M/$RUN.la$att.$dec.log; continue; }
+    $P - <<EOF
+import json, sys
+sys.path.insert(0, "voice/asr")
+from score import normalize, wer
+rows = {r["audio_filepath"].rsplit("/", 1)[-1]: r for r in map(json.loads, open("$out", encoding="utf-8"))}
+res = []
+for wav, ref in (("c2m.wav", "ref2m.txt"), ("clip16k.wav", "reference.txt")):
+    rw, hw = normalize(open("$M/" + ref, encoding="utf-8").read()), normalize(rows[wav].get("pred_text", ""))
+    res.append(f"{wav.split('.')[0]} {100 * wer(rw, hw):5.1f}% ({len(hw)}/{len(rw)} words)")
+print(f"MEETING $RUN lookahead {int($att) * 80:4d} ms {'$dec':4s} |", " | ".join(res), flush=True)
+EOF
+  done
+done
+echo MEETING_DONE
