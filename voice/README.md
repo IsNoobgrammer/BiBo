@@ -5,6 +5,8 @@ ideally one backbone that does text/speech -> text/speech.
 
 - `datasets.md` -- every verified ASR / TTS dataset (license, commercial use, access, pros / cons), eval sets, how labs
   select data, a permissive starting recipe and an 8-step data pipeline.
+- `realtime-asr-lessons.md` -- measured constraints from building RT Captions (live captions on a laptop CPU):
+  streaming vs rolling window, latency/CPU/size budgets, QAT, VAD, runtime lessons, requirements for our model.
 - `landscape.md` -- state of the art Oct 2026: Open ASR Leaderboard, Hindi ASR (Vaani benchmark), TTS <= 1B, unified
   speech-text models, speech codecs.
 
@@ -35,3 +37,27 @@ ideally one backbone that does text/speech -> text/speech.
 - Commercial vs research use (decides Emilia / GigaSpeech / Gram Vaani; see datasets.md).
 - One Hindi / Hinglish text normalization convention (script, numerals) -- must be fixed before any training.
 - Codec choice for TTS / unified: measure Hindi resynthesis WER for Mimi, DualCodec, X-codec2 first.
+
+## Chosen design: real-time trilingual ASR with built-in speaker turns (Oct 8 2026)
+For the RT Captions app (constraints: `realtime-asr-lessons.md`). Decisions: English + Hindi + Hinglish from the
+start; research / internal use for now; the internal meeting clip may be used for EVAL ONLY (never training, never
+pushed to HF or git).
+
+- **One streaming model, ~150-200M.** Cache-aware FastConformer encoder (8x subsampling, 80 ms frames), multi-lookahead
+  training (0 / 80 / 480 / 1040 ms) so one model gives fast previews and a better commit pass; TDT/RNN-T head with a
+  small prediction net + CTC head. Start from the 114M `nvidia/stt_en_fastconformer_hybrid_large_streaming_multi`
+  encoder (CC-BY-4.0); grow toward 200M only if accuracy plateaus (CPU budget favours smaller).
+- **Tokenizer:** new trilingual SentencePiece -- Devanagari for Hindi, Latin for English, Hinglish as written; cased +
+  punctuated targets; language token against drift; special tokens `<spk1>`..`<spk4>`, `<eou>`.
+- **Diarization as tokens, not a separate model (SOT / speaker-turn tokens).** Speakers are numbered by FIRST
+  APPEARANCE in the sample (first voice = `<spk1>`), so the model learns "same voice or new voice", never identity.
+  Identity across a long meeting (beyond the ~10-30 s cache) comes from a runtime speaker-profile table: the encoder's
+  pooled vector at each speaker token is matched by cosine to running profiles -- no extra network. Trade-off vs a
+  frame-level head: overlapping speech is serialized; speaker changes land on word boundaries (fine for captions).
+- **Training:** stage 1 plain trilingual ASR (pseudo-labels from Nemotron-3.5-ASR 0.6B, IndicConformer-600M,
+  Parakeet as teachers); stage 2 fine-tune with speaker tokens on AMI / Fisher / Switchboard, Sortformer- or
+  pyannote-labelled meeting audio, and SIMULATED conversations (concatenated / lightly overlapped single-speaker
+  Hindi and Indian-English utterances -- exact labels, the only scalable source of Hindi / Hinglish turn data).
+- **Then** 4-bit QAT (first/last layers + joint at 8-bit) and the CPU runtime with the C API from the lessons doc.
+- **First step:** eval set (meeting clips + Kathbath / IndicVoices test + MUCS-2021 Hinglish) and baselines for the
+  114M English model and Nemotron 0.6B, scored with RT Captions `bench` (WER, word latency p50/p95, engine busy %).
