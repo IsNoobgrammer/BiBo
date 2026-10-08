@@ -11,6 +11,7 @@ import glob
 import json
 import os
 import random
+import shutil
 
 import sys
 
@@ -71,6 +72,9 @@ def main():
     random.Random(23).shuffle(rows)
     out = os.path.join(a.mix, "hf")
     os.makedirs(os.path.join(out, "data"), exist_ok=True)
+    os.makedirs(os.path.join(out, "manifests"), exist_ok=True)   # full original rows, for fetch_mix.py on a fresh box
+    for src in {r["source"] for r in rows}:
+        shutil.copy(os.path.join(a.mix, f"{src}.jsonl"), os.path.join(out, "manifests", f"{src}.jsonl"))
     meta = {b"huggingface": json.dumps({"info": {"features": FEATURES}}).encode()}
     n_shards = (len(rows) + ROWS_PER_SHARD - 1) // ROWS_PER_SHARD
     for k in range(n_shards):

@@ -22,6 +22,7 @@ from omegaconf import OmegaConf, open_dict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from wb_layout import define_metrics, wb_keys  # noqa: E402
+import hf_sync  # noqa: E402
 
 
 class RemapLogger(WandbLogger):
@@ -55,6 +56,18 @@ class AudioMeter(Callback):
                                 "ms_per_step": 1000 * dt / max(self.win_steps, 1),
                                 "mem_gb": torch.cuda.max_memory_allocated() / 2**30})
             self.t0, self.win_secs, self.win_steps = time.perf_counter(), 0.0, 0
+
+
+class HFSync(Callback):
+    """After every evaluation (ModelCheckpoint has just written last.ckpt), push it to the private HF repo in a
+    background thread, so a dead box loses at most one eval interval."""
+
+    def __init__(self, run, ckpt_dir):
+        self.run, self.ckpt_dir = run, ckpt_dir
+
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.global_step > 0:
+            hf_sync.push(self.run, ckpt=os.path.join(self.ckpt_dir, "last.ckpt"))
 
 
 class ValAggregate(Callback):
@@ -130,8 +143,12 @@ def main():
 
     ckpt_dir = os.path.join(a.out, a.run)
     os.makedirs(ckpt_dir, exist_ok=True)
-    logger = RemapLogger(project=a.project, name=a.run, save_dir=ckpt_dir,
+    # resume: local last.ckpt, else the one in the HF repo (fresh box); the W&B run continues under the same id
+    _, hf_ckpt, wid = hf_sync.pull(a.run, os.path.dirname(a.out))
+    resume = os.path.join(ckpt_dir, "last.ckpt") if os.path.exists(os.path.join(ckpt_dir, "last.ckpt")) else hf_ckpt
+    logger = RemapLogger(project=a.project, name=a.run, save_dir=ckpt_dir, id=wid, resume="allow",
                          config={**vars(a), "eval_steps": eval_steps, "max_steps": max_steps})
+    hf_sync.push(a.run, tok_dir=a.tok, wandb_id=logger.experiment.id, block=True)
     define_metrics(logger.experiment)
     trainer = pl.Trainer(
         devices=1, accelerator="gpu", precision="bf16-mixed", max_steps=max_steps, max_epochs=-1,
@@ -139,14 +156,16 @@ def main():
         use_distributed_sampler=False, logger=logger, enable_checkpointing=True, benchmark=False,
         callbacks=[AudioMeter(), ValAggregate(a.val), LearningRateMonitor("step"),
                    ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer_all", mode="min", save_top_k=2,
-                                   save_last=True, filename="{step}-{val_wer_all:.4f}")])
+                                   save_last=True, filename="{step}-{val_wer_all:.4f}"),
+                   HFSync(a.run, ckpt_dir)])
     m.set_trainer(trainer)
     m.setup_optimization(OmegaConf.create({
         "name": "adamw", "lr": a.lr, "betas": [0.9, 0.98], "weight_decay": 1e-3,
         "sched": {"name": "CosineAnnealing", "warmup_steps": a.warmup, "min_lr": 1e-5, "max_steps": max_steps}}))
     print(f"[run] {a.run}: max_steps {max_steps}, eval every {eval_steps} steps (~{a.eval_hours} h), "
           f"batch {a.batch_sec} s, val {[os.path.basename(v) for v in a.val]}", flush=True)
-    trainer.fit(m)
+    print(f"[run] resume from {resume}", flush=True)
+    trainer.fit(m, ckpt_path=resume)
     m.save_to(os.path.join(ckpt_dir, f"{a.run}.nemo"))
     print("TRAIN_DONE", flush=True)
 

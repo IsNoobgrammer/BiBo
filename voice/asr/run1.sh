@@ -14,6 +14,9 @@ cd $W/BiBo && git log --oneline -1
 [ -f $R/val_multispk.jsonl ] || $P voice/asr/prep_train.py --mix $A/mix400 --out $R --val_only   # per-source val sets
 [ -f $E/fleurs_hi.jsonl ] || $P voice/asr/build_eval.py --out $E
 
+# a resumed run must reuse its tokenizer: pull it (and last.ckpt) from the HF ckpt repo before training a new one
+[ -d $R/tok/tokenizer_spe_bpe_v4096 ] || $P voice/asr/hf_sync.py pull run1 $A
+
 # joint tokenizer: balanced text, full Devanagari coverage, byte fallback for unseen characters, no language tags
 [ -d $R/tok/tokenizer_spe_bpe_v4096 ] || $P $W/NeMo/scripts/tokenizers/process_asr_text_tokenizer.py \
   --data_file $R/tokenizer.txt --data_root $R/tok --vocab_size 4096 --tokenizer spe --spe_type bpe \
