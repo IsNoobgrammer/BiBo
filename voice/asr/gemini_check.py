@@ -50,6 +50,7 @@ def main():
     ap.add_argument("--per_source", type=int, default=300)
     ap.add_argument("--model", default="gemini-3.8-flash")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--worst", type=int, default=0, help="> 0: only the N rows Qwen scored worst (cheap spot check)")
     a = ap.parse_args()
     key = os.environ["GEMINI_API_KEY"]
     for man in sorted(glob.glob(os.path.join(a.mix, "*.jsonl"))):
@@ -57,6 +58,8 @@ def main():
         qp = os.path.join(a.mix, "qwen", f"{src}_audit.jsonl")
         if os.path.exists(qp):                                     # same rows as the Qwen audit
             rows = [json.loads(l) for l in open(qp, encoding="utf-8")]
+            if a.worst:
+                rows = sorted(rows, key=lambda r: -r["wer"])[:a.worst]
         else:
             rows = [json.loads(l) for l in open(man, encoding="utf-8")]
             rows = random.Random(23).sample(rows, min(a.per_source, len(rows)))
