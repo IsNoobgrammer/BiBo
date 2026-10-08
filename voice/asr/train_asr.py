@@ -19,7 +19,7 @@ import time
 
 import lightning.pytorch as pl
 import torch
-from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint, TQDMProgressBar
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
@@ -39,7 +39,7 @@ class AudioMeter(Callback):
     """Audio hours seen, audio-seconds per wall-second (the throughput we optimise), ms/step, peak memory, grad norm."""
 
     def __init__(self, every=50):
-        self.every, self.secs, self.t0, self.win_secs, self.win_steps = every, 0.0, None, 0.0, 0
+        self.every, self.secs, self.t0, self.win, self.win_steps = every, 0.0, None, None, 0
 
     def on_before_optimizer_step(self, trainer, pl_module, optimizer):
         if trainer.global_step % self.every == 0:
@@ -47,18 +47,20 @@ class AudioMeter(Callback):
             pl_module.log("grad_norm", torch.stack(g).norm().item() if g else 0.0)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        s = batch[1].sum().item() / 16000
-        self.secs += s
-        self.win_secs += s
+        # samples summed ON the device: a .item() here every step drained the GPU queue (prof_step --sync_debug)
+        s = batch[1].sum()
+        self.win = s if self.win is None else self.win + s
         self.win_steps += 1
         if self.t0 is None:
             self.t0 = time.perf_counter()
         if trainer.global_step % self.every == 0:
+            win_secs = self.win.item() / 16000
+            self.secs += win_secs
             dt = max(time.perf_counter() - self.t0, 1e-6)
-            pl_module.log_dict({"audio_hours_seen": self.secs / 3600, "audio_s_per_s": self.win_secs / dt,
+            pl_module.log_dict({"audio_hours_seen": self.secs / 3600, "audio_s_per_s": win_secs / dt,
                                 "ms_per_step": 1000 * dt / max(self.win_steps, 1),
                                 "mem_gb": torch.cuda.max_memory_allocated() / 2**30})
-            self.t0, self.win_secs, self.win_steps = time.perf_counter(), 0.0, 0
+            self.t0, self.win, self.win_steps = time.perf_counter(), None, 0
 
 
 class HFSync(Callback):
@@ -144,7 +146,7 @@ def main():
         tr.pop("tarred_audio_filepaths", None)
         tr.update(manifest_filepath=a.train, is_tarred=False, use_lhotse=True, use_bucketing=True, num_buckets=30,
                   batch_duration=a.batch_sec, batch_size=None, max_duration=30, min_duration=0.1, shuffle=True,
-                  num_workers=a.workers, shuffle_buffer_size=10000, seed=23)
+                  num_workers=a.workers, shuffle_buffer_size=10000, seed=23, pin_memory=True)
     m.setup_training_data(tr)
     va = OmegaConf.create(OmegaConf.to_container(m.cfg.validation_ds))
     with open_dict(va):
@@ -179,7 +181,7 @@ def main():
         devices=1, accelerator="gpu", precision="32-true" if a.bf16_master else "bf16-mixed", max_steps=max_steps, max_epochs=-1,
         limit_train_batches=eval_steps, num_sanity_val_steps=0, gradient_clip_val=None if a.bf16_master else 1.0, log_every_n_steps=50,
         use_distributed_sampler=False, logger=logger, enable_checkpointing=True, benchmark=False,
-        callbacks=[AudioMeter(), ValAggregate(a.val), LearningRateMonitor("step"),
+        callbacks=[AudioMeter(), TQDMProgressBar(refresh_rate=50), ValAggregate(a.val), LearningRateMonitor("step"),
                    ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer_all", mode="min", save_top_k=2,
                                    save_last=True, filename="{step}-{val_wer_all:.4f}", save_on_train_epoch_end=False),
                    *([] if a.no_hf else [HFSync(a.run, ckpt_dir)])])
