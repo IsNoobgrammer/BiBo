@@ -77,7 +77,14 @@ only), plus one short Hindi TTS sample (flawed: it starts by speaking its own st
 | stt_en_fastconformer_hybrid_large_streaming_multi (114M) | streaming 0 / 80 / 480 / 1040 ms | 41.7 / 38.2 / 41.7 / 35.1% | 43.7 / 41.5 / 39.3 / 37.9% |
 | stt_en_fastconformer_hybrid_medium_streaming_80ms_pc (32M) | streaming 80 ms | 38.2% | 37.1% |
 | Nemotron 3.5 ASR streaming 0.6B (en-US) | streaming 80 / 160 / 560 / 1120 ms | 16.9 / 15.5 / 15.3 / 14.8% | 13.9 / 14.8 / 14.8 / 14.2% |
-| **Parakeet TDT 0.6B v3** | offline, 25 s chunks | **11.2%** | 9.2% |
+| **VibeVoice-ASR (8.7B, built-in diarization, whole clip at once)** | offline | **9.1%** | 9.2% |
+| **Qwen3-ASR-1.7B** | offline, 25 s chunks | 9.5% | **8.6%** |
+| Parakeet TDT 0.6B v3 | offline, 25 s chunks | 11.2% | 9.2% |
+| ARK-ASR-3B | offline | 13.2% | 9.2% |
+| Granite-speech-3.3-8B | offline | 16.1% | 17.0% |
+| Phi-4-multimodal (5.6B) | offline | 16.7% | 17.6% |
+| Whisper-large-v3-turbo | offline | 16.0% | 13.1% |
+| Voxtral-Mini-4B-Realtime | offline | 30.1% | 42.9% |
 | **Canary-Qwen-2.5B** | offline | 11.3% | **8.9%** |
 | Whisper-large-v3 | offline | 13.3% | 11.1% |
 | Canary-1B-v2 | offline | 14.1% | 10.6% |
@@ -87,6 +94,9 @@ only), plus one short Hindi TTS sample (flawed: it starts by speaking its own st
 - Hindi sample: Nemotron gets the Hindi words right but writes English words in DEVANAGARI ("jaundice" -> "जॉनडिस")
   and switches language only per utterance; **Whisper-large-v3 is the only model producing our convention** (Hindi in
   Devanagari, English in Latin: "आज हम मरीज की report देखेंगे… तो jaundice की…"); Parakeet v3 has no Hindi.
-- **Teacher plan:** English / Indian English = Parakeet v3 (+ Canary-Qwen, Whisper as agreement checks); Hindi +
+- **Teacher plan (updated after the <=8B sweep):** English / Indian English = **Qwen3-ASR-1.7B + VibeVoice-ASR** (best two, ~9%;
+  VibeVoice also gives speaker turns -> labels for the `<spk>` stage), Parakeet v3 / Canary-Qwen as agreement checks.
+  Bigger is not better: Granite 8B and Phi-4 5.6B are among the worst on accented English. Previous plan:
+  English / Indian English = Parakeet v3 (+ Canary-Qwen, Whisper as agreement checks); Hindi +
   code-switched = Whisper-large-v3 (+ Nemotron hi-IN for Hindi words), with VAD + inter-teacher agreement filtering
   (Whisper hallucinates on silence). Missing: a real Hindi test set and IndicConformer (both gated on HF -> need a token).
