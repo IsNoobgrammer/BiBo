@@ -20,14 +20,14 @@ import pyarrow.parquet as pq
 import soundfile as sf
 from huggingface_hub import HfApi, hf_hub_download
 
-# name, repo, config, split, lang, text column, hours. EN 600 h (60%) / HI 400 h (40%) at --scale 1.
+# name, repo, config, split, lang, text column, raw hours. After qwen_check (keep WER <= 0.3): EN ~580 h / HI ~400 h.
 # ponytail: Hindi is one source (All India Radio news, formal, no code-switch) until an HF token unlocks the gated
 # AI4Bharat sets; then split the 400 h as IndicVoices-hi 200 / Kathbath-hi 50 / Shrutilipi-hi 150.
 SOURCES = [
     ("peoples_speech", "MLCommons/peoples_speech", "clean", "train", "en", "text", 330),
     ("voxpopuli", "facebook/voxpopuli", "en", "train", "en", "raw_text", 190),          # accented, cased + punctuated
     ("ami_ihm", "edinburghcstr/ami", "ihm", "train", "en", "text", 80),                 # meetings, close-talk mics
-    ("shrutilipi_hi", "amithm3/shrutilipi", "hi", "train", "hi", "transcription", 400),
+    ("shrutilipi_hi", "amithm3/shrutilipi", "hi", "train", "hi", "transcription", 600),  # Qwen audit keeps ~67% of hours -> ~400 h
 ]
 FRAC = 0.5
 MIN_S, MAX_S = 1.0, 30.0
