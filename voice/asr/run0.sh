@@ -3,10 +3,8 @@
 # with its vocabulary swapped for our joint 4k en/hi SentencePiece BPE, fine-tuned on the 100 h 55/45 mix.
 #   bash voice/asr/run0.sh            (on the ASR box; NeMo repo at $W/NeMo)
 set -euo pipefail
-W=/home/marimo/work; A=$W/asr; R=$A/run0; P=/tmp/uv-venv/bin/python   # the env NeMo was installed into
+W=/home/marimo/work; A=$W/asr; R=$A/run0; P=/home/marimo/asrenv/bin/python   # made by voice/asr/setup_box.sh
 cd $W/BiBo && git log --oneline -1
-# NeMo's RNNT loss JIT-compiles numba CUDA kernels: needs libnvvm (numba-cuda cu13 wheels); numba-cuda 0.30 breaks on numpy>=2.4
-uv pip install -q --python $P "numba-cuda[cu13]" "numpy<2.4"
 
 $P voice/asr/prep_train.py --mix $A/mix100 --out $R
 
