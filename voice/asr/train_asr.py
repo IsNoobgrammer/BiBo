@@ -116,6 +116,7 @@ def main():
     ap.add_argument("--warmup", type=int, default=1000)
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--compile_layers", action="store_true")
+    ap.add_argument("--fused_joint", action="store_true", help="tkf fused joint + RNN-T loss (voice/asr/fused_joint.py)")
     ap.add_argument("--project", default="bibo-asr")
     a = ap.parse_args()
 
@@ -145,6 +146,10 @@ def main():
         torch._dynamo.config.cache_size_limit = 64
         for i, layer in enumerate(m.encoder.layers):
             m.encoder.layers[i] = torch.compile(layer, dynamic=True)
+
+    if a.fused_joint:
+        import fused_joint
+        fused_joint.enable(m)
 
     ckpt_dir = os.path.join(a.out, a.run)
     os.makedirs(ckpt_dir, exist_ok=True)
