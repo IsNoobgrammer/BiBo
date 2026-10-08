@@ -5,10 +5,11 @@
 One language per repo. Hindi: one default config (data/shared). English: the groups + configs below.
 Set HF_XET_HIGH_PERFORMANCE=1 for faster Xet transfers.
 
-Unique audio, stored ONCE, in groups; the card defines one config per English variant (prep_train.VARIANTS):
+Unique audio, stored ONCE, in groups; the card defines the full set plus the A/B variants (prep_train.VARIANTS):
     data/shared/        every source except the emilia / nptel pools (all Hindi, AMI, Spotify, phone, ...)
     data/emilia_core/   first 100 h of Emilia by prep_train.pool_split    data/emilia_extra/  the rest
     data/nptel_core/    first 50 h of NPTEL                               data/nptel_extra/   the rest
+    config default  = all five groups (full Emilia + all clean NPTEL) -- the training set
     config nptel50  = shared + emilia_core + emilia_extra + nptel_core   (Emilia-heavy, NPTEL 50 h)
     config nptel150 = shared + emilia_core + nptel_core + nptel_extra    (NPTEL ~150 h)
 Columns: audio (FLAC bytes, HF Audio), text (source transcript, original casing), lang, source, speaker, scenario,
@@ -35,7 +36,8 @@ STR = {"dtype": "string", "_type": "Value"}
 FEATURES = {"audio": {"_type": "Audio", "sampling_rate": 16000}, "text": STR, "lang": STR, "source": STR, "speaker": STR,
             "scenario": STR, "meeting": STR, "begin": {"dtype": "float64", "_type": "Value"},
             "duration": {"dtype": "float64", "_type": "Value"}}
-GROUPS = {"nptel50": ["shared", "emilia_core", "emilia_extra", "nptel_core"],
+GROUPS = {"default": ["shared", "emilia_core", "emilia_extra", "nptel_core", "nptel_extra"],   # full Emilia + all clean NPTEL
+          "nptel50": ["shared", "emilia_core", "emilia_extra", "nptel_core"],
           "nptel150": ["shared", "emilia_core", "nptel_core", "nptel_extra"]}
 
 
