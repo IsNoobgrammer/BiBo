@@ -66,9 +66,14 @@ def enable(model):
 
 
 def _check():
-    """One real batch through the run1 model: NeMo's fused loop vs the kernel, eval mode (no dropout) + one grad."""
+    """One batch through the run1 model: NeMo's fused loop vs the kernel, no dropout / SpecAugment, loss + grads."""
     import nemo.collections.asr as nemo_asr
-    m = nemo_asr.models.ASRModel.restore_from("/home/marimo/work/asr/exp/run1/run1.nemo").cuda().eval()
+    m = nemo_asr.models.ASRModel.restore_from("/home/marimo/work/asr/exp/run1/run1.nemo").cuda().train()
+    m.spec_augmentation = None                                       # cudnn LSTM backward needs train mode: switch
+    for mod in m.modules():                                          # off every random op instead
+        if isinstance(mod, torch.nn.Dropout):
+            mod.eval()
+    m.joint.eval()
     B, T, U = 16, 200, 40
     torch.manual_seed(0)
     audio = torch.randn(B, T * 1280, device="cuda") * 0.05
