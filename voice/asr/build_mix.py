@@ -88,7 +88,11 @@ def build(src, out, scale, seed):
                 if not text or (quota and (q not in quota or per_q[q] >= quota[q])):
                     skipped += 1
                     continue
-                x, sr = sf.read(io.BytesIO(r[src["audio"]]["bytes"]), dtype="float32")
+                try:
+                    x, sr = sf.read(io.BytesIO(r[src["audio"]]["bytes"]), dtype="float32")
+                except Exception:                            # corrupt / empty audio bytes (seen in psk/vaani-asr)
+                    skipped += 1
+                    continue
                 if x.ndim > 1:
                     x = x.mean(1)
                 dur = len(x) / sr
