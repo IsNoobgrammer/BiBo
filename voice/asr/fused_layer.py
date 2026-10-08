@@ -46,18 +46,15 @@ def enable(model):
 
 
 def _check():
-    """run1 model, one batch-like input, every random op off: NeMo layers vs fused, loss + grads."""
+    """run1 model in eval mode (no dropout / stochastic depth), an encoder-only loss: NeMo vs fused, + noise row."""
     import nemo.collections.asr as nemo_asr
-    m = nemo_asr.models.ASRModel.restore_from("/home/marimo/work/asr/exp/run1/run1.nemo").cuda().train()
-    m.spec_augmentation = None
-    for mod in m.modules():
-        if isinstance(mod, torch.nn.Dropout):
-            mod.eval()
+    m = nemo_asr.models.ASRModel.restore_from("/home/marimo/work/asr/exp/run1/run1.nemo").cuda().eval()
+    print("stochastic depth:", getattr(m.encoder, "layer_drop_probs", None), flush=True)
     torch.manual_seed(0)
     audio = torch.randn(8, 16000 * 6, device="cuda") * 0.05
     alen = torch.tensor([16000 * 6 - 4000 * i for i in range(8)], device="cuda")
     res = {}
-    for name in ("nemo", "fused"):
+    for name in ("nemo", "nemo again", "fused"):
         if name == "fused":
             enable(m)
         m.zero_grad()
@@ -68,8 +65,9 @@ def _check():
         res[name] = (enc.detach().float(), m.encoder.layers[3].norm_conv.weight.grad.float().clone(),
                      m.encoder.layers[0].feed_forward1.linear1.weight.grad.float().clone())
     rel = lambda a, b: ((a - b).norm() / b.norm()).item()
-    print("encoder out rel %.2e   d norm_conv.w (L3) rel %.2e   d ff1.linear1 (L0) rel %.2e" %
-          tuple(rel(a, b) for a, b in zip(res["fused"], res["nemo"])))
+    for other in ("nemo again", "fused"):
+        print(f"{other} vs nemo: encoder out rel %.2e   d norm_conv.w (L3) rel %.2e   d ff1.linear1 (L0) rel %.2e" %
+              tuple(rel(a, b) for a, b in zip(res[other], res["nemo"])), flush=True)
 
 
 if __name__ == "__main__" and "--check" in sys.argv:
