@@ -8,7 +8,8 @@ inside English words stay. Vaani markup: `फोन {phone}` keeps the Latin for
 in Latin), `पे {पर}` keeps what was said; <tags> and [events] are dropped; rows marked unintelligible are dropped.
 ponytail: punctuation + casing return as a later stage once more cased data is in.
 Val = whole SPEAKERS per source (2%, 10% for the small accent sets Svarah / Lahaja), never repeated, never in a
-multi-speaker window. Train rows are repeated per build_mix.SOURCES[*].repeat; multispk.py adds <spk> windows.
+multi-speaker window. Train rows are repeated per build_mix.SOURCES[*].repeat: copy 0 is the original, every further
+copy is a perturbed rendering (augment.py: speed, reverb, babble / coloured noise, gain). multispk.py adds <spk> windows.
 """
 import argparse
 import glob
@@ -23,6 +24,9 @@ import unicodedata
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from build_mix import SOURCES  # noqa: E402
 import multispk  # noqa: E402
+import augment  # noqa: E402
+from functools import partial  # noqa: E402
+from multiprocessing import Pool  # noqa: E402
 
 KEEP = re.compile(r"[^a-z0-9'ऀ-ॿ ]")      # Latin, digits, apostrophe, Devanagari block
 ANNOT = {"noise", "pause", "breathing", "inhaling", "unintelligible"}
@@ -45,6 +49,10 @@ def clean(text):
     t = KEEP.sub(" ", t)
     t = re.sub(r"(?<![a-z])'|'(?![a-z])", " ", t)                  # quote marks, not apostrophes
     return " ".join(t.split())
+
+
+def _copy(row, k, out_dir, babble):
+    return augment.make_copy(row, k, out_dir, babble)
 
 
 def split_by_speaker(rows, share, rng):
@@ -80,7 +88,14 @@ def main():
         val += va
         print(f"{src}: train {len(tr)} x{REPEAT.get(src, 1)}  val {len(va)} ({len({r['speaker'] for r in va})} speakers)",
               flush=True)
-    train = [r for r in base for _ in range(REPEAT.get(r["source"], 1))]
+    jobs = [(r, k) for r in base for k in range(1, REPEAT.get(r["source"], 1))]
+    babble = [r["audio_filepath"] for r in rng.sample(base, min(3000, len(base)))]
+    adir = os.path.join(a.out, "aug")
+    os.makedirs(adir, exist_ok=True)
+    with Pool(16) as pool:
+        copies = pool.starmap(partial(_copy, out_dir=adir, babble=babble), jobs, chunksize=64)
+    train = base + copies
+    print(f"augmented copies: {len(copies)} rows, {sum(r['duration'] for r in copies) / 3600:.1f} h", flush=True)
     eff_h = sum(r["duration"] for r in train) / 3600
     ms = multispk.make(base, os.path.join(a.out, "multispk"), a.multispk_share * eff_h, rng)
     train += ms
