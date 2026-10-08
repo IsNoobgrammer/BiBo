@@ -124,6 +124,7 @@ def main():
     ap.add_argument("--fused_joint", action="store_true", help="tkf fused joint + RNN-T loss (voice/asr/fused_joint.py)")
     ap.add_argument("--no_hf", action="store_true", help="A/B and smoke runs: no HF checkpoint pull / push")
     ap.add_argument("--bf16_master", action="store_true", help="bf16 model + fp32 master weights, no autocast")
+    ap.add_argument("--fused_layer", action="store_true", help="tkf residual+dropout+LayerNorm (voice/asr/fused_layer.py)")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--project", default="bibo-asr")
     a = ap.parse_args()
@@ -166,6 +167,9 @@ def main():
     if a.bf16_master:
         import bf16_master
         bf16_master.to_bf16(m)
+    if a.fused_layer:
+        import fused_layer
+        fused_layer.enable(m)
 
     ckpt_dir = os.path.join(a.out, a.run)
     os.makedirs(ckpt_dir, exist_ok=True)

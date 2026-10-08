@@ -26,6 +26,7 @@ from omegaconf import OmegaConf, open_dict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 GROUPS = [("joint+rnnt (tkf)", ("_logits_kernel", "_rowgrad", "_fix_e", "_dfg", "_hidden", "_lattice", "_combine_rows")),
+          ("res+drop+LN (tkf)", ("_fwd", "_bwd")),
           ("rnnt numba", ("rnnt_loss", "numba")),
           ("attention", ("flash", "fmha", "attention", "softmax")),
           ("gemm", ("gemm", "cutlass", "cublas", "xmma", "nvjet", "Kernel2")),
@@ -53,6 +54,7 @@ def main():
     ap.add_argument("--batch_sec", type=float, default=1200)
     ap.add_argument("--fused", action="store_true")
     ap.add_argument("--bf16_master", action="store_true")
+    ap.add_argument("--fused_layer", action="store_true")
     ap.add_argument("--phases", action="store_true")
     ap.add_argument("--sync_debug", action="store_true")
     a = ap.parse_args()
@@ -69,6 +71,9 @@ def main():
     if a.fused:
         import fused_joint
         fused_joint.enable(m)
+    if a.fused_layer:
+        import fused_layer
+        fused_layer.enable(m)
     opt = torch.optim.AdamW(m.parameters(), lr=1e-5, betas=(0.9, 0.98), weight_decay=1e-3, fused=True)
     if a.bf16_master:
         import bf16_master
@@ -80,7 +85,7 @@ def main():
     w = m.ctc_loss_weight
     it = iter(m._train_dl)
     sync = torch.cuda.synchronize
-    tag = ("fused" if a.fused else "nemo") + (" bf16-master" if a.bf16_master else " autocast") + f" {a.batch_sec:.0f}s"
+    tag = ("fused" if a.fused else "nemo") + (" +layer" if a.fused_layer else "") + (" bf16-master" if a.bf16_master else " autocast") + f" {a.batch_sec:.0f}s"
 
     def step(batch, mark=None):
         mark = mark or (lambda i: None)
