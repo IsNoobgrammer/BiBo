@@ -60,6 +60,7 @@ def main():
     m.setup_training_data(cfg)
     m = m.cuda().train()
     opt = torch.optim.AdamW(m.parameters(), lr=1e-4)
+    m._optimizer = opt                                            # training_step logs its lr
     dl = m._train_dl
     print(f"params {sum(p.numel() for p in m.parameters()) / 1e6:.1f}M  vocab {m.tokenizer.vocab_size}", flush=True)
 
