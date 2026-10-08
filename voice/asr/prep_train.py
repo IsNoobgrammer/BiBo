@@ -67,14 +67,33 @@ def split_by_speaker(rows, share, rng):
     return [r for r in rows if r["speaker"] not in val_spk], [r for r in rows if r["speaker"] in val_spk]
 
 
+def write_val_sets(val, out, rng):
+    """One manifest per source (val_<source>.jsonl -> W&B val/<source>/*) + val_multispk (speaker-turn windows built
+    from val rows only, so no train audio leaks in)."""
+    by_src = {}
+    for r in val:
+        by_src.setdefault(r["source"], []).append(r)
+    for src, rs in by_src.items():
+        with open(os.path.join(out, f"val_{src}.jsonl"), "w", encoding="utf-8") as fo:
+            fo.writelines(json.dumps(r, ensure_ascii=False) + "\n" for r in rs)
+    ms = multispk.make(val, os.path.join(out, "multispk_val"), 1.5, rng)
+    with open(os.path.join(out, "val_multispk.jsonl"), "w", encoding="utf-8") as fo:
+        fo.writelines(json.dumps(r, ensure_ascii=False) + "\n" for r in ms)
+    print(f"val sets: {sorted(by_src)} + multispk ({len(ms)} windows)", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mix", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--multispk_share", type=float, default=0.15, help="multi-speaker hours / effective train hours")
+    ap.add_argument("--val_only", action="store_true", help="only (re)write the per-source val sets from out/val.jsonl")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     rng = random.Random(23)
+    if a.val_only:
+        write_val_sets([json.loads(l) for l in open(os.path.join(a.out, "val.jsonl"), encoding="utf-8")], a.out, rng)
+        return
     base, val = [], []
     for man in sorted(glob.glob(os.path.join(a.mix, "*.jsonl"))):
         rows = [json.loads(l) for l in open(man, encoding="utf-8")]
@@ -106,6 +125,7 @@ def main():
     write("val.jsonl", val)
     for lang in ("en", "hi"):
         write(f"val_{lang}.jsonl", [r for r in val if r["lang"] == lang])
+    write_val_sets(val, a.out, random.Random(24))
     hi = [r["text"] for r in base if r["lang"] == "hi"]
     en = [r["text"] for r in base if r["lang"] == "en"]
     budget = min(sum(map(len, hi)), sum(map(len, en)))

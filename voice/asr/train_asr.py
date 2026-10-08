@@ -9,7 +9,9 @@ profile_train.py: padding was 50%), optional per-conformer-layer torch.compile, 
 train loss / WER / lr / audio hours seen / audio-s per s, top-2 + last checkpoints (.ckpt) and a final .nemo.
 """
 import argparse
+import json
 import os
+import sys
 import time
 
 import lightning.pytorch as pl
@@ -18,23 +20,67 @@ from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelChec
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from wb_layout import define_metrics, wb_keys  # noqa: E402
+
+
+class RemapLogger(WandbLogger):
+    """Every key goes through wb_layout.wb_key (core/ val/<source>/ eval/ speed/ optim/ misc/)."""
+
+    def log_metrics(self, metrics, step=None):
+        super().log_metrics(wb_keys(metrics), step)
+
 
 class AudioMeter(Callback):
-    """Logs cumulative audio hours seen and audio-seconds per wall-second (the throughput number we optimise)."""
+    """Audio hours seen, audio-seconds per wall-second (the throughput we optimise), ms/step, peak memory, grad norm."""
 
-    def __init__(self):
-        self.secs, self.t0, self.win_secs = 0.0, None, 0.0
+    def __init__(self, every=50):
+        self.every, self.secs, self.t0, self.win_secs, self.win_steps = every, 0.0, None, 0.0, 0
+
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer):
+        if trainer.global_step % self.every == 0:
+            g = [p.grad.norm() for p in pl_module.parameters() if p.grad is not None]
+            pl_module.log("grad_norm", torch.stack(g).norm().item() if g else 0.0)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         s = batch[1].sum().item() / 16000
         self.secs += s
         self.win_secs += s
+        self.win_steps += 1
         if self.t0 is None:
             self.t0 = time.perf_counter()
-        if trainer.global_step % 50 == 0:
-            dt = time.perf_counter() - self.t0
-            pl_module.log_dict({"audio_hours_seen": self.secs / 3600, "audio_s_per_s": self.win_secs / max(dt, 1e-6)})
-            self.t0, self.win_secs = time.perf_counter(), 0.0
+        if trainer.global_step % self.every == 0:
+            dt = max(time.perf_counter() - self.t0, 1e-6)
+            pl_module.log_dict({"audio_hours_seen": self.secs / 3600, "audio_s_per_s": self.win_secs / dt,
+                                "ms_per_step": 1000 * dt / max(self.win_steps, 1),
+                                "mem_gb": torch.cuda.max_memory_allocated() / 2**30})
+            self.t0, self.win_secs, self.win_steps = time.perf_counter(), 0.0, 0
+
+
+class ValAggregate(Callback):
+    """val_wer_all / _en / _hi = per-source WERs weighted by reference words (= corpus WER over the sources, given
+    each source's WER). multispk and FLEURS are reported on their own, not in the aggregate."""
+
+    def __init__(self, manifests):
+        self.sets = {}
+        for p in manifests:
+            stem = os.path.basename(p)[:-6]
+            if not stem.startswith("val_") or stem in ("val_en", "val_hi", "val_multispk"):
+                continue
+            rows = [json.loads(l) for l in open(p, encoding="utf-8")]
+            self.sets[stem] = (rows[0]["lang"], sum(len(r["text"].split()) for r in rows))
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        cm = trainer.callback_metrics
+        acc = {"all": [0.0, 0], "en": [0.0, 0], "hi": [0.0, 0]}
+        for stem, (lang, words) in self.sets.items():
+            w = cm.get(f"{stem}_val_wer")
+            if w is None:
+                continue
+            for k in ("all", lang):
+                acc[k][0] += float(w) * words
+                acc[k][1] += words
+        pl_module.log_dict({f"val_wer_{k}": e / n for k, (e, n) in acc.items() if n})
 
 
 def main():
@@ -83,15 +129,17 @@ def main():
             m.encoder.layers[i] = torch.compile(layer, dynamic=True)
 
     ckpt_dir = os.path.join(a.out, a.run)
-    logger = WandbLogger(project=a.project, name=a.run, save_dir=ckpt_dir,
+    os.makedirs(ckpt_dir, exist_ok=True)
+    logger = RemapLogger(project=a.project, name=a.run, save_dir=ckpt_dir,
                          config={**vars(a), "eval_steps": eval_steps, "max_steps": max_steps})
+    define_metrics(logger.experiment)
     trainer = pl.Trainer(
         devices=1, accelerator="gpu", precision="bf16-mixed", max_steps=max_steps, max_epochs=-1,
         limit_train_batches=eval_steps, num_sanity_val_steps=0, gradient_clip_val=1.0, log_every_n_steps=50,
         use_distributed_sampler=False, logger=logger, enable_checkpointing=True, benchmark=False,
-        callbacks=[AudioMeter(), LearningRateMonitor("step"),
-                   ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer", mode="min", save_top_k=2, save_last=True,
-                                   filename="{step}-{val_wer:.4f}")])
+        callbacks=[AudioMeter(), ValAggregate(a.val), LearningRateMonitor("step"),
+                   ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer_all", mode="min", save_top_k=2,
+                                   save_last=True, filename="{step}-{val_wer_all:.4f}")])
     m.set_trainer(trainer)
     m.setup_optimization(OmegaConf.create({
         "name": "adamw", "lr": a.lr, "betas": [0.9, 0.98], "weight_decay": 1e-3,

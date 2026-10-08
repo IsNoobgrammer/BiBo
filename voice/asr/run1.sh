@@ -2,7 +2,8 @@
 # run1: en/hi streaming ASR with speaker turns. 114M cache-aware FastConformer hybrid RNNT+CTC (NVIDIA, English,
 # CC-BY-4.0), vocabulary swapped for our joint 4k en/hi SentencePiece BPE (+ <spk1..4>), fine-tuned on the 400 h mix
 # (HI ~225 : EN ~175 effective + augmented repeats + ~15% multi-speaker windows). Eval every ~150 audio hours on the
-# speaker-held-out val splits + FLEURS en/hi, logged to W&B project bibo-asr. run0 (100 h, NeMo finetune script) is in
+# per-source speaker-held-out val sets (+ <spk> windows) + FLEURS en/hi, logged to W&B project bibo-asr
+# (layout: voice/asr/wb_layout.py). run0 (100 h, NeMo finetune script) is in
 # git history.
 #   bash voice/asr/run1.sh [extra train_asr.py args, e.g. --compile_layers]   (after the setup_repo cell)
 set -euo pipefail
@@ -10,6 +11,7 @@ W=/home/marimo/work; A=$W/asr; R=$A/run1; E=$A/eval_sets; P=/home/marimo/asrenv/
 cd $W/BiBo && git log --oneline -1
 
 [ -f $R/train.jsonl ] || $P voice/asr/prep_train.py --mix $A/mix400 --out $R
+[ -f $R/val_multispk.jsonl ] || $P voice/asr/prep_train.py --mix $A/mix400 --out $R --val_only   # per-source val sets
 [ -f $E/fleurs_hi.jsonl ] || $P voice/asr/build_eval.py --out $E
 
 # joint tokenizer: balanced text, full Devanagari coverage, byte fallback for unseen characters, no language tags
@@ -19,5 +21,5 @@ cd $W/BiBo && git log --oneline -1
   --spe_user_defined_symbols "<spk1>" "<spk2>" "<spk3>" "<spk4>"
 
 $P voice/asr/train_asr.py --run run1 --train $R/train.jsonl --tok $R/tok/tokenizer_spe_bpe_v4096 \
-  --val $R/val_en.jsonl $R/val_hi.jsonl $E/fleurs_en.jsonl $E/fleurs_hi.jsonl "$@"
+  --val $(ls $R/val_*.jsonl | grep -v -e '/val_en.jsonl' -e '/val_hi.jsonl') $E/fleurs_en.jsonl $E/fleurs_hi.jsonl "$@"
 echo RUN1_DONE
