@@ -11,6 +11,6 @@ mkdir -p $W/asr && cd $W
 [ -x $V/bin/python ] || uv venv -q --system-site-packages --python "$(command -v python3)" $V
 uv pip install -q --python $V/bin/python -e "$W/NeMo[asr]" "transformers>=4.53,<5"   # else uv backtracks to 4.12 (tokenizers build fails on py3.13)
 # NeMo's RNNT loss JIT-compiles numba CUDA kernels: needs libnvvm (numba-cuda cu13 wheels); numba-cuda 0.30 breaks on numpy>=2.4
-uv pip install -q --python $V/bin/python "numba-cuda[cu13]" "numpy<2.4" pyarrow soundfile huggingface_hub torchvision torchaudio  # tv/ta must match the venv torch (system ones are for 2.11)
+uv pip install -q --python $V/bin/python "numba-cuda[cu13]" "numpy<2.4" pyarrow soundfile huggingface_hub wandb torchvision torchaudio  # tv/ta must match the venv torch (system ones are for 2.11)
 $V/bin/python -c "import torch, nemo.collections.asr, numba.cuda; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'nemo ok')"
 echo SETUP_DONE
