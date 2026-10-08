@@ -21,6 +21,7 @@ def main():
     ap.add_argument("--arms", nargs="+", required=True)
     ap.add_argument("--val", nargs="+", required=True)
     ap.add_argument("--root", default="/home/marimo/work/asr/exp_ab")
+    ap.add_argument("--fused", action="store_true", help="score with the tkf joint + layer kernels (faster)")
     a = ap.parse_args()
     import nemo.collections.asr as nemo_asr
     words = {}
@@ -30,6 +31,11 @@ def main():
     out = {}
     for arm in a.arms:
         m = nemo_asr.models.ASRModel.restore_from(os.path.join(a.root, arm, f"{arm}.nemo")).float().cuda().eval()
+        if a.fused:
+            import fused_joint
+            import fused_layer
+            fused_joint.enable(m)
+            fused_layer.enable(m)
         va = OmegaConf.create(OmegaConf.to_container(m.cfg.validation_ds))
         with open_dict(va):
             va.update(manifest_filepath=a.val, batch_size=64, num_workers=4, shuffle=False)

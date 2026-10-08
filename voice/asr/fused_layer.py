@@ -17,7 +17,10 @@ import torch
 TKF = os.environ.get("TKF", "/home/marimo/work/triton-kernel-fused")
 
 
-def enable(model):
+def enable(model, fp32_residual=False):
+    """fp32_residual (with a bf16 model, --bf16_master): the residual stream stays fp32 between sublayers (each
+    layer casts its input up once; every LayerNorm emits bf16 for the bf16 sublayers) -- autocast's dtype layout with
+    bf16 weights. A bf16 residual stream cost 0.7 WER points in the 1500-step A/B."""
     sys.path.insert(0, TKF)
     from kernels.sm120.res_drop_ln import res_dropout_layernorm as rdl
 
@@ -27,7 +30,13 @@ def enable(model):
             return self._nemo_forward(x, att_mask=att_mask, pos_emb=pos_emb, pad_mask=pad_mask,
                                       cache_last_channel=cache_last_channel, cache_last_time=cache_last_time)
         p = self.dropout.p if self.dropout.training else 0.0               # follows the Dropout module's mode
-        ydt = torch.float32 if torch.is_autocast_enabled("cuda") else None    # autocast LN outputs fp32
+        if torch.is_autocast_enabled("cuda"):
+            ydt = torch.float32                                      # autocast LN outputs fp32
+        elif fp32_residual:
+            x = x.float()                                            # layer input = previous norm_out's bf16 y: up once
+            ydt = self.norm_out.weight.dtype                         # the sublayers' (bf16) dtype
+        else:
+            ydt = None
         ln = lambda n: (n.weight, n.bias, n.eps)
         _, y = rdl(x, None, *ln(self.norm_feed_forward1), y_dtype=ydt)
         res, y = rdl(x, self.feed_forward1(y), *ln(self.norm_self_att), p=p, factor=self.fc_factor, y_dtype=ydt)
@@ -42,7 +51,8 @@ def enable(model):
         layer._nemo_forward = layer.forward
         layer.forward = types.MethodType(forward, layer)
         n += 1
-    print(f"[fused_layer] {n} conformer layers: residual + dropout + LayerNorm -> tkf res_drop_ln", flush=True)
+    print(f"[fused_layer] {n} conformer layers: residual + dropout + LayerNorm -> tkf res_drop_ln"
+          + (" (fp32 residual stream, bf16 sublayers)" if fp32_residual else ""), flush=True)
 
 
 def _check():
