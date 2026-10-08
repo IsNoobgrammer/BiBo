@@ -1,7 +1,7 @@
-"""Quality check of an ASR training mix with Qwen3-ASR-1.7B: per-utterance WER of the dataset transcript vs Qwen's.
+"""Quality report of an ASR training mix with Qwen3-ASR-1.7B: per-utterance WER of the dataset transcript vs Qwen's.
+Measures only -- nothing is filtered.
 
-    python voice/asr/qwen_check.py --mix /home/marimo/work/asr/mix --per_source 300      # audit: is each source good?
-    python voice/asr/qwen_check.py --mix /home/marimo/work/asr/mix --keep_wer 0.3        # all rows -> *_clean.jsonl
+    python voice/asr/qwen_check.py --mix /home/marimo/work/asr/mix100 [--per_source 300]
 
 High WER means the transcript and the audio disagree (bad alignment, wrong text, wrong language) OR Qwen failed; the
 report shows the worst rows per source so a person can tell which. Qwen's cased + punctuated text is kept as `qwen_text`
@@ -43,7 +43,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mix", required=True)
     ap.add_argument("--per_source", type=int, default=0, help="random rows per source (0 = all)")
-    ap.add_argument("--keep_wer", type=float, default=0.3)
     ap.add_argument("--bs", type=int, default=32)
     a = ap.parse_args()
     proc, m = load()
@@ -51,8 +50,6 @@ def main():
     os.makedirs(qdir, exist_ok=True)
     for man in sorted(glob.glob(os.path.join(a.mix, "*.jsonl"))):
         src = os.path.basename(man)[:-6]
-        if src.endswith("_clean"):
-            continue
         rows = [json.loads(l) for l in open(man, encoding="utf-8")]
         if a.per_source:
             rows = random.Random(23).sample(rows, min(a.per_source, len(rows)))
@@ -69,11 +66,13 @@ def main():
                     words += len(ref)
                     fo.write(json.dumps(r, ensure_ascii=False) + "\n")
         ws = sorted(r["wer"] for r in rows)
-        keep = [r for r in rows if r["wer"] <= a.keep_wer]
-        hrs, khrs = sum(r["duration"] for r in rows) / 3600, sum(r["duration"] for r in keep) / 3600
-        print(f"SOURCE {src}: n={len(rows)} corpusWER={100 * edits / max(words, 1):.1f}% median={100 * ws[len(ws) // 2]:.1f}% "
-              f"<=10%: {100 * sum(w <= .1 for w in ws) / len(ws):.0f}%  >50%: {100 * sum(w > .5 for w in ws) / len(ws):.0f}%  "
-              f"keep@{a.keep_wer}: {len(keep)}/{len(rows)} rows, {khrs:.1f}/{hrs:.1f} h", flush=True)
+        print(f"SOURCE {src}: n={len(rows)} {sum(r['duration'] for r in rows) / 3600:.1f} h  corpusWER="
+              f"{100 * edits / max(words, 1):.1f}% median={100 * ws[len(ws) // 2]:.1f}%  <=10%: "
+              f"{100 * sum(w <= .1 for w in ws) / len(ws):.0f}%  >50%: {100 * sum(w > .5 for w in ws) / len(ws):.0f}%", flush=True)
+        for sc in sorted({r.get("scenario") for r in rows} - {None}):
+            sub = [r for r in rows if r.get("scenario") == sc]
+            e = sum(r["wer"] * len(normalize(r["text"])) for r in sub)
+            print(f"  scenario {sc}: n={len(sub)} corpusWER={100 * e / max(sum(len(normalize(r['text'])) for r in sub), 1):.1f}%", flush=True)
         for r in sorted(rows, key=lambda r: -r["wer"])[:3]:
             print(f"  WORST wer={r['wer']:.2f} {os.path.basename(r['audio_filepath'])}\n    ref: {r['text'][:160]}\n    qwen: {r['qwen_text'][:160]}", flush=True)
         if not a.per_source:
