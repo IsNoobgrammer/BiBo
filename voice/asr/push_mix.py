@@ -1,9 +1,9 @@
-"""Pack a build_mix.py output (+ qwen_check.py report columns) into parquet shards and push them to a PRIVATE HF dataset.
+"""Pack a build_mix.py output into parquet shards and push them to a PRIVATE HF dataset.
 
     python voice/asr/push_mix.py --mix /home/marimo/work/asr/mix100 --repo fhai50032/asr-en-hi-100h
 
 Rows are shuffled (seed 23) so every shard mixes sources. Columns: audio (FLAC bytes, HF Audio feature), text, lang,
-source, scenario, duration, qwen_text, qwen_wer. Private because IndicVoices is a gated set (CC-BY-4.0, attribution in
+source, scenario, duration. Private because IndicVoices is a gated set (CC-BY-4.0, attribution in
 the card); flip visibility on the Hub only after checking each source's terms.
 """
 import argparse
@@ -19,8 +19,7 @@ from huggingface_hub import HfApi
 ROWS_PER_SHARD = 5000
 FEATURES = {"audio": {"_type": "Audio", "sampling_rate": 16000}, "text": {"dtype": "string", "_type": "Value"},
             "lang": {"dtype": "string", "_type": "Value"}, "source": {"dtype": "string", "_type": "Value"},
-            "scenario": {"dtype": "string", "_type": "Value"}, "duration": {"dtype": "float64", "_type": "Value"},
-            "qwen_text": {"dtype": "string", "_type": "Value"}, "qwen_wer": {"dtype": "float64", "_type": "Value"}}
+            "scenario": {"dtype": "string", "_type": "Value"}, "duration": {"dtype": "float64", "_type": "Value"}}
 CARD = """---
 license: cc-by-4.0
 language: [en, hi]
@@ -32,11 +31,10 @@ configs:
 # {name}
 
 {hours:.1f} h of English + Hindi ASR audio (16 kHz FLAC, 1-30 s), built by BiBo `voice/asr/build_mix.py`. No filtering:
-every row keeps its source's human transcript. `qwen_text` / `qwen_wer` are Qwen3-ASR-1.7B's transcript and its WER
-against `text` (lowercase, punctuation and fillers stripped) -- a quality signal, not a label.
+every row keeps its source's human transcript. Hindi `scenario` = Conversation / Extempore / Read.
 
-| source | lang | hours | rows | corpus WER vs Qwen3-ASR |
-|---|---|---|---|---|
+| source | lang | hours | rows |
+|---|---|---|---|
 {table}
 
 Sources: MLCommons/peoples_speech (clean; CC-BY / CC-BY-SA), facebook/voxpopuli (en; CC0), edinburghcstr/ami (ihm;
@@ -52,20 +50,9 @@ def main():
     rows, stats = [], []
     for man in sorted(glob.glob(os.path.join(a.mix, "*.jsonl"))):
         src = os.path.basename(man)[:-6]
-        q = {}
-        qp = os.path.join(a.mix, "qwen", f"{src}_all.jsonl")
-        if os.path.exists(qp):
-            q = {r["audio_filepath"]: r for r in map(json.loads, open(qp, encoding="utf-8"))}
         src_rows = [json.loads(l) for l in open(man, encoding="utf-8")]
-        for r in src_rows:
-            r["qwen_text"] = q.get(r["audio_filepath"], {}).get("qwen_text")
-            r["qwen_wer"] = q.get(r["audio_filepath"], {}).get("wer")
         rows += src_rows
-        scored = [r for r in src_rows if r["qwen_wer"] is not None]
-        words = [len(r["text"].split()) for r in scored]
-        cwer = sum(r["qwen_wer"] * w for r, w in zip(scored, words)) / max(sum(words), 1)
-        stats.append(f"| {src} | {src_rows[0]['lang']} | {sum(r['duration'] for r in src_rows) / 3600:.1f} | "
-                     f"{len(src_rows)} | {f'{100 * cwer:.1f}%' if scored else 'n/a'} |")
+        stats.append(f"| {src} | {src_rows[0]['lang']} | {sum(r['duration'] for r in src_rows) / 3600:.1f} | {len(src_rows)} |")
     random.Random(23).shuffle(rows)
     out = os.path.join(a.mix, "hf")
     os.makedirs(os.path.join(out, "data"), exist_ok=True)
