@@ -22,10 +22,13 @@ def chunks(wav, out_dir, tag):
     x, sr = sf.read(wav)
     n = int(CHUNK_S * sr)
     paths = []
-    for i in range(0, len(x), n):
-        p = os.path.join(out_dir, "chunks", f"{tag}_{i // n:03d}.wav")
+    starts = list(range(0, len(x), n))
+    if len(starts) > 1 and len(x) - starts[-1] < sr:   # a sub-second tail joins the previous chunk (ARK crashed on 29 samples)
+        starts.pop()
+    for k, i in enumerate(starts):
+        p = os.path.join(out_dir, "chunks", f"{tag}_{k:03d}.wav")
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        sf.write(p, x[i:i + n], sr)
+        sf.write(p, x[i:starts[k + 1]] if k + 1 < len(starts) else x[i:], sr)
         paths.append(p)
     return paths
 
