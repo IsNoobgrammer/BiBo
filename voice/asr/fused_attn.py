@@ -1,7 +1,7 @@
 """NeMo RelPositionMultiHeadAttention -> tkf fused banded relative-position attention (train_asr.py --fused_attn).
 
 triton-kernel-fused kernels/sm120/relpos_attn.py: the chunked_limited band only, no T x T scores / rel_shift copies,
-fp32-accurate (3xTF32 dots; NeMo runs this block in fp32 + TF32). 1.3x (4 s clips) to 4.4x (25 s) fwd+bwd vs NeMo's
+in NeMo's own dtypes (bf16 under bf16 autocast; avoid_float16_autocast_context only acts on fp16). 1.3x (4 s clips) to 4.4x (25 s) fwd+bwd vs NeMo's
 core (bench/bench_relpos_attn.py); parity_check/parity_relpos_attn.py gates it against fp64 and NeMo-fp32.
 
 The kernel needs the batch lengths and this step's att_context_size (training samples one of [70,13] [70,6] [70,1]
@@ -42,15 +42,16 @@ def enable(model):
                 or pos_emb.size(1) != 2 * T - 1 or key is not query or value is not query):
             return self._nemo_forward(query, key, value, mask, pos_emb, cache=cache)
         (left, right), lengths, _ = ctx
-        with torch.autocast("cuda", enabled=False):                   # NeMo runs this block in fp32 too
-            x = query.float() if query.dtype != self.linear_q.weight.dtype else query
-            q = self.linear_q(x).view(B, T, self.h, self.d_k)
-            k = self.linear_k(x).view(B, T, self.h, self.d_k)
-            v = self.linear_v(x).view(B, T, self.h, self.d_k)
-            p = self.linear_pos(pos_emb.to(x.dtype)).view(-1, self.h, self.d_k)
-            o = relpos_attention(q, k, v, p, self.pos_bias_u, self.pos_bias_v, lengths, left, right,
-                                 dropout=self.dropout.p if self.dropout.training else 0.0)
-            return self.linear_out(o.to(x.dtype).reshape(B, T, self.h * self.d_k))
+        # exactly NeMo's dtypes: under bf16 autocast its avoid_float16_autocast_context is a no-op, so the projections
+        # and the attention matmuls are bf16 (softmax fp32); the kernel follows q's dtype
+        x = query.float() if torch.is_autocast_enabled() else query
+        q = self.linear_q(x).view(B, T, self.h, self.d_k)
+        k = self.linear_k(x).view(B, T, self.h, self.d_k)
+        v = self.linear_v(x).view(B, T, self.h, self.d_k)
+        p = self.linear_pos(pos_emb).view(-1, self.h, self.d_k)
+        o = relpos_attention(q, k, v, p, self.pos_bias_u, self.pos_bias_v, lengths, left, right,
+                             dropout=self.dropout.p if self.dropout.training else 0.0)
+        return self.linear_out(o.reshape(B, T, self.h * self.d_k))
 
     n = 0
     for layer in enc.layers:
