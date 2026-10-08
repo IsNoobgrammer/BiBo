@@ -83,7 +83,9 @@ class ValAggregate(Callback):
             rows = [json.loads(l) for l in open(p, encoding="utf-8")]
             self.sets[stem] = (rows[0]["lang"], sum(len(r["text"].split()) for r in rows))
 
-    def on_validation_epoch_end(self, trainer, pl_module):
+    def on_validation_end(self, trainer, pl_module):
+        # NOT on_validation_epoch_end: Lightning runs callback hooks before the module's, and NeMo publishes the
+        # per-dataloader WERs in the module's hook. Runs before ModelCheckpoint (callback order), which reads it.
         cm = trainer.callback_metrics
         acc = {"all": [0.0, 0], "en": [0.0, 0], "hi": [0.0, 0]}
         for stem, (lang, words) in self.sets.items():
@@ -93,7 +95,10 @@ class ValAggregate(Callback):
             for k in ("all", lang):
                 acc[k][0] += float(w) * words
                 acc[k][1] += words
-        pl_module.log_dict({f"val_wer_{k}": e / n for k, (e, n) in acc.items() if n})
+        out = {f"val_wer_{k}": e / n for k, (e, n) in acc.items() if n}
+        for k, v in out.items():
+            trainer.callback_metrics[k] = torch.tensor(v)
+        trainer.logger.log_metrics(out, step=trainer.global_step)
 
 
 def main():
@@ -156,7 +161,7 @@ def main():
         use_distributed_sampler=False, logger=logger, enable_checkpointing=True, benchmark=False,
         callbacks=[AudioMeter(), ValAggregate(a.val), LearningRateMonitor("step"),
                    ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer_all", mode="min", save_top_k=2,
-                                   save_last=True, filename="{step}-{val_wer_all:.4f}"),
+                                   save_last=True, filename="{step}-{val_wer_all:.4f}", save_on_train_epoch_end=False),
                    HFSync(a.run, ckpt_dir)])
     m.set_trainer(trainer)
     m.setup_optimization(OmegaConf.create({
