@@ -1,66 +1,109 @@
-"""build_mix.py output -> train / val manifests with ONE text convention + balanced tokenizer text.
+"""build_mix.py output -> train / val manifests with ONE text convention, speaker-disjoint val, repeats, multi-speaker
+windows, balanced tokenizer text.
 
-    python voice/asr/prep_train.py --mix /home/marimo/work/asr/mix100 --out /home/marimo/work/asr/run0
+    python voice/asr/prep_train.py --mix /home/marimo/work/asr/mix240 --out /home/marimo/work/asr/run1
 
-v0 convention: lowercase, no punctuation (only VoxPopuli has casing + punctuation, AMI is UPPERCASE; mixing them would
-teach the model random casing). Apostrophes inside English words are kept ("don't"). Devanagari is kept as written.
-ponytail: punctuation + casing come back as a later stage once more cased data (VoxPopuli, IndicVoices verbatim) is in.
-Val = 2% of each source (max 400 rows), seeded. tokenizer.txt = Hindi and English text balanced 50/50 by characters.
+Text v0: lowercase, no punctuation (sources disagree on casing: AMI UPPERCASE, VoxPopuli / Svarah cased). Apostrophes
+inside English words stay. Vaani markup: `फोन {phone}` keeps the Latin form (our code-switch convention: English words
+in Latin), `पे {पर}` keeps what was said; <tags> and [events] are dropped; rows marked unintelligible are dropped.
+ponytail: punctuation + casing return as a later stage once more cased data is in.
+Val = whole SPEAKERS per source (2%, 10% for the small accent sets Svarah / Lahaja), never repeated, never in a
+multi-speaker window. Train rows are repeated per build_mix.SOURCES[*].repeat; multispk.py adds <spk> windows.
 """
 import argparse
 import glob
+import itertools
 import json
 import os
 import random
 import re
+import sys
 import unicodedata
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from build_mix import SOURCES  # noqa: E402
+import multispk  # noqa: E402
+
 KEEP = re.compile(r"[^a-z0-9'ऀ-ॿ ]")      # Latin, digits, apostrophe, Devanagari block
+ANNOT = {"noise", "pause", "breathing", "inhaling", "unintelligible"}
+VAL_SHARE = {"svarah": 0.10, "lahaja": 0.10}
+REPEAT = {s["name"]: s.get("repeat", 1) for s in SOURCES}
+
+
+def brace(m):
+    said, alt = m.group(1), m.group(2).strip()
+    latin = re.search("[A-Za-z]", alt) and alt.lower() not in ANNOT
+    return alt if latin else said
 
 
 def clean(text):
-    t = unicodedata.normalize("NFC", text).lower().replace("’", "'")
+    t = unicodedata.normalize("NFC", text)
+    t = re.sub(r"(\S+)\s*\{([^{}]*)\}", brace, t)                  # Vaani: spoken {standard / English spelling}
+    t = re.sub(r"<[^<>]*>|\[[^\[\]]*\]|\{[^{}]*\}", " ", t)         # <tags>, [events], leftover braces
+    t = t.lower().replace("’", "'")
     t = "".join(" " if unicodedata.category(c).startswith("P") and c != "'" else c for c in t)
     t = KEEP.sub(" ", t)
-    t = re.sub(r"(?<![a-z])'|'(?![a-z])", " ", t)     # quote marks, not apostrophes
+    t = re.sub(r"(?<![a-z])'|'(?![a-z])", " ", t)                  # quote marks, not apostrophes
     return " ".join(t.split())
+
+
+def split_by_speaker(rows, share, rng):
+    spk = sorted({r["speaker"] for r in rows})
+    rng.shuffle(spk)
+    val_spk, n = set(), 0
+    for s in spk:                                                   # whole speakers until the share is reached
+        if n >= share * len(rows):
+            break
+        val_spk.add(s)
+        n += sum(r["speaker"] == s for r in rows)
+    return [r for r in rows if r["speaker"] not in val_spk], [r for r in rows if r["speaker"] in val_spk]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mix", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--multispk_share", type=float, default=0.15, help="multi-speaker hours / effective train hours")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     rng = random.Random(23)
-    train, val = [], []
+    base, val = [], []
     for man in sorted(glob.glob(os.path.join(a.mix, "*.jsonl"))):
         rows = [json.loads(l) for l in open(man, encoding="utf-8")]
+        rows = [r for r in rows if "unintelligible" not in r["text"].lower()]
         for r in rows:
             r["text"] = clean(r["text"])
         rows = [r for r in rows if r["text"]]
-        rng.shuffle(rows)
-        k = min(400, len(rows) // 50)
-        val += rows[:k]
-        train += rows[k:]
-        print(f"{os.path.basename(man)}: train {len(rows) - k}  val {k}", flush=True)
+        src = rows[0]["source"]
+        tr, va = split_by_speaker(rows, VAL_SHARE.get(src, 0.02), rng)
+        base += tr
+        val += va
+        print(f"{src}: train {len(tr)} x{REPEAT.get(src, 1)}  val {len(va)} ({len({r['speaker'] for r in va})} speakers)",
+              flush=True)
+    train = [r for r in base for _ in range(REPEAT.get(r["source"], 1))]
+    eff_h = sum(r["duration"] for r in train) / 3600
+    ms = multispk.make(base, os.path.join(a.out, "multispk"), a.multispk_share * eff_h, rng)
+    train += ms
+    rng.shuffle(train)
     write = lambda name, rs: open(os.path.join(a.out, name), "w", encoding="utf-8").writelines(
         json.dumps(r, ensure_ascii=False) + "\n" for r in rs)
     write("train.jsonl", train)
     write("val.jsonl", val)
     for lang in ("en", "hi"):
         write(f"val_{lang}.jsonl", [r for r in val if r["lang"] == lang])
-    hi = [r["text"] for r in train if r["lang"] == "hi"]
-    en = [r["text"] for r in train if r["lang"] == "en"]
+    hi = [r["text"] for r in base if r["lang"] == "hi"]
+    en = [r["text"] for r in base if r["lang"] == "en"]
     budget = min(sum(map(len, hi)), sum(map(len, en)))
-    pick = lambda xs: [x for x, c in zip(xs, __import__("itertools").accumulate(map(len, xs))) if c <= budget]
+    pick = lambda xs: [x for x, c in zip(xs, itertools.accumulate(map(len, xs))) if c <= budget]
     open(os.path.join(a.out, "tokenizer.txt"), "w", encoding="utf-8").write("\n".join(pick(hi) + pick(en)) + "\n")
-    hrs = lambda rs, l: sum(r["duration"] for r in rs if r["lang"] == l) / 3600
-    print(f"train en {hrs(train, 'en'):.1f} h / hi {hrs(train, 'hi'):.1f} h; val {len(val)} rows; tokenizer text "
-          f"{budget} chars per language", flush=True)
+    hrs = lambda rs, key, v: sum(r["duration"] for r in rs if r.get(key) == v) / 3600
+    print(f"train: en {hrs(train, 'lang', 'en'):.1f} h / hi {hrs(train, 'lang', 'hi'):.1f} h / multi-speaker "
+          f"{hrs(train, 'lang', 'mix'):.1f} h; val {len(val)} rows; tokenizer text {budget} chars per language", flush=True)
 
 
 if __name__ == "__main__":
     assert clean("Don't STOP, “it's” 1990 — ok!") == "don't stop it's 1990 ok"
     assert clean("कल की Meeting cancel हो गई।") == "कल की meeting cancel हो गई"
+    assert clean("<noise>एक फ्रीज़ {fridge} रखा [breathing] है पे {पर} दे {Noise}</noise>") == "एक fridge रखा है पे दे"
+    assert clean("<hi-en> दोस्तों bash में nested") == "दोस्तों bash में nested"
     main()

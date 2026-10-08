@@ -1,19 +1,20 @@
-"""100 h English/Hindi ASR training mix, 55/45, from HF parquet shards (no `datasets` dependency). No filtering: sources
-are chosen for clean human labels, and voice/asr/qwen_check.py only MEASURES each source's WER against Qwen3-ASR.
+"""240 h English/Hindi ASR training mix (HI 130 : EN 110 after repeats) from HF parquet shards, no `datasets` dependency.
+No filtering: sources are chosen for clean human labels.
 
-    python voice/asr/build_mix.py --out /home/marimo/work/asr/mix100 [--scale 1.0] [--only voxpopuli]
+    python voice/asr/build_mix.py --out /home/marimo/work/asr/mix240 [--scale 1.0] [--only svarah,lahaja]
 
 Writes <out>/audio/<source>/<n>.flac (16 kHz mono) and <out>/<source>.jsonl manifests (NeMo style: audio_filepath,
-duration, text, lang, source, + scenario when the source has one). Shards are visited in a seeded random order and only
-FRAC of each shard's rows are kept, so the hours come from many recordings / speakers instead of the first few.
-Utterances outside 1-30 s are dropped. IndicVoices is HF-gated: the box needs a token whose account accepted it.
+duration, text, lang, source, speaker, + scenario / meeting / begin when the source has them). Each source stores its
+UNIQUE audio once; `repeat` (small, high-value sets) is applied to the train manifest by prep_train.py. Shards are
+visited in a seeded random order and only `frac` of each shard's rows are kept, so the hours come from many recordings
+and speakers. Utterances outside 1-30 s are dropped. Gated sets need an HF token whose account accepted them.
 """
 import argparse
 import io
 import json
 import os
 import random
-from collections import deque
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
 
@@ -22,86 +23,110 @@ import soundfile as sf
 from huggingface_hub import HfApi, hf_hub_download
 
 CONV = "refs/convert/parquet"
-# name, repo, revision, shard prefix, audio column, text column, lang, hours. EN 55 h / HI 45 h.
-# Qwen3-ASR audit (300 rows each): VoxPopuli 6.4%, People's Speech 8.6% (mostly number spelling), AMI 9.4% WER.
-# Shrutilipi-hi was dropped: 27.8% WER, 11% of rows carry a different news sentence than the audio.
+# hours = unique hours to take (None = everything); repeat = times each train row appears (prep_train.py).
+# effective train hours: EN svarah 10x3 + people's speech 35 + voxpopuli 25 + ami 20 = ~110
+#                        HI indicvoices 40 + vaani 30 + kathbath 20 + hinglish 20 + lahaja 11x2 = ~132
 SOURCES = [
-    ("peoples_speech", "MLCommons/peoples_speech", CONV, "clean/train/", "audio", "text", "en", 30),
-    ("voxpopuli", "facebook/voxpopuli", CONV, "en/train/", "audio", "raw_text", "en", 18),   # accented, cased + punct
-    ("ami_ihm", "edinburghcstr/ami", CONV, "ihm/train/", "audio", "text", "en", 7),          # meetings, close-talk
-    ("indicvoices_hi", "ai4bharat/IndicVoices", "main", "hindi/train-", "audio_filepath", "text", "hi", 45),  # conv. / extempore / read
+    # --- English (Indian accent first) ---
+    dict(name="svarah", repo="ai4bharat/Svarah", rev="main", prefix="data/test-", audio="audio_filepath", text="text",
+         lang="en", hours=None, frac=1.0, repeat=3,
+         speaker=lambda r: f"{r.get('native_place_district')}|{r.get('gender')}|{r.get('age-group')}"),  # no speaker id column
+    dict(name="peoples_speech", repo="MLCommons/peoples_speech", rev=CONV, prefix="clean/train/", audio="audio",
+         text="text", lang="en", hours=35, frac=0.25, speaker=lambda r: r["id"].rsplit("_", 1)[0]),
+    dict(name="voxpopuli", repo="facebook/voxpopuli", rev=CONV, prefix="en/train/", audio="audio", text="raw_text",
+         lang="en", hours=25, frac=0.25, speaker=lambda r: r["speaker_id"]),
+    dict(name="ami_ihm", repo="edinburghcstr/ami", rev=CONV, prefix="ihm/train/", audio="audio", text="text", lang="en",
+         hours=20, frac=1.0, speaker=lambda r: r["speaker_id"],          # whole meetings: real turns for <spk> windows
+         extra={"meeting": "meeting_id", "begin": "begin_time"}),
+    # --- Hindi ---
+    dict(name="indicvoices_hi", repo="ai4bharat/IndicVoices", rev="main", prefix="hindi/train-", audio="audio_filepath",
+         text="text", lang="hi", hours=40, frac=0.25, speaker=lambda r: r["speaker_id"], extra={"scenario": "scenario"},
+         quota={"Conversation": 16, "Extempore": 17, "Read": 7}),       # conversation boosted over its natural 23%
+    dict(name="vaani_hi", repo="psk/vaani-asr", rev="main", prefix="hindi/train-", audio="audio", text="transcript",
+         lang="hi", hours=30, frac=0.25, speaker=lambda r: r["file_name"].split("_")[5]),  # spontaneous, loanwords {latin}
+    dict(name="kathbath_hi", repo="ai4bharat/Kathbath", rev="main", prefix="hindi/train-", audio="audio_filepath",
+         text="text", lang="hi", hours=20, frac=0.25, speaker=lambda r: str(r["speaker_id"])),
+    dict(name="hinglish", repo="agarwalayushi/hinglish", rev="main", prefix="data/train-", audio="audio", text="text",
+         lang="hi", hours=20, frac=0.1, speaker=lambda r: r["source"]),  # code-switched, English already in Latin
+    dict(name="lahaja", repo="ai4bharat/Lahaja", rev="main", prefix="data/test-", audio="audio_filepath", text="text",
+         lang="hi", hours=None, frac=1.0, repeat=2, speaker=lambda r: str(r["sp_id"])),  # Hindi from non-native speakers
 ]
-FRAC = 0.25
 MIN_S, MAX_S = 1.0, 30.0
+SPEAKER_COLS = {"native_place_district", "gender", "age-group", "id", "speaker_id", "file_name", "source", "sp_id"}
 
 
-def shard_rows(repo, rev, path, audio_col, text_col, rng):
-    local = hf_hub_download(repo, path, repo_type="dataset", revision=rev)
-    cols = pq.read_schema(local).names
-    t = pq.read_table(local, columns=[audio_col, text_col] + (["scenario"] if "scenario" in cols else [])).to_pylist()
+def shard_rows(src, path, rng):
+    local = hf_hub_download(src["repo"], path, repo_type="dataset", revision=src["rev"])
+    names = set(pq.read_schema(local).names)
+    want = {src["audio"], src["text"]} | (SPEAKER_COLS & names) | (set(src.get("extra", {}).values()) & names)
+    t = pq.read_table(local, columns=sorted(want)).to_pylist()
     os.remove(os.path.realpath(local))                  # keep the HF cache from filling the disk
-    return [r for r in t if rng.random() < FRAC]
+    return [r for r in t if rng.random() < src["frac"]]
 
 
 def build(src, out, scale, seed):
-    name, repo, rev, prefix, audio_col, text_col, lang, hours = src
-    budget = hours * scale * 3600
-    files = sorted(f for f in HfApi().list_repo_files(repo, repo_type="dataset", revision=rev)
-                   if f.startswith(prefix) and f.endswith(".parquet"))
-    rng = random.Random(seed)
-    rng.shuffle(files)
+    name = src["name"]
+    budget = src["hours"] * scale * 3600 if src["hours"] else float("inf")
+    quota = {k: v * scale * 3600 for k, v in (src.get("quota") or {}).items()}
+    files = sorted(f for f in HfApi().list_repo_files(src["repo"], repo_type="dataset", revision=src["rev"])
+                   if f.startswith(src["prefix"]) and f.endswith(".parquet"))
+    random.Random(seed).shuffle(files)
     adir = os.path.join(out, "audio", name)
     os.makedirs(adir, exist_ok=True)
-    total, n, skipped = 0.0, 0, 0
+    total, n, skipped, per_q = 0.0, 0, 0, defaultdict(float)
+    full = lambda: total >= budget or (quota and all(per_q[k] >= v for k, v in quota.items()))
     with open(os.path.join(out, f"{name}.jsonl"), "w", encoding="utf-8") as man, ThreadPoolExecutor(4) as pool:
         jobs = iter(enumerate(files))
-        window = deque(pool.submit(shard_rows, repo, rev, f, audio_col, text_col, random.Random(seed + i)) for i, f in islice(jobs, 4))
+        window = deque(pool.submit(shard_rows, src, f, random.Random(seed + i)) for i, f in islice(jobs, 4))
         while window:                                    # at most 4 shards in flight / in RAM
             rows = window.popleft().result()
             for i, f in islice(jobs, 1):
-                window.append(pool.submit(shard_rows, repo, rev, f, audio_col, text_col, random.Random(seed + i)))
+                window.append(pool.submit(shard_rows, src, f, random.Random(seed + i)))
             for r in rows:
-                text = (r[text_col] or "").strip()
-                x, sr = sf.read(io.BytesIO(r[audio_col]["bytes"]), dtype="float32")
+                text = (r[src["text"]] or "").strip()
+                q = r.get("scenario") if quota else None
+                if not text or (quota and (q not in quota or per_q[q] >= quota[q])):
+                    skipped += 1
+                    continue
+                x, sr = sf.read(io.BytesIO(r[src["audio"]]["bytes"]), dtype="float32")
                 if x.ndim > 1:
                     x = x.mean(1)
                 dur = len(x) / sr
-                if sr != 16000 or not text or not MIN_S <= dur <= MAX_S:
+                if sr != 16000 or not MIN_S <= dur <= MAX_S:
                     skipped += 1
                     continue
                 p = os.path.join(adir, f"{n:07d}.flac")
                 sf.write(p, x, sr)
-                row = {"audio_filepath": p, "duration": round(dur, 3), "text": text, "lang": lang, "source": name}
-                if "scenario" in r:
-                    row["scenario"] = r["scenario"]
+                row = {"audio_filepath": p, "duration": round(dur, 3), "text": text, "lang": src["lang"], "source": name,
+                       "speaker": f"{name}:{src['speaker'](r)}"}
+                for k, col in src.get("extra", {}).items():
+                    row[k] = r.get(col)
                 man.write(json.dumps(row, ensure_ascii=False) + "\n")
                 total += dur
                 n += 1
-                if total >= budget:
+                if q:
+                    per_q[q] += dur
+                if full():
                     break
-            print(f"{name}: {total / 3600:7.1f} / {budget / 3600:.0f} h  {n} utts  {skipped} skipped", flush=True)
-            if total >= budget:
+            print(f"{name}: {total / 3600:7.1f} / {budget / 3600:.0f} h  {n} utts  {skipped} skipped"
+                  + (f"  {dict((k, round(v / 3600, 1)) for k, v in per_q.items())}" if quota else ""), flush=True)
+            if full():
                 break
-    return name, total / 3600, n
+    return total / 3600
 
 
 def main():
-    global FRAC
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--scale", type=float, default=1.0, help="multiply every hour budget (0.01 = smoke test)")
     ap.add_argument("--only", default="", help="comma list of source names")
     ap.add_argument("--seed", type=int, default=23)
-    ap.add_argument("--frac", type=float, default=FRAC, help="share of each shard kept (lower = more recordings per hour)")
     a = ap.parse_args()
-    FRAC = a.frac
-    srcs = [s for s in SOURCES if not a.only or s[0] in a.only.split(",")]
-    res = [build(s, a.out, a.scale, a.seed) for s in srcs]
-    hrs = {"en": 0.0, "hi": 0.0}
-    for s, (_, h, _n) in zip(srcs, res):
-        hrs[s[6]] += h
-    tot = sum(hrs.values()) or 1
-    print("MIX", {k: f"{v:.1f} h ({100 * v / tot:.0f}%)" for k, v in hrs.items()}, flush=True)
+    srcs = [s for s in SOURCES if not a.only or s["name"] in a.only.split(",")]
+    hrs = defaultdict(float)
+    for s in srcs:
+        hrs[s["lang"]] += build(s, a.out, a.scale, a.seed) * s.get("repeat", 1)
+    print("MIX (effective, with repeats)", {k: f"{v:.1f} h" for k, v in hrs.items()}, flush=True)
 
 
 if __name__ == "__main__":
