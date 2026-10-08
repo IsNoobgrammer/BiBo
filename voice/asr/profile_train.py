@@ -89,8 +89,10 @@ def main():
         t4 = sync()
         return t1, t2, t3, t4, sig_len.sum().item() / 16000
 
+    import types
     m.log = lambda *x, **k: None                                  # no Lightning trainer attached
     m.log_dict = lambda *x, **k: None
+    m._trainer = types.SimpleNamespace(global_step=1, log_every_n_steps=10**9, current_epoch=0)  # never logs WER
     it = iter(dl)
     for _ in range(3):                                            # warm-up (numba JIT, cudnn autotune)
         step(next(it))
