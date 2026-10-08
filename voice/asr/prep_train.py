@@ -125,9 +125,9 @@ def main():
             r["text"] = clean(r["text"])
         rows = [r for r in rows if r["text"]]
         src = rows[0]["source"]
+        if src in pool:                                            # same split as push_mix.py (before the val split)
+            rows = pool_split(rows, pool[src])[0]
         tr, va = split_by_speaker(rows, VAL_SHARE.get(src, 0.02), rng)
-        if src in pool:
-            tr = pool_split(tr, pool[src])[0]
         base += tr
         val += va
         print(f"{src}: train {len(tr)} ({sum(r['duration'] for r in tr) / 3600:.1f} h) x{REPEAT.get(src, 1)}"

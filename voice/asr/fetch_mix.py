@@ -28,11 +28,12 @@ def main():
     for man in sorted(glob.glob(os.path.join(d, "manifests", "*.jsonl"))):
         for l in open(man, encoding="utf-8"):
             r = json.loads(l)
-            want[(r["source"], os.path.basename(r["audio_filepath"]))] = r["audio_filepath"]
+            want[f'{r["source"]}/{os.path.basename(r["audio_filepath"])}'] = r["audio_filepath"]
     n = 0
-    for f in sorted(glob.glob(os.path.join(d, "data", "*.parquet"))):
+    for f in sorted(glob.glob(os.path.join(d, "data", "**", "*.parquet"), recursive=True)):
         for row in pq.read_table(f, columns=["audio", "source"]).to_pylist():
-            p = want.get((row["source"], row["audio"]["path"]))
+            ap_ = row["audio"]["path"]                              # "<source>/<file>" (old 400 h layout: "<file>")
+            p = want.get(ap_ if "/" in ap_ else f'{row["source"]}/{ap_}')
             if p:
                 os.makedirs(os.path.dirname(p), exist_ok=True)
                 with open(p, "wb") as fo:
