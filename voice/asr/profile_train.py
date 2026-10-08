@@ -46,6 +46,8 @@ def main():
     ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--steps", type=int, default=30)
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--lhotse_sec", type=float, default=0, help="> 0: Lhotse duration-bucketed batches of this many audio seconds")
+    ap.add_argument("--compile", choices=["none", "default", "ro"], default="none", help="torch.compile the encoder (ro = reduce-overhead / CUDA graphs)")
     a = ap.parse_args()
     import nemo.collections.asr as nemo_asr
     from omegaconf import open_dict
@@ -57,8 +59,13 @@ def main():
         cfg.manifest_filepath, cfg.batch_size, cfg.num_workers = a.manifest, a.bs, a.workers
         cfg.max_duration, cfg.min_duration, cfg.shuffle, cfg.is_tarred = 30, 0.1, True, False
         cfg.pop("tarred_audio_filepaths", None)
+        if a.lhotse_sec:
+            cfg.use_lhotse, cfg.use_bucketing, cfg.num_buckets = True, True, 30
+            cfg.batch_duration, cfg.batch_size, cfg.shuffle_buffer_size = a.lhotse_sec, None, 10000
     m.setup_training_data(cfg)
     m = m.cuda().train()
+    if a.compile != "none":
+        m.encoder = torch.compile(m.encoder, mode="reduce-overhead" if a.compile == "ro" else None, dynamic=True)
     opt = torch.optim.AdamW(m.parameters(), lr=1e-4)
     m._optimizer = opt                                            # training_step logs its lr
     dl = m._train_dl
@@ -94,7 +101,7 @@ def main():
     m.log_dict = lambda *x, **k: None
     m._trainer = types.SimpleNamespace(global_step=1, log_every_n_steps=10**9, current_epoch=0)  # never logs WER
     it = iter(dl)
-    for _ in range(3):                                            # warm-up (numba JIT, cudnn autotune)
+    for _ in range(3 if a.compile == "none" else 15):             # warm-up (numba JIT, cudnn, compile shapes)
         step(next(it))
     tot = {"data": 0.0, "fwd": 0.0, "bwd": 0.0, "opt": 0.0}
     secs, t_start = 0.0, sync()
