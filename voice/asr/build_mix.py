@@ -1,4 +1,4 @@
-"""100 h English/Hindi ASR training mix, 60/40, from HF parquet shards (no `datasets` dependency). No filtering: sources
+"""100 h English/Hindi ASR training mix, 55/45, from HF parquet shards (no `datasets` dependency). No filtering: sources
 are chosen for clean human labels, and voice/asr/qwen_check.py only MEASURES each source's WER against Qwen3-ASR.
 
     python voice/asr/build_mix.py --out /home/marimo/work/asr/mix100 [--scale 1.0] [--only voxpopuli]
@@ -22,14 +22,14 @@ import soundfile as sf
 from huggingface_hub import HfApi, hf_hub_download
 
 CONV = "refs/convert/parquet"
-# name, repo, revision, shard prefix, audio column, text column, lang, hours. EN 60 h / HI 40 h.
+# name, repo, revision, shard prefix, audio column, text column, lang, hours. EN 55 h / HI 45 h.
 # Qwen3-ASR audit (300 rows each): VoxPopuli 6.4%, People's Speech 8.6% (mostly number spelling), AMI 9.4% WER.
 # Shrutilipi-hi was dropped: 27.8% WER, 11% of rows carry a different news sentence than the audio.
 SOURCES = [
-    ("peoples_speech", "MLCommons/peoples_speech", CONV, "clean/train/", "audio", "text", "en", 33),
-    ("voxpopuli", "facebook/voxpopuli", CONV, "en/train/", "audio", "raw_text", "en", 19),   # accented, cased + punct
-    ("ami_ihm", "edinburghcstr/ami", CONV, "ihm/train/", "audio", "text", "en", 8),          # meetings, close-talk
-    ("indicvoices_hi", "ai4bharat/IndicVoices", "main", "hindi/train-", "audio_filepath", "text", "hi", 40),  # conv. / extempore / read
+    ("peoples_speech", "MLCommons/peoples_speech", CONV, "clean/train/", "audio", "text", "en", 30),
+    ("voxpopuli", "facebook/voxpopuli", CONV, "en/train/", "audio", "raw_text", "en", 18),   # accented, cased + punct
+    ("ami_ihm", "edinburghcstr/ami", CONV, "ihm/train/", "audio", "text", "en", 7),          # meetings, close-talk
+    ("indicvoices_hi", "ai4bharat/IndicVoices", "main", "hindi/train-", "audio_filepath", "text", "hi", 45),  # conv. / extempore / read
 ]
 FRAC = 0.25
 MIN_S, MAX_S = 1.0, 30.0
