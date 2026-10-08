@@ -54,21 +54,23 @@ def _check():
     audio = torch.randn(8, 16000 * 6, device="cuda") * 0.05
     alen = torch.tensor([16000 * 6 - 4000 * i for i in range(8)], device="cuda")
     res = {}
-    for name in ("nemo", "nemo again", "nemo, input x (1 + 1e-7)", "fused"):
+    for name in ("fp32 reference", "nemo", "nemo again", "nemo, input x (1 + 1e-7)", "fused"):
         if name == "fused":
             enable(m)
         m.zero_grad()
         sig = audio * (1 + 1e-7) if "1e-7" in name else audio      # the model's own sensitivity: the noise floor
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=name != "fp32 reference"):
             enc, _ = m.forward(input_signal=sig, input_signal_length=alen)
         loss = (enc.float() * torch.linspace(-1, 1, enc.shape[1], device="cuda")[None, :, None]).sum()
         loss.backward()
         res[name] = (enc.detach().float(), m.encoder.layers[3].norm_conv.weight.grad.float().clone(),
                      m.encoder.layers[0].feed_forward1.linear1.weight.grad.float().clone())
     rel = lambda a, b: ((a - b).norm() / b.norm()).item()
-    for other in ("nemo again", "nemo, input x (1 + 1e-7)", "fused"):
-        print(f"{other} vs nemo: encoder out rel %.2e   d norm_conv.w (L3) rel %.2e   d ff1.linear1 (L0) rel %.2e" %
-              tuple(rel(a, b) for a, b in zip(res[other], res["nemo"])), flush=True)
+    for ref in ("nemo", "fp32 reference"):
+        for other in ("nemo", "nemo again", "nemo, input x (1 + 1e-7)", "fused"):
+            if other != ref:
+                print(f"{other:26s} vs {ref:15s}: encoder out %.2e   d norm_conv.w (L3) %.2e   d ff1.linear1 (L0) %.2e" %
+                      tuple(rel(a, b) for a, b in zip(res[other], res[ref])), flush=True)
 
 
 if __name__ == "__main__" and "--check" in sys.argv:
