@@ -47,7 +47,16 @@ def main():
     ap.add_argument("--sources", default="", help="comma list of manifests to check (default: all)")
     ap.add_argument("--keep_below", type=float, default=0,
                     help="> 0: REMOVE rows above this WER (bad labels): <src>.jsonl -> <src>_raw.jsonl, kept rows -> <src>.jsonl")
+    ap.add_argument("--reuse", default="", help="earlier <src>_all.jsonl: rows with the same text + duration keep their score")
     a = ap.parse_args()
+    key = lambda r: (r["text"], round(r["duration"], 2))                 # file names are renumbered by every rebuild
+    old = {}
+    for l in (open(a.reuse, encoding="utf-8") if a.reuse else []):
+        try:
+            r = json.loads(l)
+            old[key(r)] = (r["qwen_text"], r["wer"])
+        except Exception:                                                   # last line of a killed run
+            pass
     proc, m = load()
     qdir = os.path.join(a.mix, "qwen")
     os.makedirs(qdir, exist_ok=True)
@@ -59,17 +68,25 @@ def main():
         if a.per_source:
             rows = random.Random(23).sample(rows, min(a.per_source, len(rows)))
         rows.sort(key=lambda r: r["duration"])                 # similar lengths per batch -> less padding
-        edits = words = 0
         tag = "audit" if a.per_source else "all"
         with open(os.path.join(qdir, f"{src}_{tag}.jsonl"), "w", encoding="utf-8") as fo:
-            for i in range(0, len(rows), a.bs):
-                batch = rows[i:i + a.bs]
-                for r, h in zip(batch, transcribe(proc, m, batch)):
-                    ref, hyp = normalize(r["text"]), normalize(h)
-                    r["qwen_text"], r["wer"] = h, round(wer(ref, hyp), 4)
-                    edits += r["wer"] * len(ref)
-                    words += len(ref)
-                    fo.write(json.dumps(r, ensure_ascii=False) + "\n")
+            def emit(r, h):
+                ref = normalize(r["text"])
+                r["qwen_text"], r["wer"] = h, round(wer(ref, normalize(h)), 4)
+                fo.write(json.dumps(r, ensure_ascii=False) + "\n")
+                return r["wer"] * len(ref), len(ref)
+
+            stats, todo = [], []
+            for r in rows:
+                if key(r) in old:
+                    stats.append(emit(r, old[key(r)][0]))
+                else:
+                    todo.append(r)
+            print(f"{src}: {len(stats)} rows reuse a score, {len(todo)} to transcribe", flush=True)
+            for i in range(0, len(todo), a.bs):
+                b = todo[i:i + a.bs]
+                stats += [emit(r, h) for r, h in zip(b, transcribe(proc, m, b))]
+        edits, words = sum(e for e, _ in stats), sum(w for _, w in stats)
         ws = sorted(r["wer"] for r in rows)
         print(f"SOURCE {src}: n={len(rows)} {sum(r['duration'] for r in rows) / 3600:.1f} h  corpusWER="
               f"{100 * edits / max(words, 1):.1f}% median={100 * ws[len(ws) // 2]:.1f}%  <=10%: "

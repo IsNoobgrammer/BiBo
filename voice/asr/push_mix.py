@@ -111,8 +111,8 @@ configs:
 {"Hindi" if a.lang == "hi" else "English"} ASR audio (16 kHz FLAC), one half of the BiBo voice 1000 h mix (600 h
 Hindi / 400 h English), built by BiBo `voice/asr/build_mix.py`. Bad rows were REMOVED, never
 relabelled: Emilia keeps rows whose two independent transcripts agree (<= 5% WER) with audio quality PQ >= 6.5; Numo
-keeps its own WER <= 6% and synthetic-speech score <= 0.2; NPTEL drops rows a Qwen3-ASR pass scores above 25% WER
-(and 25-50% rows, which Gemini also rejects 90% of the time: labels running past the audio cut). Text keeps each source's original casing / markup; the training
+keeps its own WER <= 6% and synthetic-speech score <= 0.2; NPTEL drops rows a Qwen3-ASR pass scores above 15% WER
+(on a Gemini audit the 25-50% band was 90% bad: labels running past the audio cut). Text keeps each source's original casing / markup; the training
 normalisation is in `voice/asr/prep_train.py`.
 
 Configs: {", ".join(f"**{v}** {hrs(gs):.1f} h" for v, gs in configs.items())}.

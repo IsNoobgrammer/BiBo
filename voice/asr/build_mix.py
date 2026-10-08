@@ -58,7 +58,7 @@ SOURCES = [
          text="text_scribe", lang="en", hours=210, frac=1.0, keep=emilia_ok, speaker=lambda r: r["file_id"].rsplit("_W", 1)[0],
          cols=["text_emilia", "PQ"]),                                       # spontaneous YouTube English, cased + punct
     dict(name="nptel", repo="skbose/indian-english-nptel-v0", rev="main", prefix="data/train-", audio="audio",
-         text="transcription_normalised", lang="en", hours=215, frac=0.15, speaker=lambda r: r["speaker_name"]),
+         text="transcription_normalised", lang="en", hours=None, frac=0.30, speaker=lambda r: r["speaker_name"]),
     # --- English, shared ---
     dict(name="ami_ihm", repo="edinburghcstr/ami", rev=CONV, prefix="ihm/train/", audio="audio", text="text", lang="en",
          hours=None, frac=1.0, windows_only=True, speaker=lambda r: r["speaker_id"],
