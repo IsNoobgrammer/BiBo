@@ -81,7 +81,7 @@ SOURCES = [
          text="text", lang="hi", hours=300, frac=1.0, speaker=lambda r: r["speaker_id"], extra={"scenario": "scenario"},
          quota={"Conversation": 120, "Extempore": 130, "Read": 50}),       # conversation is only ~147 h of ~640 h
     dict(name="numo_hi", repo="psdn-ai/numo-indic-speech", rev="main", prefix="data/hindi/", audio="audio",
-         text="transcript", lang="hi", hours=120, frac=0.5, keep=numo_ok, max_s=70, speaker=lambda r: r["speaker_id"],
+         text="transcript", lang="hi", hours=120, frac=1.0, keep=numo_ok, max_s=70, speaker=lambda r: r["speaker_id"],
          cols=["wer", "synthetic_suspicion_score"]),                         # read, 36-67 s, 48 kHz stereo
     dict(name="vaani_hi", repo="psk/vaani-asr", rev="main", prefix="hindi/train-", audio="audio", text="transcript",
          lang="hi", hours=100, frac=0.9, speaker=lambda r: r["file_name"].split("_")[5]),
