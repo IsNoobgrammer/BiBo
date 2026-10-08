@@ -118,7 +118,7 @@ def main():
 
     batches = [next(it) for _ in range(a.steps)]                   # data off the clock (loader measured separately)
     audio = [float(b[1].sum()) / 16000 for b in batches]
-    for b in batches[:3]:                                           # warm-up: Triton / cuDNN autotune, allocator
+    for b in batches:                     # warm-up on EVERY batch: Triton compiles a variant per context / shape class
         step(b)
     sync()
     t0 = time.perf_counter()
