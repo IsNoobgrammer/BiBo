@@ -67,3 +67,26 @@ pushed to HF or git).
 - **Then** 4-bit QAT (first/last layers + joint at 8-bit) and the CPU runtime with the C API from the lessons doc.
 - **First step:** eval set (meeting clips + Kathbath / IndicVoices test + MUCS-2021 Hinglish) and baselines for the
   114M English model and Nemotron 0.6B, scored with RT Captions `bench` (WER, word latency p50/p95, engine busy %).
+
+## Baselines and teachers (Oct 8 2026, RTX PRO 6000 box; scored with `asr/score.py`, RT Captions normalizer)
+Eval: the internal 5-min meeting clip (833 words) and the 2-min dense clip (359 words) with Gemini references (eval
+only), plus one short Hindi TTS sample (flawed: it starts by speaking its own style prompt, so its WER is inflated).
+
+| Model | Mode | 5-min | 2-min |
+|---|---|---|---|
+| stt_en_fastconformer_hybrid_large_streaming_multi (114M) | streaming 0 / 80 / 480 / 1040 ms | 41.7 / 38.2 / 41.7 / 35.1% | 43.7 / 41.5 / 39.3 / 37.9% |
+| stt_en_fastconformer_hybrid_medium_streaming_80ms_pc (32M) | streaming 80 ms | 38.2% | 37.1% |
+| Nemotron 3.5 ASR streaming 0.6B (en-US) | streaming 80 / 160 / 560 / 1120 ms | 16.9 / 15.5 / 15.3 / 14.8% | 13.9 / 14.8 / 14.8 / 14.2% |
+| **Parakeet TDT 0.6B v3** | offline, 25 s chunks | **11.2%** | 9.2% |
+| **Canary-Qwen-2.5B** | offline | 11.3% | **8.9%** |
+| Whisper-large-v3 | offline | 13.3% | 11.1% |
+| Canary-1B-v2 | offline | 14.1% | 10.6% |
+
+- The small NVIDIA English streaming models (trained on LibriSpeech / WSJ / Fisher-style English) collapse on accented
+  Indian meeting speech and drop ~25% of words: the problem is data (accent + jargon), not streaming.
+- Hindi sample: Nemotron gets the Hindi words right but writes English words in DEVANAGARI ("jaundice" -> "जॉनडिस")
+  and switches language only per utterance; **Whisper-large-v3 is the only model producing our convention** (Hindi in
+  Devanagari, English in Latin: "आज हम मरीज की report देखेंगे… तो jaundice की…"); Parakeet v3 has no Hindi.
+- **Teacher plan:** English / Indian English = Parakeet v3 (+ Canary-Qwen, Whisper as agreement checks); Hindi +
+  code-switched = Whisper-large-v3 (+ Nemotron hi-IN for Hindi words), with VAD + inter-teacher agreement filtering
+  (Whisper hallucinates on silence). Missing: a real Hindi test set and IndicConformer (both gated on HF -> need a token).
