@@ -26,7 +26,7 @@ from omegaconf import OmegaConf, open_dict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 GROUPS = [("joint+rnnt (tkf)", ("_logits_kernel", "_rowgrad", "_fix_e", "_dfg", "_hidden", "_lattice", "_combine_rows")),
-          ("rel-pos attn (tkf)", ("_bwd_q", "_bwd_kv", "_dp_diag")),
+          ("rel-pos attn (tkf)", ("_rpa_fwd", "_bwd_q", "_bwd_kv", "_dp_diag")),
           ("res+drop+LN (tkf)", ("_fwd", "_bwd")),
           ("rnnt numba", ("rnnt_loss", "numba")),
           ("attention", ("flash", "fmha", "attention", "softmax")),
