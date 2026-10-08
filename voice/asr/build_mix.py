@@ -1,7 +1,7 @@
-"""240 h English/Hindi ASR training mix (HI 130 : EN 110 after repeats) from HF parquet shards, no `datasets` dependency.
+"""400 h English/Hindi ASR training mix (HI ~225 : EN ~175 after repeats) from HF parquet shards, no `datasets` dependency.
 No filtering: sources are chosen for clean human labels.
 
-    python voice/asr/build_mix.py --out /home/marimo/work/asr/mix240 [--scale 1.0] [--only svarah,lahaja]
+    python voice/asr/build_mix.py --out /home/marimo/work/asr/mix400 [--scale 1.0] [--only svarah,lahaja]
 
 Writes <out>/audio/<source>/<n>.flac (16 kHz mono) and <out>/<source>.jsonl manifests (NeMo style: audio_filepath,
 duration, text, lang, source, speaker, + scenario / meeting / begin when the source has them). Each source stores its
@@ -24,32 +24,32 @@ from huggingface_hub import HfApi, hf_hub_download
 
 CONV = "refs/convert/parquet"
 # hours = unique hours to take (None = everything); repeat = times each train row appears (prep_train.py).
-# effective train hours: EN svarah 10x3 + people's speech 35 + voxpopuli 25 + ami 20 = ~110
-#                        HI indicvoices 40 + vaani 30 + kathbath 20 + hinglish 20 + lahaja 11x2 = ~132
+# effective train hours: EN svarah 9.4x2 + people's speech 80 + ami 65 + voxpopuli 10 = ~175
+#                        HI indicvoices 60 + vaani 45 + kathbath 40 + hinglish 45 + lahaja 11x3 = ~223
 SOURCES = [
     # --- English (Indian accent first) ---
     dict(name="svarah", repo="ai4bharat/Svarah", rev="main", prefix="data/test-", audio="audio_filepath", text="text",
-         lang="en", hours=None, frac=1.0, repeat=3,
+         lang="en", hours=None, frac=1.0, repeat=2,
          speaker=lambda r: f"{r.get('native_place_district')}|{r.get('gender')}|{r.get('age-group')}"),  # no speaker id column
     dict(name="peoples_speech", repo="MLCommons/peoples_speech", rev=CONV, prefix="clean/train/", audio="audio",
-         text="text", lang="en", hours=35, frac=0.25, speaker=lambda r: r["id"].rsplit("_", 1)[0]),
+         text="text", lang="en", hours=80, frac=0.25, speaker=lambda r: r["id"].rsplit("_", 1)[0]),
     dict(name="voxpopuli", repo="facebook/voxpopuli", rev=CONV, prefix="en/train/", audio="audio", text="raw_text",
-         lang="en", hours=25, frac=0.25, speaker=lambda r: r["speaker_id"]),
+         lang="en", hours=10, frac=0.25, speaker=lambda r: r["speaker_id"]),
     dict(name="ami_ihm", repo="edinburghcstr/ami", rev=CONV, prefix="ihm/train/", audio="audio", text="text", lang="en",
-         hours=20, frac=1.0, speaker=lambda r: r["speaker_id"],          # whole meetings: real turns for <spk> windows
+         hours=65, frac=1.0, speaker=lambda r: r["speaker_id"],          # whole meetings: real turns for <spk> windows
          extra={"meeting": "meeting_id", "begin": "begin_time"}),
     # --- Hindi ---
     dict(name="indicvoices_hi", repo="ai4bharat/IndicVoices", rev="main", prefix="hindi/train-", audio="audio_filepath",
-         text="text", lang="hi", hours=40, frac=0.25, speaker=lambda r: r["speaker_id"], extra={"scenario": "scenario"},
-         quota={"Conversation": 16, "Extempore": 17, "Read": 7}),       # conversation boosted over its natural 23%
+         text="text", lang="hi", hours=60, frac=0.25, speaker=lambda r: r["speaker_id"], extra={"scenario": "scenario"},
+         quota={"Conversation": 25, "Extempore": 25, "Read": 10}),       # conversation boosted over its natural 23%
     dict(name="vaani_hi", repo="psk/vaani-asr", rev="main", prefix="hindi/train-", audio="audio", text="transcript",
-         lang="hi", hours=30, frac=0.25, speaker=lambda r: r["file_name"].split("_")[5]),  # spontaneous, loanwords {latin}
+         lang="hi", hours=45, frac=0.5, speaker=lambda r: r["file_name"].split("_")[5]),  # spontaneous, loanwords {latin}
     dict(name="kathbath_hi", repo="ai4bharat/Kathbath", rev="main", prefix="hindi/train-", audio="audio_filepath",
-         text="text", lang="hi", hours=20, frac=0.25, speaker=lambda r: str(r["speaker_id"])),
+         text="text", lang="hi", hours=40, frac=0.5, speaker=lambda r: str(r["speaker_id"])),
     dict(name="hinglish", repo="agarwalayushi/hinglish", rev="main", prefix="data/train-", audio="audio", text="text",
-         lang="hi", hours=20, frac=0.1, speaker=lambda r: r["source"]),  # code-switched, English already in Latin
+         lang="hi", hours=45, frac=0.1, speaker=lambda r: r["source"]),  # code-switched, English already in Latin
     dict(name="lahaja", repo="ai4bharat/Lahaja", rev="main", prefix="data/test-", audio="audio_filepath", text="text",
-         lang="hi", hours=None, frac=1.0, repeat=2, speaker=lambda r: str(r["sp_id"])),  # Hindi from non-native speakers
+         lang="hi", hours=None, frac=1.0, repeat=3, speaker=lambda r: str(r["sp_id"])),  # Hindi from non-native speakers
 ]
 MIN_S, MAX_S = 1.0, 30.0
 SPEAKER_COLS = {"native_place_district", "gender", "age-group", "id", "speaker_id", "file_name", "source", "sp_id"}

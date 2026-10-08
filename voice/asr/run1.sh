@@ -1,13 +1,13 @@
 #!/bin/bash
 # run1: en/hi streaming ASR with speaker turns. 114M cache-aware FastConformer hybrid RNNT+CTC (NVIDIA, English,
-# CC-BY-4.0), vocabulary swapped for our joint 4k en/hi SentencePiece BPE (+ <spk1..4>), fine-tuned on the 240 h mix
-# (HI ~132 : EN ~110 effective + ~15% multi-speaker windows). run0 (100 h, no speakers) is in git history.
+# CC-BY-4.0), vocabulary swapped for our joint 4k en/hi SentencePiece BPE (+ <spk1..4>), fine-tuned on the 400 h mix
+# (HI ~225 : EN ~175 effective + ~15% multi-speaker windows). run0 (100 h, no speakers) is in git history.
 #   bash voice/asr/run1.sh            (on the ASR box after the setup_repo cell; NeMo repo at $W/NeMo)
 set -euo pipefail
 W=/home/marimo/work; A=$W/asr; R=$A/run1; P=/home/marimo/asrenv/bin/python   # made by voice/asr/setup_box.sh
 cd $W/BiBo && git log --oneline -1
 
-$P voice/asr/prep_train.py --mix $A/mix240 --out $R
+$P voice/asr/prep_train.py --mix $A/mix400 --out $R
 
 # joint tokenizer: balanced text, full Devanagari coverage, byte fallback for unseen characters, no language tags
 $P $W/NeMo/scripts/tokenizers/process_asr_text_tokenizer.py --data_file $R/tokenizer.txt --data_root $R/tok \
@@ -22,7 +22,7 @@ $P $W/NeMo/examples/asr/speech_to_text_finetune.py \
   model.train_ds.manifest_filepath=$R/train.jsonl model.train_ds.batch_size=64 model.train_ds.max_duration=30 \
   "model.validation_ds.manifest_filepath=[$R/val_en.jsonl,$R/val_hi.jsonl]" model.validation_ds.batch_size=64 \
   model.optim.lr=5e-4 model.optim.sched.warmup_steps=1000 model.optim.sched.min_lr=1e-5 \
-  trainer.devices=1 trainer.max_epochs=12 trainer.precision=bf16-mixed trainer.strategy=auto \
+  trainer.devices=1 trainer.max_epochs=7 trainer.precision=bf16-mixed trainer.strategy=auto \
   exp_manager.exp_dir=$R/exp exp_manager.name=run1 \
   exp_manager.create_wandb_logger=true exp_manager.wandb_logger_kwargs.project=bibo-asr exp_manager.wandb_logger_kwargs.name=run1 \
   exp_manager.checkpoint_callback_params.save_top_k=2
