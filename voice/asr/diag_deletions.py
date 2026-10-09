@@ -108,12 +108,17 @@ def main():
     ap.add_argument("--pad", type=float, default=1.0, help="seconds of trailing silence for the end-pad A/B (0 = off)")
     ap.add_argument("--att_context", type=int, nargs=2, default=None, help="e.g. 70 0 (no look-ahead) or 70 13")
     ap.add_argument("--bs", type=int, default=32)
+    ap.add_argument("--blank_penalty", type=float, default=0.0, help="RNN-T decode: blank logit -= this (blank_penalty.py)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     import nemo.collections.asr as nemo_asr
     m = nemo_asr.models.ASRModel.restore_from(a.nemo).cuda().eval()
     if a.att_context:
         m.encoder.set_default_att_context_size(list(a.att_context))
+    if a.blank_penalty:
+        import blank_penalty
+        blank_penalty.apply(a.blank_penalty)
+    tot = collections.Counter()
     rng = random.Random(0)
     report = {}
     print(f"{'set':18s} {'words':>6s} {'WER':>6s} {'S':>6s} {'D':>6s} {'I':>6s} | D first10/mid/last10 "
@@ -129,6 +134,7 @@ def main():
         if a.pad:
             _, ppos, *_ = analyse(rows, transcribe(m, rows, a.pad, a.bs))
             pad_last = ppos["last10"] / N
+        tot.update(acc)
         rates = [rd[b] / rn[b] if rn[b] else float("nan") for b in ("<1.5", "1.5-2.5", "2.5-3.5", ">3.5")]
         print(f"{stem:18s} {acc['N']:6d} {(acc['S'] + acc['D'] + acc['I']) / N:6.3f} {acc['S'] / N:6.3f} "
               f"{acc['D'] / N:6.3f} {acc['I'] / N:6.3f} | {pos['first10'] / N:.3f}/{pos['middle'] / N:.3f}/"
@@ -138,6 +144,9 @@ def main():
                         "D_pos": {k: v / N for k, v in pos.items()}, "D_last10_padded": pad_last,
                         "D_by_wps": dict(zip(("<1.5", "1.5-2.5", "2.5-3.5", ">3.5"), rates)),
                         "worst": [{"deleted": d, "audio": f, "ref": r, "hyp": h} for d, f, r, h in worst]}
+    T = max(tot["N"], 1)
+    print(f"{'TOTAL':18s} {tot['N']:6d} {(tot['S'] + tot['D'] + tot['I']) / T:6.3f} {tot['S'] / T:6.3f} "
+          f"{tot['D'] / T:6.3f} {tot['I'] / T:6.3f}   (blank penalty {a.blank_penalty:g})", flush=True)
     if a.out:
         json.dump(report, open(a.out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
         print(f"wrote {a.out} (per-set numbers + 10 worst rows each)", flush=True)
