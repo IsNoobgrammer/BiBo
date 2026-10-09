@@ -6,7 +6,9 @@
 set -uo pipefail
 RUN=${1:-run1}
 BP=${BP:-}                                        # BP=0.5: decode-time blank penalty (blank_penalty.py), both heads
-TAG=$RUN${BP:+.bp$BP}
+LOCK=${LOCK:-}                                    # LOCK=en: English script lock (no Devanagari tokens), as RT Captions
+[ -n "$LOCK" ] && BP=${BP:-0}
+TAG=$RUN${BP:+.bp$BP}${LOCK:+.$LOCK}
 W=/home/marimo/work; A=$W/asr; M=$A/eval_meeting; P=/home/marimo/asrenv/bin/python
 NEMO=$A/exp/$RUN/$RUN.nemo
 until [ -f "$NEMO" ]; do sleep 30; done
@@ -25,7 +27,7 @@ for att in 0 1 3 6 13; do
   for dec in rnnt ctc; do
     out=$M/$TAG.la$att.$dec.jsonl
     rm -rf $out
-    $P ${BP:+voice/asr/blank_penalty.py $dec:$BP} $W/NeMo/examples/asr/asr_cache_aware_streaming/speech_to_text_cache_aware_streaming_infer.py \
+    $P ${BP:+voice/asr/blank_penalty.py $dec:$BP${LOCK:+:$LOCK}} $W/NeMo/examples/asr/asr_cache_aware_streaming/speech_to_text_cache_aware_streaming_infer.py \
       model_path=$NEMO dataset_manifest=$M/meeting.jsonl output_path=$out batch_size=1 \
       "att_context_size=[$left,$att]" decoder_type=$dec > $M/$TAG.la$att.$dec.log 2>&1 || { echo "FAILED la$att $dec"; tail -5 $M/$TAG.la$att.$dec.log; continue; }
     $P - <<EOF
