@@ -60,6 +60,7 @@ def main():
     ap.add_argument("--fused_layer", action="store_true")
     ap.add_argument("--fused_attn", action="store_true")
     ap.add_argument("--fused_conv", action="store_true")
+    ap.add_argument("--ops", action="store_true", help="also list aten ops by GPU time, with input shapes")
     ap.add_argument("--phases", action="store_true")
     ap.add_argument("--sync_debug", action="store_true")
     a = ap.parse_args()
@@ -155,6 +156,18 @@ def main():
     print("  top kernels:")
     for k, v in sorted(kern.items(), key=lambda x: -x[1])[:15]:
         print(f"    {v:7.2f} ms  {100 * v / gt:5.1f}%  [{group(k)}]  {k[:80]}")
+
+    if a.ops:                             # which aten op launched the elementwise / copy kernels (CPU + CUDA trace)
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                torch.profiler.ProfilerActivity.CUDA], record_shapes=True) as prof:
+            for b in batches[3:5]:
+                step(b)
+            sync()
+        print("  aten ops by GPU time (incl. children), ms/step [input shapes]:")
+        rows = [e for e in prof.key_averages(group_by_input_shape=True)
+                if e.key.startswith("aten::") and e.device_time_total > 0]
+        for e in sorted(rows, key=lambda e: -e.device_time_total)[:40]:
+            print(f"    {e.device_time_total / 2 / 1000:7.2f}  x{e.count // 2:<4d} {e.key:28s} {str(e.input_shapes)[:90]}")
 
     if a.phases:
         names = ["h2d", "encoder fwd", "decoder+joint+rnnt fwd", "ctc fwd", "backward", "clip+optimizer"]
