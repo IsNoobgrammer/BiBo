@@ -3,7 +3,7 @@
     python voice/asr/diag_deletions.py --nemo exp/run2/run2.nemo --val R/val_*.jsonl E/fleurs_*.jsonl \
         [--max_per_source 400] [--pad 1.0] [--att_context 70 13] [--out diag_run2.json]
 
-Per val set (word-aligned with jiwer):
+Per val set (word-level Levenshtein alignment):
   S / D / I rates      deletions >> insertions = a deletion bias
   D by position        first 10 % / middle / last 10 % of the reference words. End-heavy = the streaming encoder
                        never "flushes" the last words (fix at inference); spread = model / data
@@ -17,9 +17,6 @@ import json
 import os
 import random
 
-import numpy as np
-import soundfile as sf
-import torch
 
 
 def load_rows(path, n, rng):
@@ -28,6 +25,9 @@ def load_rows(path, n, rng):
 
 
 def transcribe(m, rows, pad, bs):
+    import numpy as np
+    import soundfile as sf
+    import torch
     audio = []
     for r in rows:
         x, sr = sf.read(r["audio_filepath"], dtype="float32", always_2d=False)
@@ -45,8 +45,35 @@ def transcribe(m, rows, pad, bs):
     return [h.text if hasattr(h, "text") else h for h in out]
 
 
+def align(ref, hyp):
+    """Levenshtein over words -> (S, D, I, deleted ref indices). Ties prefer substitution, like jiwer."""
+    n, m = len(ref), len(hyp)
+    d = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        d[i][0] = i
+    for j in range(m + 1):
+        d[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            d[i][j] = min(d[i - 1][j - 1] + (ref[i - 1] != hyp[j - 1]), d[i - 1][j] + 1, d[i][j - 1] + 1)
+    s = de = ins = 0
+    dels = []
+    i, j = n, m
+    while i or j:
+        if i and j and d[i][j] == d[i - 1][j - 1] + (ref[i - 1] != hyp[j - 1]):
+            s += ref[i - 1] != hyp[j - 1]
+            i, j = i - 1, j - 1
+        elif i and d[i][j] == d[i - 1][j] + 1:
+            de += 1
+            dels.append(i - 1)
+            i -= 1
+        else:
+            ins += 1
+            j -= 1
+    return s, de, ins, dels
+
+
 def analyse(rows, hyps):
-    import jiwer
     acc = collections.Counter()
     pos = collections.Counter()
     rate_d, rate_n = collections.Counter(), collections.Counter()
@@ -55,19 +82,15 @@ def analyse(rows, hyps):
         ref = r["text"].split()
         if not ref:
             continue
-        hyp = h.split()
-        o = jiwer.process_words(" ".join(ref), " ".join(hyp) if hyp else "")
+        s, de, ins, dels = align(ref, h.split())
         acc["N"] += len(ref)
-        acc["S"] += o.substitutions
-        acc["D"] += o.deletions
-        acc["I"] += o.insertions
-        nd = 0
-        for c in o.alignments[0]:
-            if c.type == "delete":
-                for i in range(c.ref_start_idx, c.ref_end_idx):
-                    f = i / len(ref)
-                    pos["first10" if f < 0.1 else "last10" if f >= 0.9 else "middle"] += 1
-                    nd += 1
+        acc["S"] += s
+        acc["D"] += de
+        acc["I"] += ins
+        nd = de
+        for i in dels:
+            f = i / len(ref)
+            pos["first10" if f < 0.1 else "last10" if f >= 0.9 else "middle"] += 1
         wps = len(ref) / max(r["duration"], 1e-3)
         b = "<1.5" if wps < 1.5 else "1.5-2.5" if wps < 2.5 else "2.5-3.5" if wps < 3.5 else ">3.5"
         rate_d[b] += nd
