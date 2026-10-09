@@ -181,8 +181,9 @@ class EpochShuffle(Callback):
         self.done += 1
         if self.blog:
             import hashlib
-            self.blog.write(f"{trainer.global_step} {trainer.current_epoch} "
-                           f"{hashlib.sha1(batch[1].cpu().numpy().tobytes()).hexdigest()[:12]}\n")
+            h = lambda t: hashlib.sha1(t.cpu().numpy().tobytes()).hexdigest()[:12]  # noqa: E731
+            # lens (augmentation changes them) + tokens (data order only)
+            self.blog.write(f"{trainer.global_step} {trainer.current_epoch} {h(batch[1])} {h(batch[2])}\n")
             self.blog.flush()
 
 
