@@ -283,6 +283,9 @@ def main():
             g.pop("initial_lr", None)
         sched = torch.optim.lr_scheduler.LambdaLR(m._optimizer, wsd_lambda(a.warmup, max_steps, a.decay_frac, 1e-5 / a.lr))
         m._scheduler = {"scheduler": sched, "interval": "step", "frequency": 1}
+        # NeMo's configure_optimizers() re-runs setup_optimization() at fit time, rebuilding the cosine scheduler
+        # over ours (smoke test: lr followed the cosine). Hand Lightning this optimizer + scheduler directly.
+        m.configure_optimizers = lambda: ([m._optimizer], [m._scheduler])
         print(f"[run] WSD: warm-up {a.warmup}, flat to step {int(max_steps * (1 - a.decay_frac))}, "
               f"linear decay to {max_steps}", flush=True)
     print(f"[run] {a.run}: max_steps {max_steps}, eval every {eval_steps} steps (~{a.eval_hours} h), "
