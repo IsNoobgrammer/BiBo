@@ -40,8 +40,7 @@ class M:
 
 m = M(); m._train_dl = loader(2); T.wrap_train_sampler(m)
 m._train_dl.sampler.set_epoch(2); full = [tuple(b) for b in itertools.islice(iter(m._train_dl), 60)]
-ep = T.EpochShuffle(); ep.load_state_dict({"done": 50})
-ep.on_train_epoch_start(type("TR", (), {"current_epoch": 2})(), m)
+ep = T.EpochShuffle(None, m); ep.load_state_dict({"done": 50, "epoch": 2})        # applied at restore, no hook
 assert [tuple(b) for b in itertools.islice(iter(m._train_dl), 10)] == full[50:60], "DataLoader resume mismatch"
 a = T.AudioMeter(); a.gn_ema = 4.2; b = T.AudioMeter(); b.load_state_dict(a.state_dict()); assert b.gn_ema == 4.2
 print("test_resume ok")

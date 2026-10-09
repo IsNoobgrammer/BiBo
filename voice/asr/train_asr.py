@@ -58,6 +58,14 @@ class AudioMeter(Callback):
                 self.gn_ema = lg if self.gn_ema is None else 0.98 * self.gn_ema + 0.02 * lg
                 pl_module.log("grad_norm_level", math.exp(self.gn_ema))
 
+    # validation wall time is not training time (the step after each eval read ~650 audio-s/s)
+    def on_validation_start(self, trainer, pl_module):
+        self.vt = time.perf_counter()
+
+    def on_validation_end(self, trainer, pl_module):
+        if self.t0 is not None:
+            self.t0 += time.perf_counter() - self.vt
+
     # the running level survives a resume (it restarted from one noisy step: a fake hump on the chart, alert blind)
     def state_dict(self):
         return {"gn_ema": self.gn_ema}
@@ -129,34 +137,43 @@ class EpochShuffle(Callback):
     set_epoch: with a fixed shard_seed every new iterator replays the same batches (run2 v1 trained on its first
     ~280 h eleven times). batch_log: ASR_BATCH_LOG=path writes 'step epoch lens-hash' per batch (replay checks)."""
 
-    def __init__(self, aug_schedule=None):
+    def __init__(self, aug_schedule=None, model=None):
         self.blog = open(os.environ["ASR_BATCH_LOG"], "a") if os.environ.get("ASR_BATCH_LOG") else None
-        self.aug_schedule = aug_schedule
-        self.done, self.resumed = 0, False                 # batches trained in the current epoch (saved in the ckpt)
+        self.aug_schedule, self.m = aug_schedule, model
+        self.done, self.epoch, self.restored = 0, 0, False  # batches trained in the current epoch (saved in the ckpt)
 
     def state_dict(self):
-        return {"done": self.done}
+        return {"done": self.done, "epoch": self.epoch}
 
     def load_state_dict(self, state):
-        self.done, self.resumed = state.get("done", 0), True
+        # Applied HERE, at checkpoint restore: on a mid-epoch resume Lightning builds the epoch's iterator (and forks
+        # the loader workers) BEFORE on_train_epoch_start -- run5's resumed epoch printed "p = 0.5" but trained
+        # un-augmented (6,000 audio-s/s and clean-audio loss until the next epoch boundary, where it fell to 4,450)
+        if "epoch" not in state:                     # checkpoint from before this field: no skip
+            return
+        self.done, self.epoch, self.restored = state["done"], state["epoch"], True
+        self._begin(self.epoch, skip=self.done)
+        print(f"[run] resume: epoch {self.epoch}, skipping the {self.done} batches it already trained on", flush=True)
 
-    def on_train_epoch_start(self, trainer, pl_module):
-        dl = pl_module._train_dl
+    def _begin(self, epoch, skip=0):
+        dl = self.m._train_dl
         s = getattr(dl.dataset, "sampler", None) or dl.sampler
-        s.set_epoch(trainer.current_epoch)
-        # resume mid-epoch: Lightning restores the step but the sampler restarts the epoch (run5 replayed ~1,950
-        # batches). Skip the batches this epoch already trained on: same epoch seed -> same order -> exact position.
-        if self.resumed and isinstance(s, SkipFirst):
-            s.skip = self.done
-            print(f"[run] resume: skipping the {self.done} batches epoch {trainer.current_epoch} already trained on",
-                  flush=True)
-        else:
-            self.done = 0
-        self.resumed = False
+        s.set_epoch(epoch)
+        # resume mid-epoch: the sampler restarts the epoch (run5 replayed ~1,950 batches); skip what this epoch
+        # already trained on: same epoch seed -> same order -> exact position (test_resume.py)
+        if isinstance(s, SkipFirst):
+            s.skip = skip
         if self.aug_schedule:                          # aug_online: workers fork at this epoch's iter(), inherit p
             import aug_online
-            aug_online.STATE.update(p=aug_online.p_for(self.aug_schedule, trainer.current_epoch),
-                                    epoch=trainer.current_epoch)
+            aug_online.STATE.update(p=aug_online.p_for(self.aug_schedule, epoch), epoch=epoch)
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        if not (self.restored and trainer.current_epoch == self.epoch):   # restored epoch: already set up at load
+            self.done, self.epoch = 0, trainer.current_epoch
+            self._begin(self.epoch)
+        self.restored = False
+        if self.aug_schedule:
+            import aug_online
             pl_module.log("aug_p", aug_online.STATE["p"])
             print(f"[run] epoch {trainer.current_epoch}: augmentation p = {aug_online.STATE['p']}", flush=True)
 
@@ -507,7 +524,7 @@ def main():
         val_check_interval=eval_steps, check_val_every_n_epoch=None if eval_steps else 1,
         num_sanity_val_steps=0, gradient_clip_val=None if a.bf16_master else 1.0, log_every_n_steps=50,
         use_distributed_sampler=False, logger=logger, enable_checkpointing=True, benchmark=False,
-        callbacks=[AudioMeter(), EpochShuffle(a.aug_schedule), TQDMProgressBar(refresh_rate=50), ValAggregate(a.val), LearningRateMonitor("step"),
+        callbacks=[AudioMeter(), EpochShuffle(a.aug_schedule, m), TQDMProgressBar(refresh_rate=50), ValAggregate(a.val), LearningRateMonitor("step"),
                    ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer_all", mode="min", save_top_k=2,
                                    save_last=True, filename="{step}-{val_wer_all:.4f}", save_on_train_epoch_end=False),
                    *([SaveSteps(a.save_steps, ckpt_dir)] if a.save_steps else []),
