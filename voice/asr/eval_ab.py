@@ -54,13 +54,16 @@ def main():
             if w is not None:
                 res[stem] = w
         agg = {}
+        # per-source val sets only: val_multispk is windows of the others, val_en / val_hi are prep_train's
+        # per-language unions of them (counting them too double-weights every source)
+        src = [s for s in res if s.startswith("val_") and s not in ("val_multispk", "val_en", "val_hi")]
         for k in ("en", "hi"):
-            num = sum(res[s] * words[s][1] for s in res if words[s][0] == k and s.startswith("val_") and s != "val_multispk")
-            den = sum(words[s][1] for s in res if words[s][0] == k and s.startswith("val_") and s != "val_multispk")
+            num = sum(res[s] * words[s][1] for s in src if words[s][0] == k)
+            den = sum(words[s][1] for s in src if words[s][0] == k)
             if den:
                 agg[k] = num / den
-        num = sum(res[s] * words[s][1] for s in res if s.startswith("val_") and s != "val_multispk")
-        den = sum(words[s][1] for s in res if s.startswith("val_") and s != "val_multispk")
+        num = sum(res[s] * words[s][1] for s in src)
+        den = sum(words[s][1] for s in src)
         agg["all"] = num / den
         out[arm] = (agg, res)
         print(f"{arm}: val_wer all {agg['all']:.4f}  en {agg.get('en', 0):.4f}  hi {agg.get('hi', 0):.4f}  |  " +
