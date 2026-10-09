@@ -34,7 +34,9 @@ def main():
     pl.seed_everything(a.seed)
     m = nemo_asr.models.ASRModel.from_pretrained("stt_en_fastconformer_hybrid_large_streaming_multi")
     m.change_vocabulary(new_tokenizer_dir=a.tok, new_tokenizer_type="bpe")
-    print("init weights", h(torch.cat([p.flatten() for p in m.parameters()])), flush=True)
+    print("init weights", hashlib.sha1("".join(h(p) for p in m.parameters()).encode()).hexdigest()[:12],
+          "| decoder+joint", hashlib.sha1("".join(h(p) for p in [*m.decoder.parameters(), *m.joint.parameters()]).encode()).hexdigest()[:12],
+          flush=True)
     tr = OmegaConf.create(OmegaConf.to_container(m.cfg.train_ds))
     with open_dict(tr):
         tr.pop("tarred_audio_filepaths", None)
