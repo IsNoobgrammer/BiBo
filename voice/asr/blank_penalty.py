@@ -1,38 +1,53 @@
-"""RNN-T decode-time blank penalty: subtract `delta` from the blank logit of every joint output (inference only).
+"""Decode-time blank penalty (inference only): subtract `delta` from the blank score of every frame / joint output.
 
-An RNN-T drops a word by choosing blank where a token belonged; a penalty on blank trades deletions for insertions.
-Patched at the CLASS level (RNNTJoint.joint_after_projection), so it reaches greedy / batched / streaming decoding
-inside any script -- NeMo's cache-aware streaming example included:
+A model drops a word by choosing blank where a token belonged; a penalty on blank trades deletions for insertions.
+  RNN-T: RNNTJoint.joint_after_projection output (blank = last class)
+  CTC:   ConvASRDecoder output log-probs (blank = last class), with head="ctc"
+Patched at the CLASS level, so it reaches greedy / batched / streaming decoding inside any script -- NeMo's
+cache-aware streaming example included:
 
-    import blank_penalty; blank_penalty.apply(1.0)
-    python voice/asr/blank_penalty.py 1.0 NeMo/examples/.../speech_to_text_cache_aware_streaming_infer.py args...
+    import blank_penalty; blank_penalty.apply(0.5)            # RNN-T
+    import blank_penalty; blank_penalty.apply(0.3, head="ctc")
+    python voice/asr/blank_penalty.py 0.5 NeMo/examples/.../speech_to_text_cache_aware_streaming_infer.py args...
+    python voice/asr/blank_penalty.py ctc:0.3 ...               # CTC head
 """
 import runpy
 import sys
 
 
-def apply(delta):
-    from nemo.collections.asr.modules.rnnt import RNNTJoint
-    if getattr(RNNTJoint, "_bp_orig", None) is None:
-        RNNTJoint._bp_orig = RNNTJoint.joint_after_projection
-    orig = RNNTJoint._bp_orig
+def _patch(cls, name, delta):
+    key = f"_bp_orig_{name}"
+    if getattr(cls, key, None) is None:
+        setattr(cls, key, getattr(cls, name))
+    orig = getattr(cls, key)
     if not delta:
-        RNNTJoint.joint_after_projection = orig
+        setattr(cls, name, orig)
         return
 
-    def joint_after_projection(self, f, g):
-        out = orig(self, f, g)
+    def wrapped(self, *args, **kwargs):
+        out = orig(self, *args, **kwargs)
         if self.training:
             return out
         out = out.clone()
-        out[..., -1] -= delta                       # blank = the last class (NeMo RNNT convention)
+        out[..., -1] -= delta
         return out
 
-    RNNTJoint.joint_after_projection = joint_after_projection
+    setattr(cls, name, wrapped)
+
+
+def apply(delta, head="rnnt"):
+    if head == "ctc":
+        from nemo.collections.asr.modules.conv_asr import ConvASRDecoder
+        _patch(ConvASRDecoder, "forward", delta)
+    else:
+        from nemo.collections.asr.modules.rnnt import RNNTJoint
+        _patch(RNNTJoint, "joint_after_projection", delta)
 
 
 if __name__ == "__main__":
-    apply(float(sys.argv[1]))
+    spec = sys.argv[1]
+    head, _, d = spec.rpartition(":")
+    apply(float(d), head=head or "rnnt")
     script = sys.argv[2]
     sys.argv = [script] + sys.argv[3:]
     runpy.run_path(script, run_name="__main__")

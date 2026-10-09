@@ -108,7 +108,8 @@ def main():
     ap.add_argument("--pad", type=float, default=1.0, help="seconds of trailing silence for the end-pad A/B (0 = off)")
     ap.add_argument("--att_context", type=int, nargs=2, default=None, help="e.g. 70 0 (no look-ahead) or 70 13")
     ap.add_argument("--bs", type=int, default=32)
-    ap.add_argument("--blank_penalty", type=float, default=0.0, help="RNN-T decode: blank logit -= this (blank_penalty.py)")
+    ap.add_argument("--blank_penalty", type=float, default=0.0, help="decode: blank score -= this (blank_penalty.py)")
+    ap.add_argument("--decoder", choices=["rnnt", "ctc"], default="rnnt", help="which head of the hybrid model decodes")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     import nemo.collections.asr as nemo_asr
@@ -119,7 +120,9 @@ def main():
         import sys
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # NeMo's import drops the script dir
         import blank_penalty
-        blank_penalty.apply(a.blank_penalty)
+        blank_penalty.apply(a.blank_penalty, head=a.decoder)
+    if a.decoder == "ctc":
+        m.change_decoding_strategy(decoder_type="ctc")
     tot = collections.Counter()
     rng = random.Random(0)
     report = {}
@@ -148,7 +151,7 @@ def main():
                         "worst": [{"deleted": d, "audio": f, "ref": r, "hyp": h} for d, f, r, h in worst]}
     T = max(tot["N"], 1)
     print(f"{'TOTAL':18s} {tot['N']:6d} {(tot['S'] + tot['D'] + tot['I']) / T:6.3f} {tot['S'] / T:6.3f} "
-          f"{tot['D'] / T:6.3f} {tot['I'] / T:6.3f}   (blank penalty {a.blank_penalty:g})", flush=True)
+          f"{tot['D'] / T:6.3f} {tot['I'] / T:6.3f}   ({a.decoder} blank penalty {a.blank_penalty:g})", flush=True)
     if a.out:
         json.dump(report, open(a.out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
         print(f"wrote {a.out} (per-set numbers + 10 worst rows each)", flush=True)
