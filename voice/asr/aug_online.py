@@ -129,7 +129,7 @@ def augment(audio, lens, p, g):
     out = torch.nn.functional.pad(audio, (0, out_t - audio.shape[1]))
     out[sel] = torch.nn.functional.pad(x, (0, out_t - t)).to(out.dtype)
     new = lens.clone()
-    new[sel] = xl
+    new[sel] = xl.to(new.dtype)                      # NeMo's lens are int32
     return out, new
 
 
@@ -152,12 +152,13 @@ if __name__ == "__main__":
     import time
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(0)
-    lens = torch.randint(16000, 16000 * 15, (150,), device=dev)
+    lens = torch.randint(16000, 16000 * 15, (150,), device=dev, dtype=torch.int32)
     a = torch.randn(150, int(lens.max()), device=dev) * 0.1 * _mask(lens, int(lens.max()))
     run = lambda p, s: augment(a, lens, p, torch.Generator(device=dev).manual_seed(s))  # noqa: E731
     y1, l1 = run(0.5, 5)
     y2, l2 = run(0.5, 5)
     assert torch.equal(y1, y2) and torch.equal(l1, l2), "not deterministic"
+    assert l1.dtype == lens.dtype
     assert torch.isfinite(y1).all() and y1.abs().max() <= 1.0 + 1e-6
     assert (y1[_mask(l1, y1.shape[1]).logical_not()] == 0).all(), "audio beyond lens"
     changed = (l1 != lens).sum().item()
