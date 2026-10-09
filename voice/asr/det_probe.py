@@ -27,6 +27,7 @@ def main():
     ap.add_argument("--seed", type=int, default=23)
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--fused", action="store_true")
+    ap.add_argument("--no_concurrent", action="store_true", help="concurrent_bucketing=False (no filler thread)")
     ap.add_argument("--shard_seed", default=None, help="Lhotse shard_seed (NeMo default 'trng' = true random)")
     a = ap.parse_args()
     import lightning.pytorch as pl
@@ -46,6 +47,8 @@ def main():
                   num_workers=a.workers, shuffle_buffer_size=10000, seed=23, pin_memory=True)
         if a.shard_seed:
             tr.shard_seed = a.shard_seed
+        if a.no_concurrent:
+            tr.concurrent_bucketing = False
     m.setup_training_data(tr)
     it = iter(m._train_dl)
     batches = [next(it) for _ in range(3)]
@@ -63,6 +66,9 @@ def main():
         fused_conv.enable(m)
     b = [x.cuda() if torch.is_tensor(x) else x for x in batches[0]]
     m._optimizer = torch.optim.AdamW(m.parameters(), lr=1e-5)      # training_step logs its lr
+    import types
+    m._trainer = types.SimpleNamespace(global_step=0, log_every_n_steps=1)  # outside fit: global_step + no-op logging
+    m.log = m.log_dict = lambda *x, **k: None
     torch.manual_seed(a.seed)
     for s in range(3):
         m.zero_grad()
