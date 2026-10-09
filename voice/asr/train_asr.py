@@ -68,13 +68,20 @@ class EpochShuffle(Callback):
     set_epoch: with a fixed shard_seed every new iterator replays the same batches (run2 v1 trained on its first
     ~280 h eleven times). batch_log: ASR_BATCH_LOG=path writes 'step epoch lens-hash' per batch (replay checks)."""
 
-    def __init__(self):
+    def __init__(self, aug_schedule=None):
         self.blog = open(os.environ["ASR_BATCH_LOG"], "w") if os.environ.get("ASR_BATCH_LOG") else None
+        self.aug_schedule = aug_schedule
 
     def on_train_epoch_start(self, trainer, pl_module):
         dl = pl_module._train_dl
         s = getattr(dl.dataset, "sampler", None) or dl.sampler
         s.set_epoch(trainer.current_epoch)
+        if self.aug_schedule:                          # aug_online: workers fork at this epoch's iter(), inherit p
+            import aug_online
+            aug_online.STATE.update(p=aug_online.p_for(self.aug_schedule, trainer.current_epoch),
+                                    epoch=trainer.current_epoch)
+            pl_module.log("aug_p", aug_online.STATE["p"])
+            print(f"[run] epoch {trainer.current_epoch}: augmentation p = {aug_online.STATE['p']}", flush=True)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if self.blog:
@@ -251,6 +258,9 @@ def main():
     ap.add_argument("--fastemit", type=float, default=None, help="FastEmit lambda (model default 0.005)")
     ap.add_argument("--save_steps", type=int, nargs="*", default=[],
                     help="also save a full checkpoint at these global steps (WSD: branch decays from the stable phase)")
+    ap.add_argument("--aug_schedule", type=float, nargs="*", default=None,
+                    help="per-epoch fraction of utterances augmented on the fly (aug_online.py), last value repeats, "
+                         "e.g. 0 0.5 0.5 0.5 0.2")
     ap.add_argument("--grad_diag", type=int, default=0, help="log per-module grad norms + look-ahead every N steps")
     ap.add_argument("--stop_step", type=int, default=None, help="stop at this global step (schedule unchanged)")
     ap.add_argument("--lr_scale", type=float, default=None, help="multiply the scheduler lrs at train start (resumes)")
@@ -302,6 +312,9 @@ def main():
                   # (shard_seed "trng") and fill buckets from a background thread (timing-dependent batch contents)
                   shard_seed="randomized", concurrent_bucketing=False)
     m.setup_training_data(tr)
+    if a.aug_schedule:
+        import aug_online
+        aug_online.wrap(m._train_dl.dataset)
     va = OmegaConf.create(OmegaConf.to_container(m.cfg.validation_ds))
     with open_dict(va):
         va.update(manifest_filepath=a.val, batch_size=64, num_workers=4, shuffle=False)
@@ -370,7 +383,7 @@ def main():
         val_check_interval=eval_steps, check_val_every_n_epoch=None if eval_steps else 1,
         num_sanity_val_steps=0, gradient_clip_val=None if a.bf16_master else 1.0, log_every_n_steps=50,
         use_distributed_sampler=False, logger=logger, enable_checkpointing=True, benchmark=False,
-        callbacks=[AudioMeter(), EpochShuffle(), TQDMProgressBar(refresh_rate=50), ValAggregate(a.val), LearningRateMonitor("step"),
+        callbacks=[AudioMeter(), EpochShuffle(a.aug_schedule), TQDMProgressBar(refresh_rate=50), ValAggregate(a.val), LearningRateMonitor("step"),
                    ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer_all", mode="min", save_top_k=2,
                                    save_last=True, filename="{step}-{val_wer_all:.4f}", save_on_train_epoch_end=False),
                    *([SaveSteps(a.save_steps, ckpt_dir)] if a.save_steps else []),
