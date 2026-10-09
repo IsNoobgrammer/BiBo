@@ -11,6 +11,7 @@ Heads (all causal: zero added latency, same behaviour in training and streaming 
   C4  swa4 + mlp      same, window 4 (current + 3 previous)
   E   swa3_sc         input -> causal SWA(w=3) -> vocab (aux) -> + embed(softmax) -> SWA(w=3) -> vocab; no MLP
   F   selfcond_lin    D without the MLP
+  Jr/Gr               J / G with BiBo's radial normsilu in the MLP readout instead of SiLU (= Swish)
   J   selfcond_37     D with loss 0.7 final + 0.3 pass 1 (normalised like G/H); F uses the same weights
   G/H sc3_mlp/_lin     3-pass self-conditioning, CTC loss 0.2 / 0.3 / 0.5 on passes 1 / 2 / 3, readouts MLP / Linear
   D   selfcond        intermediate CTC posterior (current + previous frame) projected back into the features, then B;
@@ -47,12 +48,21 @@ def set_lookahead(enc, r):
 
 
 class MLP(nn.Module):
-    def __init__(self, d, c):
+    """LN -> Linear d->d -> act -> Linear d->vocab. act = SiLU (= Swish), or BiBo's radial normsilu:
+    silu(g / r) * r ** sigmoid(theta), r = RMS(g) over the features, theta one learnable scalar (init 0 -> p 0.5)."""
+
+    def __init__(self, d, c, radial=False):
         super().__init__()
         self.ln, self.l1, self.l2 = nn.LayerNorm(d), nn.Linear(d, d), nn.Linear(d, c)
+        self.radial_theta = nn.Parameter(torch.zeros(())) if radial else None
 
     def forward(self, h):
-        return self.l2(F.silu(self.l1(self.ln(h))))
+        g = self.l1(self.ln(h))
+        if self.radial_theta is None:
+            return self.l2(F.silu(g))
+        g32 = g.float()
+        r = torch.sqrt(g32.square().mean(-1, keepdim=True) + 1e-6)
+        return self.l2((F.silu(g32 / r) * r.pow(torch.sigmoid(self.radial_theta.float()))).to(g.dtype))
 
 
 class Linear(nn.Module):
@@ -144,10 +154,10 @@ class SelfCond3(nn.Module):
     """3-pass self-conditioned CTC: z1 = Linear(h); h2 = h + cur1(p1) + prev1(p1 of frame t-1); z2 = R2(h2);
     h3 = h2 + cur2(p2) + prev2(p2 of t-1); z3 = R3(h3). Loss 0.2 z1 + 0.3 z2 + 0.5 z3. R = MLP or Linear."""
 
-    def __init__(self, d, c, mlp):
+    def __init__(self, d, c, mlp, radial=False):
         super().__init__()
         self.l1 = nn.Linear(d, c)
-        self.r2, self.r3 = (MLP(d, c), MLP(d, c)) if mlp else (nn.Linear(d, c), nn.Linear(d, c))
+        self.r2, self.r3 = (MLP(d, c, radial), MLP(d, c, radial)) if mlp else (nn.Linear(d, c), nn.Linear(d, c))
         self.cond = nn.ModuleList([nn.ModuleDict({"cur": nn.Linear(c, d, bias=False), "prev": nn.Linear(c, d, bias=False)})
                                    for _ in range(2)])
         self.auxs, self.final_w = None, 0.5
@@ -166,12 +176,12 @@ class SelfCond3(nn.Module):
 
 
 class SelfCond(nn.Module):
-    def __init__(self, d, c, final_w=1.0, aux_w=0.3):
+    def __init__(self, d, c, final_w=1.0, aux_w=0.3, radial=False):
         super().__init__()
         self.final_w, self.aux_w = final_w, aux_w
         self.l1 = nn.Linear(d, c)
         self.cur, self.prev = nn.Linear(c, d, bias=False), nn.Linear(c, d, bias=False)
-        self.mlp = MLP(d, c)
+        self.mlp = MLP(d, c, radial)
         self.aux = None
 
     def forward(self, h):
@@ -235,11 +245,16 @@ def main():
            "C4_swa4": lambda: SWA(d, c, 4), "D_selfcond": lambda: SelfCond(d, c),
            "E_swa3_sc": lambda: SwaSelfCond(d, c, 3), "F_selfcond_lin": lambda: SelfCondLin(d, c, 0.7, 0.3),
            "J_selfcond_37": lambda: SelfCond(d, c, 0.7, 0.3),
-           "G_sc3_mlp": lambda: SelfCond3(d, c, True), "H_sc3_lin": lambda: SelfCond3(d, c, False)}
+           "G_sc3_mlp": lambda: SelfCond3(d, c, True), "H_sc3_lin": lambda: SelfCond3(d, c, False),
+           "Jr_selfcond_radial": lambda: SelfCond(d, c, 0.7, 0.3, radial=True),
+           "Gr_sc3_radial": lambda: SelfCond3(d, c, True, radial=True)}
     heads = nn.ModuleDict({k: zoo[k]() for k in a.heads}).cuda()
     for k, h in heads.items():
         print(f"[heads] {k}: {sum(p.numel() for p in h.parameters()) / 1e6:.2f}M", flush=True)
-    opt = torch.optim.AdamW(heads.parameters(), lr=a.lr, weight_decay=1e-3)
+    theta = [p for n, p in heads.named_parameters() if n.endswith("radial_theta")]
+    rest = [p for n, p in heads.named_parameters() if not n.endswith("radial_theta")]
+    # radial theta: its own lr 0.01, no decay (BiBo: p needs its own lr)
+    opt = torch.optim.AdamW([{"params": rest}, {"params": theta, "lr": 0.01, "weight_decay": 0.0}], lr=a.lr, weight_decay=1e-3)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1, (s + 1) / 100) * 0.5 * (1 + math.cos(math.pi * min(s / a.steps, 1))))
     tr = OmegaConf.create(OmegaConf.to_container(m.cfg.train_ds))
     with open_dict(tr):
@@ -279,9 +294,11 @@ def main():
             print(f"[train] step {step} {time.time() - t0:.0f}s " + " ".join(f"{k} {v / 100:.3f}" for k, v in run.items()),
                   flush=True)
             run = {k: 0.0 for k in heads}
-        if step == 100 and a.minutes:                # size the run to the wall-clock budget from the measured rate
-            rate = 100 / (time.time() - t0)
-            a.steps = int(100 + (a.minutes * 60 - (time.time() - t0)) * rate)
+        if step == 100:
+            t100 = time.time()
+        if step == 300 and a.minutes:                # size the run to the wall-clock budget from the measured rate
+            rate = 200 / (time.time() - t100)          # steps 100-300: past the data-loader warm-up (0-100 read 3.3/s, real 5.9/s)
+            a.steps = int(300 + (a.minutes * 60 - (time.time() - t0)) * rate)
             print(f"[train] {rate:.2f} steps/s -> {a.steps} steps for {a.minutes} min", flush=True)
         if step >= a.steps:
             break
