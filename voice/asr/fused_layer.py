@@ -71,6 +71,11 @@ def _check():
     for name in ("fp32 reference", "nemo", "nemo again", "nemo, input x (1 + 1e-7)", "fused"):
         if name == "fused":
             enable(m)
+            if "--all" in sys.argv:                                  # the training configuration: every tkf kernel
+                import fused_attn
+                import fused_conv
+                fused_attn.enable(m)
+                fused_conv.enable(m)
         m.zero_grad()
         sig = audio * (1 + 1e-7) if "1e-7" in name else audio      # the model's own sensitivity: the noise floor
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=name != "fp32 reference"):
