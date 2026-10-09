@@ -1,0 +1,232 @@
+"""CTC head A/B on a FROZEN encoder: every head variant trains at once on the same encoder outputs (one encoder pass
+per batch, one CTC loss per head), then each is scored per look-ahead on the English val sets and the meeting clips.
+
+    python voice/asr/ctc_heads.py --nemo exp/run5/run5.eval.nemo --train asr/en1/train.jsonl --val asr/en1/val_*.jsonl \
+        --steps 2000
+
+Heads (all causal: zero added latency, same behaviour in training and streaming at every look-ahead):
+  A   linear          LayerNorm-free Linear d -> vocab+1 (what run5 has), retrained from scratch
+  B   mlp             LN -> Linear d->d -> SiLU -> Linear d->vocab+1
+  C2  swa2 + mlp      causal sliding-window attention over the current + previous 1 encoder frame (4 heads), then B
+  C4  swa4 + mlp      same, window 4 (current + 3 previous)
+  D   selfcond        intermediate CTC posterior (current + previous frame) projected back into the features, then B;
+                      loss = final + 0.3 * intermediate (self-conditioned CTC, as IBM Granite)
+  run5                the trained run5 CTC head, frozen (reference: 17.6k joint steps, not comparable in training)
+In streaming, C keeps the last W-1 encoder frames and D the previous frame's posterior as a cache (cf. the conv cache).
+The encoder sees a random look-ahead per batch (the run5 mix); evaluation is the full utterance under each chunked
+look-ahead mask, which is what the cache-aware streaming loop computes. English script lock on every head at eval.
+"""
+import argparse
+import glob
+import json
+import math
+import os
+import random
+import sys
+import time
+
+import numpy as np
+import soundfile as sf
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+MIX = {0: 0.05, 1: 0.20, 3: 0.40, 6: 0.15, 13: 0.20}
+MEETING = (("c2m.wav", "ref2m.txt"), ("clip16k.wav", "reference.txt"), ("g5_16k.wav", "g5_ref_gemini.txt"))
+
+
+def set_lookahead(enc, r):
+    enc.set_default_att_context_size([70 - 70 % (r + 1), r])      # = the training mask (70 // (r+1) chunks)
+
+
+class MLP(nn.Module):
+    def __init__(self, d, c):
+        super().__init__()
+        self.ln, self.l1, self.l2 = nn.LayerNorm(d), nn.Linear(d, d), nn.Linear(d, c)
+
+    def forward(self, h):
+        return self.l2(F.silu(self.l1(self.ln(h))))
+
+
+class Linear(nn.Module):
+    def __init__(self, d, c):
+        super().__init__()
+        self.l = nn.Linear(d, c)
+
+    def forward(self, h):
+        return self.l(h)
+
+
+class SWA(nn.Module):
+    """Causal local attention: frame t attends to frames t-W+1 .. t (zero-padded before the start, masked)."""
+
+    def __init__(self, d, c, w, heads=4):
+        super().__init__()
+        self.w, self.h = w, heads
+        self.ln, self.q, self.kv, self.o = nn.LayerNorm(d), nn.Linear(d, d), nn.Linear(d, 2 * d), nn.Linear(d, d)
+        self.mlp = MLP(d, c)
+
+    def forward(self, h):
+        b, t, d = h.shape
+        x = self.ln(h)
+        win = torch.stack([F.pad(x, (0, 0, k, 0))[:, :t] for k in range(self.w)], 2)      # (b, t, w, d): t, t-1, ..
+        valid = torch.arange(t, device=h.device)[:, None] >= torch.arange(self.w, device=h.device)[None]   # (t, w)
+        q = self.q(x).view(b, t, self.h, 1, d // self.h)
+        k, v = self.kv(win).view(b, t, self.w, 2, self.h, d // self.h).unbind(3)
+        k, v = k.transpose(2, 3), v.transpose(2, 3)                                         # (b, t, h, w, dh)
+        s = (q * k).sum(-1) / math.sqrt(d // self.h)                                        # (b, t, h, w)
+        s = s.masked_fill(~valid[None, :, None], float("-inf"))
+        a = (s.softmax(-1)[..., None] * v).sum(3).reshape(b, t, d)
+        return self.mlp(h + self.o(a))
+
+
+class SelfCond(nn.Module):
+    def __init__(self, d, c):
+        super().__init__()
+        self.l1 = nn.Linear(d, c)
+        self.cur, self.prev = nn.Linear(c, d, bias=False), nn.Linear(c, d, bias=False)
+        self.mlp = MLP(d, c)
+        self.aux = None
+
+    def forward(self, h):
+        z1 = self.l1(h)
+        self.aux = z1
+        p = z1.float().softmax(-1).to(h.dtype)
+        p_prev = F.pad(p, (0, 0, 1, 0))[:, : p.shape[1]]
+        return self.mlp(h + self.cur(p) + self.prev(p_prev))
+
+
+def ctc(logits, lens, tgt, tlen, blank):
+    lp = logits.float().log_softmax(-1).transpose(0, 1)
+    return F.ctc_loss(lp, tgt, lens, tlen, blank=blank, reduction="mean", zero_infinity=True)
+
+
+def greedy(logits, n, blank):
+    ids = logits[:n].argmax(-1).tolist()
+    out, prev = [], None
+    for i in ids:
+        if i != prev and i != blank:
+            out.append(i)
+        prev = i
+    return out
+
+
+@torch.no_grad()
+def encode(m, audio, lens):
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        f, fl = m.preprocessor(input_signal=audio, length=lens)
+        e, el = m.encoder(audio_signal=f, length=fl)
+    return e.transpose(1, 2).float(), el
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--nemo", required=True)
+    ap.add_argument("--train", required=True)
+    ap.add_argument("--val", nargs="+", required=True)
+    ap.add_argument("--meeting", default="/home/marimo/work/asr/eval_meeting")
+    ap.add_argument("--steps", type=int, default=2000)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--batch_sec", type=float, default=1200)
+    ap.add_argument("--val_per_source", type=int, default=200)
+    ap.add_argument("--seed", type=int, default=23)
+    a = ap.parse_args()
+    import nemo.collections.asr as nemo_asr
+    from omegaconf import OmegaConf, open_dict
+    from score import normalize, wer
+    import blank_penalty
+    torch.manual_seed(a.seed); random.seed(a.seed)
+    m = nemo_asr.models.ASRModel.restore_from(a.nemo, map_location="cuda").eval()
+    for p in m.parameters():
+        p.requires_grad_(False)
+    d, c = m.cfg.encoder.d_model, m.ctc_decoder.decoder_layers[0].out_channels
+    blank = c - 1
+    lock = blank_penalty.devanagari_ids(os.path.join(os.path.dirname(a.nemo), "..", "..", "run1", "tok",
+                                                      "tokenizer_spe_bpe_v4096", "tokenizer.model"))
+    heads = nn.ModuleDict({"A_linear": Linear(d, c), "B_mlp": MLP(d, c), "C2_swa2": SWA(d, c, 2),
+                           "C4_swa4": SWA(d, c, 4), "D_selfcond": SelfCond(d, c)}).cuda()
+    for k, h in heads.items():
+        print(f"[heads] {k}: {sum(p.numel() for p in h.parameters()) / 1e6:.2f}M", flush=True)
+    opt = torch.optim.AdamW(heads.parameters(), lr=a.lr, weight_decay=1e-3)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1, (s + 1) / 100) * 0.5 * (1 + math.cos(math.pi * min(s / a.steps, 1))))
+    tr = OmegaConf.create(OmegaConf.to_container(m.cfg.train_ds))
+    with open_dict(tr):
+        tr.pop("tarred_audio_filepaths", None)
+        tr.update(manifest_filepath=a.train, is_tarred=False, use_lhotse=True, use_bucketing=True, num_buckets=30,
+                  batch_duration=a.batch_sec, batch_size=None, max_duration=30, min_duration=0.1, shuffle=True,
+                  num_workers=12, shuffle_buffer_size=10000, seed=a.seed, pin_memory=True, shard_seed="randomized",
+                  concurrent_bucketing=False)
+    m.setup_training_data(tr)
+    rs, ps = list(MIX), list(MIX.values())
+    t0, step, run = time.time(), 0, {k: 0.0 for k in heads}
+    for batch in m._train_dl:
+        audio, alen, tgt, tlen = (x.cuda(non_blocking=True) for x in batch[:4])
+        set_lookahead(m.encoder, random.choices(rs, ps)[0])
+        h, hl = encode(m, audio, alen)
+        loss = 0.0
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            for k, head in heads.items():
+                li = ctc(head(h), hl, tgt, tlen, blank)
+                if k == "D_selfcond":
+                    li = li + 0.3 * ctc(head.aux, hl, tgt, tlen, blank)
+                run[k] += li.item()
+                loss = loss + li
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(heads.parameters(), 1.0)
+        opt.step(); sched.step(); step += 1
+        if step % 100 == 0:
+            print(f"[train] step {step} {time.time() - t0:.0f}s " + " ".join(f"{k} {v / 100:.3f}" for k, v in run.items()),
+                  flush=True)
+            run = {k: 0.0 for k in heads}
+        if step >= a.steps:
+            break
+    heads.eval()
+    run5_head = lambda h: m.ctc_decoder(encoder_output=h.transpose(1, 2)).float()   # noqa: E731  (log-probs)
+    every = {**{k: v for k, v in heads.items()}, "run5": run5_head}
+    vals = []
+    for p in sorted(sum((glob.glob(v) for v in a.val), [])):
+        rows = [json.loads(l) for l in open(p, encoding="utf-8")]
+        random.Random(0).shuffle(rows)
+        vals += rows[: a.val_per_source]
+    vals.sort(key=lambda r: r["duration"])
+    meet = [(sf.read(os.path.join(a.meeting, w))[0].astype(np.float32), open(os.path.join(a.meeting, r), encoding="utf-8").read())
+            for w, r in MEETING]
+    words = [len(normalize(r)) for _, r in meet]
+    print(f"[eval] val {len(vals)} utterances from {len(a.val)} sets; meeting clips {words} words", flush=True)
+    for r in (0, 1, 3, 6, 13):
+        set_lookahead(m.encoder, r)
+        errs = {k: [0, 0] for k in every}
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            for i in range(0, len(vals), 32):
+                chunk = vals[i:i + 32]
+                xs = [sf.read(x["audio_filepath"])[0].astype(np.float32) for x in chunk]
+                L = torch.tensor([len(x) for x in xs]).cuda()
+                A = torch.zeros(len(xs), int(L.max())).cuda()
+                for j, x in enumerate(xs):
+                    A[j, : len(x)] = torch.from_numpy(x)
+                h, hl = encode(m, A, L)
+                for k, f in every.items():
+                    z = f(h).float() + lock
+                    for j, x in enumerate(chunk):
+                        ref = normalize(x["text"])
+                        hyp = normalize(m.tokenizer.ids_to_text(greedy(z[j], int(hl[j]), blank)))
+                        errs[k][0] += wer(ref, hyp) * len(ref); errs[k][1] += len(ref)
+            mt = {k: [] for k in every}
+            for x, ref in meet:
+                h, hl = encode(m, torch.from_numpy(x)[None].cuda(), torch.tensor([len(x)]).cuda())
+                for k, f in every.items():
+                    z = f(h).float() + lock
+                    hyp = normalize(m.tokenizer.ids_to_text(greedy(z[0], int(hl[0]), blank)))
+                    mt[k].append((wer(normalize(ref), hyp), len(hyp)))
+        for k in every:
+            pooled = sum(w * n for (w, _), n in zip(mt[k], words)) / sum(words)
+            print(f"RESULT look-ahead {r * 80:4d} ms {k:11s} | val {100 * errs[k][0] / errs[k][1]:5.2f} | meeting pooled "
+                  f"{100 * pooled:5.2f} | " + " ".join(f"{100 * w:5.1f}({n})" for w, n in mt[k]), flush=True)
+    print("HEADS_DONE", flush=True)
+
+
+if __name__ == "__main__":
+    main()
