@@ -43,11 +43,14 @@ def _patch(cls, name, delta, mask_ids=None):
 def devanagari_ids(tok_model):
     """Token ids whose piece contains a Devanagari character (U+0900-U+097F): the English-mode script lock, the
     same rule as RT Captions (on our meeting clips run5's CTC head emitted ~50 Devanagari words on g5, refs have 0)."""
+    import re
     import sentencepiece as spm
     import torch
     sp = spm.SentencePieceProcessor(model_file=tok_model)
+    # + the byte-fallback pieces <0x80>..<0xFF>: with whole Devanagari pieces banned, byte_fallback can still spell
+    # them byte by byte (UTF-8 0xE0 0xA4 ..); RT Captions bans the same set (gguf.rs non_latin_tokens)
     ids = torch.tensor([i for i in range(sp.get_piece_size())
-                        if any("ऀ" <= c <= "ॿ" for c in sp.id_to_piece(i))])
+                        if re.fullmatch(r"<0x[89A-F][0-9A-F]>", sp.id_to_piece(i)) or any("ऀ" <= c <= "ॿ" for c in sp.id_to_piece(i))])
     return ids.pin_memory() if torch.cuda.is_available() else ids
 
 
