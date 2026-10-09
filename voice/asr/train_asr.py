@@ -116,7 +116,8 @@ def main():
     ap.add_argument("--init", default="stt_en_fastconformer_hybrid_large_streaming_multi")
     ap.add_argument("--batch_sec", type=float, default=1200, help="real audio seconds per batch (Lhotse bucketing)")
     ap.add_argument("--total_hours", type=float, default=3200, help="audio hours to train on (~7 x 460 h)")
-    ap.add_argument("--eval_hours", type=float, default=150, help="evaluate every this many audio hours")
+    ap.add_argument("--eval_hours", type=float, default=150,
+                    help="evaluate every this many audio hours (must be < one data epoch); 0 = every data epoch")
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--warmup", type=int, default=1000)
     ap.add_argument("--workers", type=int, default=12)
@@ -135,7 +136,9 @@ def main():
 
     import nemo.collections.asr as nemo_asr
     torch.set_float32_matmul_precision("high")
-    eval_steps = int(a.eval_hours * 3600 / a.batch_sec)
+    # eval_hours 0 = every data epoch. A Lightning "epoch" ends when the Lhotse iterator runs dry, and validation only
+    # fires when batch_idx reaches limit_train_batches: an eval interval longer than the data epoch NEVER validates.
+    eval_steps = int(a.eval_hours * 3600 / a.batch_sec) or None
     max_steps = int(a.total_hours * 3600 / a.batch_sec)
 
     if a.seed is not None:
@@ -209,6 +212,7 @@ def main():
           f"batch {a.batch_sec} s, val {[os.path.basename(v) for v in a.val]}", flush=True)
     print(f"[run] resume from {resume}", flush=True)
     trainer.fit(m, ckpt_path=resume)
+    trainer.validate(m)                                         # the final model, wherever the last eval fell
     m.save_to(os.path.join(ckpt_dir, f"{a.run}.nemo"))
     print("TRAIN_DONE", flush=True)
 

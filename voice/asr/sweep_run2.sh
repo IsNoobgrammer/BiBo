@@ -1,6 +1,6 @@
 #!/bin/bash
 # run2 sweep: 3 epochs each on the 1,200 h mix (fhai50032/asr-english + asr-hindi, every source x1), from the NVIDIA
-# base model with run1's tokenizer, all tkf kernels, eval once per epoch. One factor per arm vs base:
+# base model with run1's tokenizer, all tkf kernels, eval at every data epoch end + the final model. One factor per arm vs base:
 #   base     lr 5e-4, 1200 s batches, bf16 autocast (fp32 weights)
 #   bf16m    bf16 weights + fp32 master (--bf16_master)
 #   lr1e3 / lr2e4    learning rate
@@ -31,7 +31,7 @@ for arm in ${ARMS:-base bf16m lr1e3 lr2e4 b2400}; do
   esac
   rm -rf $A/exp_sweep/s-$arm
   $P voice/asr/train_asr.py --run s-$arm --out $A/exp_sweep --project bibo-asr-sweep --no_hf --seed 23 \
-    --train $R/train.jsonl --tok $TOK --val $VALS --total_hours $((3 * H)) --eval_hours $H \
+    --train $R/train.jsonl --tok $TOK --val $VALS --total_hours $((3 * H)) --eval_hours 0 \
     --fused_joint --fused_layer --fused_attn --fused_conv $X > $A/sweep_$arm.log 2>&1
   echo "ARM_END $arm $?"
 done
