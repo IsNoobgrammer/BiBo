@@ -21,6 +21,7 @@ The encoder sees a random look-ahead per batch (the run5 mix); evaluation is the
 look-ahead mask, which is what the cache-aware streaming loop computes. English script lock on every head at eval.
 """
 import argparse
+import copy
 import glob
 import json
 import math
@@ -201,6 +202,8 @@ def main():
     ap.add_argument("--val", nargs="+", required=True)
     ap.add_argument("--meeting", default="/home/marimo/work/asr/eval_meeting")
     ap.add_argument("--steps", type=int, default=2700, help="~8 min on the RTX PRO 6000 (1,500 steps took 4.5 min)")
+    ap.add_argument("--minutes", type=float, default=13, help="training wall-clock budget (sets --steps after 100)")
+    ap.add_argument("--tok", default=None, help="tokenizer dir for the heads (default: the model's own)")
     ap.add_argument("--eval_batch", type=int, default=128)
     ap.add_argument("--las", type=int, nargs="+", default=[0, 1, 3, 6, 13], help="look-aheads to score (80 ms frames)")
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -217,10 +220,17 @@ def main():
     m = nemo_asr.models.ASRModel.restore_from(a.nemo, map_location="cuda").eval()
     for p in m.parameters():
         p.requires_grad_(False)
-    d, c = m.cfg.encoder.d_model, m.ctc_decoder.decoder_layers[0].out_channels
-    blank = c - 1
+    old_tok, old_ctc = m.tokenizer, copy.deepcopy(m.ctc_decoder)       # run5's own head = the reference row
     lock = blank_penalty.devanagari_ids(os.path.join(os.path.dirname(a.nemo), "..", "..", "run1", "tok",
                                                       "tokenizer_spe_bpe_v4096", "tokenizer.model"))
+    if a.tok:   # heads train from scratch: any vocabulary (the English 1,024 BPE), the frozen encoder does not care
+        m.change_vocabulary(new_tokenizer_dir=a.tok, new_tokenizer_type="bpe")
+        for p in m.parameters():
+            p.requires_grad_(False)
+    d, c = m.cfg.encoder.d_model, m.tokenizer.vocab_size + 1
+    blank = c - 1
+    print(f"[vocab] heads: {c - 1} tokens + blank ({a.tok or 'run5 tokenizer'}); run5 reference: "
+          f"{old_ctc.decoder_layers[0].out_channels - 1} + blank", flush=True)
     zoo = {"A_linear": lambda: Linear(d, c), "B_mlp": lambda: MLP(d, c), "C2_swa2": lambda: SWA(d, c, 2),
            "C4_swa4": lambda: SWA(d, c, 4), "D_selfcond": lambda: SelfCond(d, c),
            "E_swa3_sc": lambda: SwaSelfCond(d, c, 3), "F_selfcond_lin": lambda: SelfCondLin(d, c, 0.7, 0.3),
@@ -269,11 +279,17 @@ def main():
             print(f"[train] step {step} {time.time() - t0:.0f}s " + " ".join(f"{k} {v / 100:.3f}" for k, v in run.items()),
                   flush=True)
             run = {k: 0.0 for k in heads}
+        if step == 100 and a.minutes:                # size the run to the wall-clock budget from the measured rate
+            rate = 100 / (time.time() - t0)
+            a.steps = int(100 + (a.minutes * 60 - (time.time() - t0)) * rate)
+            print(f"[train] {rate:.2f} steps/s -> {a.steps} steps for {a.minutes} min", flush=True)
         if step >= a.steps:
             break
     heads.eval()
-    run5_head = lambda h: m.ctc_decoder(encoder_output=h.transpose(1, 2)).float()   # noqa: E731  (log-probs)
-    every = {**{k: v for k, v in heads.items()}, "run5": run5_head}
+    # name -> (logits fn, tokenizer, blank id, logit bias): the new heads have no Devanagari tokens to lock
+    every = {k: (v, m.tokenizer, blank, 0.0) for k, v in heads.items()}
+    every["run5"] = (lambda h: old_ctc(encoder_output=h.transpose(1, 2)).float(), old_tok,
+                     old_ctc.decoder_layers[0].out_channels - 1, lock)
     vals = []
     for p in sorted(sum((glob.glob(v) for v in a.val), [])):
         rows = [json.loads(l) for l in open(p, encoding="utf-8")]
@@ -295,13 +311,13 @@ def main():
     words = [len(r) for _, r in meet]
     print(f"[eval] val {len(vals)} utterances, {len(vb)} batches; meeting clips {words} words; look-aheads {a.las}", flush=True)
 
-    def texts(z, hl):
+    def texts(z, hl, tok, blank):
         """Greedy CTC on the GPU for a whole batch: argmax, drop blanks and repeats, ONE host copy."""
         ids = z.argmax(-1)
         valid = torch.arange(ids.shape[1], device=ids.device)[None] < hl[:, None]
         keep = (ids != blank) & (ids != F.pad(ids, (1, 0), value=-1)[:, :-1]) & valid
         ids, keep = ids.cpu().numpy(), keep.cpu().numpy()
-        return [normalize(m.tokenizer.ids_to_text(ids[j][keep[j]].tolist())) for j in range(len(ids))]
+        return [normalize(tok.ids_to_text(ids[j][keep[j]].tolist())) for j in range(len(ids))]
 
     for r in a.las:
         t1 = time.time()
@@ -311,14 +327,14 @@ def main():
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             for A, L, i in vb:
                 h, hl = encode(m, A.cuda(non_blocking=True), L.cuda())
-                for k, f in every.items():
-                    for j, hyp in enumerate(texts(f(h).float() + lock, hl)):
+                for k, (f, tok, bl, bias) in every.items():
+                    for j, hyp in enumerate(texts(f(h).float() + bias, hl, tok, bl)):
                         ref = refs[i + j]
                         errs[k][0] += wer(ref, hyp) * len(ref); errs[k][1] += len(ref)
             for x, ref in meet:
                 h, hl = encode(m, torch.from_numpy(x)[None].cuda(), torch.tensor([len(x)]).cuda())
-                for k, f in every.items():
-                    hyp = texts(f(h).float() + lock, hl)[0]
+                for k, (f, tok, bl, bias) in every.items():
+                    hyp = texts(f(h).float() + bias, hl, tok, bl)[0]
                     mt[k].append((wer(ref, hyp), len(hyp)))
         for k in every:
             pooled = sum(w * n for (w, _), n in zip(mt[k], words)) / sum(words)
