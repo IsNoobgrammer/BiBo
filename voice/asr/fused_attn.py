@@ -42,12 +42,13 @@ def enable(model):
                 or pos_emb.size(1) != 2 * T - 1 or key is not query or value is not query):
             return self._nemo_forward(query, key, value, mask, pos_emb, cache=cache)
         (left, right), lengths, _ = ctx
-        # exactly NeMo's dtypes: under bf16 autocast its avoid_float16_autocast_context is a no-op, so the projections
-        # and the attention matmuls are bf16 (softmax fp32); the kernel follows q's dtype
-        x = query.float() if torch.is_autocast_enabled() else query
-        q = self.linear_q(x).view(B, T, self.h, self.d_k)
-        k = self.linear_k(x).view(B, T, self.h, self.d_k)
-        v = self.linear_v(x).view(B, T, self.h, self.d_k)
+        # NeMo's dtypes: under bf16 autocast its avoid_float16_autocast_context is a no-op, so the projections and the
+        # attention matmuls are bf16 (softmax fp32); the kernel follows q's dtype. q, k, v = ONE GEMM (one input cast,
+        # and the input grad is a single fp32-accumulated GEMM instead of three bf16 grads summed)
+        lq, lk, lv = self.linear_q, self.linear_k, self.linear_v
+        qkv = torch.nn.functional.linear(query, torch.cat([lq.weight, lk.weight, lv.weight]),
+                                         torch.cat([lq.bias, lk.bias, lv.bias]))
+        q, k, v = qkv.view(B, T, 3, self.h, self.d_k).unbind(2)
         p = self.linear_pos(pos_emb).view(-1, self.h, self.d_k)
         o = relpos_attention(q, k, v, p, self.pos_bias_u, self.pos_bias_v, lengths, left, right,
                              dropout=self.dropout.p if self.dropout.training else 0.0)

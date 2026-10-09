@@ -31,18 +31,22 @@ def enable(model, fp32_residual=False):
                                       cache_last_channel=cache_last_channel, cache_last_time=cache_last_time)
         p = self.dropout.p if self.dropout.training else 0.0               # follows the Dropout module's mode
         if torch.is_autocast_enabled("cuda"):
-            ydt = torch.float32                                      # autocast LN outputs fp32
+            # autocast LN outputs fp32, which every consuming linear then casts to bf16 (q, k, v: 3 times): the four
+            # norms that feed linears write bf16 directly (same values, no cast copies); norm_out (the residual
+            # stream) stays fp32
+            ydt, ydt_in = torch.float32, torch.get_autocast_dtype("cuda")
         elif fp32_residual:
             x = x.float()                                            # layer input = previous norm_out's bf16 y: up once
-            ydt = self.norm_out.weight.dtype                         # the sublayers' (bf16) dtype
+            ydt = ydt_in = self.norm_out.weight.dtype                # the sublayers' (bf16) dtype
         else:
-            ydt = None
+            ydt = ydt_in = None
         ln = lambda n: (n.weight, n.bias, n.eps)
-        _, y = rdl(x, None, *ln(self.norm_feed_forward1), y_dtype=ydt)
-        res, y = rdl(x, self.feed_forward1(y), *ln(self.norm_self_att), p=p, factor=self.fc_factor, y_dtype=ydt)
+        _, y = rdl(x, None, *ln(self.norm_feed_forward1), y_dtype=ydt_in)
+        res, y = rdl(x, self.feed_forward1(y), *ln(self.norm_self_att), p=p, factor=self.fc_factor, y_dtype=ydt_in)
         h = self.self_attn(query=y, key=y, value=y, mask=att_mask, pos_emb=pos_emb, cache=None)
-        res, y = rdl(res, h, *ln(self.norm_conv), p=p, y_dtype=ydt)
-        res, y = rdl(res, self.conv(y, pad_mask=pad_mask, cache=None), *ln(self.norm_feed_forward2), p=p, y_dtype=ydt)
+        res, y = rdl(res, h, *ln(self.norm_conv), p=p, y_dtype=ydt_in)
+        res, y = rdl(res, self.conv(y, pad_mask=pad_mask, cache=None), *ln(self.norm_feed_forward2), p=p,
+                     y_dtype=ydt_in)
         _, y = rdl(res, self.feed_forward2(y), *ln(self.norm_out), p=p, factor=self.fc_factor, y_dtype=ydt)
         return y
 
