@@ -20,18 +20,21 @@ TOK=$A/run1/tok/tokenizer_spe_bpe_v4096                       # run1's joint en/
 H=$($P -c "import json; print(round(sum(json.loads(l)['duration'] for l in open('$R/train.jsonl')) / 3600))")
 echo "train hours per epoch: $H"
 VALS="$(ls $R/val_*.jsonl | grep -v -e '/val_en.jsonl' -e '/val_hi.jsonl') $E/fleurs_en.jsonl $E/fleurs_hi.jsonl"
+# TOTAL_H= audio hours per arm (default 3 x manifest hours; one real pass is ~1,100 h: numo_hi > 30 s is dropped)
+# PROJECT= W&B project. Arm lr<x> = --lr <x> (e.g. lr2e-3).
 for arm in ${ARMS:-base bf16m lr1e3 lr2e4 b2400}; do
   case $arm in
     base)  X="" ;;
     bf16m) X="--bf16_master" ;;
     lr1e3) X="--lr 1e-3" ;;
     lr2e4) X="--lr 2.5e-4" ;;
+    lr*)   X="--lr ${arm#lr}" ;;
     b2400) X="--batch_sec 2400" ;;
     *) echo "unknown arm $arm"; continue ;;
   esac
   rm -rf $A/exp_sweep/s-$arm
-  $P voice/asr/train_asr.py --run s-$arm --out $A/exp_sweep --project bibo-asr-sweep --no_hf --seed 23 \
-    --train $R/train.jsonl --tok $TOK --val $VALS --total_hours $((3 * H)) --eval_hours 0 \
+  $P voice/asr/train_asr.py --run s-$arm --out $A/exp_sweep --project ${PROJECT:-bibo-asr-sweep} --no_hf --seed 23 \
+    --train $R/train.jsonl --tok $TOK --val $VALS --total_hours ${TOTAL_H:-$((3 * H))} --eval_hours 0 \
     --fused_joint --fused_layer --fused_attn --fused_conv $X > $A/sweep_$arm.log 2>&1
   echo "ARM_END $arm $?"
 done
