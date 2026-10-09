@@ -27,6 +27,7 @@ def main():
     ap.add_argument("--seed", type=int, default=23)
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--fused", action="store_true")
+    ap.add_argument("--shard_seed", default=None, help="Lhotse shard_seed (NeMo default 'trng' = true random)")
     a = ap.parse_args()
     import lightning.pytorch as pl
     import nemo.collections.asr as nemo_asr
@@ -43,6 +44,8 @@ def main():
         tr.update(manifest_filepath=a.train, is_tarred=False, use_lhotse=True, use_bucketing=True, num_buckets=30,
                   batch_duration=1200, batch_size=None, max_duration=30, min_duration=0.1, shuffle=True,
                   num_workers=a.workers, shuffle_buffer_size=10000, seed=23, pin_memory=True)
+        if a.shard_seed:
+            tr.shard_seed = a.shard_seed
     m.setup_training_data(tr)
     it = iter(m._train_dl)
     batches = [next(it) for _ in range(3)]
@@ -59,6 +62,7 @@ def main():
         fused_attn.enable(m)
         fused_conv.enable(m)
     b = [x.cuda() if torch.is_tensor(x) else x for x in batches[0]]
+    m._optimizer = torch.optim.AdamW(m.parameters(), lr=1e-5)      # training_step logs its lr
     torch.manual_seed(a.seed)
     for s in range(3):
         m.zero_grad()
