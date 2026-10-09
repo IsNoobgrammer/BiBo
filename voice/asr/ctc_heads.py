@@ -11,6 +11,7 @@ Heads (all causal: zero added latency, same behaviour in training and streaming 
   C4  swa4 + mlp      same, window 4 (current + 3 previous)
   E   swa3_sc         input -> causal SWA(w=3) -> vocab (aux) -> + embed(softmax) -> SWA(w=3) -> vocab; no MLP
   F   selfcond_lin    D without the MLP
+  G371                G with CTC loss weights 0.3 / 0.7 / 1.0
   Br/Dr/Jr/Gr         B / D / J / G with BiBo's radial normsilu in the MLP readout instead of SiLU (= Swish)
   J   selfcond_37     D with loss 0.7 final + 0.3 pass 1 (normalised like G/H); F uses the same weights
   G/H sc3_mlp/_lin     3-pass self-conditioning, CTC loss 0.2 / 0.3 / 0.5 on passes 1 / 2 / 3, readouts MLP / Linear
@@ -154,13 +155,14 @@ class SelfCond3(nn.Module):
     """3-pass self-conditioned CTC: z1 = Linear(h); h2 = h + cur1(p1) + prev1(p1 of frame t-1); z2 = R2(h2);
     h3 = h2 + cur2(p2) + prev2(p2 of t-1); z3 = R3(h3). Loss 0.2 z1 + 0.3 z2 + 0.5 z3. R = MLP or Linear."""
 
-    def __init__(self, d, c, mlp, radial=False):
+    def __init__(self, d, c, mlp, radial=False, w=(0.2, 0.3, 0.5)):
         super().__init__()
+        self.w = w                                             # CTC loss weights of pass 1 / 2 / 3
         self.l1 = nn.Linear(d, c)
         self.r2, self.r3 = (MLP(d, c, radial), MLP(d, c, radial)) if mlp else (nn.Linear(d, c), nn.Linear(d, c))
         self.cond = nn.ModuleList([nn.ModuleDict({"cur": nn.Linear(c, d, bias=False), "prev": nn.Linear(c, d, bias=False)})
                                    for _ in range(2)])
-        self.auxs, self.final_w = None, 0.5
+        self.auxs, self.final_w = None, w[2]
 
     def _feed(self, h, z, k):
         p = z.float().softmax(-1).to(h.dtype)
@@ -171,7 +173,7 @@ class SelfCond3(nn.Module):
         h2 = self._feed(h, z1, 0)
         z2 = self.r2(h2)
         z3 = self.r3(self._feed(h2, z2, 1))
-        self.auxs = [(z1, 0.2), (z2, 0.3)]
+        self.auxs = [(z1, self.w[0]), (z2, self.w[1])]
         return z3
 
 
@@ -201,7 +203,8 @@ def make_head(name, d, c):
            "Br_mlp_radial": lambda: MLP(d, c, radial=True),
            "Dr_selfcond_radial": lambda: SelfCond(d, c, radial=True),
            "Jr_selfcond_radial": lambda: SelfCond(d, c, 0.7, 0.3, radial=True),
-           "Gr_sc3_radial": lambda: SelfCond3(d, c, True, radial=True)}
+           "Gr_sc3_radial": lambda: SelfCond3(d, c, True, radial=True),
+           "G371_sc3_mlp": lambda: SelfCond3(d, c, True, w=(0.3, 0.7, 1.0))}
     return zoo[name]()
 
 
@@ -226,6 +229,7 @@ def main():
     ap.add_argument("--meeting", default="/home/marimo/work/asr/eval_meeting")
     ap.add_argument("--steps", type=int, default=2700, help="~8 min on the RTX PRO 6000 (1,500 steps took 4.5 min)")
     ap.add_argument("--minutes", type=float, default=13, help="training wall-clock budget (sets --steps after 100)")
+    ap.add_argument("--per_pass", action="store_true", help="also score pass 1 / 2 of the 3-pass heads")
     ap.add_argument("--save", default=None, help="save the trained heads here (.pt), e.g. for head_diag.py")
     ap.add_argument("--tok", default=None, help="tokenizer dir for the heads (default: the model's own)")
     ap.add_argument("--eval_batch", type=int, default=128)
@@ -317,6 +321,11 @@ def main():
         print(f"[save] heads -> {a.save}", flush=True)
     # name -> (logits fn, tokenizer, blank id, logit bias): the new heads have no Devanagari tokens to lock
     every = {k: (v, m.tokenizer, blank, 0.0) for k, v in heads.items()}
+    if a.per_pass:   # also decode pass 1 / pass 2 of the multi-pass heads (their intermediate CTC outputs)
+        for k, v in list(heads.items()):
+            if isinstance(v, SelfCond3):
+                for i in (0, 1):
+                    every[f"{k}/p{i + 1}"] = ((lambda h, v=v, i=i: (v(h), v.auxs[i][0])[1]), m.tokenizer, blank, 0.0)
     every["run5"] = (lambda h: old_ctc(encoder_output=h.transpose(1, 2)).float(), old_tok,
                      old_ctc.decoder_layers[0].out_channels - 1, lock)
     vals = []
