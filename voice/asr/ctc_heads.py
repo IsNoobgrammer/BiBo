@@ -11,7 +11,7 @@ Heads (all causal: zero added latency, same behaviour in training and streaming 
   C4  swa4 + mlp      same, window 4 (current + 3 previous)
   E   swa3_sc         input -> causal SWA(w=3) -> vocab (aux) -> + embed(softmax) -> SWA(w=3) -> vocab; no MLP
   F   selfcond_lin    D without the MLP
-  Jr/Gr               J / G with BiBo's radial normsilu in the MLP readout instead of SiLU (= Swish)
+  Br/Dr/Jr/Gr         B / D / J / G with BiBo's radial normsilu in the MLP readout instead of SiLU (= Swish)
   J   selfcond_37     D with loss 0.7 final + 0.3 pass 1 (normalised like G/H); F uses the same weights
   G/H sc3_mlp/_lin     3-pass self-conditioning, CTC loss 0.2 / 0.3 / 0.5 on passes 1 / 2 / 3, readouts MLP / Linear
   D   selfcond        intermediate CTC posterior (current + previous frame) projected back into the features, then B;
@@ -246,6 +246,8 @@ def main():
            "E_swa3_sc": lambda: SwaSelfCond(d, c, 3), "F_selfcond_lin": lambda: SelfCondLin(d, c, 0.7, 0.3),
            "J_selfcond_37": lambda: SelfCond(d, c, 0.7, 0.3),
            "G_sc3_mlp": lambda: SelfCond3(d, c, True), "H_sc3_lin": lambda: SelfCond3(d, c, False),
+           "Br_mlp_radial": lambda: MLP(d, c, radial=True),
+           "Dr_selfcond_radial": lambda: SelfCond(d, c, radial=True),
            "Jr_selfcond_radial": lambda: SelfCond(d, c, 0.7, 0.3, radial=True),
            "Gr_sc3_radial": lambda: SelfCond3(d, c, True, radial=True)}
     heads = nn.ModuleDict({k: zoo[k]() for k in a.heads}).cuda()
