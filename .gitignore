@@ -20,3 +20,6 @@ bench/configs/_tmp_*.yaml
 pyrightconfig.json
 paper_ideas/
 wandb/
+
+# internal meeting clips + reference transcripts: EVAL ONLY, never commit / push / train on
+voice/eval_meeting/
