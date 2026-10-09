@@ -84,6 +84,79 @@ class EpochShuffle(Callback):
             self.blog.flush()
 
 
+class GradDiag(Callback):
+    """Divergence forensics: every `every` steps log the grad norm per module group (before clipping) and the
+    look-ahead (right context) that batch trained with, under diag/*. Groups: encoder attn / ff / conv / norm /
+    pre_encode, decoder (prediction net), joint, ctc_decoder; plus the worst single encoder layer."""
+
+    def __init__(self, every=50):
+        self.every = every
+
+    @staticmethod
+    def group(n):
+        if n.startswith("encoder.layers."):
+            sub = n.split(".")[3]
+            for g, keys in (("attn", ("self_attn",)), ("ff", ("feed_forward",)), ("conv", ("conv",)), ("norm", ("norm",))):
+                if any(sub.startswith(k) for k in keys):
+                    return "enc_" + g
+            return "enc_other"
+        for g in ("encoder.pre_encode", "decoder", "joint", "ctc_decoder"):
+            if n.startswith(g):
+                return g.split(".")[-1]
+        return "other"
+
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer):
+        if trainer.global_step % self.every:
+            return
+        acc, layer = {}, {}
+        for n, p in pl_module.named_parameters():
+            if p.grad is None:
+                continue
+            sq = p.grad.detach().float().pow(2).sum()
+            g = self.group(n)
+            acc[g] = acc.get(g, 0) + sq
+            if n.startswith("encoder.layers."):
+                li = int(n.split(".")[2])
+                layer[li] = layer.get(li, 0) + sq
+        out = {f"diag/gn_{g}": v.sqrt().item() for g, v in acc.items()}
+        if layer:
+            li, v = max(layer.items(), key=lambda kv: kv[1].item())
+            out["diag/gn_worst_layer"] = v.sqrt().item()
+            out["diag/worst_layer_idx"] = float(li)
+        ctx = getattr(pl_module.encoder, "_fused_ctx", None)
+        if ctx:
+            out["diag/lookahead_r"] = float(ctx[0][1])
+        pl_module.log_dict(out)
+
+
+class StopAt(Callback):
+    """--stop_step: end a (resumed) run at this global step WITHOUT changing max_steps, so the LR schedule is
+    identical to the full run's (replay experiments)."""
+
+    def __init__(self, step):
+        self.step = step
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if trainer.global_step >= self.step:
+            trainer.should_stop = True
+
+
+class LrScale(Callback):
+    """--lr_scale: multiply the scheduler's base lrs once training starts (after a resume restored them)."""
+
+    def __init__(self, scale):
+        self.scale = scale
+
+    def on_train_start(self, trainer, pl_module):
+        for cfg in trainer.lr_scheduler_configs:
+            sch = cfg.scheduler
+            if hasattr(sch, "base_lrs"):
+                sch.base_lrs = [b * self.scale for b in sch.base_lrs]
+            for g in sch.optimizer.param_groups:
+                g["lr"] *= self.scale
+        print(f"[run] lr scaled x{self.scale}", flush=True)
+
+
 class SaveSteps(Callback):
     def __init__(self, steps, ckpt_dir):
         self.steps, self.ckpt_dir = set(steps), ckpt_dir
@@ -178,6 +251,9 @@ def main():
     ap.add_argument("--fastemit", type=float, default=None, help="FastEmit lambda (model default 0.005)")
     ap.add_argument("--save_steps", type=int, nargs="*", default=[],
                     help="also save a full checkpoint at these global steps (WSD: branch decays from the stable phase)")
+    ap.add_argument("--grad_diag", type=int, default=0, help="log per-module grad norms + look-ahead every N steps")
+    ap.add_argument("--stop_step", type=int, default=None, help="stop at this global step (schedule unchanged)")
+    ap.add_argument("--lr_scale", type=float, default=None, help="multiply the scheduler lrs at train start (resumes)")
     ap.add_argument("--ckpt", default=None, help="resume from this checkpoint (e.g. a --save_steps one, for a decay branch)")
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--compile_layers", action="store_true")
@@ -298,6 +374,9 @@ def main():
                    ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer_all", mode="min", save_top_k=2,
                                    save_last=True, filename="{step}-{val_wer_all:.4f}", save_on_train_epoch_end=False),
                    *([SaveSteps(a.save_steps, ckpt_dir)] if a.save_steps else []),
+                   *([GradDiag(a.grad_diag)] if a.grad_diag else []),
+                   *([StopAt(a.stop_step)] if a.stop_step else []),
+                   *([LrScale(a.lr_scale)] if a.lr_scale else []),
                    *([] if a.no_hf else [HFSync(a.run, ckpt_dir)])])
     m.set_trainer(trainer)
     m.setup_optimization(OmegaConf.create({
