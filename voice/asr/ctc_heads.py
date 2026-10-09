@@ -192,6 +192,19 @@ class SelfCond(nn.Module):
         return self.mlp(h + self.cur(p) + self.prev(p_prev))
 
 
+def make_head(name, d, c):
+    zoo = {"A_linear": lambda: Linear(d, c), "B_mlp": lambda: MLP(d, c), "C2_swa2": lambda: SWA(d, c, 2),
+           "C4_swa4": lambda: SWA(d, c, 4), "D_selfcond": lambda: SelfCond(d, c),
+           "E_swa3_sc": lambda: SwaSelfCond(d, c, 3), "F_selfcond_lin": lambda: SelfCondLin(d, c, 0.7, 0.3),
+           "J_selfcond_37": lambda: SelfCond(d, c, 0.7, 0.3),
+           "G_sc3_mlp": lambda: SelfCond3(d, c, True), "H_sc3_lin": lambda: SelfCond3(d, c, False),
+           "Br_mlp_radial": lambda: MLP(d, c, radial=True),
+           "Dr_selfcond_radial": lambda: SelfCond(d, c, radial=True),
+           "Jr_selfcond_radial": lambda: SelfCond(d, c, 0.7, 0.3, radial=True),
+           "Gr_sc3_radial": lambda: SelfCond3(d, c, True, radial=True)}
+    return zoo[name]()
+
+
 def ctc(logits, lens, tgt, tlen, blank):
     lp = logits.float().log_softmax(-1).transpose(0, 1)
     return F.ctc_loss(lp, tgt, lens, tlen, blank=blank, reduction="mean", zero_infinity=True)
@@ -213,6 +226,7 @@ def main():
     ap.add_argument("--meeting", default="/home/marimo/work/asr/eval_meeting")
     ap.add_argument("--steps", type=int, default=2700, help="~8 min on the RTX PRO 6000 (1,500 steps took 4.5 min)")
     ap.add_argument("--minutes", type=float, default=13, help="training wall-clock budget (sets --steps after 100)")
+    ap.add_argument("--save", default=None, help="save the trained heads here (.pt), e.g. for head_diag.py")
     ap.add_argument("--tok", default=None, help="tokenizer dir for the heads (default: the model's own)")
     ap.add_argument("--eval_batch", type=int, default=128)
     ap.add_argument("--las", type=int, nargs="+", default=[0, 1, 3, 6, 13], help="look-aheads to score (80 ms frames)")
@@ -241,16 +255,7 @@ def main():
     blank = c - 1
     print(f"[vocab] heads: {c - 1} tokens + blank ({a.tok or 'run5 tokenizer'}); run5 reference: "
           f"{old_ctc.decoder_layers[0].out_channels - 1} + blank", flush=True)
-    zoo = {"A_linear": lambda: Linear(d, c), "B_mlp": lambda: MLP(d, c), "C2_swa2": lambda: SWA(d, c, 2),
-           "C4_swa4": lambda: SWA(d, c, 4), "D_selfcond": lambda: SelfCond(d, c),
-           "E_swa3_sc": lambda: SwaSelfCond(d, c, 3), "F_selfcond_lin": lambda: SelfCondLin(d, c, 0.7, 0.3),
-           "J_selfcond_37": lambda: SelfCond(d, c, 0.7, 0.3),
-           "G_sc3_mlp": lambda: SelfCond3(d, c, True), "H_sc3_lin": lambda: SelfCond3(d, c, False),
-           "Br_mlp_radial": lambda: MLP(d, c, radial=True),
-           "Dr_selfcond_radial": lambda: SelfCond(d, c, radial=True),
-           "Jr_selfcond_radial": lambda: SelfCond(d, c, 0.7, 0.3, radial=True),
-           "Gr_sc3_radial": lambda: SelfCond3(d, c, True, radial=True)}
-    heads = nn.ModuleDict({k: zoo[k]() for k in a.heads}).cuda()
+    heads = nn.ModuleDict({k: make_head(k, d, c) for k in a.heads}).cuda()
     for k, h in heads.items():
         print(f"[heads] {k}: {sum(p.numel() for p in h.parameters()) / 1e6:.2f}M", flush=True)
     theta = [p for n, p in heads.named_parameters() if n.endswith("radial_theta")]
@@ -305,6 +310,11 @@ def main():
         if step >= a.steps:
             break
     heads.eval()
+    if a.save:
+        os.makedirs(os.path.dirname(a.save) or ".", exist_ok=True)
+        torch.save({"heads": {k: h.state_dict() for k, h in heads.items()}, "d": d, "c": c, "tok": a.tok,
+                    "nemo": a.nemo, "steps": step, "seed": a.seed}, a.save)
+        print(f"[save] heads -> {a.save}", flush=True)
     # name -> (logits fn, tokenizer, blank id, logit bias): the new heads have no Devanagari tokens to lock
     every = {k: (v, m.tokenizer, blank, 0.0) for k, v in heads.items()}
     every["run5"] = (lambda h: old_ctc(encoder_output=h.transpose(1, 2)).float(), old_tok,
