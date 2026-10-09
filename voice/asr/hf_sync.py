@@ -7,6 +7,7 @@ Repo layout: <run>/tok/* (tokenizer -- a resumed run MUST reuse it; retraining c
 <run>/last.ckpt (Lightning: weights + optimizer + scheduler + step), <run>/wandb_id.
 """
 import os
+import shutil
 import sys
 import threading
 
@@ -15,18 +16,35 @@ from huggingface_hub import HfApi, snapshot_download
 REPO = "fhai50032/bibo-asr-ckpt"
 
 
+TOK_FILES = ["tokenizer.model", "tokenizer.vocab", "vocab.txt"]
+_PUSH_LOCK = threading.Lock()          # one upload at a time: a slow push must not overlap the next eval's
+
+
 def push(run, tok_dir=None, ckpt=None, wandb_id=None, block=False):
+    # The checkpoint is FROZEN (copied) before the thread starts: ModelCheckpoint rewrites last.ckpt at the next
+    # eval, and uploading the live file raced with that ("LFS pointer pointed to a file that does not exist").
+    snap = None
+    if ckpt and os.path.exists(ckpt):
+        snap = ckpt + ".upload"
+        shutil.copyfile(ckpt, snap)
+
     def _go():
-        api = HfApi()
-        api.create_repo(REPO, private=True, exist_ok=True)
-        if tok_dir and os.path.isdir(tok_dir):
-            api.upload_folder(repo_id=REPO, folder_path=tok_dir, path_in_repo=f"{run}/tok", commit_message=f"{run} tok")
-        if ckpt and os.path.exists(ckpt):
-            api.upload_file(repo_id=REPO, path_or_fileobj=ckpt, path_in_repo=f"{run}/last.ckpt",
-                            commit_message=f"{run} ckpt")
-        if wandb_id:
-            api.upload_file(repo_id=REPO, path_or_fileobj=wandb_id.encode(), path_in_repo=f"{run}/wandb_id",
-                            commit_message=f"{run} wandb id")
+        with _PUSH_LOCK:
+            api = HfApi()
+            api.create_repo(REPO, private=True, exist_ok=True)
+            if tok_dir and os.path.isdir(tok_dir):
+                # only the tokenizer files themselves (a stray nested tok/ dir was uploaded as <run>/tok/tok/)
+                api.upload_folder(repo_id=REPO, folder_path=tok_dir, path_in_repo=f"{run}/tok",
+                                  allow_patterns=TOK_FILES, commit_message=f"{run} tok")
+            if snap:
+                try:
+                    api.upload_file(repo_id=REPO, path_or_fileobj=snap, path_in_repo=f"{run}/last.ckpt",
+                                    commit_message=f"{run} ckpt")
+                finally:
+                    os.remove(snap)
+            if wandb_id:
+                api.upload_file(repo_id=REPO, path_or_fileobj=wandb_id.encode(), path_in_repo=f"{run}/wandb_id",
+                                commit_message=f"{run} wandb id")
     if block:
         _go()
     else:
