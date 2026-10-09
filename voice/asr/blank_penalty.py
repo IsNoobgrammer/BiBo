@@ -33,8 +33,9 @@ def _patch(cls, name, delta, mask_ids=None):
         out = out.clone()
         out[..., -1] -= delta
         if mask_ids is not None:                  # script lock: these tokens can never be emitted
-            # pinned + non_blocking: RNN-T greedy decoding runs under CUDA-graph capture, which refuses pageable copies
-            out[..., mask_ids.to(out.device, non_blocking=True)] = -1e4
+            # ids live on the decoding device from the start (devanagari_ids): RNN-T greedy decoding runs under
+            # CUDA-graph capture, which refuses host->device copies (even pinned non_blocking ones failed)
+            out[..., mask_ids] = -1e4
         return out
 
     setattr(cls, name, wrapped)
@@ -51,7 +52,7 @@ def devanagari_ids(tok_model):
     # them byte by byte (UTF-8 0xE0 0xA4 ..); RT Captions bans the same set (gguf.rs non_latin_tokens)
     ids = torch.tensor([i for i in range(sp.get_piece_size())
                         if re.fullmatch(r"<0x[89A-F][0-9A-F]>", sp.id_to_piece(i)) or any("ऀ" <= c <= "ॿ" for c in sp.id_to_piece(i))])
-    return ids.pin_memory() if torch.cuda.is_available() else ids
+    return ids.to("cuda") if torch.cuda.is_available() else ids
 
 
 def apply(delta, head="rnnt", mask_ids=None):
