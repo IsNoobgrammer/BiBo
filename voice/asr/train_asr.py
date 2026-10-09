@@ -211,15 +211,27 @@ def wsd_lambda(warmup, max_steps, decay_frac, min_ratio):
 
 
 class HFSync(Callback):
-    """After every evaluation (ModelCheckpoint has just written last.ckpt), push it to the private HF repo in a
-    background thread, so a dead box loses at most one eval interval."""
+    """After every evaluation, push last.ckpt to the private HF repo in a background thread, so a dead box loses at
+    most one eval interval. Lightning runs ModelCheckpoint AFTER every other callback, so at on_validation_end
+    last.ckpt is still the PREVIOUS eval's (run5 resumed from step 9000, not 10800): push at the next train batch
+    (or at train end), when the new file is on disk."""
 
     def __init__(self, run, ckpt_dir):
-        self.run, self.ckpt_dir = run, ckpt_dir
+        self.run, self.ckpt_dir, self.pending = run, ckpt_dir, False
 
     def on_validation_end(self, trainer, pl_module):
-        if trainer.global_step > 0:
+        self.pending = trainer.global_step > 0 and not trainer.sanity_checking
+
+    def _push(self):
+        if self.pending:
+            self.pending = False
             hf_sync.push(self.run, ckpt=os.path.join(self.ckpt_dir, "last.ckpt"))
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        self._push()
+
+    def on_train_end(self, trainer, pl_module):
+        self._push()
 
 
 class ValAggregate(Callback):
