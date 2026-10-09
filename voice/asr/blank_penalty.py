@@ -15,8 +15,8 @@ cache-aware streaming example included:
 
 ILM subtraction (RNN-T): the prediction network is an internal LM fitted to the training transcripts (lectures, read
 speech); on other text (meetings) it pulls decoding towards that domain. Its estimate = the joint with the encoder
-contribution zeroed (f = 0), log-softmax over the non-blank labels; label log-probs get `- ilm * log P_ILM(label)`,
-blank untouched. Then the blank penalty / script lock as above.
+contribution zeroed (f = 0), log-softmax over the non-blank labels; the label distribution is re-ranked by
+`- ilm * log P_ILM(label)` and renormalised inside the non-blank mass, so P(blank) is unchanged. Then the blank penalty / script lock as above.
 """
 import os
 import runpy
@@ -41,8 +41,12 @@ def _patch(cls, name, delta, mask_ids=None, ilm=0.0):
         if ilm:                                   # RNN-T only: args = (f projected encoder, g projected prediction)
             f, g = args[0], args[1]
             il = orig(self, torch.zeros_like(f), g, **kwargs).float()[..., :-1].log_softmax(-1)
-            out = out.float().log_softmax(-1)
-            out[..., :-1] -= ilm * il
+            lp = out.float().log_softmax(-1)
+            blank = lp[..., -1:]
+            # P(blank) kept as the model says; ILM only re-ranks WHICH label (subtracting it from the label log-probs
+            # directly boosted every label over blank: 2-3x insertions on the meeting clips at weight 0.2-0.3)
+            labels = (lp[..., :-1] - ilm * il).log_softmax(-1) + torch.log1p(-blank.exp().clamp(max=1 - 1e-6))
+            out = torch.cat([labels, blank], -1)
         else:
             out = out.clone()
         out[..., -1] -= delta
