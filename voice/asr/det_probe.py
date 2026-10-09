@@ -27,12 +27,17 @@ def main():
     ap.add_argument("--seed", type=int, default=23)
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--fused", action="store_true")
+    ap.add_argument("--det", action="store_true", help="torch deterministic algorithms (warn_only: lists offenders)")
     ap.add_argument("--no_concurrent", action="store_true", help="concurrent_bucketing=False (no filler thread)")
     ap.add_argument("--shard_seed", default=None, help="Lhotse shard_seed (NeMo default 'trng' = true random)")
     a = ap.parse_args()
     import lightning.pytorch as pl
     import nemo.collections.asr as nemo_asr
     torch.set_float32_matmul_precision("high")
+    if a.det:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = True, False
     pl.seed_everything(a.seed)
     m = nemo_asr.models.ASRModel.from_pretrained("stt_en_fastconformer_hybrid_large_streaming_multi")
     m.change_vocabulary(new_tokenizer_dir=a.tok, new_tokenizer_type="bpe")
