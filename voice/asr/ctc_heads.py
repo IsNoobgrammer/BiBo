@@ -9,6 +9,8 @@ Heads (all causal: zero added latency, same behaviour in training and streaming 
   B   mlp             LN -> Linear d->d -> SiLU -> Linear d->vocab+1
   C2  swa2 + mlp      causal sliding-window attention over the current + previous 1 encoder frame (4 heads), then B
   C4  swa4 + mlp      same, window 4 (current + 3 previous)
+  E   swa3_sc         input -> causal SWA(w=3) -> vocab (aux) -> + embed(softmax) -> SWA(w=3) -> vocab; no MLP
+  F   selfcond_lin    D without the MLP
   D   selfcond        intermediate CTC posterior (current + previous frame) projected back into the features, then B;
                       loss = final + 0.3 * intermediate (self-conditioned CTC, as IBM Granite)
   run5                the trained run5 CTC head, frozen (reference: 17.6k joint steps, not comparable in training)
@@ -82,6 +84,58 @@ class SWA(nn.Module):
         return self.mlp(h + self.o(a))
 
 
+class Mix(nn.Module):
+    """Causal local attention as a residual block (no MLP): x + O(attend(LN(x)) over frames t-W+1 .. t)."""
+
+    def __init__(self, d, w, heads=4):
+        super().__init__()
+        self.w, self.h = w, heads
+        self.ln, self.q, self.kv, self.o = nn.LayerNorm(d), nn.Linear(d, d), nn.Linear(d, 2 * d), nn.Linear(d, d)
+
+    def forward(self, h):
+        b, t, d = h.shape
+        x = self.ln(h)
+        win = torch.stack([F.pad(x, (0, 0, k, 0))[:, :t] for k in range(self.w)], 2)
+        valid = torch.arange(t, device=h.device)[:, None] >= torch.arange(self.w, device=h.device)[None]
+        q = self.q(x).view(b, t, self.h, 1, d // self.h)
+        k, v = self.kv(win).view(b, t, self.w, 2, self.h, d // self.h).unbind(3)
+        k, v = k.transpose(2, 3), v.transpose(2, 3)
+        s = ((q * k).sum(-1) / math.sqrt(d // self.h)).masked_fill(~valid[None, :, None], float("-inf"))
+        return h + self.o((s.softmax(-1)[..., None] * v).sum(3).reshape(b, t, d))
+
+
+class SwaSelfCond(nn.Module):
+    """input -> SWA(w) -> vocab (pass 1, aux CTC) -> + embed(softmax(pass 1)) -> SWA(w) -> vocab (final). No MLP.
+    Pass 2's window holds the CONDITIONED frames, so it attends over what the previous w-1 frames predicted."""
+
+    def __init__(self, d, c, w=3):
+        super().__init__()
+        self.m1, self.l1, self.emb, self.m2, self.l2 = Mix(d, w), nn.Linear(d, c), nn.Linear(c, d, bias=False),             Mix(d, w), nn.Linear(d, c)
+        self.aux = None
+
+    def forward(self, h):
+        x1 = self.m1(h)
+        z1 = self.l1(x1)
+        self.aux = z1
+        return self.l2(self.m2(x1 + self.emb(z1.float().softmax(-1).to(x1.dtype))))
+
+
+class SelfCondLin(nn.Module):
+    """D without the MLP: h + cur(p) + prev(p_prev) -> Linear."""
+
+    def __init__(self, d, c):
+        super().__init__()
+        self.l1, self.l2 = nn.Linear(d, c), nn.Linear(d, c)
+        self.cur, self.prev = nn.Linear(c, d, bias=False), nn.Linear(c, d, bias=False)
+        self.aux = None
+
+    def forward(self, h):
+        z1 = self.l1(h)
+        self.aux = z1
+        p = z1.float().softmax(-1).to(h.dtype)
+        return self.l2(h + self.cur(p) + self.prev(F.pad(p, (0, 0, 1, 0))[:, : p.shape[1]]))
+
+
 class SelfCond(nn.Module):
     def __init__(self, d, c):
         super().__init__()
@@ -132,6 +186,7 @@ def main():
     ap.add_argument("--batch_sec", type=float, default=1200)
     ap.add_argument("--val_per_source", type=int, default=200)
     ap.add_argument("--seed", type=int, default=23)
+    ap.add_argument("--heads", nargs="+", default=["A_linear", "B_mlp", "C2_swa2", "C4_swa4", "D_selfcond"])
     a = ap.parse_args()
     import nemo.collections.asr as nemo_asr
     from omegaconf import OmegaConf, open_dict
@@ -145,8 +200,10 @@ def main():
     blank = c - 1
     lock = blank_penalty.devanagari_ids(os.path.join(os.path.dirname(a.nemo), "..", "..", "run1", "tok",
                                                       "tokenizer_spe_bpe_v4096", "tokenizer.model"))
-    heads = nn.ModuleDict({"A_linear": Linear(d, c), "B_mlp": MLP(d, c), "C2_swa2": SWA(d, c, 2),
-                           "C4_swa4": SWA(d, c, 4), "D_selfcond": SelfCond(d, c)}).cuda()
+    zoo = {"A_linear": lambda: Linear(d, c), "B_mlp": lambda: MLP(d, c), "C2_swa2": lambda: SWA(d, c, 2),
+           "C4_swa4": lambda: SWA(d, c, 4), "D_selfcond": lambda: SelfCond(d, c),
+           "E_swa3_sc": lambda: SwaSelfCond(d, c, 3), "F_selfcond_lin": lambda: SelfCondLin(d, c)}
+    heads = nn.ModuleDict({k: zoo[k]() for k in a.heads}).cuda()
     for k, h in heads.items():
         print(f"[heads] {k}: {sum(p.numel() for p in h.parameters()) / 1e6:.2f}M", flush=True)
     opt = torch.optim.AdamW(heads.parameters(), lr=a.lr, weight_decay=1e-3)
@@ -169,7 +226,7 @@ def main():
         with torch.autocast("cuda", dtype=torch.bfloat16):
             for k, head in heads.items():
                 li = ctc(head(h), hl, tgt, tlen, blank)
-                if k == "D_selfcond":
+                if getattr(head, "aux", None) is not None:
                     li = li + 0.3 * ctc(head.aux, hl, tgt, tlen, blank)
                 run[k] += li.item()
                 loss = loss + li
