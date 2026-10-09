@@ -63,6 +63,27 @@ class AudioMeter(Callback):
             self.t0, self.win, self.win_steps = time.perf_counter(), None, 0
 
 
+class EpochShuffle(Callback):
+    """A new (seeded) Lhotse order every data epoch. NeMo hands the sampler to a plain DataLoader and nobody calls
+    set_epoch: with a fixed shard_seed every new iterator replays the same batches (run2 v1 trained on its first
+    ~280 h eleven times). batch_log: ASR_BATCH_LOG=path writes 'step epoch lens-hash' per batch (replay checks)."""
+
+    def __init__(self):
+        self.log = open(os.environ["ASR_BATCH_LOG"], "w") if os.environ.get("ASR_BATCH_LOG") else None
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        dl = pl_module._train_dl
+        s = getattr(dl.dataset, "sampler", None) or dl.sampler
+        s.set_epoch(trainer.current_epoch)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if self.log:
+            import hashlib
+            self.log.write(f"{trainer.global_step} {trainer.current_epoch} "
+                           f"{hashlib.sha1(batch[1].cpu().numpy().tobytes()).hexdigest()[:12]}\n")
+            self.log.flush()
+
+
 class HFSync(Callback):
     """After every evaluation (ModelCheckpoint has just written last.ckpt), push it to the private HF repo in a
     background thread, so a dead box loses at most one eval interval."""
@@ -143,8 +164,9 @@ def main():
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.use_deterministic_algorithms(True, warn_only=True)
         torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = True, False
-    # eval_hours 0 = every data epoch. A Lightning "epoch" ends when the Lhotse iterator runs dry, and validation only
-    # fires when batch_idx reaches limit_train_batches: an eval interval longer than the data epoch NEVER validates.
+    # eval every eval_steps batches ACROSS data epochs (val_check_interval, check_val_every_n_epoch=None): the train
+    # iterator keeps running through evals. (limit_train_batches=eval_steps ended a Lightning epoch at every eval and
+    # rebuilt the iterator -> with a fixed shard_seed, the same batches every segment.) eval_hours 0 = every data epoch.
     eval_steps = int(a.eval_hours * 3600 / a.batch_sec) or None
     max_steps = int(a.total_hours * 3600 / a.batch_sec)
 
@@ -209,9 +231,10 @@ def main():
     define_metrics(logger.experiment)
     trainer = pl.Trainer(
         devices=1, accelerator="gpu", precision="32-true" if a.bf16_master else "bf16-mixed", max_steps=max_steps, max_epochs=-1,
-        limit_train_batches=eval_steps, num_sanity_val_steps=0, gradient_clip_val=None if a.bf16_master else 1.0, log_every_n_steps=50,
+        val_check_interval=eval_steps, check_val_every_n_epoch=None if eval_steps else 1,
+        num_sanity_val_steps=0, gradient_clip_val=None if a.bf16_master else 1.0, log_every_n_steps=50,
         use_distributed_sampler=False, logger=logger, enable_checkpointing=True, benchmark=False,
-        callbacks=[AudioMeter(), TQDMProgressBar(refresh_rate=50), ValAggregate(a.val), LearningRateMonitor("step"),
+        callbacks=[AudioMeter(), EpochShuffle(), TQDMProgressBar(refresh_rate=50), ValAggregate(a.val), LearningRateMonitor("step"),
                    ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer_all", mode="min", save_top_k=2,
                                    save_last=True, filename="{step}-{val_wer_all:.4f}", save_on_train_epoch_end=False),
                    *([] if a.no_hf else [HFSync(a.run, ckpt_dir)])])
