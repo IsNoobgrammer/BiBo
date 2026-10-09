@@ -12,8 +12,8 @@ W=/home/marimo/work; A=$W/asr; M=$A/mix1000; R=$A/run2; E=$A/eval_sets; P=/home/
 cd $W/BiBo && git log --oneline -1
 # data: two repos, one mix dir (fetch_mix skips a dir that already has manifests, so Hindi lands in a side dir first)
 $P voice/asr/fetch_mix.py --repo fhai50032/asr-english --mix $M
-[ -f $M/kathbath_hi.jsonl ] || { mkdir -p $A/mix1000_hi && $P voice/asr/fetch_mix.py --repo fhai50032/asr-hindi --mix $A/mix1000_hi \
-  && mv $A/mix1000_hi/*.jsonl $M/; }
+[ -f $M/.hindi_fetched ] || { mkdir -p $A/mix1000_hi && $P voice/asr/fetch_mix.py --repo fhai50032/asr-hindi --mix $A/mix1000_hi \
+  && mv $A/mix1000_hi/*.jsonl $M/ && touch $M/.hindi_fetched; }
 [ -f $R/train.jsonl ] || $P voice/asr/prep_train.py --mix $M --out $R
 [ -f $E/fleurs_hi.jsonl ] || $P voice/asr/build_eval.py --out $E
 TOK=$A/run1/tok/tokenizer_spe_bpe_v4096                       # run1's joint en/hi tokenizer, same for every arm
