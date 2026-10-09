@@ -11,6 +11,7 @@ Heads (all causal: zero added latency, same behaviour in training and streaming 
   C4  swa4 + mlp      same, window 4 (current + 3 previous)
   E   swa3_sc         input -> causal SWA(w=3) -> vocab (aux) -> + embed(softmax) -> SWA(w=3) -> vocab; no MLP
   F   selfcond_lin    D without the MLP
+  G/H sc3_mlp/_lin     3-pass self-conditioning, CTC loss 0.2 / 0.3 / 0.5 on passes 1 / 2 / 3, readouts MLP / Linear
   D   selfcond        intermediate CTC posterior (current + previous frame) projected back into the features, then B;
                       loss = final + 0.3 * intermediate (self-conditioned CTC, as IBM Granite)
   run5                the trained run5 CTC head, frozen (reference: 17.6k joint steps, not comparable in training)
@@ -136,6 +137,31 @@ class SelfCondLin(nn.Module):
         return self.l2(h + self.cur(p) + self.prev(F.pad(p, (0, 0, 1, 0))[:, : p.shape[1]]))
 
 
+class SelfCond3(nn.Module):
+    """3-pass self-conditioned CTC: z1 = Linear(h); h2 = h + cur1(p1) + prev1(p1 of frame t-1); z2 = R2(h2);
+    h3 = h2 + cur2(p2) + prev2(p2 of t-1); z3 = R3(h3). Loss 0.2 z1 + 0.3 z2 + 0.5 z3. R = MLP or Linear."""
+
+    def __init__(self, d, c, mlp):
+        super().__init__()
+        self.l1 = nn.Linear(d, c)
+        self.r2, self.r3 = (MLP(d, c), MLP(d, c)) if mlp else (nn.Linear(d, c), nn.Linear(d, c))
+        self.cond = nn.ModuleList([nn.ModuleDict({"cur": nn.Linear(c, d, bias=False), "prev": nn.Linear(c, d, bias=False)})
+                                   for _ in range(2)])
+        self.auxs, self.final_w = None, 0.5
+
+    def _feed(self, h, z, k):
+        p = z.float().softmax(-1).to(h.dtype)
+        return h + self.cond[k]["cur"](p) + self.cond[k]["prev"](F.pad(p, (0, 0, 1, 0))[:, : p.shape[1]])
+
+    def forward(self, h):
+        z1 = self.l1(h)
+        h2 = self._feed(h, z1, 0)
+        z2 = self.r2(h2)
+        z3 = self.r3(self._feed(h2, z2, 1))
+        self.auxs = [(z1, 0.2), (z2, 0.3)]
+        return z3
+
+
 class SelfCond(nn.Module):
     def __init__(self, d, c):
         super().__init__()
@@ -202,7 +228,8 @@ def main():
                                                       "tokenizer_spe_bpe_v4096", "tokenizer.model"))
     zoo = {"A_linear": lambda: Linear(d, c), "B_mlp": lambda: MLP(d, c), "C2_swa2": lambda: SWA(d, c, 2),
            "C4_swa4": lambda: SWA(d, c, 4), "D_selfcond": lambda: SelfCond(d, c),
-           "E_swa3_sc": lambda: SwaSelfCond(d, c, 3), "F_selfcond_lin": lambda: SelfCondLin(d, c)}
+           "E_swa3_sc": lambda: SwaSelfCond(d, c, 3), "F_selfcond_lin": lambda: SelfCondLin(d, c),
+           "G_sc3_mlp": lambda: SelfCond3(d, c, True), "H_sc3_lin": lambda: SelfCond3(d, c, False)}
     heads = nn.ModuleDict({k: zoo[k]() for k in a.heads}).cuda()
     for k, h in heads.items():
         print(f"[heads] {k}: {sum(p.numel() for p in h.parameters()) / 1e6:.2f}M", flush=True)
@@ -225,9 +252,11 @@ def main():
         loss = 0.0
         with torch.autocast("cuda", dtype=torch.bfloat16):
             for k, head in heads.items():
-                li = ctc(head(h), hl, tgt, tlen, blank)
+                li = getattr(head, "final_w", 1.0) * ctc(head(h), hl, tgt, tlen, blank)
                 if getattr(head, "aux", None) is not None:
                     li = li + 0.3 * ctc(head.aux, hl, tgt, tlen, blank)
+                for z, w in getattr(head, "auxs", None) or []:                     # multi-pass heads
+                    li = li + w * ctc(z, hl, tgt, tlen, blank)
                 run[k] += li.item()
                 loss = loss + li
         opt.zero_grad(set_to_none=True)
