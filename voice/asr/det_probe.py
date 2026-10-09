@@ -27,6 +27,7 @@ def main():
     ap.add_argument("--seed", type=int, default=23)
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--fused", action="store_true")
+    ap.add_argument("--fused_ctc", action="store_true", help="with --fused: also the tkf deterministic CTC loss")
     ap.add_argument("--det", action="store_true", help="torch deterministic algorithms (warn_only: lists offenders)")
     ap.add_argument("--no_concurrent", action="store_true", help="concurrent_bucketing=False (no filler thread)")
     ap.add_argument("--shard_seed", default=None, help="Lhotse shard_seed (NeMo default 'trng' = true random)")
@@ -69,6 +70,9 @@ def main():
         fused_layer.enable(m)
         fused_attn.enable(m)
         fused_conv.enable(m)
+        if a.fused_ctc:
+            import fused_ctc
+            fused_ctc.enable(m)
     b = [x.cuda() if torch.is_tensor(x) else x for x in batches[0]]
     m._optimizer = torch.optim.AdamW(m.parameters(), lr=1e-5)      # training_step logs its lr
     import types

@@ -129,6 +129,7 @@ def main():
     ap.add_argument("--fp32_residual", action="store_true", help="with --bf16_master --fused_layer: fp32 residual stream")
     ap.add_argument("--fused_attn", action="store_true", help="tkf banded rel-pos attention (voice/asr/fused_attn.py)")
     ap.add_argument("--fused_conv", action="store_true", help="tkf conv module + FFN silu/dropout (voice/asr/fused_conv.py)")
+    ap.add_argument("--fused_ctc", action="store_true", help="tkf deterministic CTC loss (voice/asr/fused_ctc.py)")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--project", default="bibo-asr")
     a = ap.parse_args()
@@ -186,6 +187,9 @@ def main():
     if a.fused_conv:
         import fused_conv
         fused_conv.enable(m)
+    if a.fused_ctc:
+        import fused_ctc
+        fused_ctc.enable(m)
 
     ckpt_dir = os.path.join(a.out, a.run)
     os.makedirs(ckpt_dir, exist_ok=True)
