@@ -116,6 +116,8 @@ def main():
     if a.att_context:
         m.encoder.set_default_att_context_size(list(a.att_context))
     if a.blank_penalty:
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # NeMo's import drops the script dir
         import blank_penalty
         blank_penalty.apply(a.blank_penalty)
     tot = collections.Counter()
