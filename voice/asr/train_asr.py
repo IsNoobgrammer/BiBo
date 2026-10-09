@@ -84,6 +84,31 @@ class EpochShuffle(Callback):
             self.blog.flush()
 
 
+class SaveSteps(Callback):
+    def __init__(self, steps, ckpt_dir):
+        self.steps, self.ckpt_dir = set(steps), ckpt_dir
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if trainer.global_step in self.steps:
+            self.steps.discard(trainer.global_step)
+            trainer.save_checkpoint(os.path.join(self.ckpt_dir, f"step{trainer.global_step}.ckpt"))
+
+
+def wsd_lambda(warmup, max_steps, decay_frac, min_ratio):
+    """lr multiplier: linear warm-up, flat at 1, linear decay over the last decay_frac of max_steps to min_ratio.
+    The decay start depends only on max_steps, so a run's stable phase is identical to any longer run's: a branch
+    resumed from a stable-phase checkpoint with a shorter --total_hours decays from exactly that point."""
+    start = int(max_steps * (1 - decay_frac))
+
+    def f(s):
+        if s < warmup:
+            return (s + 1) / warmup
+        if s < start:
+            return 1.0
+        return max(min_ratio, 1.0 - (s - start) / max(max_steps - start, 1) * (1.0 - min_ratio))
+    return f
+
+
 class HFSync(Callback):
     """After every evaluation (ModelCheckpoint has just written last.ckpt), push it to the private HF repo in a
     background thread, so a dead box loses at most one eval interval."""
@@ -141,6 +166,12 @@ def main():
                     help="evaluate every this many audio hours (must be < one data epoch); 0 = every data epoch")
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--warmup", type=int, default=1000)
+    ap.add_argument("--sched", choices=["cosine", "wsd"], default="cosine",
+                    help="wsd = linear warm-up, flat at --lr, linear decay over the last --decay_frac to 1e-5")
+    ap.add_argument("--decay_frac", type=float, default=0.2)
+    ap.add_argument("--save_steps", type=int, nargs="*", default=[],
+                    help="also save a full checkpoint at these global steps (WSD: branch decays from the stable phase)")
+    ap.add_argument("--ckpt", default=None, help="resume from this checkpoint (e.g. a --save_steps one, for a decay branch)")
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--compile_layers", action="store_true")
     ap.add_argument("--fused_joint", action="store_true", help="tkf fused joint + RNN-T loss (voice/asr/fused_joint.py)")
@@ -224,6 +255,7 @@ def main():
     # resume: local last.ckpt, else the one in the HF repo (fresh box); the W&B run continues under the same id
     _, hf_ckpt, wid = (None, None, None) if a.no_hf else hf_sync.pull(a.run, os.path.dirname(a.out))
     resume = os.path.join(ckpt_dir, "last.ckpt") if os.path.exists(os.path.join(ckpt_dir, "last.ckpt")) else hf_ckpt
+    resume = a.ckpt or resume
     logger = RemapLogger(project=a.project, name=a.run, save_dir=ckpt_dir, id=wid, resume="allow",
                          config={**vars(a), "eval_steps": eval_steps, "max_steps": max_steps})
     if not a.no_hf:
@@ -237,6 +269,7 @@ def main():
         callbacks=[AudioMeter(), EpochShuffle(), TQDMProgressBar(refresh_rate=50), ValAggregate(a.val), LearningRateMonitor("step"),
                    ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer_all", mode="min", save_top_k=2,
                                    save_last=True, filename="{step}-{val_wer_all:.4f}", save_on_train_epoch_end=False),
+                   *([SaveSteps(a.save_steps, ckpt_dir)] if a.save_steps else []),
                    *([] if a.no_hf else [HFSync(a.run, ckpt_dir)])])
     m.set_trainer(trainer)
     m.setup_optimization(OmegaConf.create({
@@ -244,6 +277,14 @@ def main():
         "sched": {"name": "CosineAnnealing", "warmup_steps": a.warmup, "min_lr": 1e-5, "max_steps": max_steps}}))
     if a.bf16_master:
         bf16_master.wrap(m._optimizer, clip=1.0)                    # clips on the fp32 masters
+    if a.sched == "wsd":
+        for g in m._optimizer.param_groups:                        # NeMo's scheduler may have set a warm-up lr
+            g["lr"] = a.lr
+            g.pop("initial_lr", None)
+        sched = torch.optim.lr_scheduler.LambdaLR(m._optimizer, wsd_lambda(a.warmup, max_steps, a.decay_frac, 1e-5 / a.lr))
+        m._scheduler = {"scheduler": sched, "interval": "step", "frequency": 1}
+        print(f"[run] WSD: warm-up {a.warmup}, flat to step {int(max_steps * (1 - a.decay_frac))}, "
+              f"linear decay to {max_steps}", flush=True)
     print(f"[run] {a.run}: max_steps {max_steps}, eval every {eval_steps} steps (~{a.eval_hours} h), "
           f"batch {a.batch_sec} s, val {[os.path.basename(v) for v in a.val]}", flush=True)
     print(f"[run] resume from {resume}", flush=True)
