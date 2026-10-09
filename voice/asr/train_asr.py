@@ -69,7 +69,7 @@ class EpochShuffle(Callback):
     ~280 h eleven times). batch_log: ASR_BATCH_LOG=path writes 'step epoch lens-hash' per batch (replay checks)."""
 
     def __init__(self):
-        self.log = open(os.environ["ASR_BATCH_LOG"], "w") if os.environ.get("ASR_BATCH_LOG") else None
+        self.blog = open(os.environ["ASR_BATCH_LOG"], "w") if os.environ.get("ASR_BATCH_LOG") else None
 
     def on_train_epoch_start(self, trainer, pl_module):
         dl = pl_module._train_dl
@@ -77,11 +77,11 @@ class EpochShuffle(Callback):
         s.set_epoch(trainer.current_epoch)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if self.log:
+        if self.blog:
             import hashlib
-            self.log.write(f"{trainer.global_step} {trainer.current_epoch} "
+            self.blog.write(f"{trainer.global_step} {trainer.current_epoch} "
                            f"{hashlib.sha1(batch[1].cpu().numpy().tobytes()).hexdigest()[:12]}\n")
-            self.log.flush()
+            self.blog.flush()
 
 
 class HFSync(Callback):
