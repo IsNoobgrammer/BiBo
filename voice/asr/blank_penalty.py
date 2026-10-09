@@ -11,18 +11,26 @@ cache-aware streaming example included:
     python voice/asr/blank_penalty.py 0.5 NeMo/examples/.../speech_to_text_cache_aware_streaming_infer.py args...
     python voice/asr/blank_penalty.py ctc:0.3 ...               # CTC head
     python voice/asr/blank_penalty.py ctc:0.5:en ...            # + English script lock (no Devanagari tokens)
+    ASR_ILM=0.2 python voice/asr/blank_penalty.py 0 ...         # RNN-T internal-LM subtraction, weight 0.2
+
+ILM subtraction (RNN-T): the prediction network is an internal LM fitted to the training transcripts (lectures, read
+speech); on other text (meetings) it pulls decoding towards that domain. Its estimate = the joint with the encoder
+contribution zeroed (f = 0), log-softmax over the non-blank labels; label log-probs get `- ilm * log P_ILM(label)`,
+blank untouched. Then the blank penalty / script lock as above.
 """
 import os
 import runpy
 import sys
 
+import torch
 
-def _patch(cls, name, delta, mask_ids=None):
+
+def _patch(cls, name, delta, mask_ids=None, ilm=0.0):
     key = f"_bp_orig_{name}"
     if getattr(cls, key, None) is None:
         setattr(cls, key, getattr(cls, name))
     orig = getattr(cls, key)
-    if not delta and mask_ids is None:
+    if not delta and mask_ids is None and not ilm:
         setattr(cls, name, orig)
         return
 
@@ -30,7 +38,13 @@ def _patch(cls, name, delta, mask_ids=None):
         out = orig(self, *args, **kwargs)
         if self.training:
             return out
-        out = out.clone()
+        if ilm:                                   # RNN-T only: args = (f projected encoder, g projected prediction)
+            f, g = args[0], args[1]
+            il = orig(self, torch.zeros_like(f), g, **kwargs).float()[..., :-1].log_softmax(-1)
+            out = out.float().log_softmax(-1)
+            out[..., :-1] -= ilm * il
+        else:
+            out = out.clone()
         out[..., -1] -= delta
         if mask_ids is not None:                  # script lock: these tokens can never be emitted
             # an additive bias built on the device once (devanagari_ids): RNN-T greedy decoding runs under CUDA-graph
@@ -57,13 +71,13 @@ def devanagari_ids(tok_model):
     return bias.to("cuda") if torch.cuda.is_available() else bias
 
 
-def apply(delta, head="rnnt", mask_ids=None):
+def apply(delta, head="rnnt", mask_ids=None, ilm=0.0):
     if head == "ctc":
         from nemo.collections.asr.modules.conv_asr import ConvASRDecoder
         _patch(ConvASRDecoder, "forward", delta, mask_ids)
     else:
         from nemo.collections.asr.modules.rnnt import RNNTJoint
-        _patch(RNNTJoint, "joint_after_projection", delta, mask_ids)
+        _patch(RNNTJoint, "joint_after_projection", delta, mask_ids, ilm)
 
 
 if __name__ == "__main__":
@@ -72,7 +86,8 @@ if __name__ == "__main__":
     lock = parts[-1] == "en" and parts.pop()
     head, d = (parts[0], parts[1]) if len(parts) == 2 else ("rnnt", parts[0])
     tok = os.environ.get("ASR_TOK", "/home/marimo/work/asr/run1/tok/tokenizer_spe_bpe_v4096/tokenizer.model")
-    apply(float(d), head=head, mask_ids=devanagari_ids(tok) if lock else None)
+    apply(float(d), head=head, mask_ids=devanagari_ids(tok) if lock else None,
+          ilm=float(os.environ.get("ASR_ILM", 0)) if head == "rnnt" else 0.0)
     script = sys.argv[2]
     sys.argv = [script] + sys.argv[3:]
     runpy.run_path(script, run_name="__main__")
