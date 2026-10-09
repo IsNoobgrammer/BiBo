@@ -13,7 +13,7 @@ cd $W/BiBo && git log --oneline -1
 $P - <<EOF
 import json, soundfile as sf
 with open("$M/meeting.jsonl", "w") as f:
-    for wav in ("c2m.wav", "clip16k.wav"):
+    for wav in ("c2m.wav", "clip16k.wav", "g5_16k.wav"):
         x, sr = sf.read("$M/" + wav)
         f.write(json.dumps({"audio_filepath": "$M/" + wav, "duration": len(x) / sr, "text": ""}) + "\n")
 EOF
@@ -31,7 +31,7 @@ from score import normalize, wer
 order = [json.loads(l)["audio_filepath"].rsplit("/", 1)[-1] for l in open("$M/meeting.jsonl")]
 rows = dict(zip(order, map(json.loads, open(glob.glob("$out/*.json")[0], encoding="utf-8"))))
 res = []
-for wav, ref in (("c2m.wav", "ref2m.txt"), ("clip16k.wav", "reference.txt")):
+for wav, ref in (("c2m.wav", "ref2m.txt"), ("clip16k.wav", "reference.txt"), ("g5_16k.wav", "g5_ref_gemini.txt")):
     rw, hw = normalize(open("$M/" + ref, encoding="utf-8").read()), normalize(rows[wav].get("pred_text", ""))
     res.append(f"{wav.split('.')[0]} {100 * wer(rw, hw):5.1f}% ({len(hw)}/{len(rw)} words)")
 print(f"MEETING $RUN lookahead {int($att) * 80:4d} ms {'$dec':4s} |", " | ".join(res), flush=True)
