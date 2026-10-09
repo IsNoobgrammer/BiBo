@@ -35,9 +35,11 @@ def main():
             import fused_joint
             import fused_layer
             import fused_attn
+            import fused_conv
             fused_joint.enable(m)
             fused_layer.enable(m)
             fused_attn.enable(m)
+            fused_conv.enable(m)
         va = OmegaConf.create(OmegaConf.to_container(m.cfg.validation_ds))
         with open_dict(va):
             va.update(manifest_filepath=a.val, batch_size=64, num_workers=4, shuffle=False)
