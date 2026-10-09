@@ -10,6 +10,7 @@ train loss / WER / lr / audio hours seen / audio-s per s, top-2 + last checkpoin
 """
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -40,16 +41,34 @@ class AudioMeter(Callback):
 
     def __init__(self, every=50):
         self.every, self.secs, self.t0, self.win, self.win_steps = every, 0.0, None, None, 0
+        self.lsum, self.tsum, self.gn_ema = None, None, None
 
     def on_before_optimizer_step(self, trainer, pl_module, optimizer):
         if trainer.global_step % self.every == 0:
             g = [p.grad.norm() for p in pl_module.parameters() if p.grad is not None]
-            pl_module.log("grad_norm", torch.stack(g).norm().item() if g else 0.0)
+            gn = torch.stack(g).norm().item() if g else 0.0
+            pl_module.log("grad_norm", gn)
+            # divergence alarm (run4: median 49 -> 132 -> 720 -> 3445 over ~1,500 steps, unnoticed until an eval).
+            # Running mean in log space over the logged points; a sustained >5x jump prints GRAD_ALERT.
+            if gn > 0:
+                lg = math.log(gn)
+                if self.gn_ema is not None and gn > 5 * math.exp(self.gn_ema) and trainer.global_step > 2000:
+                    print(f"[GRAD_ALERT] step {trainer.global_step}: grad norm {gn:.1f} = "
+                          f"{gn / math.exp(self.gn_ema):.1f}x its running level {math.exp(self.gn_ema):.1f}", flush=True)
+                self.gn_ema = lg if self.gn_ema is None else 0.98 * self.gn_ema + 0.02 * lg
+                pl_module.log("grad_norm_level", math.exp(self.gn_ema))
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         # samples summed ON the device: a .item() here every step drained the GPU queue (prof_step --sync_debug)
         s = batch[1].sum()
         self.win = s if self.win is None else self.win + s
+        # per-token loss (the logged train loss is a per-utterance SUM, so it swings with utterance length)
+        loss = outputs["loss"] if isinstance(outputs, dict) else outputs
+        if loss is not None:
+            ls = loss.detach() * batch[3].numel()
+            tk = batch[3].sum()
+            self.lsum = ls if self.lsum is None else self.lsum + ls
+            self.tsum = tk if self.tsum is None else self.tsum + tk
         self.win_steps += 1
         if self.t0 is None:
             self.t0 = time.perf_counter()
@@ -60,7 +79,9 @@ class AudioMeter(Callback):
             pl_module.log_dict({"audio_hours_seen": self.secs / 3600, "audio_s_per_s": win_secs / dt,
                                 "ms_per_step": 1000 * dt / max(self.win_steps, 1),
                                 "mem_gb": torch.cuda.max_memory_allocated() / 2**30})
-            self.t0, self.win, self.win_steps = time.perf_counter(), None, 0
+            if self.lsum is not None:
+                pl_module.log("loss_per_token", (self.lsum / self.tsum.clamp(min=1)).item())
+            self.t0, self.win, self.win_steps, self.lsum, self.tsum = time.perf_counter(), None, 0, None, None
 
 
 class EpochShuffle(Callback):
@@ -315,6 +336,7 @@ def main():
     if a.aug_schedule:
         import aug_online
         aug_online.wrap(m._train_dl.dataset)
+    m.compute_eval_loss = True          # the model config had compute_eval_loss: false -> no validation loss at all
     va = OmegaConf.create(OmegaConf.to_container(m.cfg.validation_ds))
     with open_dict(va):
         va.update(manifest_filepath=a.val, batch_size=64, num_workers=4, shuffle=False)
