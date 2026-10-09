@@ -183,16 +183,6 @@ def ctc(logits, lens, tgt, tlen, blank):
     return F.ctc_loss(lp, tgt, lens, tlen, blank=blank, reduction="mean", zero_infinity=True)
 
 
-def greedy(logits, n, blank):
-    ids = logits[:n].argmax(-1).tolist()
-    out, prev = [], None
-    for i in ids:
-        if i != prev and i != blank:
-            out.append(i)
-        prev = i
-    return out
-
-
 @torch.no_grad()
 def encode(m, audio, lens):
     with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -207,7 +197,9 @@ def main():
     ap.add_argument("--train", required=True)
     ap.add_argument("--val", nargs="+", required=True)
     ap.add_argument("--meeting", default="/home/marimo/work/asr/eval_meeting")
-    ap.add_argument("--steps", type=int, default=2000)
+    ap.add_argument("--steps", type=int, default=2700, help="~8 min on the RTX PRO 6000 (1,500 steps took 4.5 min)")
+    ap.add_argument("--eval_batch", type=int, default=128)
+    ap.add_argument("--las", type=int, nargs="+", default=[0, 1, 3, 6, 13], help="look-aheads to score (80 ms frames)")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch_sec", type=float, default=1200)
     ap.add_argument("--val_per_source", type=int, default=200)
@@ -245,7 +237,13 @@ def main():
     m.setup_training_data(tr)
     rs, ps = list(MIX), list(MIX.values())
     t0, step, run = time.time(), 0, {k: 0.0 for k in heads}
-    for batch in m._train_dl:
+    def batches():                                   # > 1 epoch when --steps asks for it, reshuffled per epoch
+        for ep in range(1000):
+            sm = getattr(m._train_dl.dataset, "sampler", None) or m._train_dl.sampler
+            sm.set_epoch(ep)
+            yield from m._train_dl
+
+    for batch in batches():
         audio, alen, tgt, tlen = (x.cuda(non_blocking=True) for x in batch[:4])
         set_lookahead(m.encoder, random.choices(rs, ps)[0])
         h, hl = encode(m, audio, alen)
@@ -278,39 +276,51 @@ def main():
         random.Random(0).shuffle(rows)
         vals += rows[: a.val_per_source]
     vals.sort(key=lambda r: r["duration"])
-    meet = [(sf.read(os.path.join(a.meeting, w))[0].astype(np.float32), open(os.path.join(a.meeting, r), encoding="utf-8").read())
+    refs = [normalize(x["text"]) for x in vals]
+    # audio read ONCE, padded batches built ONCE (was: re-read from disk at every look-ahead, batches of 32)
+    vb = []
+    for i in range(0, len(vals), a.eval_batch):
+        xs = [sf.read(x["audio_filepath"])[0].astype(np.float32) for x in vals[i:i + a.eval_batch]]
+        L = torch.tensor([len(x) for x in xs])
+        A = torch.zeros(len(xs), int(L.max()))
+        for j, x in enumerate(xs):
+            A[j, : len(x)] = torch.from_numpy(x)
+        vb.append((A, L, i))
+    meet = [(sf.read(os.path.join(a.meeting, w))[0].astype(np.float32), normalize(open(os.path.join(a.meeting, r), encoding="utf-8").read()))
             for w, r in MEETING]
-    words = [len(normalize(r)) for _, r in meet]
-    print(f"[eval] val {len(vals)} utterances from {len(a.val)} sets; meeting clips {words} words", flush=True)
-    for r in (0, 1, 3, 6, 13):
+    words = [len(r) for _, r in meet]
+    print(f"[eval] val {len(vals)} utterances, {len(vb)} batches; meeting clips {words} words; look-aheads {a.las}", flush=True)
+
+    def texts(z, hl):
+        """Greedy CTC on the GPU for a whole batch: argmax, drop blanks and repeats, ONE host copy."""
+        ids = z.argmax(-1)
+        valid = torch.arange(ids.shape[1], device=ids.device)[None] < hl[:, None]
+        keep = (ids != blank) & (ids != F.pad(ids, (1, 0), value=-1)[:, :-1]) & valid
+        ids, keep = ids.cpu().numpy(), keep.cpu().numpy()
+        return [normalize(m.tokenizer.ids_to_text(ids[j][keep[j]].tolist())) for j in range(len(ids))]
+
+    for r in a.las:
+        t1 = time.time()
         set_lookahead(m.encoder, r)
         errs = {k: [0, 0] for k in every}
+        mt = {k: [] for k in every}
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-            for i in range(0, len(vals), 32):
-                chunk = vals[i:i + 32]
-                xs = [sf.read(x["audio_filepath"])[0].astype(np.float32) for x in chunk]
-                L = torch.tensor([len(x) for x in xs]).cuda()
-                A = torch.zeros(len(xs), int(L.max())).cuda()
-                for j, x in enumerate(xs):
-                    A[j, : len(x)] = torch.from_numpy(x)
-                h, hl = encode(m, A, L)
+            for A, L, i in vb:
+                h, hl = encode(m, A.cuda(non_blocking=True), L.cuda())
                 for k, f in every.items():
-                    z = f(h).float() + lock
-                    for j, x in enumerate(chunk):
-                        ref = normalize(x["text"])
-                        hyp = normalize(m.tokenizer.ids_to_text(greedy(z[j], int(hl[j]), blank)))
+                    for j, hyp in enumerate(texts(f(h).float() + lock, hl)):
+                        ref = refs[i + j]
                         errs[k][0] += wer(ref, hyp) * len(ref); errs[k][1] += len(ref)
-            mt = {k: [] for k in every}
             for x, ref in meet:
                 h, hl = encode(m, torch.from_numpy(x)[None].cuda(), torch.tensor([len(x)]).cuda())
                 for k, f in every.items():
-                    z = f(h).float() + lock
-                    hyp = normalize(m.tokenizer.ids_to_text(greedy(z[0], int(hl[0]), blank)))
-                    mt[k].append((wer(normalize(ref), hyp), len(hyp)))
+                    hyp = texts(f(h).float() + lock, hl)[0]
+                    mt[k].append((wer(ref, hyp), len(hyp)))
         for k in every:
             pooled = sum(w * n for (w, _), n in zip(mt[k], words)) / sum(words)
             print(f"RESULT look-ahead {r * 80:4d} ms {k:11s} | val {100 * errs[k][0] / errs[k][1]:5.2f} | meeting pooled "
                   f"{100 * pooled:5.2f} | " + " ".join(f"{100 * w:5.1f}({n})" for w, n in mt[k]), flush=True)
+        print(f"[eval] look-ahead {r * 80} ms took {time.time() - t1:.0f}s", flush=True)
     print("HEADS_DONE", flush=True)
 
 
