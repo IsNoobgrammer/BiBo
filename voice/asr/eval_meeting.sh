@@ -24,7 +24,7 @@ with open("$M/meeting.jsonl", "w") as f:
 EOF
 for att in 0 1 3 6 13; do
   left=$((70 - 70 % (att + 1)))                  # the training mask's effective left context
-  for dec in rnnt ctc; do
+  for dec in ${DECS:-rnnt ctc}; do                 # DECS=rnnt: one head only
     out=$M/$TAG.la$att.$dec.jsonl
     rm -rf $out
     $P ${BP:+voice/asr/blank_penalty.py $dec:$BP${LOCK:+:$LOCK}} $W/NeMo/examples/asr/asr_cache_aware_streaming/speech_to_text_cache_aware_streaming_infer.py \
