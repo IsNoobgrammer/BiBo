@@ -154,7 +154,10 @@ def main():
         tr.pop("tarred_audio_filepaths", None)
         tr.update(manifest_filepath=a.train, is_tarred=False, use_lhotse=True, use_bucketing=True, num_buckets=30,
                   batch_duration=a.batch_sec, batch_size=None, max_duration=30, min_duration=0.1, shuffle=True,
-                  num_workers=a.workers, shuffle_buffer_size=10000, seed=23, pin_memory=True)
+                  num_workers=a.workers, shuffle_buffer_size=10000, seed=23 if a.seed is None else a.seed, pin_memory=True,
+                  # same seed -> same batches (det_probe.py): NeMo's defaults draw per-worker seeds from the OS RNG
+                  # (shard_seed "trng") and fill buckets from a background thread (timing-dependent batch contents)
+                  shard_seed="randomized", concurrent_bucketing=False)
     m.setup_training_data(tr)
     va = OmegaConf.create(OmegaConf.to_container(m.cfg.validation_ds))
     with open_dict(va):
