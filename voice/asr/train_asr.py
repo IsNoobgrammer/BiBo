@@ -58,6 +58,13 @@ class AudioMeter(Callback):
                 self.gn_ema = lg if self.gn_ema is None else 0.98 * self.gn_ema + 0.02 * lg
                 pl_module.log("grad_norm_level", math.exp(self.gn_ema))
 
+    # the running level survives a resume (it restarted from one noisy step: a fake hump on the chart, alert blind)
+    def state_dict(self):
+        return {"gn_ema": self.gn_ema}
+
+    def load_state_dict(self, state):
+        self.gn_ema = state.get("gn_ema")
+
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         # samples summed ON the device: a .item() here every step drained the GPU queue (prof_step --sync_debug)
         s = batch[1].sum()
@@ -84,19 +91,68 @@ class AudioMeter(Callback):
             self.t0, self.win, self.win_steps, self.lsum, self.tsum = time.perf_counter(), None, 0, None, None
 
 
+class SkipFirst:
+    """Train sampler wrapper: the next iteration drops its first `skip` batches (mid-epoch resume, see EpochShuffle).
+    The sampler runs in the main process (map-style Lhotse: workers only load audio), so skipping reads metadata only."""
+
+    def __init__(self, sampler):
+        self.sampler, self.skip = sampler, 0
+
+    def set_epoch(self, epoch):
+        self.sampler.set_epoch(epoch)
+
+    def __iter__(self):
+        # next() only: Lhotse's sampler IS its own iterator and iter() on it restarts the epoch (so no `yield from`,
+        # no returning it to code that may call iter() again)
+        it, k, self.skip = iter(self.sampler), self.skip, 0
+        for _ in range(k):
+            next(it, None)
+        while True:
+            try:
+                yield next(it)
+            except StopIteration:
+                return
+
+
+def wrap_train_sampler(m):
+    """Rebuild NeMo's train DataLoader around SkipFirst(sampler); every other DataLoader setting is kept."""
+    from torch.utils.data import DataLoader
+    old = m._train_dl
+    assert not hasattr(old.dataset, "sampler"), "iterable (tarred / Shar) Lhotse data: sampler lives in the workers"
+    m._train_dl = DataLoader(old.dataset, sampler=SkipFirst(old.sampler), batch_size=None, num_workers=old.num_workers,
+                             collate_fn=old.collate_fn, pin_memory=old.pin_memory, worker_init_fn=old.worker_init_fn,
+                             prefetch_factor=old.prefetch_factor, persistent_workers=old.persistent_workers)
+
+
 class EpochShuffle(Callback):
     """A new (seeded) Lhotse order every data epoch. NeMo hands the sampler to a plain DataLoader and nobody calls
     set_epoch: with a fixed shard_seed every new iterator replays the same batches (run2 v1 trained on its first
     ~280 h eleven times). batch_log: ASR_BATCH_LOG=path writes 'step epoch lens-hash' per batch (replay checks)."""
 
     def __init__(self, aug_schedule=None):
-        self.blog = open(os.environ["ASR_BATCH_LOG"], "w") if os.environ.get("ASR_BATCH_LOG") else None
+        self.blog = open(os.environ["ASR_BATCH_LOG"], "a") if os.environ.get("ASR_BATCH_LOG") else None
         self.aug_schedule = aug_schedule
+        self.done, self.resumed = 0, False                 # batches trained in the current epoch (saved in the ckpt)
+
+    def state_dict(self):
+        return {"done": self.done}
+
+    def load_state_dict(self, state):
+        self.done, self.resumed = state.get("done", 0), True
 
     def on_train_epoch_start(self, trainer, pl_module):
         dl = pl_module._train_dl
         s = getattr(dl.dataset, "sampler", None) or dl.sampler
         s.set_epoch(trainer.current_epoch)
+        # resume mid-epoch: Lightning restores the step but the sampler restarts the epoch (run5 replayed ~1,950
+        # batches). Skip the batches this epoch already trained on: same epoch seed -> same order -> exact position.
+        if self.resumed and isinstance(s, SkipFirst):
+            s.skip = self.done
+            print(f"[run] resume: skipping the {self.done} batches epoch {trainer.current_epoch} already trained on",
+                  flush=True)
+        else:
+            self.done = 0
+        self.resumed = False
         if self.aug_schedule:                          # aug_online: workers fork at this epoch's iter(), inherit p
             import aug_online
             aug_online.STATE.update(p=aug_online.p_for(self.aug_schedule, trainer.current_epoch),
@@ -105,6 +161,7 @@ class EpochShuffle(Callback):
             print(f"[run] epoch {trainer.current_epoch}: augmentation p = {aug_online.STATE['p']}", flush=True)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        self.done += 1
         if self.blog:
             import hashlib
             self.blog.write(f"{trainer.global_step} {trainer.current_epoch} "
@@ -259,10 +316,37 @@ class ValAggregate(Callback):
             for k in ("all", lang):
                 acc[k][0] += float(w) * words
                 acc[k][1] += words
+        if acc["all"][1] < sum(w for _, w in self.sets.values()):
+            # a resume re-enters the interrupted validation loop and runs only its tail (run5 @ 9000 logged an
+            # English-only 20.6 %): never publish an aggregate over a subset of the sources
+            print(f"[run] partial validation at step {trainer.global_step}: aggregate not logged", flush=True)
+            trainer.callback_metrics["val_wer_all"] = torch.tensor(float("inf"))  # ModelCheckpoint raises if missing
+            return
         out = {f"val_wer_{k}": e / n for k, (e, n) in acc.items() if n}
         for k, v in out.items():
             trainer.callback_metrics[k] = torch.tensor(v)
         trainer.logger.log_metrics(out, step=trainer.global_step)
+
+
+def wandb_fork(logger, project, old_id, upto_step):
+    """Manual W&B fork for a resume (rewind / fork_from are private preview on this account): copy the old run's
+    history up to the checkpoint's global step into the NEW run, then tag + rename the old one 'superseded'. The
+    steps the old run logged after the checkpoint (lost with the box) no longer overlap the resumed ones."""
+    import wandb
+    api = wandb.Api()
+    old = api.run(f"{logger.experiment.entity}/{project}/{old_id}")
+    n = 0
+    for row in old.scan_history(page_size=5000):
+        st = row.get("trainer/global_step")
+        if st is None or st > upto_step:
+            continue
+        logger.experiment.log({k: v for k, v in row.items() if not k.startswith("_") and v is not None
+                               and not isinstance(v, dict)})
+        n += 1
+    old.name, old.tags = f"{old.name}-superseded", [*old.tags, "superseded"]
+    old.update()
+    print(f"[run] W&B: resumed as {logger.experiment.id}, copied {n} history rows <= step {upto_step} from {old_id} "
+          f"(now '{old.name}')", flush=True)
 
 
 def main():
@@ -345,6 +429,7 @@ def main():
                   # (shard_seed "trng") and fill buckets from a background thread (timing-dependent batch contents)
                   shard_seed="randomized", concurrent_bucketing=False)
     m.setup_training_data(tr)
+    wrap_train_sampler(m)
     if a.aug_schedule:
         import aug_online
         aug_online.wrap(m._train_dl.dataset)
@@ -407,11 +492,16 @@ def main():
     _, hf_ckpt, wid = (None, None, None) if a.no_hf else hf_sync.pull(a.run, os.path.dirname(a.out))
     resume = os.path.join(ckpt_dir, "last.ckpt") if os.path.exists(os.path.join(ckpt_dir, "last.ckpt")) else hf_ckpt
     resume = a.ckpt or resume
-    logger = RemapLogger(project=a.project, name=a.run, save_dir=ckpt_dir, id=wid, resume="allow",
+    # W&B: a resume gets a NEW run carrying the old one's history up to the checkpoint (wandb_fork); continuing the
+    # old run drew two overlapping lines (run5: the lost 9000-11600 tail and the resumed steps)
+    fork = bool(wid and resume and not a.ckpt)
+    logger = RemapLogger(project=a.project, name=a.run, save_dir=ckpt_dir, id=None if fork else wid, resume="allow",
                          config={**vars(a), "eval_steps": eval_steps, "max_steps": max_steps})
+    define_metrics(logger.experiment)
+    if fork:
+        wandb_fork(logger, a.project, wid, torch.load(resume, map_location="cpu", mmap=True, weights_only=False)["global_step"])
     if not a.no_hf:
         hf_sync.push(a.run, tok_dir=a.tok, wandb_id=logger.experiment.id, block=True)
-    define_metrics(logger.experiment)
     trainer = pl.Trainer(
         devices=1, accelerator="gpu", precision="32-true" if a.bf16_master else "bf16-mixed", max_steps=max_steps, max_epochs=-1,
         val_check_interval=eval_steps, check_val_every_n_epoch=None if eval_steps else 1,
