@@ -163,7 +163,7 @@ class EpochShuffle(Callback):
         # already trained on: same epoch seed -> same order -> exact position (test_resume.py)
         if isinstance(s, SkipFirst):
             s.skip = skip
-        if self.aug_schedule:                          # aug_online: workers fork at this epoch's iter(), inherit p
+        if self.aug_schedule:                          # aug_online reads p in the main process (GPU)
             import aug_online
             aug_online.STATE.update(p=aug_online.p_for(self.aug_schedule, epoch), epoch=epoch)
 
@@ -448,8 +448,8 @@ def main():
     m.setup_training_data(tr)
     wrap_train_sampler(m)
     if a.aug_schedule:
-        import aug_online
-        aug_online.wrap(m._train_dl.dataset)
+        import aug_online                              # on the GPU, after the host->device copy
+        aug_online.install(m, 23 if a.seed is None else a.seed)
     m.compute_eval_loss = True          # the model config had compute_eval_loss: false -> no validation loss at all
     va = OmegaConf.create(OmegaConf.to_container(m.cfg.validation_ds))
     with open_dict(va):
