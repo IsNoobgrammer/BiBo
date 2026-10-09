@@ -131,12 +131,18 @@ def main():
     ap.add_argument("--fused_conv", action="store_true", help="tkf conv module + FFN silu/dropout (voice/asr/fused_conv.py)")
     ap.add_argument("--fused_ctc", action="store_true", help="tkf deterministic CTC loss (voice/asr/fused_ctc.py)")
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--deterministic", action="store_true",
+                    help="bitwise same-seed runs (with --fused_ctc): torch deterministic algorithms, cuDNN deterministic")
     ap.add_argument("--project", default="bibo-asr")
     a = ap.parse_args()
     assert not a.fp32_residual or (a.bf16_master and a.fused_layer), "--fp32_residual needs --bf16_master --fused_layer"
 
     import nemo.collections.asr as nemo_asr
     torch.set_float32_matmul_precision("high")
+    if a.deterministic:    # det_probe.py: without these the gradient bits still differ run to run (cuDNN / cuBLAS)
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = True, False
     # eval_hours 0 = every data epoch. A Lightning "epoch" ends when the Lhotse iterator runs dry, and validation only
     # fires when batch_idx reaches limit_train_batches: an eval interval longer than the data epoch NEVER validates.
     eval_steps = int(a.eval_hours * 3600 / a.batch_sec) or None
