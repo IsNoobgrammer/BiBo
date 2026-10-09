@@ -16,7 +16,9 @@ $P voice/asr/fetch_mix.py --repo fhai50032/asr-english --mix $M
   && mv $A/mix1000_hi/*.jsonl $M/ && touch $M/.hindi_fetched; }
 [ -f $R/train.jsonl ] || $P voice/asr/prep_train.py --mix $M --out $R
 [ -f $E/fleurs_hi.jsonl ] || $P voice/asr/build_eval.py --out $E
-TOK=$A/run1/tok/tokenizer_spe_bpe_v4096                       # run1's joint en/hi tokenizer, same for every arm
+TOK=$A/run1/tok/tokenizer_spe_bpe_v4096   # the joint en/hi tokenizer every run uses (trained for run1; run1 deleted from HF)
+[ -f $TOK/tokenizer.model ] || { mkdir -p $TOK && $P -c "from huggingface_hub import hf_hub_download as h; import shutil
+for f in ('tokenizer.model', 'tokenizer.vocab', 'vocab.txt'): shutil.copy(h('fhai50032/bibo-asr-ckpt', 'run2v2/tok/' + f), '$TOK/' + f)"; }
 H=$($P -c "import json; print(round(sum(json.loads(l)['duration'] for l in open('$R/train.jsonl')) / 3600))")
 echo "train hours per epoch: $H"
 VALS="$(ls $R/val_*.jsonl | grep -v -e '/val_en.jsonl' -e '/val_hi.jsonl') $E/fleurs_en.jsonl $E/fleurs_hi.jsonl"

@@ -9,8 +9,11 @@ set -euo pipefail
 W=/home/marimo/work; A=$W/asr; R=$A/run2; E=$A/eval_sets; P=/home/marimo/asrenv/bin/python
 export TKF=${TKF:-$W/tkf_ctc}                                  # triton-kernel-fused with kernels/sm120/ctc_loss.py
 cd $W/BiBo && git log --oneline -1 && git -C $TKF log --oneline -1
+TOK=$A/run1/tok/tokenizer_spe_bpe_v4096   # the joint en/hi tokenizer every run uses (trained for run1; run1 deleted from HF)
+[ -f $TOK/tokenizer.model ] || { mkdir -p $TOK && $P -c "from huggingface_hub import hf_hub_download as h; import shutil
+for f in ('tokenizer.model', 'tokenizer.vocab', 'vocab.txt'): shutil.copy(h('fhai50032/bibo-asr-ckpt', 'run2v2/tok/' + f), '$TOK/' + f)"; }
 VALS="$(ls $R/val_*.jsonl | grep -v -e '/val_en.jsonl' -e '/val_hi.jsonl') $E/fleurs_en.jsonl $E/fleurs_hi.jsonl"
 $P voice/asr/train_asr.py --run ${RUN:-run2v2} --out $A/exp --seed 23 --train $R/train.jsonl \
-  --tok $A/run1/tok/tokenizer_spe_bpe_v4096 --val $VALS --lr 1e-3 --warmup 1000 --batch_sec 1200 \
+  --tok $TOK --val $VALS --lr 1e-3 --warmup 1000 --batch_sec 1200 \
   --total_hours 3200 --eval_hours 300 --fused_joint --fused_layer --fused_attn --fused_conv --fused_ctc "$@"
 echo RUN2_DONE
