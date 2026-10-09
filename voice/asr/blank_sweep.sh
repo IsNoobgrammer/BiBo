@@ -31,7 +31,7 @@ res = []
 for wav, ref in (("c2m.wav", "ref2m.txt"), ("clip16k.wav", "reference.txt")):
     rw, hw = normalize(open("$M/" + ref, encoding="utf-8").read()), normalize(rows[wav].get("pred_text", ""))
     res.append(f"{wav.split('.')[0]} {100 * wer(rw, hw):5.1f}% ({len(hw)}/{len(rw)} words)")
-print(f"MEETING $RUN blank penalty {float($d):3.1f} rnnt 480 ms |", " | ".join(res), flush=True)
+print(f"MEETING $RUN blank penalty {float($d):g} rnnt 480 ms |", " | ".join(res), flush=True)
 EOF
   $P voice/asr/diag_deletions.py --nemo $NEMO --val $(ls $R/val_*.jsonl) $E/fleurs_en.jsonl $E/fleurs_hi.jsonl \
     --max_per_source 200 --pad 0 --blank_penalty $d 2>&1 | grep -a "^TOTAL"
