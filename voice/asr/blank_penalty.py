@@ -33,7 +33,8 @@ def _patch(cls, name, delta, mask_ids=None):
         out = out.clone()
         out[..., -1] -= delta
         if mask_ids is not None:                  # script lock: these tokens can never be emitted
-            out[..., mask_ids.to(out.device)] = -1e4
+            # pinned + non_blocking: RNN-T greedy decoding runs under CUDA-graph capture, which refuses pageable copies
+            out[..., mask_ids.to(out.device, non_blocking=True)] = -1e4
         return out
 
     setattr(cls, name, wrapped)
@@ -45,8 +46,9 @@ def devanagari_ids(tok_model):
     import sentencepiece as spm
     import torch
     sp = spm.SentencePieceProcessor(model_file=tok_model)
-    return torch.tensor([i for i in range(sp.get_piece_size())
-                         if any("ऀ" <= c <= "ॿ" for c in sp.id_to_piece(i))])
+    ids = torch.tensor([i for i in range(sp.get_piece_size())
+                        if any("ऀ" <= c <= "ॿ" for c in sp.id_to_piece(i))])
+    return ids.pin_memory() if torch.cuda.is_available() else ids
 
 
 def apply(delta, head="rnnt", mask_ids=None):
