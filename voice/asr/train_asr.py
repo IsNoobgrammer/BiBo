@@ -172,6 +172,9 @@ def main():
     ap.add_argument("--lookahead_probs", nargs="*", default=None,
                     help="training mix of the multi-lookahead contexts as RIGHT:PROB, right context in 80 ms frames, "
                          "e.g. 0:0.2 1:0.4 6:0.2 13:0.2 (NeMo default: uniform)")
+    ap.add_argument("--lookaheads", type=int, nargs="*", default=None,
+                    help="replace the trained look-ahead set: RIGHT contexts in 80 ms frames, e.g. 13 6 3 1 0 "
+                         "(the FIRST is the default = validation context; left context 70 kept)")
     ap.add_argument("--fastemit", type=float, default=None, help="FastEmit lambda (model default 0.005)")
     ap.add_argument("--save_steps", type=int, nargs="*", default=[],
                     help="also save a full checkpoint at these global steps (WSD: branch decays from the stable phase)")
@@ -235,6 +238,15 @@ def main():
         for i, layer in enumerate(m.encoder.layers):
             m.encoder.layers[i] = torch.compile(layer, dynamic=True)
 
+    if a.lookaheads:
+        left = m.encoder.att_context_size_all[0][0]
+        m.encoder.att_context_size_all = [[left, r] for r in a.lookaheads]
+        m.encoder.att_context_probs = [1.0 / len(a.lookaheads)] * len(a.lookaheads)
+        m.encoder.set_default_att_context_size([left, a.lookaheads[0]])
+        with open_dict(m.cfg):                                       # saved .nemo / GGUF export see the new set
+            m.cfg.encoder.att_context_size = [[left, r] for r in a.lookaheads]
+            m.cfg.encoder.att_context_probs = m.encoder.att_context_probs
+        print(f"[run] look-ahead set {m.encoder.att_context_size_all}", flush=True)
     if a.lookahead_probs:
         want = {int(r): float(p) for r, p in (x.split(":") for x in a.lookahead_probs)}
         ctxs = [list(c) for c in m.encoder.att_context_size_all]
