@@ -470,7 +470,9 @@ def main():
         m.encoder.att_context_probs = [1.0 / len(a.lookaheads)] * len(a.lookaheads)
         m.encoder.set_default_att_context_size([left, a.lookaheads[0]])
         with open_dict(m.cfg):                                       # saved .nemo / GGUF export see the new set
-            m.cfg.encoder.att_context_size = [[left, r] for r in a.lookaheads]
+            # NeMo's constructor demands left % (r+1) == 0; the mask uses left // (r+1) chunks anyway, so
+            # [70 - 70 % (r+1), r] is the SAME mask ([70,3] made run5.nemo unloadable for streaming eval)
+            m.cfg.encoder.att_context_size = [[left - left % (r + 1), r] for r in a.lookaheads]
             m.cfg.encoder.att_context_probs = m.encoder.att_context_probs
         print(f"[run] look-ahead set {m.encoder.att_context_size_all}", flush=True)
     if a.lookahead_probs:

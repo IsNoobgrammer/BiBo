@@ -10,6 +10,7 @@ NEMO=$A/exp/$RUN/$RUN.nemo
 until [ -f "$NEMO" ]; do sleep 30; done
 sleep 20                                         # let save_to finish writing
 cd $W/BiBo && git log --oneline -1
+$P voice/asr/nemo_ctx_fix.py $NEMO ${NEMO%.nemo}.eval.nemo && NEMO=${NEMO%.nemo}.eval.nemo   # [70,3] -> [68,3]
 $P - <<EOF
 import json, soundfile as sf
 with open("$M/meeting.jsonl", "w") as f:
@@ -17,12 +18,13 @@ with open("$M/meeting.jsonl", "w") as f:
         x, sr = sf.read("$M/" + wav)
         f.write(json.dumps({"audio_filepath": "$M/" + wav, "duration": len(x) / sr, "text": ""}) + "\n")
 EOF
-for att in 0 1 6 13; do
+for att in 0 1 3 6 13; do
+  left=$((70 - 70 % (att + 1)))                  # the training mask's effective left context
   for dec in rnnt ctc; do
     out=$M/$RUN.la$att.$dec.jsonl
     $P $W/NeMo/examples/asr/asr_cache_aware_streaming/speech_to_text_cache_aware_streaming_infer.py \
       model_path=$NEMO dataset_manifest=$M/meeting.jsonl output_path=$out batch_size=1 \
-      "att_context_size=[70,$att]" decoder_type=$dec > $M/$RUN.la$att.$dec.log 2>&1 || { echo "FAILED la$att $dec"; tail -5 $M/$RUN.la$att.$dec.log; continue; }
+      "att_context_size=[$left,$att]" decoder_type=$dec > $M/$RUN.la$att.$dec.log 2>&1 || { echo "FAILED la$att $dec"; tail -5 $M/$RUN.la$att.$dec.log; continue; }
     $P - <<EOF
 import glob, json, sys
 sys.path.insert(0, "voice/asr")
