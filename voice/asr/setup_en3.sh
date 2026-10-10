@@ -17,8 +17,13 @@ if [ ! -f "$M/run5" ]; then
 fi
 echo "run5.nemo ok"
 if [ ! -f "$M/fetch" ]; then
-  (cd $W/BiBo && HF_HUB_ENABLE_HF_TRANSFER=1 $P voice/asr/fetch_mix.py --repo fhai50032/asr-english --mix $A/mix_en) \
-    && touch "$M/fetch" || { echo "FETCH FAILED"; exit 1; }
+  # en3's sources live in THREE repos (base / v2: meetings, far-field, read, VITW / nc: SPGI 2.0, TED-LIUM), merged
+  # into one mix dir. Oct 10: fetching only asr-english left most of en3's rows without audio.
+  for R in asr-english asr-english-v2 asr-english-nc; do
+    (cd $W/BiBo && HF_HUB_ENABLE_HF_TRANSFER=1 $P voice/asr/fetch_mix.py --repo fhai50032/$R --mix $A/mix_en --merge) \
+      || { echo "FETCH FAILED $R"; exit 1; }
+  done
+  touch "$M/fetch"
 fi
 echo "mix_en ok"
 if [ ! -f "$M/en3" ]; then
