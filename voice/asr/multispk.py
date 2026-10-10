@@ -31,7 +31,7 @@ def _text(turns):
     ids, out, prev = {}, [], None
     for s, t in turns:
         ids.setdefault(s, len(ids))
-        if s != prev:
+        if s != prev and ids[s] < len(TOK):       # a 5th+ speaker gets no tag (prep_en strips every tag anyway)
             out.append(TOK[ids[s]])
         out.append(t)
         prev = s
