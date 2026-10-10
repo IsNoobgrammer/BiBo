@@ -11,7 +11,7 @@ pinned batches. Replaces Lhotse's cut objects / buffered sampler / float32 colla
                  <= batch_sec of REAL audio, one partial tail per bucket, order seeded by (seed, epoch); yields int64
                  row-index arrays; set_epoch / len / stats (the preflight).
   FastAudioDataset  __getitem__(row ids) -> (audio int16 (B, Tmax), audio_len int32, tokens int64 (B, Umax),
-                 token_len int32): FLAC decoded straight to int16 into one preallocated buffer, tokens gathered from
+                 token_len int64) -- NeMo's own dtypes: FLAC decoded straight to int16 into one preallocated buffer, tokens gathered from
                  the flat array. DataLoader pin_memory=True pins the int16 batch; install() converts it to float32 on
                  the GPU after the copy (before aug_online, which wraps the same hook).
 
@@ -171,7 +171,7 @@ class FastAudioDataset(torch.utils.data.Dataset):
             alen[k] = len(m) if m.ndim == 1 else m.shape[0]
         audio = audio[:, : int(alen.max())]
         to = ix.a["tok_off"]
-        tl = (to[ids + 1] - to[ids]).astype(np.int32)
+        tl = (to[ids + 1] - to[ids]).astype(np.int64)                         # NeMo's dtype
         toks = np.zeros((len(ids), max(int(tl.max()), 1)), np.int64)
         for k, i in enumerate(ids):
             toks[k, : tl[k]] = ix.a["tok"][to[i]:to[i + 1]]
@@ -244,7 +244,7 @@ def _selftest():
     assert p1 != [b.tolist() for b in plan]
     ds = FastAudioDataset(ix)
     a, al, t, tl = ds[np.array(p1[0])]
-    assert a.dtype == torch.int16 and al.dtype == torch.int32 and t.dtype == torch.int64 and tl.dtype == torch.int32
+    assert a.dtype == torch.int16 and al.dtype == torch.int32 and t.dtype == torch.int64 and tl.dtype == torch.int64
     for k, i in enumerate(p1[0]):
         ref, _ = sf.read(rows[i]["audio_filepath"], dtype="int16")
         assert int(al[k]) == len(ref) and np.array_equal(a[k, : len(ref)].numpy(), ref) and (a[k, len(ref):] == 0).all()

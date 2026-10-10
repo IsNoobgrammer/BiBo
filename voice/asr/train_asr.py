@@ -129,6 +129,21 @@ def wrap_train_sampler(m, a=None):
     from torch.utils.data import DataLoader
     old = m._train_dl
     assert not hasattr(old.dataset, "sampler"), "iterable (tarred / Shar) Lhotse data: sampler lives in the workers"
+    if a is not None and a.loader == "fast":           # fast_loader: numpy index, exact batches, int16 pinned
+        import fast_loader
+        ix = fast_loader.ManifestIndex.load(a.train, os.path.join(a.tok, "tokenizer.model"))
+        ix = ix.filter(lambda v: (v.col("dur") >= 0.1) & (v.col("dur") <= 30.0))   # NeMo's train_ds limits
+        dl, plan = fast_loader.loader(ix, a.batch_sec, a.buckets, 23 if a.seed is None else a.seed, a.workers)
+        st = plan.stats()
+        print(f"[preflight] fast loader: {len(ix)} clips, {st['batches']} batches/epoch, fill {100 * st['fill']:.1f}% "
+              f"(worst {100 * st['min_fill']:.1f}%) of {a.batch_sec:.0f} s, {st['tails']} bucket tails, padding "
+              f"{100 * st['padding']:.1f}%, {st['utts']:.0f} clips/batch, {dl.num_workers} workers", flush=True)
+        assert st["fill"] >= 0.95, f"preflight: batches only {100 * st['fill']:.1f}% full -- fix before training"
+        m._train_dl = torch.utils.data.DataLoader(dl.dataset, sampler=SkipFirst(plan), batch_size=None,
+                                                  num_workers=dl.num_workers, pin_memory=True,
+                                                  persistent_workers=dl.num_workers > 0, prefetch_factor=4)
+        fast_loader.install(m)                         # int16 -> float32 on the GPU, before aug_online's hook
+        return
     sampler = old.sampler
     if a is not None and a.sampler == "packed":
         from packed_sampler import PackedBuckets
@@ -390,6 +405,8 @@ def main():
     ap.add_argument("--buckets", type=int, default=30, help="Lhotse length buckets (more = less padding)")
     ap.add_argument("--sampler", choices=["packed", "lhotse"], default="packed",
                     help="packed = our exact bucketing sampler (packed_sampler.py); lhotse = NeMo's buffered one")
+    ap.add_argument("--loader", choices=["fast", "nemo"], default="fast",
+                    help="fast = fast_loader.py (numpy index, exact batches, int16 pinned); nemo = NeMo/Lhotse loader")
     ap.add_argument("--total_hours", type=float, default=3200, help="audio hours to train on (~7 x 460 h)")
     ap.add_argument("--eval_hours", type=float, default=150,
                     help="evaluate every this many audio hours (must be < one data epoch); 0 = every data epoch")
@@ -414,7 +431,7 @@ def main():
     ap.add_argument("--stop_step", type=int, default=None, help="stop at this global step (schedule unchanged)")
     ap.add_argument("--lr_scale", type=float, default=None, help="multiply the scheduler lrs at train start (resumes)")
     ap.add_argument("--ckpt", default=None, help="resume from this checkpoint (e.g. a --save_steps one, for a decay branch)")
-    ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--workers", type=int, default=None, help="loader workers (default: CPU count - 1)")
     ap.add_argument("--compile_layers", action="store_true")
     ap.add_argument("--fused_joint", action="store_true", help="tkf fused joint + RNN-T loss (voice/asr/fused_joint.py)")
     ap.add_argument("--no_hf", action="store_true", help="A/B and smoke runs: no HF checkpoint pull / push")
@@ -464,7 +481,7 @@ def main():
         tr.pop("tarred_audio_filepaths", None)
         tr.update(manifest_filepath=a.train, is_tarred=False, use_lhotse=True, use_bucketing=True, num_buckets=a.buckets,
                   batch_duration=a.batch_sec, batch_size=None, max_duration=30, min_duration=0.1, shuffle=True,
-                  num_workers=a.workers, shuffle_buffer_size=10000, seed=23 if a.seed is None else a.seed, pin_memory=True,
+                  num_workers=a.workers or max(1, (os.cpu_count() or 2) - 1), shuffle_buffer_size=10000, seed=23 if a.seed is None else a.seed, pin_memory=True,
                   # same seed -> same batches (det_probe.py): NeMo's defaults draw per-worker seeds from the OS RNG
                   # (shard_seed "trng") and fill buckets from a background thread (timing-dependent batch contents)
                   shard_seed="randomized", concurrent_bucketing=False)
