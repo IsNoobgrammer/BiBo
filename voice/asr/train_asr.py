@@ -651,6 +651,19 @@ def main():
     m.setup_optimization(OmegaConf.create({
         "name": "adamw", "lr": a.lr, "betas": [0.9, 0.98], "weight_decay": 1e-3,
         "sched": {"name": "CosineAnnealing", "warmup_steps": a.warmup, "min_lr": 1e-5, "max_steps": max_steps}}))
+    def fuse(opt):                       # NeMo builds AdamW with foreach/fused None: the per-parameter path cost
+        if not a.bf16_master:            # 107.7 ms of CPU per step launching ~700 tensors' kernels (--profile_steps)
+            for g in opt.param_groups:
+                g["foreach"], g["fused"] = False, True
+        return opt
+    fuse(m._optimizer)
+    nemo_configure = m.configure_optimizers
+
+    def configure_optimizers():          # NeMo re-runs setup_optimization at fit time: fuse what it rebuilds
+        out = nemo_configure()
+        fuse(m._optimizer)
+        return out
+    m.configure_optimizers = configure_optimizers
     if a.bf16_master:
         bf16_master.wrap(m._optimizer, clip=1.0)                    # clips on the fp32 masters
     if a.sched == "wsd":
@@ -661,7 +674,7 @@ def main():
         m._scheduler = {"scheduler": sched, "interval": "step", "frequency": 1}
         # NeMo's configure_optimizers() re-runs setup_optimization() at fit time, rebuilding the cosine scheduler
         # over ours (smoke test: lr followed the cosine). Hand Lightning this optimizer + scheduler directly.
-        m.configure_optimizers = lambda: ([m._optimizer], [m._scheduler])
+        m.configure_optimizers = lambda: ([fuse(m._optimizer)], [m._scheduler])
         print(f"[run] WSD: warm-up {a.warmup}, flat to step {int(max_steps * (1 - a.decay_frac))}, "
               f"linear decay to {max_steps}", flush=True)
     print(f"[run] {a.run}: max_steps {max_steps}, eval every {eval_steps} steps (~{a.eval_hours} h), "
