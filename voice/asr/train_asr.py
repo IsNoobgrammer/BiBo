@@ -409,6 +409,7 @@ def main():
     ap.add_argument("--fp32_residual", action="store_true", help="with --bf16_master --fused_layer: fp32 residual stream")
     ap.add_argument("--fused_attn", action="store_true", help="tkf banded rel-pos attention (voice/asr/fused_attn.py)")
     ap.add_argument("--fused_conv", action="store_true", help="tkf conv module + FFN silu/dropout (voice/asr/fused_conv.py)")
+    ap.add_argument("--ctc_only", action="store_true", help="CTC-only training: no RNN-T decoder / joint / loss")
     ap.add_argument("--ctc_head", default=None, help="self-conditioned CTC head, readouts per pass: lin_glu, glu_glu, "
                     "lin_glu_glu ... (selfcond_head.py, fused training loss)")
     ap.add_argument("--fused_ctc", action="store_true", help="tkf deterministic CTC loss (voice/asr/fused_ctc.py)")
@@ -507,6 +508,9 @@ def main():
     if a.fused_ctc:
         import fused_ctc
         fused_ctc.enable(m)
+    if a.ctc_only:                       # before ctc_head: selfcond_head wraps this training_step
+        import ctc_only
+        ctc_only.enable(m)
     if a.ctc_head:                       # after fused_ctc: the eval-time CTC loss still goes through it
         import selfcond_head
         selfcond_head.enable(m, a.ctc_head)
