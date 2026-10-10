@@ -21,7 +21,7 @@ INFO = {
     "spgi2": ("Calls", "kensho/SPGISpeech2.0", "Kensho terms (non-commercial research)", "earnings calls; ~75 s snippets cut at the word alignment into single-speaker pieces <= 25 s"),
     "phone": ("Calls", "sawradip/phone-asr-data", "see origin", "phone conversations"),
     "tedlium": ("Talks / lectures", "kfajdsl/tedlium (TED-LIUM r3 legacy train)", "CC-BY-NC-ND-3.0", "TED talks (human subtitles, auto-aligned); segments containing <unk> dropped"),
-    "nptel": ("Talks / lectures", "skbose/indian-english-nptel-v0", "see origin", "Indian-English university lectures; Qwen3-ASR check dropped rows > 15% WER; `nptel_150h` = the fixed 150 h prep_en trains on"),
+    "nptel": ("Talks / lectures", "skbose/indian-english-nptel-v0", "see origin", "Indian-English university lectures; Qwen3-ASR check dropped rows > 15% WER"),
     "voxpopuli": ("Talks / lectures", "facebook/voxpopuli (en)", "CC0", "European Parliament speeches"),
     "emilia": ("Conversational / web", "MrDragonFox/EN_Emilia_Yodas_616h", "CC-BY-4.0", "spontaneous YouTube English; rows where two independent transcripts agree (<= 5% WER) and audio PQ >= 6.5"),
     "spotify": ("Conversational / web", "SALT-NLP/spotify_podcast_ASR", "see origin", "podcasts, human verbatim, 2-3 speakers"),
