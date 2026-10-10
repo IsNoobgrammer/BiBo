@@ -63,6 +63,11 @@ SOURCES = [
     dict(name="ami_ihm", repo="edinburghcstr/ami", rev=CONV, prefix="ihm/train/", audio="audio", text="text", lang="en",
          hours=None, frac=1.0, windows_only=True, speaker=lambda r: r["speaker_id"],
          extra={"meeting": "meeting_id", "begin": "begin_time"}),           # ONLY as full-meeting <spk> windows
+    dict(name="ami_sdm", repo="edinburghcstr/ami", rev=CONV, prefix="sdm/train/", audio="audio", text="text", lang="en",
+         hours=None, frac=1.0, windows_only=True, speaker=lambda r: r["speaker_id"],
+         extra={"meeting": "meeting_id", "begin": "begin_time"}),           # same meetings, single distant mic (far-field)
+    dict(name="librispeech", repo="openslr/librispeech_asr", rev="main", prefix="all/train.clean.100/", audio="audio",
+         text="text", lang="en", hours=None, frac=1.0, speaker=lambda r: str(r["speaker_id"])),  # read, train-clean-100
     dict(name="spotify", loader="spotify", repo="SALT-NLP/spotify_podcast_ASR", lang="en", hours=None, max_s=60,
          speaker=lambda r: r["filename"]),                                  # human verbatim podcast talk, 2-3 speakers
     dict(name="phone", repo="sawradip/phone-asr-data", rev="main", prefix="data/", audio="audio", text="transcription",

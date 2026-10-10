@@ -25,6 +25,7 @@ from prep_train import REPEAT, VAL_SHARE, WINDOWS_ONLY, _copy, clean  # noqa: E4
 
 DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 VAL_CAP_H = {"phone": 0.5}                     # val hours ceiling per source (default 1 h); phone = 6 speakers, 4 h
+SAME_SPEAKERS = {"ami_ihm": "ami", "ami_sdm": "ami"}   # one recording session, several mics: one val speaker set
 
 
 def split_val(rows, share, cap_h, rng):
@@ -57,7 +58,7 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     rng = lambda *key: random.Random(":".join(map(str, (a.seed,) + key)))     # str seeds are deterministic
-    base, val = [], []
+    base, val, val_spk = [], [], {}
     for man in sorted(glob.glob(os.path.join(a.mix, "*.jsonl"))):
         if man.endswith("_raw.jsonl"):
             continue
@@ -69,7 +70,15 @@ def main():
         if not rows:
             continue
         src = rows[0]["source"]
-        tr, va = split_val(rows, VAL_SHARE.get(src, 0.02), VAL_CAP_H.get(src, 1.0), rng("val", src))
+        grp = SAME_SPEAKERS.get(src)
+        if grp in val_spk:                     # another recording of the same people: reuse its val speakers (no leak)
+            pick = {s.split(":", 1)[-1] for s in val_spk[grp]}
+            va = [r for r in rows if str(r["speaker"]).split(":", 1)[-1] in pick]
+            tr = [r for r in rows if str(r["speaker"]).split(":", 1)[-1] not in pick]
+        else:
+            tr, va = split_val(rows, VAL_SHARE.get(src, 0.02), VAL_CAP_H.get(src, 1.0), rng("val", src))
+        if grp:
+            val_spk[grp] = {r["speaker"] for r in va}
         base += tr
         val += va
         print(f"{src}: train {len(tr)} ({sum(r['duration'] for r in tr) / 3600:.1f} h) x{REPEAT.get(src, 1)}"

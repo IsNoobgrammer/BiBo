@@ -3,7 +3,8 @@
 Speakers are numbered by FIRST APPEARANCE in the window (the model learns "same voice / new voice", not identity), max 4.
 Kinds (all from TRAIN rows only, texts already cleaned), hours per kind from `budgets` (None = as many as exist):
   ami  -- real meetings: consecutive AMI utterances of one meeting at their real start times (real turns + overlap;
-          ihm = close-talk mics summed, so cross-talk bleed is real too). EVERY speaker's words are labelled.
+          ihm = close-talk mics summed, so cross-talk bleed is real too; sdm = the one distant mic, overlaps copied).
+          EVERY speaker's words are labelled.
   hi   -- simulated Hindi conversations: 2-4 different speakers, 0.1-0.8 s gaps, 10% of turns overlap by <= 0.4 s
   cs   -- simulated code-switched conversations: the same, alternating a Hindi and an English speaker
   bc   -- backchannels: speaker A says two utterances; a DIFFERENT speaker's short reply ("okay", "yeah", "haan", "जी")
@@ -19,6 +20,7 @@ import soundfile as sf
 
 MAX_S, SR = 25.0, 16000
 TOK = ["<spk1>", "<spk2>", "<spk3>", "<spk4>"]
+AMI = {"ami_ihm", "ami_sdm"}                    # ihm = close-talk mics summed; sdm = the single distant mic (far-field)
 BACKCHANNELS = {"okay", "ok", "yeah", "yes", "yep", "right", "sure", "hmm", "mhm", "uh huh", "exactly", "correct",
                 "haan", "han", "achha", "accha", "theek hai", "हाँ", "हां", "जी", "हाँ जी", "जी हाँ", "अच्छा", "ठीक है",
                 "हम्म", "सही", "बिल्कुल"}
@@ -44,7 +46,10 @@ def _render(pieces, path):
         o, r, g = p[0], p[1], (p[2] if len(p) > 2 else 1.0)
         x, _ = sf.read(r["audio_filepath"], dtype="float32")
         i = int(o * SR)
-        y[i:i + len(x)] += g * x[: len(y) - i]
+        if r["source"] == "ami_sdm":            # one distant mic: overlapping segments ARE the same signal, copy not sum
+            y[i:i + len(x)] = g * x[: len(y) - i]
+        else:
+            y[i:i + len(x)] += g * x[: len(y) - i]
     peak = np.abs(y).max()
     sf.write(path, y / peak * 0.9 if peak > 1 else y, SR)
     return len(y) / SR
@@ -53,8 +58,8 @@ def _render(pieces, path):
 def _ami_windows(rows, rng):
     by_m = defaultdict(list)
     for r in rows:
-        if r["source"] == "ami_ihm" and r.get("meeting") is not None:
-            by_m[r["meeting"]].append(r)
+        if r["source"] in AMI and r.get("meeting") is not None:
+            by_m[r["source"], r["meeting"]].append(r)      # headset and distant-mic windows kept apart
     wins = []
     for m in by_m.values():
         m.sort(key=lambda r: r["begin"])
@@ -117,7 +122,7 @@ def make(rows, out_dir, budgets, rng):
     os.makedirs(out_dir, exist_ok=True)
     by_lang = {"hi": defaultdict(list), "en": defaultdict(list)}
     for r in rows:
-        if r["duration"] <= 12 and r["source"] != "ami_ihm":
+        if r["duration"] <= 12 and r["source"] not in AMI:
             by_lang[r["lang"]][r["speaker"]].append(r)
     bcs = [r for r in rows if r["duration"] <= 2.0 and r["text"] in BACKCHANNELS]
     ami = _ami_windows(rows, rng)
