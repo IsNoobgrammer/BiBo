@@ -70,7 +70,7 @@ SOURCES = [
          text="text", lang="en", hours=None, frac=1.0, speaker=lambda r: str(r["speaker_id"])),  # read, train-clean-100
     dict(name="earnings22", loader="earnings22", repo="anton-l/earnings22_baseline_5_gram", lang="en", hours=None,
          speaker=lambda r: r["call"]),                                      # earnings calls, many accents (CC BY-SA)
-    dict(name="tedlium", loader="tedlium", repo="kfajdsl/tedlium", lang="en", hours=300,
+    dict(name="tedlium", loader="tedlium", repo="kfajdsl/tedlium", lang="en", hours=None,
          speaker=lambda r: r["talk"]),                                      # TED talks, wide vocabulary (CC BY-NC-ND)
     dict(name="spgi2", loader="spgi2", repo="kensho/SPGISpeech2.0", lang="en", hours=300,
          speaker=lambda r: str(r["spk"])),                                  # earnings calls (Kensho: non-commercial)
@@ -182,17 +182,24 @@ def earnings22_shards(src, seed):
 
 
 def tedlium_shards(src, seed):
-    """kfajdsl/tedlium (mirror of LIUM/tedlium) release 3 legacy train_1 (~300 h of 452, all of it): talk .sph + .stm segments.
+    """kfajdsl/tedlium (mirror of LIUM/tedlium) release 3 legacy train_1 + train_2 (452 h of segments; ~37% have no <unk>): talk .sph + .stm segments.
     Text fixes as ESB: lowercase, "it 's" -> "it's"; a segment with <unk> (an unknown spoken word) is dropped, not
     kept with the word deleted. Speaker = the talk."""
     import re
     import tarfile
     root = os.path.join(src["_out"], "_tedlium_extract")
-    if not os.path.isdir(root):
-        local = hf(hf_hub_download, src["repo"], "TEDLIUM_release3/legacy/train_1.tar.gz", repo_type="dataset")
+    for part in ("train_1", "train_2"):                # all of release 3 legacy train; <unk> rows are dropped below
+        mark = os.path.join(root, f".{part}.done")
+        if os.path.exists(mark) or (part == "train_1" and os.path.isdir(root) and not os.path.exists(os.path.join(root, ".train_2.done"))
+                                    and glob_files(root, ".stm")):
+            if not os.path.exists(mark):
+                open(mark, "w").close()                # train_1 unpacked before these markers existed
+            continue
+        local = hf(hf_hub_download, src["repo"], f"TEDLIUM_release3/legacy/{part}.tar.gz", repo_type="dataset")
         with tarfile.open(local) as t:
             t.extractall(root)
         os.remove(os.path.realpath(local))
+        open(mark, "w").close()
     stms = sorted(glob_files(root, ".stm"))
     random.Random(seed).shuffle(stms)
     # this mirror's tar holds train/<talk>.sph/<talk>.sph (a folder per file): index the audio by talk name
