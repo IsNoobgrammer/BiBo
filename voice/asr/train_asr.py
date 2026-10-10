@@ -376,6 +376,7 @@ def main():
     ap.add_argument("--out", default="/home/marimo/work/asr/exp")
     ap.add_argument("--init", default="stt_en_fastconformer_hybrid_large_streaming_multi")
     ap.add_argument("--batch_sec", type=float, default=1200, help="real audio seconds per batch (Lhotse bucketing)")
+    ap.add_argument("--buckets", type=int, default=30, help="Lhotse length buckets (more = less padding)")
     ap.add_argument("--total_hours", type=float, default=3200, help="audio hours to train on (~7 x 460 h)")
     ap.add_argument("--eval_hours", type=float, default=150,
                     help="evaluate every this many audio hours (must be < one data epoch); 0 = every data epoch")
@@ -448,7 +449,7 @@ def main():
     tr = OmegaConf.create(OmegaConf.to_container(m.cfg.train_ds))
     with open_dict(tr):
         tr.pop("tarred_audio_filepaths", None)
-        tr.update(manifest_filepath=a.train, is_tarred=False, use_lhotse=True, use_bucketing=True, num_buckets=30,
+        tr.update(manifest_filepath=a.train, is_tarred=False, use_lhotse=True, use_bucketing=True, num_buckets=a.buckets,
                   batch_duration=a.batch_sec, batch_size=None, max_duration=30, min_duration=0.1, shuffle=True,
                   num_workers=a.workers, shuffle_buffer_size=10000, seed=23 if a.seed is None else a.seed, pin_memory=True,
                   # same seed -> same batches (det_probe.py): NeMo's defaults draw per-worker seeds from the OS RNG

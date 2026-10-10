@@ -60,6 +60,7 @@ def main():
     ap.add_argument("--ctx", default="68,3", help="fixed look-ahead for every step: LEFT,RIGHT or full")
     ap.add_argument("--steps", type=int, default=14)
     ap.add_argument("--batch_sec", type=float, default=1200)
+    ap.add_argument("--buckets", type=int, default=30, help="Lhotse length buckets (more = less padding)")
     ap.add_argument("--fused", action="store_true")
     ap.add_argument("--bf16_master", action="store_true")
     ap.add_argument("--fused_layer", action="store_true")
@@ -83,7 +84,7 @@ def main():
     tr = OmegaConf.create(OmegaConf.to_container(m.cfg.train_ds))
     with open_dict(tr):
         tr.pop("tarred_audio_filepaths", None)
-        tr.update(manifest_filepath=a.train, is_tarred=False, use_lhotse=True, use_bucketing=True, num_buckets=30,
+        tr.update(manifest_filepath=a.train, is_tarred=False, use_lhotse=True, use_bucketing=True, num_buckets=a.buckets,
                   batch_duration=a.batch_sec, batch_size=None, max_duration=30, min_duration=0.1, shuffle=True,
                   num_workers=12, shuffle_buffer_size=10000, seed=23)
     m.setup_training_data(tr)
