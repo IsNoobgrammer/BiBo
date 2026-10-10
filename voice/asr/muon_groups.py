@@ -141,7 +141,7 @@ class Combined(__import__("torch").optim.Optimizer):
         return "Combined(" + ", ".join(type(o).__name__ for o in self.opts) + ")"
 
 
-def build(model, lr, muon_lr=None, wd=1e-3, muon_wd=None, momentum=0.95, variant="muown", rows=None):
+def build(model, lr, muon_lr=None, wd=1e-3, muon_wd=None, momentum=0.95, variant="muown", ns="dsv4", rows=None):
     """FusedMuon (tkf sm120, variant muown, scale "adam": update RMS 0.2 so the AdamW lr band applies) on the muon*
     groups + fused AdamW on the rest, as one Combined optimizer. Prints the assignment."""
     import torch
@@ -152,9 +152,9 @@ def build(model, lr, muon_lr=None, wd=1e-3, muon_wd=None, momentum=0.95, variant
     mats = [p for _n, p, g, _w in rows if g.startswith("muon")]
     rest = [p for _n, p, g, _w in rows if g == "adamw"]
     muon = FusedMuon([{"params": mats}], lr=muon_lr or lr, momentum=momentum,
-                     weight_decay=wd if muon_wd is None else muon_wd, variant=variant, scale="adam")
+                     weight_decay=wd if muon_wd is None else muon_wd, variant=variant, scale="adam", ns_coeffs=ns)
     adamw = torch.optim.AdamW(rest, lr=lr, betas=(0.9, 0.98), weight_decay=wd, fused=True)
-    print(f"[muon_groups] optimizer: FusedMuon(variant={variant}, lr={muon_lr or lr:g}, wd={wd if muon_wd is None else muon_wd:g}, "
+    print(f"[muon_groups] optimizer: FusedMuon(variant={variant}, ns={ns}, lr={muon_lr or lr:g}, wd={wd if muon_wd is None else muon_wd:g}, "
           f"momentum={momentum}) on {len(mats)} tensors + fused AdamW(lr={lr:g}, wd={wd:g}) on {len(rest)}", flush=True)
     return Combined([muon, adamw])
 
