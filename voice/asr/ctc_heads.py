@@ -11,7 +11,8 @@ Heads (all causal: zero added latency, same behaviour in training and streaming 
   C4  swa4 + mlp      same, window 4 (current + 3 previous)
   E   swa3_sc         input -> causal SWA(w=3) -> vocab (aux) -> + embed(softmax) -> SWA(w=3) -> vocab; no MLP
   F   selfcond_lin    D without the MLP
-  G_ffn4 / G_glu      G with param-matched transformer readouts (d->4d->d vs GLU 8d/3), Gr_* = radial act
+  G_ffn4 / G_glu      G with param-matched transformer readouts (d->4d->d vs GLU 8d/3), Gr_* = radial act,
+                      *_nores = without the residual h + ... (the readout is then a pure 2-layer map to vocab)
   G371                G with CTC loss weights 0.3 / 0.7 / 1.0
   Br/Dr/Jr/Gr         B / D / J / G with BiBo's radial normsilu in the MLP readout instead of SiLU (= Swish)
   J   selfcond_37     D with loss 0.7 final + 0.3 pass 1 (normalised like G/H); F uses the same weights
@@ -80,9 +81,9 @@ class FFNReadout(nn.Module):
       glu : h + down(act(gate(LN h)) * up(LN h)), hidden 8d/3 rounded to 8  (3 * 8/3 d^2 params)
     then Linear d -> vocab. act = SiLU or radial normsilu (on the gate for glu, as in BiBo's experts)."""
 
-    def __init__(self, d, c, kind, radial=False):
+    def __init__(self, d, c, kind, radial=False, residual=True):
         super().__init__()
-        self.kind = kind
+        self.kind, self.residual = kind, residual
         hid = 4 * d if kind == "ffn4" else (8 * d // 3 + 7) // 8 * 8
         self.ln = nn.LayerNorm(d)
         self.up = nn.Linear(d, (2 if kind == "glu" else 1) * hid)
@@ -100,7 +101,7 @@ class FFNReadout(nn.Module):
             x = self.act(g) * u
         else:
             x = self.act(x)
-        return self.out(h + self.down(x))
+        return self.out((h if self.residual else 0) + self.down(x))
 
 
 class Linear(nn.Module):
@@ -192,12 +193,12 @@ class SelfCond3(nn.Module):
     """3-pass self-conditioned CTC: z1 = Linear(h); h2 = h + cur1(p1) + prev1(p1 of frame t-1); z2 = R2(h2);
     h3 = h2 + cur2(p2) + prev2(p2 of t-1); z3 = R3(h3). Loss 0.2 z1 + 0.3 z2 + 0.5 z3. R = MLP or Linear."""
 
-    def __init__(self, d, c, mlp, radial=False, w=(0.2, 0.3, 0.5), readout=None):
+    def __init__(self, d, c, mlp, radial=False, w=(0.2, 0.3, 0.5), readout=None, residual=True):
         super().__init__()
         self.w = w                                             # CTC loss weights of pass 1 / 2 / 3
         self.l1 = nn.Linear(d, c)
         if readout:                                            # "ffn4" / "glu": FFNReadout at passes 2 and 3
-            self.r2, self.r3 = FFNReadout(d, c, readout, radial), FFNReadout(d, c, readout, radial)
+            self.r2, self.r3 = (FFNReadout(d, c, readout, radial, residual), FFNReadout(d, c, readout, radial, residual))
         else:
             self.r2, self.r3 = (MLP(d, c, radial), MLP(d, c, radial)) if mlp else (nn.Linear(d, c), nn.Linear(d, c))
         self.cond = nn.ModuleList([nn.ModuleDict({"cur": nn.Linear(c, d, bias=False), "prev": nn.Linear(c, d, bias=False)})
@@ -248,7 +249,9 @@ def make_head(name, d, c):
            "G_ffn4": lambda: SelfCond3(d, c, True, readout="ffn4"),
            "Gr_ffn4": lambda: SelfCond3(d, c, True, radial=True, readout="ffn4"),
            "G_glu": lambda: SelfCond3(d, c, True, readout="glu"),
-           "Gr_glu": lambda: SelfCond3(d, c, True, radial=True, readout="glu")}
+           "Gr_glu": lambda: SelfCond3(d, c, True, radial=True, readout="glu"),
+           "G_glu_nores": lambda: SelfCond3(d, c, True, readout="glu", residual=False),
+           "Gr_glu_nores": lambda: SelfCond3(d, c, True, radial=True, readout="glu", residual=False)}
     return zoo[name]()
 
 
