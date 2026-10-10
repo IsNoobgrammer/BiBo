@@ -69,7 +69,8 @@ def devanagari_ids(tok_model):
     # + the byte-fallback pieces <0x80>..<0xFF>: with whole Devanagari pieces banned, byte_fallback can still spell
     # them byte by byte (UTF-8 0xE0 0xA4 ..); RT Captions bans the same set (gguf.rs non_latin_tokens)
     ids = torch.tensor([i for i in range(sp.get_piece_size())
-                        if re.fullmatch(r"<0x[89A-F][0-9A-F]>", sp.id_to_piece(i)) or any("ऀ" <= c <= "ॿ" for c in sp.id_to_piece(i))])
+                        if re.fullmatch(r"<0x[89A-F][0-9A-F]>", sp.id_to_piece(i)) or any("ऀ" <= c <= "ॿ" for c in sp.id_to_piece(i))],
+                       dtype=torch.long)                               # an English tokenizer can ban nothing: [] is float
     bias = torch.zeros(sp.get_piece_size() + 1)                        # + blank (last class)
     bias[ids] = -1e4
     return bias.to("cuda") if torch.cuda.is_available() else bias

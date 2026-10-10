@@ -43,7 +43,7 @@ def main():
     ap.add_argument("--bp", type=float, nargs="+", default=[0.0, 0.5, 1.0])
     ap.add_argument("--las", type=int, nargs="+", default=[0, 1, 3, 6, 13])
     ap.add_argument("--meeting", default="/home/marimo/work/asr/eval_meeting")
-    ap.add_argument("--tok", default="/home/marimo/work/asr/en1/tok/tokenizer_spe_bpe_v2047/tokenizer.model")
+    ap.add_argument("--tok", default="/home/marimo/work/asr/en2/tok/tokenizer_spe_bpe_v2047/tokenizer.model")
     a = ap.parse_args()
     torch.set_grad_enabled(False)
     clips = [(sf.read(os.path.join(a.meeting, w))[0].astype(np.float32),
