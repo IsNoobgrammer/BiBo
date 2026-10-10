@@ -39,6 +39,7 @@ class PackedBuckets:
 
     def _batches(self):
         rng = random.Random(f"{self.seed}:{self.epoch}")
+        self._tails = set()
         out = []
         for b in self.buckets:
             ids = b[:]
@@ -53,6 +54,7 @@ class PackedBuckets:
                 acc += d
             if cur:
                 out.append(cur)
+                self._tails.add(id(cur))                  # the bucket's remainder: the only batch allowed short
         rng.shuffle(out)
         return out
 
@@ -68,10 +70,10 @@ class PackedBuckets:
         bs = self._batches()[: n or None]
         real = [sum(self.cuts[i].duration for i in b) for b in bs]
         padded = [len(b) * max(self.cuts[i].duration for i in b) for b in bs]
-        full = [r for r in real if r >= 0.5 * self.batch_sec]          # partial bucket tails reported separately
+        full = [r for b, r in zip(bs, real) if id(b) not in self._tails]   # bucket tails reported separately
         return dict(batches=len(bs), fill=sum(full) / (len(full) * self.batch_sec) if full else 0.0,
-                    partial=len(bs) - len(full), padding=1 - sum(real) / sum(padded),
-                    utts=sum(map(len, bs)) / len(bs), real_s=sum(real) / len(bs))
+                    min_fill=min(full) / self.batch_sec if full else 0.0, tails=len(bs) - len(full),
+                    padding=1 - sum(real) / sum(padded), utts=sum(map(len, bs)) / len(bs), real_s=sum(real) / len(bs))
 
 
 if __name__ == "__main__":
@@ -85,7 +87,7 @@ if __name__ == "__main__":
     cs = [cut(i, rnd.uniform(1, 30)) for i in range(5000)]
     s = PackedBuckets(cs, batch_sec=1200, buckets=10, seed=1)
     st = s.stats()
-    assert st["fill"] > 0.97 and st["partial"] <= 10, st                  # exact packing, <= 1 tail per bucket
+    assert st["fill"] > 0.97 and st["min_fill"] > 0.97 and st["tails"] <= 10, st   # exact packing, <= 1 tail/bucket
     a = [[c.id for c in b] for b in s]
     assert a == [[c.id for c in b] for b in s]                            # same epoch -> same batches
     s.set_epoch(1)
