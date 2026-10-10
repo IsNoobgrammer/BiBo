@@ -61,6 +61,7 @@ def main():
     ap.add_argument("--steps", type=int, default=14)
     ap.add_argument("--batch_sec", type=float, default=1200)
     ap.add_argument("--buckets", type=int, default=30, help="Lhotse length buckets (more = less padding)")
+    ap.add_argument("--sampler", choices=["packed", "lhotse"], default="packed")
     ap.add_argument("--fused", action="store_true")
     ap.add_argument("--bf16_master", action="store_true")
     ap.add_argument("--fused_layer", action="store_true")
@@ -88,6 +89,14 @@ def main():
                   batch_duration=a.batch_sec, batch_size=None, max_duration=30, min_duration=0.1, shuffle=True,
                   num_workers=12, shuffle_buffer_size=10000, seed=23)
     m.setup_training_data(tr)
+    if a.sampler == "packed":                   # the train_asr default: exact batches (packed_sampler.py)
+        from torch.utils.data import DataLoader
+        from packed_sampler import PackedBuckets
+        old = m._train_dl
+        ps = PackedBuckets(old.sampler.cuts[0], a.batch_sec, a.buckets, 23)
+        print("  preflight", {k: round(v, 3) if isinstance(v, float) else v for k, v in ps.stats().items()}, flush=True)
+        m._train_dl = DataLoader(old.dataset, sampler=ps, batch_size=None, num_workers=old.num_workers,
+                                 collate_fn=old.collate_fn, pin_memory=old.pin_memory)
     if a.fused:
         import fused_joint
         fused_joint.enable(m)

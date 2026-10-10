@@ -122,12 +122,23 @@ class SkipFirst:
                 return
 
 
-def wrap_train_sampler(m):
-    """Rebuild NeMo's train DataLoader around SkipFirst(sampler); every other DataLoader setting is kept."""
+def wrap_train_sampler(m, a=None):
+    """Rebuild NeMo's train DataLoader around SkipFirst(sampler); every other DataLoader setting is kept.
+    --sampler packed (default): our PackedBuckets (exact batches, packed_sampler.py) replaces Lhotse's buffered
+    sampler, and the PREFLIGHT runs here: the epoch's fill / padding / clips per batch, abort if batches are short."""
     from torch.utils.data import DataLoader
     old = m._train_dl
     assert not hasattr(old.dataset, "sampler"), "iterable (tarred / Shar) Lhotse data: sampler lives in the workers"
-    m._train_dl = DataLoader(old.dataset, sampler=SkipFirst(old.sampler), batch_size=None, num_workers=old.num_workers,
+    sampler = old.sampler
+    if a is not None and a.sampler == "packed":
+        from packed_sampler import PackedBuckets
+        sampler = PackedBuckets(old.sampler.cuts[0], a.batch_sec, a.buckets, 23 if a.seed is None else a.seed)
+        st = sampler.stats()
+        print(f"[preflight] sampler packed: {st['batches']} batches/epoch, fill {100 * st['fill']:.1f}% "
+              f"(worst {100 * st['min_fill']:.1f}%) of {a.batch_sec:.0f} s, {st['tails']} bucket tails, padding "
+              f"{100 * st['padding']:.1f}%, {st['utts']:.0f} clips/batch", flush=True)
+        assert st["fill"] >= 0.95, f"preflight: batches only {100 * st['fill']:.1f}% full -- fix before training"
+    m._train_dl = DataLoader(old.dataset, sampler=SkipFirst(sampler), batch_size=None, num_workers=old.num_workers,
                              collate_fn=old.collate_fn, pin_memory=old.pin_memory, worker_init_fn=old.worker_init_fn,
                              prefetch_factor=old.prefetch_factor, persistent_workers=old.persistent_workers)
 
@@ -377,6 +388,8 @@ def main():
     ap.add_argument("--init", default="stt_en_fastconformer_hybrid_large_streaming_multi")
     ap.add_argument("--batch_sec", type=float, default=1200, help="real audio seconds per batch (Lhotse bucketing)")
     ap.add_argument("--buckets", type=int, default=30, help="Lhotse length buckets (more = less padding)")
+    ap.add_argument("--sampler", choices=["packed", "lhotse"], default="packed",
+                    help="packed = our exact bucketing sampler (packed_sampler.py); lhotse = NeMo's buffered one")
     ap.add_argument("--total_hours", type=float, default=3200, help="audio hours to train on (~7 x 460 h)")
     ap.add_argument("--eval_hours", type=float, default=150,
                     help="evaluate every this many audio hours (must be < one data epoch); 0 = every data epoch")
@@ -456,7 +469,7 @@ def main():
                   # (shard_seed "trng") and fill buckets from a background thread (timing-dependent batch contents)
                   shard_seed="randomized", concurrent_bucketing=False)
     m.setup_training_data(tr)
-    wrap_train_sampler(m)
+    wrap_train_sampler(m, a)
     if a.aug_schedule:
         import aug_online                              # on the GPU, after the host->device copy
         aug_online.install(m, 23 if a.seed is None else a.seed)
