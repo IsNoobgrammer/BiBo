@@ -740,16 +740,17 @@ def main():
         return out
     m.configure_optimizers = configure_optimizers
     if a.optim == "muown":               # FusedMuon(muown) on the matrices + fused AdamW on the rest (muon_groups.py)
-        assert not a.bf16_master and a.sched == "cosine", "--optim muown: autocast + cosine only"
+        assert not a.bf16_master, "--optim muown: autocast only"
         import muon_groups
         opt = muon_groups.build(m, a.lr, muon_lr=a.muon_lr, wd=1e-3, variant=a.muon_variant, ns=a.muon_ns,
                                 heads=m.encoder.layers[0].self_attn.h if a.muon_heads else 0)
-        sch = muon_groups.warmup_cosine(opt, a.warmup, max_steps, 1e-5)
+        sch = (torch.optim.lr_scheduler.LambdaLR(opt, wsd_lambda(a.warmup, max_steps, a.decay_frac, 1e-5 / a.lr))
+               if a.sched == "wsd" else muon_groups.warmup_cosine(opt, a.warmup, max_steps, 1e-5))
         m._optimizer, m._scheduler = opt, sch
         m.configure_optimizers = lambda: ([opt], [{"scheduler": sch, "interval": "step", "frequency": 1}])
     if a.bf16_master:
         bf16_master.wrap(m._optimizer, clip=1.0)                    # clips on the fp32 masters
-    if a.sched == "wsd":
+    if a.sched == "wsd" and a.optim != "muown":                     # (muown builds its own WSD above)
         for g in m._optimizer.param_groups:                        # NeMo's scheduler may have set a warm-up lr
             g["lr"] = a.lr
             g.pop("initial_lr", None)
@@ -758,6 +759,7 @@ def main():
         # NeMo's configure_optimizers() re-runs setup_optimization() at fit time, rebuilding the cosine scheduler
         # over ours (smoke test: lr followed the cosine). Hand Lightning this optimizer + scheduler directly.
         m.configure_optimizers = lambda: ([fuse(m._optimizer)], [m._scheduler])
+    if a.sched == "wsd":
         print(f"[run] WSD: warm-up {a.warmup}, flat to step {int(max_steps * (1 - a.decay_frac))}, "
               f"linear decay to {max_steps}", flush=True)
     print(f"[run] {a.run}: max_steps {max_steps}, eval every {eval_steps} steps (~{a.eval_hours} h), "
