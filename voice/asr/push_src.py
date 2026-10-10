@@ -13,7 +13,7 @@ import sys
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from huggingface_hub import HfApi
+from huggingface_hub import CommitOperationDelete, HfApi
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from push_mix import FEATURES, ROWS_PER_SHARD  # noqa: E402
@@ -56,6 +56,14 @@ def main():
     api = HfApi()
     api.create_repo(a.repo, repo_type="dataset", private=a.private, exist_ok=True)
     api.upload_large_folder(repo_id=a.repo, repo_type="dataset", folder_path=out)
+    # a re-push with fewer shards must not leave the old ones behind (a config reads every file in the folder)
+    mine = {os.path.relpath(os.path.join(d, f), out).replace(os.sep, "/") for d, _, fs in os.walk(out) for f in fs}
+    stale = [f for f in api.list_repo_files(a.repo, repo_type="dataset")
+             if f.startswith(f"data/{a.source}/") and f.endswith(".parquet") and f not in mine]
+    if stale:
+        api.create_commit(a.repo, repo_type="dataset", operations=[CommitOperationDelete(path_in_repo=f) for f in stale],
+                          commit_message=f"{a.source}: remove {len(stale)} stale shards of an earlier push")
+        print(f"removed {len(stale)} stale shards of {a.source}", flush=True)
     shutil.rmtree(out, ignore_errors=True)                  # the staged parquet copy is not needed after the upload
     print(f"PUSHED {a.source} {len(rows)} rows {sum(r['duration'] for r in rows) / 3600:.1f} h -> {a.repo}", flush=True)
 
