@@ -271,6 +271,9 @@ class ProfileSteps(Callback):
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         g = trainer.global_step
         if g == self.a:
+            opts = trainer.optimizers
+            print(f"[profile] optimizer: {[type(o).__name__ for o in opts]}, groups fused / foreach: "
+                  f"{[(gr.get('fused'), gr.get('foreach')) for o in opts for gr in o.param_groups]}", flush=True)
             torch.cuda.synchronize()
             self.prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                                            torch.profiler.ProfilerActivity.CUDA])
@@ -298,15 +301,20 @@ class ProfileSteps(Callback):
             self.prof.__exit__(None, None, None)
             ev = self.prof.key_averages()
             n = self.b - self.a + 1
-            gpu = sum(e.self_device_time_total for e in ev) / n / 1000
+            from torch.autograd import DeviceType
+            kern = [e for e in self.prof.events() if e.device_type == DeviceType.CUDA]   # kernel / memcpy events only
+            gpu = sum(e.device_time for e in kern) / n / 1000
             print(f"[profile] steps {self.a}-{self.b}: wall {wall:.1f} ms/step, GPU kernels {gpu:.1f} ms/step "
                   f"({100 * gpu / wall:.0f}% busy, {wall - gpu:.1f} ms/step GPU idle)", flush=True)
             print("[profile] top CPU ops by self time (ms/step):", flush=True)
             for e in sorted(ev, key=lambda e: -e.self_cpu_time_total)[:25]:
                 print(f"    {e.self_cpu_time_total / n / 1000:7.2f}  x{e.count / n:<6.1f} {e.key[:90]}", flush=True)
             print("[profile] top CUDA kernels (ms/step):", flush=True)
-            for e in sorted(ev, key=lambda e: -e.self_device_time_total)[:12]:
-                print(f"    {e.self_device_time_total / n / 1000:7.2f}  {e.key[:90]}", flush=True)
+            agg = {}
+            for e in kern:
+                agg[e.name] = agg.get(e.name, 0.0) + e.device_time
+            for k, v in sorted(agg.items(), key=lambda kv: -kv[1])[:12]:
+                print(f"    {v / n / 1000:7.2f}  {k[:90]}", flush=True)
             self.prof = None
         if self.sites is not None and g == self.b + 2:
             import warnings
