@@ -386,7 +386,7 @@ def main():
     ap.add_argument("--decay_frac", type=float, default=0.2)
     ap.add_argument("--lookahead_probs", nargs="*", default=None,
                     help="training mix of the multi-lookahead contexts as RIGHT:PROB, right context in 80 ms frames, "
-                         "e.g. 0:0.2 1:0.4 6:0.2 13:0.2 (NeMo default: uniform)")
+                         "e.g. 0:0.2 1:0.4 6:0.2 13:0.2 full:0.2 (full = the -1 look-ahead; NeMo default: uniform)")
     ap.add_argument("--lookaheads", type=int, nargs="*", default=None,
                     help="replace the trained look-ahead set: RIGHT contexts in 80 ms frames, e.g. 13 6 3 1 0 -1 "
                          "(-1 = full context; the FIRST is the default = validation context; left context 70 kept)")
@@ -485,13 +485,13 @@ def main():
             m.cfg.encoder.att_context_probs = m.encoder.att_context_probs
         print(f"[run] look-ahead set {m.encoder.att_context_size_all}", flush=True)
     if a.lookahead_probs:
-        want = {int(r): float(p) for r, p in (x.split(":") for x in a.lookahead_probs)}
+        want = {(-1 if r == "full" else int(r)): float(p) for r, p in (x.split(":") for x in a.lookahead_probs)}
         ctxs = [list(c) for c in m.encoder.att_context_size_all]
         assert sorted(want) == sorted(c[1] for c in ctxs) and abs(sum(want.values()) - 1) < 1e-6, (want, ctxs)
         m.encoder.att_context_probs = [want[c[1]] for c in ctxs]       # sampled per batch (random.choices)
         with open_dict(m.cfg):
             m.cfg.encoder.att_context_probs = m.encoder.att_context_probs
-        print(f"[run] lookahead mix {dict((c[1] * 80, p) for c, p in zip(ctxs, m.encoder.att_context_probs))} (ms: prob)",
+        print(f"[run] lookahead mix {dict(('full' if c[1] < 0 else c[1] * 80, p) for c, p in zip(ctxs, m.encoder.att_context_probs))} (ms: prob)",
               flush=True)
     if a.fastemit is not None:                                       # fused_joint reads it from the loss config
         with open_dict(m.cfg):
