@@ -42,6 +42,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.environ.get("TKF", "/home/marimo/work/tkf_ctc"))      # tkf kernels (--fused)
 
 MIX = {0: 0.05, 1: 0.20, 3: 0.40, 6: 0.15, 13: 0.20}
 MEETING = (("c2m.wav", "ref2m.txt"), ("clip16k.wav", "reference.txt"), ("g5_16k.wav", "g5_ref_gemini.txt"))
@@ -95,14 +96,18 @@ class FFNReadout(nn.Module):
     def act(self, g):
         return F.silu(g) if self.radial_theta is None else _radial(g, self.radial_theta)
 
-    def forward(self, h):
+    def hidden(self, h):
+        """Everything before the vocab projection (the fused CTC pass takes this and self.out)."""
         x = self.up(self.ln(h))
         if self.kind == "glu":
             g, u = x.chunk(2, -1)
             x = self.act(g) * u
         else:
             x = self.act(x)
-        return self.out((h if self.residual else 0) + self.down(x))
+        return (h if self.residual else 0) + self.down(x)
+
+    def forward(self, h):
+        return self.out(self.hidden(h))
 
 
 class Linear(nn.Module):
@@ -242,6 +247,22 @@ class SelfCondN(nn.Module):
         self.auxs = list(zip(zs[:-1], self.w[:-1]))
         return zs[-1]
 
+    def fused_loss(self, h, hl, tgt, tlen, blank):
+        """Training loss via tkf's fused pass (kernels/sm120/selfcond_ctc.py): sum_i w_i * CTC_i with ctc()'s
+        normalisation (nll / target length, batch mean). Same parameters and maths as forward() + ctc()."""
+        from kernels.sm120.selfcond_ctc import selfcond_ctc_pass
+        d, T = h.shape[-1], h.shape[1]
+        loss, q = 0.0, None
+        for i, r in enumerate(self.r):
+            if i:
+                h = h + (q[..., :d] + F.pad(q[..., d:], (0, 0, 1, 0))[:, :T]).to(h.dtype)
+            x, lin = (h, r) if isinstance(r, nn.Linear) else (r.hidden(h), r.out)
+            wf = (torch.cat([self.cond[i]["cur"].weight, self.cond[i]["prev"].weight], 0)
+                  if i < self.npass - 1 else None)
+            nll, q = selfcond_ctc_pass(x, lin.weight, lin.bias, wf, tgt, hl, tlen, blank)
+            loss = loss + self.w[i] * (nll / tlen.clamp(min=1)).mean()
+        return loss
+
 
 class SelfCond(nn.Module):
     def __init__(self, d, c, final_w=1.0, aux_w=0.3, radial=False):
@@ -303,6 +324,7 @@ def main():
     ap.add_argument("--meeting", default="/home/marimo/work/asr/eval_meeting")
     ap.add_argument("--steps", type=int, default=2700, help="~8 min on the RTX PRO 6000 (1,500 steps took 4.5 min)")
     ap.add_argument("--minutes", type=float, default=13, help="training wall-clock budget (sets --steps after 100)")
+    ap.add_argument("--fused", action="store_true", help="train SelfCondN heads with tkf's fused CTC pass")
     ap.add_argument("--per_pass", action="store_true", help="also score pass 1 / 2 of the 3-pass heads")
     ap.add_argument("--save", default=None, help="save the trained heads here (.pt), e.g. for head_diag.py")
     ap.add_argument("--tok", default=None, help="tokenizer dir for the heads (default: the model's own)")
@@ -364,6 +386,11 @@ def main():
         loss = 0.0
         with torch.autocast("cuda", dtype=torch.bfloat16):
             for k, head in heads.items():
+                if a.fused and hasattr(head, "fused_loss"):
+                    li = head.fused_loss(h, hl, tgt, tlen, blank)
+                    run[k] += li.item()
+                    loss = loss + li
+                    continue
                 li = getattr(head, "final_w", 1.0) * ctc(head(h), hl, tgt, tlen, blank)
                 if getattr(head, "aux", None) is not None:
                     li = li + getattr(head, "aux_w", 0.3) * ctc(head.aux, hl, tgt, tlen, blank)
