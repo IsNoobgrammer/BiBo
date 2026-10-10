@@ -74,6 +74,12 @@ SOURCES = [
          speaker=lambda r: r["talk"]),                                      # TED talks, wide vocabulary (CC BY-NC-ND)
     dict(name="spgi2", loader="spgi2", repo="kensho/SPGISpeech2.0", lang="en", hours=300,
          speaker=lambda r: str(r["spk"])),                                  # earnings calls (Kensho: non-commercial)
+    # Voices-in-the-Wild (Apache-2.0): LibriSpeech-train / Common Voice sentences re-recorded through simulated
+    # acoustics; English rows only (its question field), 24 kHz -> resampled. No speaker ids (each row its own).
+    *[dict(name=f"vitw_{s}", repo="zhifeixie/Voices-in-the-Wild-2M", rev="main", prefix=f"data/{s}-", audio="audio",
+           text="answer", lang="en", hours=50, frac=1.0, cols=["question", "name"],
+           keep=lambda r: r["question"].startswith("Please transcribe"), speaker=lambda r: r["name"])
+      for s in ("distortion", "dropout", "echo", "far_field", "noise", "obstructed", "recording", "far_field_noise")],
     dict(name="spotify", loader="spotify", repo="SALT-NLP/spotify_podcast_ASR", lang="en", hours=None, max_s=60,
          speaker=lambda r: r["filename"]),                                  # human verbatim podcast talk, 2-3 speakers
     dict(name="phone", repo="sawradip/phone-asr-data", rev="main", prefix="data/", audio="audio", text="transcription",

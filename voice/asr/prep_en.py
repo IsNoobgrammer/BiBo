@@ -85,8 +85,14 @@ def main():
               f"{' windows only' if src in WINDOWS_ONLY else ''}  val {len(va)} ({sum(r['duration'] for r in va) / 3600:.2f} h, "
               f"{len({r['speaker'] for r in va})} speakers)",
               flush=True)
+    # one sentence can sit in several sources (Voices-in-the-Wild re-records LibriSpeech train sentences): a training
+    # row whose text IS a val sentence (>= 4 words) is dropped, whatever source it came from
+    held = {r["text"] for r in val if len(r["text"].split()) >= 4}
+    n0 = len(base)
+    base = [r for r in base if r["text"] not in held]
+    print(f"dropped {n0 - len(base)} train rows whose text is a val sentence", flush=True)
     single = [r for r in base if r["source"] not in WINDOWS_ONLY]
-    jobs = [(r, k) for r in single for k in range(1, REPEAT.get(r["source"], 1))]
+    jobs =[(r, k) for r in single for k in range(1, REPEAT.get(r["source"], 1))]
     copies = []
     if jobs:                                   # ponytail: every source is x1 today, so normally no audio is written
         babble = [r["audio_filepath"] for r in rng("babble").sample(base, min(3000, len(base)))]
