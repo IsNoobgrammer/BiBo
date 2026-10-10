@@ -21,9 +21,30 @@ from multiprocessing import Pool
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import multispk  # noqa: E402
-from prep_train import REPEAT, VAL_SHARE, WINDOWS_ONLY, _copy, clean, split_by_speaker  # noqa: E402
+from prep_train import REPEAT, VAL_SHARE, WINDOWS_ONLY, _copy, clean  # noqa: E402
 
 DEVANAGARI = re.compile(r"[ऀ-ॿ]")
+VAL_CAP_H = {"phone": 0.5}                     # val hours ceiling per source (default 1 h); phone = 6 speakers, 4 h
+
+
+def split_val(rows, share, cap_h, rng):
+    """Whole speakers to val in a seeded order until share of the hours is reached, skipping any speaker that would
+    push val past cap_h (a big speaker stays in train); never an unlabelled speaker ("<src>:None")."""
+    hrs = {}
+    for r in rows:
+        hrs[r["speaker"]] = hrs.get(r["speaker"], 0) + r["duration"] / 3600
+    spk = sorted(s for s in hrs if not str(s).endswith(":None"))
+    rng.shuffle(spk)
+    target, val_spk, h = min(share * sum(hrs.values()), cap_h), set(), 0.0
+    for s in spk:
+        if h >= target:
+            break
+        if h + hrs[s] <= cap_h:
+            val_spk.add(s)
+            h += hrs[s]
+    if not val_spk and spk:                    # every speaker is over the cap: the smallest one
+        val_spk = {min(spk, key=hrs.get)}
+    return [r for r in rows if r["speaker"] not in val_spk], [r for r in rows if r["speaker"] in val_spk]
 
 
 def main():
@@ -48,11 +69,12 @@ def main():
         if not rows:
             continue
         src = rows[0]["source"]
-        tr, va = split_by_speaker(rows, VAL_SHARE.get(src, 0.02), rng("val", src))
+        tr, va = split_val(rows, VAL_SHARE.get(src, 0.02), VAL_CAP_H.get(src, 1.0), rng("val", src))
         base += tr
         val += va
         print(f"{src}: train {len(tr)} ({sum(r['duration'] for r in tr) / 3600:.1f} h) x{REPEAT.get(src, 1)}"
-              f"{' windows only' if src in WINDOWS_ONLY else ''}  val {len(va)} ({len({r['speaker'] for r in va})} speakers)",
+              f"{' windows only' if src in WINDOWS_ONLY else ''}  val {len(va)} ({sum(r['duration'] for r in va) / 3600:.2f} h, "
+              f"{len({r['speaker'] for r in va})} speakers)",
               flush=True)
     single = [r for r in base if r["source"] not in WINDOWS_ONLY]
     jobs = [(r, k) for r in single for k in range(1, REPEAT.get(r["source"], 1))]
@@ -91,4 +113,7 @@ def main():
 
 
 if __name__ == "__main__":
+    _r = [{"speaker": s, "duration": 3600 * h} for s, h in (("p:A", 0.8), ("p:B", 0.7), ("p:C", 0.24), ("p:None", 3))]
+    _tr, _va = split_val(_r, 0.02, 0.5, random.Random(0))
+    assert {r["speaker"] for r in _va} == {"p:C"}, _va                 # only the speaker under the cap; never None
     main()
