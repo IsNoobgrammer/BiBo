@@ -13,6 +13,7 @@ Heads (all causal: zero added latency, same behaviour in training and streaming 
   F   selfcond_lin    D without the MLP
   G_ffn4 / G_glu      G with param-matched transformer readouts (d->4d->d vs GLU 8d/3), Gr_* = radial act,
                       *_nores = without the residual h + ... (the readout is then a pure 2-layer map to vocab)
+  S2_lin_glu / S2_glu_glu   2-pass: Linear or GLU readout at pass 1, GLU at pass 2 (loss 0.3 / 0.7)
   G371                G with CTC loss weights 0.3 / 0.7 / 1.0
   Br/Dr/Jr/Gr         B / D / J / G with BiBo's radial normsilu in the MLP readout instead of SiLU (= Swish)
   J   selfcond_37     D with loss 0.7 final + 0.3 pass 1 (normalised like G/H); F uses the same weights
@@ -218,6 +219,30 @@ class SelfCond3(nn.Module):
         return z3
 
 
+class SelfCondN(nn.Module):
+    """N-pass self-conditioned CTC with a readout per pass ("lin" = Linear d->vocab, "glu" = FFNReadout glu with the
+    residual): z_1 = R_1(h); h_{i+1} = h_i + cur_i(p_i) + prev_i(p_i of frame t-1); z_i = R_i(h_i). Loss sum w_i z_i,
+    the last pass is decoded."""
+
+    def __init__(self, d, c, readouts, w):
+        super().__init__()
+        self.npass, self.w = len(readouts), w
+        self.r = nn.ModuleList([nn.Linear(d, c) if k == "lin" else FFNReadout(d, c, k) for k in readouts])
+        self.cond = nn.ModuleList([nn.ModuleDict({"cur": nn.Linear(c, d, bias=False), "prev": nn.Linear(c, d, bias=False)})
+                                   for _ in range(self.npass - 1)])
+        self.auxs, self.final_w = None, w[-1]
+
+    def forward(self, h):
+        zs = []
+        for i, r in enumerate(self.r):
+            if i:
+                p = zs[-1].float().softmax(-1).to(h.dtype)
+                h = h + self.cond[i - 1]["cur"](p) + self.cond[i - 1]["prev"](F.pad(p, (0, 0, 1, 0))[:, : p.shape[1]])
+            zs.append(r(h))
+        self.auxs = list(zip(zs[:-1], self.w[:-1]))
+        return zs[-1]
+
+
 class SelfCond(nn.Module):
     def __init__(self, d, c, final_w=1.0, aux_w=0.3, radial=False):
         super().__init__()
@@ -250,6 +275,8 @@ def make_head(name, d, c):
            "Gr_ffn4": lambda: SelfCond3(d, c, True, radial=True, readout="ffn4"),
            "G_glu": lambda: SelfCond3(d, c, True, readout="glu"),
            "Gr_glu": lambda: SelfCond3(d, c, True, radial=True, readout="glu"),
+           "S2_lin_glu": lambda: SelfCondN(d, c, ["lin", "glu"], (0.3, 0.7)),
+           "S2_glu_glu": lambda: SelfCondN(d, c, ["glu", "glu"], (0.3, 0.7)),
            "G_glu_nores": lambda: SelfCond3(d, c, True, readout="glu", residual=False),
            "Gr_glu_nores": lambda: SelfCond3(d, c, True, radial=True, readout="glu", residual=False)}
     return zoo[name]()
@@ -370,8 +397,9 @@ def main():
     every = {k: (v, m.tokenizer, blank, 0.0) for k, v in heads.items()}
     if a.per_pass:   # also decode pass 1 / pass 2 of the multi-pass heads (their intermediate CTC outputs)
         for k, v in list(heads.items()):
-            if isinstance(v, SelfCond3):
-                for i in (0, 1):
+            n = 3 if isinstance(v, SelfCond3) else getattr(v, "npass", 1)
+            if n > 1:
+                for i in range(n - 1):
                     every[f"{k}/p{i + 1}"] = ((lambda h, v=v, i=i: (v(h), v.auxs[i][0])[1]), m.tokenizer, blank, 0.0)
     every["run5"] = (lambda h: old_ctc(encoder_output=h.transpose(1, 2)).float(), old_tok,
                      old_ctc.decoder_layers[0].out_channels - 1, lock)
