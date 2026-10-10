@@ -52,6 +52,9 @@ def numo_ok(r):
 # EN per variant ~400: [emilia + nptel pools: nptel50 = emilia ~200 + nptel 50, nptel150 = emilia 100 + nptel ~150]
 #   + ami windows ~80 + spotify + phone + voxpopuli 20 + people's speech 15 + svarah ~9 + medical ~8 + phone
 # HI 600: indicvoices 300 + numo 120 + vaani 100 + kathbath 50 + hinglish 20 + lahaja ~11
+# English hours per Voices-in-the-Wild condition: weighted to meetings / VoIP (far-field + noise, transmission dropout)
+VITW_HOURS = {"far_field_noise": 100, "noise": 80, "dropout": 80, "obstructed": 60, "far_field": 50, "recording": 50,
+              "echo": 30, "distortion": 20}
 SOURCES = [
     # --- English pools for the two variants ---
     dict(name="emilia", repo="MrDragonFox/EN_Emilia_Yodas_616h", rev="main", prefix="data/train-", audio="audio",
@@ -79,9 +82,9 @@ SOURCES = [
     # Voices-in-the-Wild (Apache-2.0): LibriSpeech-train / Common Voice sentences re-recorded through simulated
     # acoustics; English rows only (its question field), 24 kHz -> resampled. No speaker ids (each row its own).
     *[dict(name=f"vitw_{s}", repo="zhifeixie/Voices-in-the-Wild-2M", rev="main", prefix=f"data/{s}-", audio="audio",
-           text="answer", lang="en", hours=50, frac=1.0, cols=["question", "name"],
+           text="answer", lang="en", hours=h, frac=1.0, cols=["question", "name"],
            keep=lambda r: r["question"].startswith("Please transcribe"), speaker=lambda r: r["name"])
-      for s in ("distortion", "dropout", "echo", "far_field", "noise", "obstructed", "recording", "far_field_noise")],
+      for s, h in VITW_HOURS.items()],
     dict(name="spotify", loader="spotify", repo="SALT-NLP/spotify_podcast_ASR", lang="en", hours=None, max_s=60,
          speaker=lambda r: r["filename"]),                                  # human verbatim podcast talk, 2-3 speakers
     dict(name="phone", repo="sawradip/phone-asr-data", rev="main", prefix="data/", audio="audio", text="transcription",
