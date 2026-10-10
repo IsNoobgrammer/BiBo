@@ -75,7 +75,7 @@ SOURCES = [
     dict(name="spgi2", loader="spgi2", repo="kensho/SPGISpeech2.0", lang="en", hours=300,
          speaker=lambda r: str(r["spk"])),                                  # earnings calls (Kensho: non-commercial)
     dict(name="notsofar", loader="notsofar", repo="microsoft/NOTSOFAR", lang="en", hours=None,
-         speaker=lambda r: r["meeting"], extra={"device": "device"}),       # real far-field office meetings, <spk> windows
+         speaker=lambda r: r["meeting"], extra={"device": "device"}),       # real far-field office meetings, word-cut windows
     # Voices-in-the-Wild (Apache-2.0): LibriSpeech-train / Common Voice sentences re-recorded through simulated
     # acoustics; English rows only (its question field), 24 kHz -> resampled. No speaker ids (each row its own).
     *[dict(name=f"vitw_{s}", repo="zhifeixie/Voices-in-the-Wild-2M", rev="main", prefix=f"data/{s}-", audio="audio",
@@ -300,9 +300,11 @@ def meeting_windows(segs, max_s=25.0):
 
 def notsofar_shards(src, seed):
     """microsoft/NOTSOFAR train 240825.1 (72 real office meetings, ~6 min, CC-BY-4.0; the older train releases hold
-    the dev-1 meetings): every far-field device (sc_* and mc_* channel 0, ~9 per meeting) cut into meeting_windows
-    with <spk> turn tags. Speaker = the meeting, so val takes whole meetings across all devices."""
-    from multispk import _text
+    the dev-1 meetings): every far-field device (sc_* and mc_* channel 0, ~9 per meeting) cut into windows at WORD
+    level -- meeting_windows over every speaker's word timings, so a cut falls between words even inside overlapped
+    speech (no overlap stretch is lost); text = the words in start-time order (the order CTC needs), no speaker tags.
+    Audio is cut half-way between a window's last word and the next one. Speaker = the meeting (val takes whole
+    meetings across all devices)."""
     base = "benchmark-datasets/train_set/240825.1_train/MTG/"
     files = hf(HfApi().list_repo_files, src["repo"], repo_type="dataset")
     meets = sorted({f[len(base):].split("/")[0] for f in files if f.startswith(base)})
@@ -310,18 +312,19 @@ def notsofar_shards(src, seed):
 
     def shard(m):
         gt = json.load(open(hf(hf_hub_download, src["repo"], f"{base}{m}/gt_transcription.json", repo_type="dataset")))
-        segs = [(g["start_time"], g["end_time"], g["speaker_id"], g["text"]) for g in gt]
-        wins = [w for w in meeting_windows(segs) if len({s for s, _ in w[2]}) <= 4]   # <spk1..4> only (4-8 attend)
+        words = [(w[1], w[2], g["speaker_id"], w[0]) for g in gt for w in g.get("word_timing") or [] if w[2] > w[1]]
+        wins = meeting_windows(words)
         rows = []
         for f in sorted(f for f in files if f.startswith(f"{base}{m}/") and f.endswith("/ch0.wav")
                         and f.split("/")[-2].startswith(("sc_", "mc_"))):
             local = hf(hf_hub_download, src["repo"], f, repo_type="dataset")
             x, sr = sf.read(local, dtype="float32")
             os.remove(os.path.realpath(local))
-            for lo, hi, turns in wins:
-                a, b = max(lo - 0.2, 0.0), hi + 0.2
-                rows.append({"audio": _wav(x[int(a * sr): int(b * sr)], sr), "text": _text(turns), "meeting": m,
-                             "device": f.split("/")[-2]})
+            for i, (lo, hi, ws) in enumerate(wins):
+                a = (wins[i - 1][1] + lo) / 2 if i else max(lo - 0.2, 0.0)
+                b = (hi + wins[i + 1][0]) / 2 if i + 1 < len(wins) else hi + 0.2
+                rows.append({"audio": _wav(x[int(a * sr): int(b * sr)], sr), "text": " ".join(t for _, t in ws),
+                             "meeting": m, "device": f.split("/")[-2]})
         return rows
     return [(lambda m=m: shard(m)) for m in meets]
 

@@ -6,7 +6,8 @@
 Same text convention, speaker-disjoint val shares, repeats and AMI meeting windows as prep_train.py, but every random
 choice has its OWN generator seeded by (seed, purpose, source): adding, dropping or reordering other data (Hindi, new
 English sources) never moves an existing source's val speakers. A mix dir that also holds Hindi manifests is fine:
-only lang == "en" rows (no Devanagari) are read. Tokenizer: English SentencePiece BPE on the training text, <spk1..4>.
+only lang == "en" rows (no Devanagari) are read. Plain ASR: no speaker tags anywhere (the meeting windows'
+turn tags are stripped). Tokenizer: English SentencePiece BPE on the training text, no user-defined symbols.
 """
 import argparse
 import glob
@@ -24,7 +25,7 @@ import multispk  # noqa: E402
 from prep_train import REPEAT, VAL_SHARE, WINDOWS_ONLY, _copy, clean  # noqa: E402
 
 DEVANAGARI = re.compile(r"[ऀ-ॿ]")
-SPK = re.compile(r"(<spk[1-4]>)")
+SPK = re.compile(r"<spk[1-9]>")
 VAL_CAP_H = {"phone": 0.5}                     # val hours ceiling per source (default 1 h); phone = 6 speakers, 4 h
 SAME_SPEAKERS = {"ami_ihm": "ami", "ami_sdm": "ami"}   # one recording session, several mics: one val speaker set
 
@@ -65,8 +66,8 @@ def main():
             continue
         rows = [json.loads(l) for l in open(man, encoding="utf-8")]
         rows = [r for r in rows if r.get("lang") == "en" and "unintelligible" not in r["text"].lower()]
-        for r in rows:                         # <spkN> turn tags (meeting windows) survive the cleaning
-            r["text"] = " ".join(p if SPK.fullmatch(p) else clean(p) for p in SPK.split(r["text"]) if p.strip()).strip()
+        for r in rows:
+            r["text"] = clean(r["text"])
         rows = [r for r in rows if r["text"] and not DEVANAGARI.search(r["text"])]
         if not rows:
             continue
@@ -102,6 +103,8 @@ def main():
             copies = p.starmap(partial(_copy, out_dir=os.path.join(a.out, "aug"), babble=babble), jobs, chunksize=64)
     no_sim = {"hi": 0, "cs": 0, "bc": 0}       # English-only: real AMI meeting windows, no simulated mixes
     train = single + copies + multispk.make(base, os.path.join(a.out, "multispk"), {"ami": None, **no_sim}, rng("multispk"))
+    for r in train:                            # plain ASR, no diarization: the meeting windows' <spkN> turn tags go
+        r["text"] = " ".join(SPK.sub(" ", r["text"]).split())
     rng("shuffle").shuffle(train)
     write = lambda name, rs: open(os.path.join(a.out, name), "w", encoding="utf-8").writelines(
         json.dumps(r, ensure_ascii=False) + "\n" for r in rs)
@@ -118,8 +121,8 @@ def main():
     if not os.path.isdir(os.path.join(tok, f"tokenizer_spe_bpe_v{a.vocab}")):
         subprocess.run([sys.executable, os.path.join(a.nemo, "scripts/tokenizers/process_asr_text_tokenizer.py"),
                         "--data_file", os.path.join(a.out, "tokenizer.txt"), "--data_root", tok,
-                        "--vocab_size", str(a.vocab), "--tokenizer", "spe", "--spe_type", "bpe", "--no_lower_case",
-                        "--spe_user_defined_symbols", "<spk1>", "<spk2>", "<spk3>", "<spk4>"], check=True)
+                        "--vocab_size", str(a.vocab), "--tokenizer", "spe", "--spe_type", "bpe", "--no_lower_case"],
+                       check=True)
     by = {}
     for r in train:
         by[r.get("source")] = by.get(r.get("source"), 0) + r["duration"] / 3600
