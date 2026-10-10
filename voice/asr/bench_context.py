@@ -43,7 +43,9 @@ def main():
         T = enc(audio_signal=f, length=fl)[0].shape[-1]   # the encoder's real frame count (not a guess: +-1 frame
                                                           # puts the last frame in its own chunk)
 
-    def step(ctx, keep=False):
+    def step(ctx, keep=False, nemo=False):
+        enc._fused_off = nemo or ctx == "nemo"     # NeMo's own attention ("nemo" row = full context through it)
+        ctx = [-1, -1] if ctx == "nemo" else ctx
         enc.att_context_size_all = [ctx]           # sampled context = this one
         enc.set_default_att_context_size(ctx)
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -68,18 +70,22 @@ def main():
 
     print(f"batch {a.utts} x {a.sec:.0f} s = {a.utts * a.sec:.0f} s of audio, T = {T} encoder frames", flush=True)
     rows = [("80 ms   [70,1]", [70, 1]), ("240 ms  [68,3]", [68, 3]), ("480 ms  [70,6]", [70, 6]),
-            ("1040 ms [70,13]", [70, 13]), ("full, NeMo attention [-1,-1]", [-1, -1]),
-            ("full, fused one chunk [0,T-1]", [0, T - 1])]
+            ("1040 ms [70,13]", [70, 13]), ("full, NeMo attention [-1,-1]", "nemo"), ("full, fused [-1,-1]", [-1, -1])]
     for name, ctx in rows:
         bench(ctx)                                 # pass 1: warm every shape
     for rep in (1, 2):
         for name, ctx in rows:
             ms, gb = bench(ctx)
             print(f"rep {rep}  {name:32s} {ms:7.1f} ms/step  {a.utts * a.sec / ms * 1000:8.0f} audio-s/s (encoder fwd+bwd)  peak {gb:5.1f} GB", flush=True)
-    m.eval()                                       # dropout off: the two paths must match exactly-ish
-    (e1, g1), (e2, g2) = step([-1, -1], keep=True), step([0, T - 1], keep=True)
+    m.eval()                                       # dropout off: the two paths must match up to bf16 rounding
     rel = lambda x, y: ((x - y).norm() / y.norm()).item()
-    print(f"parity full NeMo vs fused one-chunk: out {rel(e2, e1):.2e}  dWq(layer 8) {rel(g2, g1):.2e}", flush=True)
+    for name, c in (("full [-1,-1]", [-1, -1]), ("240 ms [68,3]", [68, 3])):
+        enc._fused_calls = 0
+        e2, g2 = step(c, keep=True)
+        calls = enc._fused_calls
+        e1, g1 = step(c, keep=True, nemo=True)
+        print(f"parity {name}: fused vs NeMo attention: out {rel(e2, e1):.2e}  dWq(layer 8) {rel(g2, g1):.2e}  "
+              f"(fused kernel calls in the fused pass: {calls})", flush=True)
 
 
 if __name__ == "__main__":

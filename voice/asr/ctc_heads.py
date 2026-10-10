@@ -49,7 +49,8 @@ MEETING = (("c2m.wav", "ref2m.txt"), ("clip16k.wav", "reference.txt"), ("g5_16k.
 
 
 def set_lookahead(enc, r):
-    enc.set_default_att_context_size([70 - 70 % (r + 1), r])      # = the training mask (70 // (r+1) chunks)
+    enc.set_default_att_context_size([-1, -1] if r < 0 else [70 - 70 % (r + 1), r])   # -1 = full context; else
+    #                                                                 the training mask (70 // (r+1) chunks)
 
 
 class MLP(nn.Module):

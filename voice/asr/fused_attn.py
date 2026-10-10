@@ -6,8 +6,8 @@ core (bench/bench_relpos_attn.py); parity_check/parity_relpos_attn.py gates it a
 
 The kernel needs the batch lengths and this step's att_context_size (training samples one of [70,13] [70,6] [70,1]
 [70,0] per batch), not the (B, T, T) mask: ConformerEncoder._create_masks is wrapped to record both, and every
-attention layer reads them. Anything else (streaming cache, other attention styles, unlimited right context, batched
-pos_emb) calls NeMo's forward.
+attention layer reads them. Anything else (streaming cache, other attention styles, a right-unlimited band [left >= 0, -1],
+batched pos_emb) calls NeMo's forward. Full context [-1, -1] (offline / voice typing) runs in the kernel as one chunk.
 
     import fused_attn; fused_attn.enable(model)
 """
@@ -38,10 +38,13 @@ def enable(model):
     def forward(self, query, key, value, mask, pos_emb, cache=None):
         ctx = getattr(enc, "_fused_ctx", None)
         B, T = query.shape[0], query.shape[1]
-        if (cache is not None or ctx is None or ctx[2] is not None or ctx[0][1] < 0 or pos_emb.size(0) != 1
+        if (cache is not None or ctx is None or ctx[2] is not None or (ctx[0][1] < 0 and ctx[0][0] >= 0)
+                or getattr(enc, "_fused_off", False)        # parity checks: force NeMo's attention
+                or pos_emb.size(0) != 1
                 or pos_emb.size(1) != 2 * T - 1 or key is not query or value is not query):
             return self._nemo_forward(query, key, value, mask, pos_emb, cache=cache)
         (left, right), lengths, _ = ctx
+        enc._fused_calls += 1                    # parity / plumbing checks assert the kernel really ran
         # NeMo's dtypes: under bf16 autocast its avoid_float16_autocast_context is a no-op, so the projections and the
         # attention matmuls are bf16 (softmax fp32); the kernel follows q's dtype. q, k, v = ONE GEMM (one input cast,
         # and the input grad is a single fp32-accumulated GEMM instead of three bf16 grads summed)
@@ -54,6 +57,7 @@ def enable(model):
                              dropout=self.dropout.p if self.dropout.training else 0.0)
         return self.linear_out(o.reshape(B, T, self.h * self.d_k))
 
+    enc._fused_calls = 0
     n = 0
     for layer in enc.layers:
         att = layer.self_attn

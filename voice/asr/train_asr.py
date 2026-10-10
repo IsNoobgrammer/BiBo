@@ -388,8 +388,8 @@ def main():
                     help="training mix of the multi-lookahead contexts as RIGHT:PROB, right context in 80 ms frames, "
                          "e.g. 0:0.2 1:0.4 6:0.2 13:0.2 (NeMo default: uniform)")
     ap.add_argument("--lookaheads", type=int, nargs="*", default=None,
-                    help="replace the trained look-ahead set: RIGHT contexts in 80 ms frames, e.g. 13 6 3 1 0 "
-                         "(the FIRST is the default = validation context; left context 70 kept)")
+                    help="replace the trained look-ahead set: RIGHT contexts in 80 ms frames, e.g. 13 6 3 1 0 -1 "
+                         "(-1 = full context; the FIRST is the default = validation context; left context 70 kept)")
     ap.add_argument("--fastemit", type=float, default=None, help="FastEmit lambda (model default 0.005)")
     ap.add_argument("--save_steps", type=int, nargs="*", default=[],
                     help="also save a full checkpoint at these global steps (WSD: branch decays from the stable phase)")
@@ -474,13 +474,14 @@ def main():
 
     if a.lookaheads:
         left = m.encoder.att_context_size_all[0][0]
-        m.encoder.att_context_size_all = [[left, r] for r in a.lookaheads]
+        ctx = lambda r: [-1, -1] if r < 0 else [left, r]                   # -1 = full context (offline)
+        m.encoder.att_context_size_all = [ctx(r) for r in a.lookaheads]
         m.encoder.att_context_probs = [1.0 / len(a.lookaheads)] * len(a.lookaheads)
-        m.encoder.set_default_att_context_size([left, a.lookaheads[0]])
+        m.encoder.set_default_att_context_size(ctx(a.lookaheads[0]))
         with open_dict(m.cfg):                                       # saved .nemo / GGUF export see the new set
             # NeMo's constructor demands left % (r+1) == 0; the mask uses left // (r+1) chunks anyway, so
             # [70 - 70 % (r+1), r] is the SAME mask ([70,3] made run5.nemo unloadable for streaming eval)
-            m.cfg.encoder.att_context_size = [[left - left % (r + 1), r] for r in a.lookaheads]
+            m.cfg.encoder.att_context_size = [[-1, -1] if r < 0 else [left - left % (r + 1), r] for r in a.lookaheads]
             m.cfg.encoder.att_context_probs = m.encoder.att_context_probs
         print(f"[run] look-ahead set {m.encoder.att_context_size_all}", flush=True)
     if a.lookahead_probs:

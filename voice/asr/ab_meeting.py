@@ -59,7 +59,7 @@ def main():
     def report(name, dec, la, bp, hyps):           # per-clip WER, pooled WER and its S / D / I split, hyp words
         sdi = [edits(ref, h) for (_, ref), h in zip(clips, hyps)]
         s, d, i = (sum(x[k] for x in sdi) for k in range(3))
-        print(f"MEET {name:24s} {dec:4s} la {la * 80:4d} ms bp {bp:.1f} | pooled {100 * (s + d + i) / n:5.2f} "
+        print(f"MEET {name:24s} {dec:4s} la {'full' if la < 0 else str(la * 80) + ' ms':>7s} bp {bp:.1f} | pooled {100 * (s + d + i) / n:5.2f} "
               f"(S {100 * s / n:5.2f} D {100 * d / n:5.2f} I {100 * i / n:5.2f}) | "
               + " ".join(f"{100 * wer(ref, h):5.1f}" for (_, ref), h in zip(clips, hyps))
               + f" | hyp/ref words {sum(map(len, hyps))}/{n}", flush=True)
