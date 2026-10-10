@@ -484,6 +484,10 @@ def main():
     ap.add_argument("--warmup", type=int, default=1000)
     ap.add_argument("--sched", choices=["cosine", "wsd"], default="cosine",
                     help="wsd = linear warm-up, flat at --lr, linear decay over the last --decay_frac to 1e-5")
+    ap.add_argument("--optim", choices=["adamw", "muown"], default="adamw",
+                    help="muown = tkf FusedMuon on the weight matrices + AdamW on the rest (muon_groups.py)")
+    ap.add_argument("--muon_lr", type=float, default=None, help="Muon lr (scale adam: same band as AdamW); default --lr")
+    ap.add_argument("--muon_variant", default="muown", help="FusedMuon variant: muown | aurora | normuon")
     ap.add_argument("--decay_frac", type=float, default=0.2)
     ap.add_argument("--lookahead_probs", nargs="*", default=None,
                     help="training mix of the multi-lookahead contexts as RIGHT:PROB, right context in 80 ms frames, "
@@ -681,6 +685,13 @@ def main():
         fuse(m._optimizer)
         return out
     m.configure_optimizers = configure_optimizers
+    if a.optim == "muown":               # FusedMuon(muown) on the matrices + fused AdamW on the rest (muon_groups.py)
+        assert not a.bf16_master and a.sched == "cosine", "--optim muown: autocast + cosine only"
+        import muon_groups
+        opt = muon_groups.build(m, a.lr, muon_lr=a.muon_lr, wd=1e-3, variant=a.muon_variant)
+        sch = muon_groups.warmup_cosine(opt, a.warmup, max_steps, 1e-5)
+        m._optimizer, m._scheduler = opt, sch
+        m.configure_optimizers = lambda: ([opt], [{"scheduler": sch, "interval": "step", "frequency": 1}])
     if a.bf16_master:
         bf16_master.wrap(m._optimizer, clip=1.0)                    # clips on the fp32 masters
     if a.sched == "wsd":
