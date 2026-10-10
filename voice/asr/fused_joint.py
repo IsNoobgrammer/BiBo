@@ -31,6 +31,46 @@ def enable(model):
     assert getattr(joint, "temperature", 1.0) == 1.0
     lam = float((model.cfg.loss.get("warprnnt_numba_kwargs") or {}).get("fastemit_lambda", 0.0))
     nemo_forward = joint.forward
+    # The kernel needs N = sum(T_enc * (U + 1)) to size its buffers; asking the GPU for it is a host sync that drains
+    # the queue every step. Every term is known on the CPU before the batch is copied: audio lengths (or
+    # aug_online's new lengths, computed on the CPU), token lengths, and NeMo's own length formulas.
+    from nemo.collections.asr.parts.submodules.subsampling import calc_length
+    feat, pre = model.preprocessor.featurizer, model.encoder.pre_encode
+    host = {"alen": None, "ylen": None, "checked": 0}
+    before = model.on_before_batch_transfer
+
+    def on_before_batch_transfer(batch, dataloader_idx):
+        batch = before(batch, dataloader_idx)
+        if isinstance(batch, (tuple, list)) and len(batch) >= 4 and not batch[1].is_cuda:
+            host["alen"], host["ylen"] = batch[1].clone(), batch[3].clone()
+        else:
+            host["alen"] = host["ylen"] = None
+        if "aug_online" in sys.modules:
+            sys.modules["aug_online"].STATE["cpu_lens"] = None          # set again by this step's augmentation
+        return batch
+
+    model.on_before_batch_transfer = on_before_batch_transfer
+
+    def enc_len_host(alen):
+        f = feat.get_seq_len(alen.long())
+        f = torch.where(alen == 0, torch.zeros_like(f), f)               # NeMo's zero-length rule
+        return calc_length(f, all_paddings=pre._left_padding + pre._right_padding, kernel_size=pre._kernel_size,
+                           stride=pre._stride, ceil_mode=pre._ceil_mode, repeat_num=pre._sampling_num)
+
+    def n_rows_host(encoder_lengths, transcript_lengths):
+        aug = sys.modules.get("aug_online")
+        alen = aug.STATE.get("cpu_lens") if aug is not None and aug.STATE.get("cpu_lens") is not None else host["alen"]
+        ylen = host["ylen"]
+        if alen is None or ylen is None or alen.shape[0] != encoder_lengths.shape[0]:
+            return None                                                  # unknown on the host: the synced path
+        el = enc_len_host(alen)
+        if host["checked"] < 3:                                          # plumbing check: 3 one-off syncs, then trust
+            assert torch.equal(el.long(), encoder_lengths.long().cpu()), "host encoder lengths != the encoder's"
+            assert torch.equal(ylen.long(), transcript_lengths.long().cpu()), "host token lengths != the batch's"
+            host["checked"] += 1
+            if host["checked"] == 3:
+                print("[fused_joint] host-side lattice sizes match the device's (3 checks): no per-step sync", flush=True)
+        return int((el.long() * (ylen.long() + 1)).sum())
 
     def forward(self, encoder_outputs, decoder_outputs=None, encoder_lengths=None, transcripts=None,
                 transcript_lengths=None, compute_wer=False, keep_hypotheses=False):
@@ -42,7 +82,8 @@ def enable(model):
         g = self.project_prednet(decoder_outputs.transpose(1, 2))
         p = drop.p if (drop is not None and self.training) else 0.0
         loss, _ = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
-                                  transcript_lengths, fastemit_lambda=lam, dropout=p)
+                                  transcript_lengths, fastemit_lambda=lam, dropout=p,
+                                  n_rows=n_rows_host(encoder_lengths, transcript_lengths))
         wer = wer_num = wer_denom = None
         hyp = []
         if compute_wer:                                              # NeMo's per-sub-batch WER, on the whole batch

@@ -96,6 +96,7 @@ def augment(audio, lens_cpu, p, gc, gg):
     b = audio.shape[0]
     sel = (torch.rand(b, generator=gc) < p).nonzero().squeeze(1)
     if p <= 0 or len(sel) == 0 or b < 3:
+        STATE["cpu_lens"] = lens_cpu                                    # fused_joint sizes its lattice from these
         return audio, _up(lens_cpu, dev)
     n = len(sel)
     L = lens_cpu[sel].long()
@@ -132,6 +133,7 @@ def augment(audio, lens_cpu, p, gc, gg):
     out[sel_d] = torch.nn.functional.pad(x, (0, out_t - t)).to(out.dtype)
     new = lens_cpu.clone()
     new[sel] = newL.to(new.dtype)                                      # NeMo's lens are int32
+    STATE["cpu_lens"] = new                                             # the CPU lengths after speed perturbation
     return out, _up(new, dev)
 
 

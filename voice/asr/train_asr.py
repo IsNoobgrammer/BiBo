@@ -656,6 +656,13 @@ def main():
                    *([LrScale(a.lr_scale)] if a.lr_scale else []),
                    *([] if a.no_hf else [HFSync(a.run, ckpt_dir)])])
     m.set_trainer(trainer)
+    lightning_log = m.log
+
+    def log(name, value, *args, **kw):   # Lightning turns a Python number into a GPU tensor: a blocking H2D copy per
+        if isinstance(value, (int, float)) and not isinstance(value, bool):   # logged value per step (--profile_steps)
+            value = torch.tensor(float(value))
+        return lightning_log(name, value, *args, **kw)
+    m.log = log
     m.setup_optimization(OmegaConf.create({
         "name": "adamw", "lr": a.lr, "betas": [0.9, 0.98], "weight_decay": 1e-3,
         "sched": {"name": "CosineAnnealing", "warmup_steps": a.warmup, "min_lr": 1e-5, "max_steps": max_steps}}))
