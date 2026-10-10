@@ -266,10 +266,50 @@ class ProfileSteps(Callback):
 
     def __init__(self, spec):
         self.a, self.b = map(int, spec.split(":"))
-        self.prof, self.sites, self.t0 = None, None, None
+        self.prof, self.sites, self.t0, self.marks, self.phases = None, None, None, None, {}
+
+    def _ev(self, key):                                 # GPU-side phase mark (CUDA event on the current stream)
+        if self.marks is not None:
+            e = torch.cuda.Event(enable_timing=True)
+            e.record()
+            self.marks.append((key, e))
+
+    def _wrap_steps(self, trainer):
+        """Time every (sub-)optimizer's step on the GPU: Combined -> its FusedMuon / AdamW; plain AdamW itself."""
+        for o in trainer.optimizers:
+            for sub in getattr(o, "opts", [o]):
+                if getattr(sub, "_phase_wrapped", False):
+                    continue
+                f, name = sub.step, type(sub).__name__
+
+                def step(closure=None, _f=f, _n=name):
+                    if closure is None:                     # a Combined sub-optimizer: the update only
+                        self._ev(f"opt:{_n}")
+                    else:                                   # Lightning's step(closure) runs fwd+bwd first
+                        def c(_c=closure):
+                            r = _c()
+                            self._ev(f"opt:{_n}")
+                            return r
+                        closure = c
+                    r = _f(closure) if closure is not None else _f()
+                    self._ev(f"end:{_n}")
+                    return r
+                sub.step, sub._phase_wrapped = step, True
+
+    def on_before_backward(self, trainer, pl_module, loss):
+        self._ev("backward")
+
+    def on_after_backward(self, trainer, pl_module):
+        self._ev("after_backward")
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         g = trainer.global_step
+        if self.a <= g <= self.b:
+            if g == self.a:
+                self._wrap_steps(trainer)
+                self.phases = {}
+            self.marks = []
+            self._ev("forward")
         if g == self.a:
             opts = trainer.optimizers
             print(f"[profile] optimizer: {[type(o).__name__ for o in opts]}, groups fused / foreach: "
@@ -295,7 +335,19 @@ class ProfileSteps(Callback):
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         g = trainer.global_step                         # already incremented for this step
+        if self.marks is not None:                      # GPU ms per phase = gap between consecutive marks
+            self._ev("rest")
+            self._ev("stop")
+            torch.cuda.synchronize()
+            for (k, e), (_k2, e2) in zip(self.marks, self.marks[1:]):
+                self.phases[k] = self.phases.get(k, 0.0) + e.elapsed_time(e2)
+            self.marks = None
         if self.prof is not None and g == self.b + 1:
+            n = self.b - self.a + 1
+            tot = sum(self.phases.values())
+            print(f"[profile] GPU timeline by phase (ms/step, event-to-event; total {tot / n:.1f}):", flush=True)
+            for k, v in self.phases.items():
+                print(f"    {v / n:7.2f}  {100 * v / tot:5.1f}%  {k}", flush=True)
             torch.cuda.synchronize()
             wall = (time.perf_counter() - self.t0) / (self.b - self.a + 1) * 1000
             self.prof.__exit__(None, None, None)
