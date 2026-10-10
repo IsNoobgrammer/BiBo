@@ -22,11 +22,12 @@ from multiprocessing import Pool
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import multispk  # noqa: E402
-from prep_train import REPEAT, VAL_SHARE, WINDOWS_ONLY, _copy, clean  # noqa: E402
+from prep_train import REPEAT, VAL_SHARE, WINDOWS_ONLY, _copy, clean, pool_split  # noqa: E402
 
 DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 SPK = re.compile(r"<spk[1-9]>")
 VAL_CAP_H = {"phone": 0.5}                     # val hours ceiling per source (default 1 h); phone = 6 speakers, 4 h
+TRAIN_HOURS = {"nptel": 150}                   # cap a source (prep_train.pool_split = HF data/nptel/core150)
 SAME_SPEAKERS = {"ami_ihm": "ami", "ami_sdm": "ami"}   # one recording session, several mics: one val speaker set
 
 
@@ -72,6 +73,8 @@ def main():
         if not rows:
             continue
         src = rows[0]["source"]
+        if src in TRAIN_HOURS:
+            rows = pool_split(rows, TRAIN_HOURS[src])[0]
         grp = SAME_SPEAKERS.get(src)
         if grp in val_spk:                     # another recording of the same people: reuse its val speakers (no leak)
             pick = {s.split(":", 1)[-1] for s in val_spk[grp]}

@@ -10,6 +10,14 @@ import os
 from huggingface_hub import HfApi, hf_hub_download
 
 INFO = {   # source -> (origin, license, what / how it was cut)
+    "emilia": ("MrDragonFox/EN_Emilia_Yodas_616h", "CC-BY-4.0", "spontaneous YouTube English; rows where two transcripts agree (<= 5% WER) and PQ >= 6.5"),
+    "nptel": ("skbose/indian-english-nptel-v0", "see origin", "Indian-English lectures; Qwen3-ASR check drops rows > 15% WER; core150 = the 150 h prep_en trains on"),
+    "spotify": ("SALT-NLP/spotify_podcast_ASR", "see origin", "podcasts, human verbatim, 2-3 speakers"),
+    "phone": ("sawradip/phone-asr-data", "see origin", "phone conversations"),
+    "voxpopuli": ("facebook/voxpopuli (en)", "CC0", "European Parliament speeches"),
+    "peoples_speech": ("MLCommons/peoples_speech (clean)", "CC-BY / CC-BY-SA", "mixed web audio"),
+    "svarah": ("ai4bharat/Svarah", "see origin", "Indian-accented English (a public TEST set: no official numbers on it)"),
+    "medical": ("yashtiwari/PaulMooney-Medical-ASR-Data", "see origin", "medical dictation / dialogue"),
     "ami_ihm": ("edinburghcstr/ami (ihm)", "CC-BY-4.0", "AMI meetings, close-talk headsets; utterances >= 0.2 s (meeting windows built at training-prep time)"),
     "ami_sdm": ("edinburghcstr/ami (sdm)", "CC-BY-4.0", "AMI meetings, single distant mic (far-field); utterances >= 0.2 s"),
     "librispeech": ("openslr/librispeech_asr (train.clean.100)", "CC-BY-4.0", "read audiobooks"),
@@ -33,8 +41,13 @@ def main():
         man = [json.loads(l) for l in open(hf_hub_download(a.repo, f"manifests/{s}.jsonl", repo_type="dataset"), encoding="utf-8")]
         rows[s] = (len(man), sum(r["duration"] for r in man) / 3600)
     info = lambda s: INFO.get(s) or ((VITW[0], VITW[1], VITW[2].format(s[5:].replace("_", " "))) if s.startswith("vitw_") else ("?", "?", ""))
-    cfg = "\n".join([f"- config_name: all\n  data_files:\n  - split: train\n    path: data/*/*.parquet"] +
-                    [f"- config_name: {s}\n  data_files:\n  - split: train\n    path: data/{s}/*.parquet" for s in srcs])
+    srcs = [s for s in srcs if any(f.startswith(f"data/{s}/") for f in files)]   # a manifest without data: not listed
+    cfg = [f"- config_name: all\n  data_files:\n  - split: train\n    path: data/**/*.parquet"]
+    for s in srcs:
+        cfg.append(f"- config_name: {s}\n  data_files:\n  - split: train\n    path: data/{s}/**/*.parquet")
+        for sub in sorted({f.split("/")[2] for f in files if f.startswith(f"data/{s}/core") and f.count("/") == 3}):
+            cfg.append(f"- config_name: {s}_{sub[4:]}h\n  data_files:\n  - split: train\n    path: data/{s}/{sub}/*.parquet")
+    cfg = "\n".join(cfg)
     table = "\n".join(f"| {s} | {rows[s][1]:.1f} | {rows[s][0]:,} | {info(s)[2]} | {info(s)[0]} | {info(s)[1]} |" for s in srcs)
     total = sum(h for _, h in rows.values())
     card = f"""---

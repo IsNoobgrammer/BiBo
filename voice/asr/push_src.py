@@ -25,25 +25,34 @@ def main():
     ap.add_argument("--source", required=True)
     ap.add_argument("--repo", required=True)
     ap.add_argument("--private", action="store_true")
+    ap.add_argument("--core_hours", type=float, default=None,
+                    help="also split into data/<src>/core<H>/ (prep_train.pool_split, the subset prep_en trains on) + rest/")
     a = ap.parse_args()
     rows = [json.loads(l) for l in open(os.path.join(a.mix, f"{a.source}.jsonl"), encoding="utf-8")]
     out = os.path.join(a.mix, "_push", a.source)
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(os.path.join(out, "manifests"))
-    os.makedirs(os.path.join(out, "data", a.source))
     shutil.copy(os.path.join(a.mix, f"{a.source}.jsonl"), os.path.join(out, "manifests", f"{a.source}.jsonl"))
-    meta = {b"huggingface": json.dumps({"info": {"features": FEATURES}}).encode()}
-    random.Random(23).shuffle(rows)
-    n = (len(rows) + ROWS_PER_SHARD - 1) // ROWS_PER_SHARD
-    for k in range(n):
-        part = rows[k * ROWS_PER_SHARD:(k + 1) * ROWS_PER_SHARD]
-        cols = {"audio": [{"bytes": open(r["audio_filepath"], "rb").read(),
-                           "path": f"{r['source']}/{os.path.basename(r['audio_filepath'])}"} for r in part]}
-        for c in list(FEATURES)[1:]:
-            cols[c] = [None if r.get(c) is None else (str(r[c]) if FEATURES[c].get("dtype") == "string" else r[c])
-                       for r in part]
-        pq.write_table(pa.table(cols).replace_schema_metadata(meta), os.path.join(out, "data", a.source, f"train-{k:05d}.parquet"))
-        print(f"packed {a.source} {k + 1}/{n}", flush=True)
+    meta ={b"huggingface": json.dumps({"info": {"features": FEATURES}}).encode()}
+    if a.core_hours:
+        from prep_train import pool_split
+        core, rest = pool_split(rows, a.core_hours)
+        groups = {f"{a.source}/core{a.core_hours:g}": core, f"{a.source}/rest": rest}
+    else:
+        groups = {a.source: rows}
+    for g, grows in groups.items():
+        os.makedirs(os.path.join(out, "data", g))
+        random.Random(23).shuffle(grows)
+        n = (len(grows) + ROWS_PER_SHARD - 1) // ROWS_PER_SHARD
+        for k in range(n):
+            part = grows[k * ROWS_PER_SHARD:(k + 1) * ROWS_PER_SHARD]
+            cols = {"audio": [{"bytes": open(r["audio_filepath"], "rb").read(),
+                               "path": f"{r['source']}/{os.path.basename(r['audio_filepath'])}"} for r in part]}
+            for c in list(FEATURES)[1:]:
+                cols[c] = [None if r.get(c) is None else (str(r[c]) if FEATURES[c].get("dtype") == "string" else r[c])
+                           for r in part]
+            pq.write_table(pa.table(cols).replace_schema_metadata(meta), os.path.join(out, "data", g, f"train-{k:05d}.parquet"))
+            print(f"packed {g} {k + 1}/{n}", flush=True)
     api = HfApi()
     api.create_repo(a.repo, repo_type="dataset", private=a.private, exist_ok=True)
     api.upload_large_folder(repo_id=a.repo, repo_type="dataset", folder_path=out)
