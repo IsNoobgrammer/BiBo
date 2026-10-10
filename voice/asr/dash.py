@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROBE = r'''
 import json, os, re, glob, subprocess, sys
-A = "/home/marimo/work/asr"; L = A + "/par1000"; M = A + "/mix1000"
+A = "/home/marimo/work/asr"; L = A + "/par_en"; M = A + "/mix_en"
 sys.path.insert(0, "/home/marimo/work/BiBo/voice/asr")
 try:   # budgets straight from the source text (importing build_mix needs torchaudio, absent in the kernel env)
     src = open("/home/marimo/work/BiBo/voice/asr/build_mix.py", encoding="utf-8").read()
@@ -23,9 +23,13 @@ try:   # budgets straight from the source text (importing build_mix needs torcha
               for n, h in re.findall(r'dict\(name="(\w+)".*?hours=(None|[\d.]+)', src, re.S)}
 except Exception:
     budget = {}
-LANES = {"emilia": ["emilia"], "nptel2": ["nptel"],
-         "hindi": ["indicvoices_hi", "numo_hi", "vaani_hi", "kathbath_hi", "hinglish", "lahaja"],
-         "english": ["ami_ihm", "spotify", "phone", "voxpopuli", "peoples_speech", "svarah", "medical"]}
+def lane_srcs(name):          # the lane lists straight from par_en.sh
+    try:
+        t = open("/home/marimo/work/BiBo/voice/asr/par_en.sh").read()
+        return re.search(f'LANE_{name}="([^"]+)"', t).group(1).split()
+    except Exception:
+        return []
+LANES = {"A": lane_srcs("A"), "B": lane_srcs("B")}
 pat = re.compile(r"^(\w+):\s+([\d.]+) / (\S+) h\s+(\d+) utts\s+(\d+) skipped(?:\s+(\d+) dropped)?(.*)$")
 def tail(p, n=200000):
     try:
@@ -49,37 +53,21 @@ for lane, srcs in LANES.items():
     rows = []
     for s in srcs:
         d = last.get(s, {})
-        done = os.path.exists(f"{M}/{s}.jsonl") and s in last and srcs.index(s) < max([srcs.index(x) for x in last] + [-1])
+        if s == "restore_old":
+            r = re.findall(r"fetch_mix: .*", log)
+            d = {"h": 0, "utts": 0, "skipped": 0, "dropped": 0, "extra": (r[-1][:120] if r else "restoring fhai50032/asr-english")}
         rows.append(dict(source=s, budget=budget.get(s), **({"h": 0, "utts": 0, "skipped": 0, "dropped": 0, "extra": ""} | d),
-                         finished=bool(done or status(lane) is not None and s in last)))
+                         finished=os.path.exists(f"{L}/{s}.built"),
+                         push=("pushed" if os.path.exists(f"{L}/{s}.pushed") else "push failed" if os.path.exists(f"{L}/{s}.pushfail")
+                               else "pushing" if os.path.exists(f"{L}/{s}.built") else "")))
     out["lanes"][lane] = dict(status=status(lane), sources=rows, errors=err)
-# NPTEL Qwen clean-up
-q = dict(status=status("nptel2_qwen"), scored=0, total=0, kept=None)
-try:
-    q["total"] = sum(1 for _ in open(f"{M}/nptel.jsonl")) if not os.path.exists(f"{M}/nptel_raw.jsonl") else sum(1 for _ in open(f"{M}/nptel_raw.jsonl"))
-except Exception: pass
-try: q["scored"] = sum(1 for _ in open(f"{M}/qwen/nptel_all.jsonl"))
-except Exception: pass
-ql = tail(f"{L}/nptel2_qwen.log")
-k = re.findall(r"KEPT nptel: .*", ql); q["kept"] = k[-1] if k else None
-s_ = re.findall(r"SOURCE nptel: .*", ql); q["summary"] = s_[-1][:200] if s_ else None
-q["running"] = any(b"qwen_check.py" in open(f"/proc/{p}/cmdline", "rb").read() for p in os.listdir("/proc") if p.isdigit() and os.path.exists(f"/proc/{p}/cmdline"))
-out["qwen"] = q
-# pushes
-pushes = {}
-for lang in ("hi", "en"):
-    t = tail(f"{L}/push_{lang}.log", 40000).replace("\r", "\n")
-    lines = [l.strip() for l in t.splitlines() if l.strip()]
-    stage = "waiting"
-    if any("group " in l for l in lines): stage = "packing shards"
-    if any(("Upload" in l or "upload" in l or "Processing Files" in l or "%|" in l) for l in lines): stage = "uploading"
-    if any("PUSH_" in l and "END" in l for l in lines): stage = "done"
-    if any("FAILED" in l or "SKIP" in l for l in lines): stage = "failed / skipped"
-    pct = re.findall(r"(\d+)%\|", t)
-    pushes[lang] = dict(stage=stage, groups=[l for l in lines if l.startswith("group ")][-6:],
-                        pushed=next((l for l in lines if l.startswith("PUSHED")), None),
-                        last=(lines[-1][:160] if lines else ""), pct=(int(pct[-1]) if pct else None))
-out["push"] = pushes
+pl = tail(f"{L}/push.log", 40000).replace(chr(13), chr(10))
+lines = [l.strip() for l in pl.splitlines() if l.strip()]
+cur = [l for l in lines if l.startswith("PUSH_START")]
+pct = re.findall(r"(\d+)%\|", pl)
+out["push"] = dict(status=status("push"), current=(cur[-1][11:] if cur else None),
+                   pushed=[l for l in lines if l.startswith("PUSHED")][-20:], failed=[l for l in lines if "FAILED" in l][-5:],
+                   last=(lines[-1][:160] if lines else ""), pct=(int(pct[-1]) if pct else None))
 try:
     g = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"],
                        capture_output=True, text=True).stdout.strip().split(", ")
@@ -128,7 +116,7 @@ class Box:
 
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Voice Data Build</title>
+<title>English Data Build</title>
 <style>
 :root{--bg:#f5f6f8;--card:#fff;--fg:#1d2330;--muted:#677084;--rule:#e1e4ea;--bar:#e7eaf0;--fill:#2f6fde;--done:#1f9d55;--warn:#c47a10;--bad:#c4372f}
 @media (prefers-color-scheme:dark){:root{--bg:#12151b;--card:#1a1f27;--fg:#e8ebf1;--muted:#9aa3b5;--rule:#2b323d;--bar:#262d38;--fill:#5b93f0;--done:#3cc078;--warn:#e0a03a;--bad:#ef6a62}}
@@ -151,13 +139,13 @@ h1{font-size:22px;margin:0}.meta{color:var(--muted);font-variant-numeric:tabular
 .kv{display:flex;flex-wrap:wrap;gap:6px 18px;font-variant-numeric:tabular-nums}.kv b{font-weight:600}
 code{font-size:12px;color:var(--muted)}
 </style></head><body><div class="wrap">
-<header><h1>Voice data build &middot; 1000 h</h1><div class="meta" id="meta">connecting...</div></header>
+<header><h1>English data build &middot; ~2,000 h</h1><div class="meta" id="meta">connecting...</div></header>
 <div class="alert" id="alert"></div>
 <div class="grid" id="top"></div>
 <div class="grid" id="lanes"></div>
 </div>
 <script>
-const LANE_NAMES={emilia:"Emilia (very good only)",nptel2:"NPTEL (raw, before clean-up)",hindi:"Hindi lane",english:"English lane"};
+const LANE_NAMES={A:"Lane A (restore old English, AMI-sdm, LibriSpeech, Earnings-22, NOTSOFAR, VITW x4)",B:"Lane B (SPGISpeech 2.0, TED-LIUM, VITW x4)"};
 const esc=s=>String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 function pill(st){if(st===null||st===undefined)return '<span class="pill run">running</span>';return st==="0"?'<span class="pill ok">done</span>':'<span class="pill bad">failed ('+esc(st)+')</span>';}
 const HIST={};let LAST=null,AT=0;
@@ -167,21 +155,19 @@ function rate(s){const h=HIST[s.source]||[];const [t0,h0]=h[0]||[],[t1,h1]=h[h.l
 function srcRow(s){const b=s.budget;const pct=b?Math.min(100,100*s.h/b):(s.finished?100:null);
  const bar=pct===null?'<div class="bar"><i style="width:100%;opacity:.35"></i></div>':'<div class="bar"><i class="'+(pct>=99.5||s.finished?'full':'')+'" style="width:'+pct.toFixed(1)+'%"></i></div>';
  return '<div class="row"><div class="name" title="'+esc(s.source)+'">'+esc(s.source)+'</div>'+bar+
- '<div class="sub">'+s.h.toFixed(1)+' / '+(b?b+' h':'all')+' &middot; '+s.utts.toLocaleString()+' rows &middot; '+s.dropped.toLocaleString()+' dropped &middot; '+s.skipped.toLocaleString()+' skipped '+(s.extra?'&middot; '+esc(s.extra):'')+rate(s)+'</div></div>';}
+ '<div class="sub">'+s.h.toFixed(1)+' / '+(b?b+' h':'all')+' &middot; '+s.utts.toLocaleString()+' rows &middot; '+s.dropped.toLocaleString()+' dropped &middot; '+s.skipped.toLocaleString()+' skipped '+(s.extra?'&middot; '+esc(s.extra):'')+(s.push?' &middot; <b>'+esc(s.push)+'</b>':'')+rate(s)+'</div></div>';}
 async function tick(){let d;try{d=await (await fetch('/api')).json();}catch(e){document.getElementById('meta').textContent='dashboard server not reachable';return;}
  const al=document.getElementById('alert');
  if(d.err){al.style.display='block';al.textContent='Box not answering: '+d.err+(d.age?' (last good data '+Math.round(d.age)+' s ago)':'');}else al.style.display='none';
  const b=d.data;if(!b){document.getElementById('meta').textContent='waiting for first data...';return;}
  AT=Date.now()-(d.age||0)*1000;if(b.time!==LAST){LAST=b.time;for(const l of Object.values(b.lanes))for(const s of l.sources){const h=HIST[s.source]=HIST[s.source]||[];h.push([AT,s.h]);while(h.length>1&&AT-h[0][0]>600000)h.shift();}}
  document.getElementById('meta').innerHTML='box time '+b.time+' · updated <span id=age></span> s ago · output '+b.disk+(b.gpu?' · GPU '+b.gpu.util+'% / '+(b.gpu.mem/1024).toFixed(1)+' GB':'');
- const q=b.qwen;const qp=q.total?Math.min(100,100*q.scored/q.total):0;
- const qst=q.kept?'<span class="pill ok">done</span>':(q.running?'<span class="pill run">scoring</span>':(q.status&&q.status!=="0"?'<span class="pill bad">failed</span>':'<span class="pill wait">waits for NPTEL build</span>'));
- let top='<div class="card"><h2>NPTEL clean-up (Qwen, drop rows &gt; 15% WER)'+qst+'</h2><div class="row"><div class="name">scored</div><div class="bar"><i class="'+(q.kept?'full':'')+'" style="width:'+(q.kept?100:qp).toFixed(1)+'%"></i></div><div class="sub">'+q.scored.toLocaleString()+' / '+(q.total||'?').toLocaleString()+' rows</div></div>'+
- (q.summary?'<div class="sub" style="margin-top:6px">'+esc(q.summary)+'</div>':'')+(q.kept?'<div style="margin-top:6px"><b>'+esc(q.kept)+'</b></div>':'')+'</div>';
- for(const [lang,p] of Object.entries(b.push)){const cls=p.stage==='done'?'ok':(p.stage.startsWith('failed')?'bad':(p.stage==='waiting'?'wait':'run'));
-  top+='<div class="card"><h2>Push '+(lang==='hi'?'fhai50032/asr-hindi':'fhai50032/asr-english')+'<span class="pill '+cls+'">'+esc(p.stage)+(p.pct!==null&&p.stage==='uploading'?' '+p.pct+'%':'')+'</span></h2>'+
-  (p.groups.length?'<div class="sub">'+p.groups.map(esc).join('<br>')+'</div>':'<div class="sub">'+(lang==='hi'?'starts when the Hindi lane finishes':'starts when Emilia, English and the NPTEL clean-up finish')+'</div>')+
-  (p.pushed?'<div style="margin-top:6px"><b>'+esc(p.pushed)+'</b></div>':'')+(p.last&&p.stage!=='waiting'?'<div class="sub" style="margin-top:6px"><code>'+esc(p.last)+'</code></div>':'')+'</div>';}
+ const p=b.push;const pst=p.status==="0"?'<span class="pill ok">all pushed</span>':(p.current?'<span class="pill run">uploading</span>':'<span class="pill wait">waiting for a built source</span>');
+ let top='<div class="card"><h2>Push to HF (each source as soon as it is built)'+pst+'</h2>'+
+  (p.current?'<div class="sub">now: <b>'+esc(p.current)+'</b>'+(p.pct!==null?' &middot; '+p.pct+'%':'')+'</div>':'')+
+  (p.pushed.length?'<div class="sub" style="margin-top:6px">'+p.pushed.map(esc).join('<br>')+'</div>':'')+
+  (p.failed.length?'<div class="err">'+p.failed.map(esc).join('<br>')+'</div>':'')+
+  (p.last?'<div class="sub" style="margin-top:6px"><code>'+esc(p.last)+'</code></div>':'')+'</div>';
  document.getElementById('top').innerHTML=top;
  let html='';for(const [lane,l] of Object.entries(b.lanes)){const tot=l.sources.reduce((a,s)=>a+s.h,0);
   html+='<div class="card"><h2>'+esc(LANE_NAMES[lane]||lane)+' <span>'+'<span class="meta" style="margin-right:8px">'+tot.toFixed(1)+' h</span>'+pill(l.status)+'</span></h2>'+l.sources.map(srcRow).join('')+(l.errors.length?'<div class="err">'+l.errors.map(esc).join('<br>')+'</div>':'')+'</div>';}

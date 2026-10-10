@@ -19,9 +19,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", required=True)
     ap.add_argument("--mix", required=True)
+    ap.add_argument("--merge", action="store_true", help="restore into a mix dir other sources are being built into")
     a = ap.parse_args()
-    if glob.glob(os.path.join(a.mix, "*.jsonl")):
-        print(f"fetch_mix: {a.mix} already has manifests, skipping", flush=True)
+    done = os.path.join(a.mix, f".restored_{a.repo.replace('/', '__')}")
+    if os.path.exists(done) or (glob.glob(os.path.join(a.mix, "*.jsonl")) and not a.merge):
+        print(f"fetch_mix: {a.mix} already restored / has manifests, skipping", flush=True)
         return
     d = snapshot_download(a.repo, repo_type="dataset", local_dir=os.path.join(os.path.dirname(a.mix), "hf_mix"))
     want = {}
@@ -44,6 +46,7 @@ def main():
     assert missing == 0, f"{missing} manifest rows have no audio in {a.repo}"
     for man in glob.glob(os.path.join(d, "manifests", "*.jsonl")):
         os.replace(man, os.path.join(a.mix, os.path.basename(man)))
+    open(done, "w").close()
     print(f"fetch_mix: restored {n} files into {a.mix}", flush=True)
 
 
