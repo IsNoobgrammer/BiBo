@@ -52,7 +52,12 @@ def group(name):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--train", required=True)
-    ap.add_argument("--nemo", default="/home/marimo/work/asr/exp/run1/run1.nemo")
+    ap.add_argument("--nemo", default="stt_en_fastconformer_hybrid_large_streaming_multi", help=".nemo or pretrained name")
+    ap.add_argument("--tok", default=None, help="switch to this tokenizer dir (e.g. en3's 2047 BPE)")
+    ap.add_argument("--ctc_head", default=None, help="self-conditioned head (glu_glu, lin_glu): fused selfcond CTC loss")
+    ap.add_argument("--fused_ctc", action="store_true")
+    ap.add_argument("--ctc_only", action="store_true", help="no RNN-T decoder / joint / loss")
+    ap.add_argument("--ctx", default="68,3", help="fixed look-ahead for every step: LEFT,RIGHT or full")
     ap.add_argument("--steps", type=int, default=14)
     ap.add_argument("--batch_sec", type=float, default=1200)
     ap.add_argument("--fused", action="store_true")
@@ -66,7 +71,15 @@ def main():
     a = ap.parse_args()
     import nemo.collections.asr as nemo_asr
     torch.set_float32_matmul_precision("high")
-    m = nemo_asr.models.ASRModel.restore_from(a.nemo).cuda().train()
+    m = (nemo_asr.models.ASRModel.restore_from(a.nemo) if a.nemo.endswith(".nemo")
+         else nemo_asr.models.ASRModel.from_pretrained(a.nemo)).cuda().train()
+    if a.tok:
+        m.change_vocabulary(new_tokenizer_dir=a.tok, new_tokenizer_type="bpe")
+        m = m.cuda().train()
+    ctx = [-1, -1] if a.ctx == "full" else [int(x) for x in a.ctx.split(",")]
+    m.encoder.att_context_size_all = [ctx]
+    m.encoder.att_context_probs = [1.0]
+    m.encoder.set_default_att_context_size(ctx)
     tr = OmegaConf.create(OmegaConf.to_container(m.cfg.train_ds))
     with open_dict(tr):
         tr.pop("tarred_audio_filepaths", None)
@@ -86,7 +99,17 @@ def main():
     if a.fused_conv:
         import fused_conv
         fused_conv.enable(m)
-    opt = torch.optim.AdamW(m.parameters(), lr=1e-5, betas=(0.9, 0.98), weight_decay=1e-3, fused=True)
+    if a.fused_ctc:
+        import fused_ctc
+        fused_ctc.enable(m)
+    dec = None
+    if a.ctc_head:
+        import selfcond_head
+        dec = selfcond_head.enable(m, a.ctc_head)
+    if a.ctc_only:
+        for mod in (m.decoder, m.joint):
+            mod.requires_grad_(False)
+    opt = torch.optim.AdamW([q for q in m.parameters() if q.requires_grad], lr=1e-5, betas=(0.9, 0.98), weight_decay=1e-3, fused=True)
     if a.bf16_master:
         import bf16_master
         bf16_master.to_bf16(m)
@@ -97,7 +120,7 @@ def main():
     w = m.ctc_loss_weight
     it = iter(m._train_dl)
     sync = torch.cuda.synchronize
-    tag = ("fused" if a.fused else "nemo") + (" +layer" if a.fused_layer else "") + (" +attn" if a.fused_attn else "") + (" +conv" if a.fused_conv else "") + (" bf16-master" if a.bf16_master else " autocast") + f" {a.batch_sec:.0f}s"
+    tag = (f"{'ctc-only' if a.ctc_only else 'hybrid'} head {a.ctc_head or 'stock'} ctx {a.ctx} | ") + ("fused" if a.fused else "nemo") + (" +layer" if a.fused_layer else "") + (" +attn" if a.fused_attn else "") + (" +conv" if a.fused_conv else "") + (" bf16-master" if a.bf16_master else " autocast") + f" {a.batch_sec:.0f}s"
 
     def step(batch, mark=None):
         mark = mark or (lambda i: None)
@@ -106,18 +129,23 @@ def main():
         with amp():
             enc, enc_len = m.forward(input_signal=sig, input_signal_length=sig_len)
             mark(1)
-            dec, _, _ = m.decoder(targets=y, target_length=y_len)
-            rnnt, _, _, _ = m.joint(encoder_outputs=enc, decoder_outputs=dec, encoder_lengths=enc_len,
-                                    transcripts=y, transcript_lengths=y_len)
+            if not a.ctc_only:
+                pred, _, _ = m.decoder(targets=y, target_length=y_len)
+                rnnt, _, _, _ = m.joint(encoder_outputs=enc, decoder_outputs=pred, encoder_lengths=enc_len,
+                                        transcripts=y, transcript_lengths=y_len)
             mark(2)
+            if dec is not None:                    # the self-conditioned head's fused loss, as in training
+                dec.stash = [y, y_len, enc_len, lambda nll, tl: m.ctc_loss.reduce(nll, tl)]
             ctc = m.ctc_loss(log_probs=m.ctc_decoder(encoder_output=enc), targets=y, input_lengths=enc_len,
                              target_lengths=y_len)
-            loss = (1 - w) * rnnt + w * ctc
+            if dec is not None:
+                dec.stash, dec.loss = None, None
+            loss = ctc if a.ctc_only else (1 - w) * rnnt + w * ctc
         mark(3)
         loss.backward()
         mark(4)
         if not a.bf16_master:
-            torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0, foreach=True)
+            torch.nn.utils.clip_grad_norm_([q for q in m.parameters() if q.requires_grad], 1.0, foreach=True)
         opt.step()
         opt.zero_grad(set_to_none=True)
         mark(5)
@@ -125,6 +153,9 @@ def main():
 
     batches = [next(it) for _ in range(a.steps)]                   # data off the clock (loader measured separately)
     audio = [float(b[1].sum()) / 16000 for b in batches]
+    pad = [float(b[0].shape[0] * b[0].shape[1]) / 16000 for b in batches]
+    print(f"  batches: {sum(audio) / len(audio):.0f} s real audio, {sum(pad) / len(pad):.0f} s incl. padding "
+          f"({100 * (1 - sum(audio) / sum(pad)):.1f}% padding), {sum(b[0].shape[0] for b in batches) / len(batches):.0f} utts/batch", flush=True)
     for b in batches:                     # warm-up on EVERY batch: Triton compiles a variant per context / shape class
         step(b)
     sync()
@@ -170,7 +201,7 @@ def main():
             print(f"    {e.device_time_total / 2 / 1000:7.2f}  x{e.count // 2:<4d} {e.key:28s} {str(e.input_shapes)[:90]}")
 
     if a.phases:
-        names = ["h2d", "encoder fwd", "decoder+joint+rnnt fwd", "ctc fwd", "backward", "clip+optimizer"]
+        names = ["h2d", "preprocessor+encoder fwd", "decoder+joint+rnnt fwd", "ctc head fwd", "backward", "clip+optimizer"]
         acc = [0.0] * 6
         for b in batches[3:]:
             ts = []
