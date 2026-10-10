@@ -141,7 +141,7 @@ class Combined(__import__("torch").optim.Optimizer):
         return "Combined(" + ", ".join(type(o).__name__ for o in self.opts) + ")"
 
 
-def build(model, lr, muon_lr=None, wd=1e-3, muon_wd=None, momentum=0.95, variant="muown", ns="dsv4", rows=None):
+def build(model, lr, muon_lr=None, wd=1e-3, muon_wd=None, momentum=0.95, variant="muown", ns="ns8", rows=None):
     """FusedMuon (tkf sm120, variant muown, scale "adam": update RMS 0.2 so the AdamW lr band applies) on the muon*
     groups + fused AdamW on the rest, as one Combined optimizer. Prints the assignment."""
     import torch

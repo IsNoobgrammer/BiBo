@@ -488,7 +488,7 @@ def main():
                     help="muown = tkf FusedMuon on the weight matrices + AdamW on the rest (muon_groups.py)")
     ap.add_argument("--muon_lr", type=float, default=None, help="Muon lr (scale adam: same band as AdamW); default --lr")
     ap.add_argument("--muon_variant", default="muown", help="FusedMuon variant: muown | aurora | normuon")
-    ap.add_argument("--muon_ns", default="dsv4", help="Newton-Schulz preset: dsv4 (10 steps, FusedMuon default) | ns8 | ns6")
+    ap.add_argument("--muon_ns", default="ns8", help="Newton-Schulz preset: ns8 (6 quintic + 2 finishing, the BiBo board default) | ns6 | dsv4 (10)")
     ap.add_argument("--decay_frac", type=float, default=0.2)
     ap.add_argument("--lookahead_probs", nargs="*", default=None,
                     help="training mix of the multi-lookahead contexts as RIGHT:PROB, right context in 80 ms frames, "
