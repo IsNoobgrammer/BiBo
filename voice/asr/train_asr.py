@@ -536,8 +536,8 @@ def main():
     ap.add_argument("--warmup", type=int, default=1000)
     ap.add_argument("--sched", choices=["cosine", "wsd"], default="cosine",
                     help="wsd = linear warm-up, flat at --lr, linear decay over the last --decay_frac to 1e-5")
-    ap.add_argument("--optim", choices=["adamw", "muown"], default="adamw",
-                    help="muown = tkf FusedMuon on the weight matrices + AdamW on the rest (muon_groups.py)")
+    ap.add_argument("--optim", choices=["adamw", "muown"], default="muown",
+                    help="muown (default; beats AdamW -0.55 val WER over 2 epochs, 2 seeds, W&B asr-muown-vs-adamw-2ep) = tkf FusedMuon on the weight matrices + AdamW on the rest (muon_groups.py)")
     ap.add_argument("--muon_lr", type=float, default=None, help="Muon lr (scale adam: same band as AdamW); default --lr")
     ap.add_argument("--muon_variant", default="muown", help="FusedMuon variant: muown | aurora | normuon")
     ap.add_argument("--muon_heads", action="store_true", help="Muon on attention q/k/v/pos PER HEAD: (512,512) -> 8 x (64,512)")
