@@ -151,7 +151,7 @@ const LANE_NAMES={A:"Lane A (restore old English, AMI-sdm, LibriSpeech, Earnings
 const esc=s=>String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 function pill(st){if(st===null||st===undefined)return '<span class="pill run">running</span>';return st==="0"?'<span class="pill ok">done</span>':'<span class="pill bad">failed ('+esc(st)+')</span>';}
 const HIST={};let LAST=null,AT=0;
-function rate(s){const h=HIST[s.source]||[];const [t0,h0]=h[0]||[],[t1,h1]=h[h.length-1]||[];if(!(t1-t0>=60000))return ' &middot; rate in ~1 min';const r=(h1-h0)/((t1-t0)/60000);
+function rate(s){if(!s.h&&!s.finished)return ' &middot; queued / preparing (download, unpack)';const h=HIST[s.source]||[];const [t0,h0]=h[0]||[],[t1,h1]=h[h.length-1]||[];if(!(t1-t0>=60000))return ' &middot; rate in ~1 min';const r=(h1-h0)/((t1-t0)/60000);
  if(!(r>0))return s.finished?'':' &middot; <b>stalled</b>';const eta=s.budget&&!s.finished?(s.budget-s.h)/r:null;
  return ' &middot; <b>'+(r*60).toFixed(1)+' h/hr</b>'+(eta!==null?' &middot; ETA '+(eta>=60?(eta/60).toFixed(1)+' h':Math.round(eta)+' min'):'');}
 function srcRow(s){const b=s.budget;const pct=b?Math.min(100,100*s.h/b):(s.finished?100:null);
