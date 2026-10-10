@@ -302,7 +302,9 @@ class ProfileSteps(Callback):
             ev = self.prof.key_averages()
             n = self.b - self.a + 1
             from torch.autograd import DeviceType
-            kern = [e for e in self.prof.events() if e.device_type == DeviceType.CUDA]   # kernel / memcpy events only
+            cpu_names = {e.key for e in ev if e.self_cpu_time_total > 0}  # a CUDA-side copy of a CPU range (e.g.
+            kern = [e for e in self.prof.events() if e.device_type == DeviceType.CUDA   # Optimizer.step) is no kernel
+                    and e.name not in cpu_names]
             gpu = sum(e.device_time for e in kern) / n / 1000
             print(f"[profile] steps {self.a}-{self.b}: wall {wall:.1f} ms/step, GPU kernels {gpu:.1f} ms/step "
                   f"({100 * gpu / wall:.0f}% busy, {wall - gpu:.1f} ms/step GPU idle)", flush=True)
