@@ -18,7 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--nemo", required=True)
+    ap.add_argument("--nemo", default="stt_en_fastconformer_hybrid_large_streaming_multi",
+                    help=".nemo path or a pretrained name (throughput depends only on the architecture)")
     ap.add_argument("--utts", type=int, default=80)
     ap.add_argument("--sec", type=float, default=15.0)
     ap.add_argument("--iters", type=int, default=20)
@@ -27,7 +28,8 @@ def main():
     import fused_attn
     import fused_conv
     import fused_layer
-    m = nemo_asr.models.ASRModel.restore_from(a.nemo, map_location="cuda").cuda().train()
+    m = (nemo_asr.models.ASRModel.restore_from(a.nemo, map_location="cuda") if a.nemo.endswith(".nemo")
+         else nemo_asr.models.ASRModel.from_pretrained(a.nemo, map_location="cuda")).cuda().train()   # same encoder
     for k in (fused_layer, fused_attn, fused_conv):
         k.enable(m)
     enc = m.encoder
