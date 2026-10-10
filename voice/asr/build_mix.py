@@ -70,7 +70,7 @@ SOURCES = [
          text="text", lang="en", hours=None, frac=1.0, speaker=lambda r: str(r["speaker_id"])),  # read, train-clean-100
     dict(name="earnings22", loader="earnings22", repo="anton-l/earnings22_baseline_5_gram", lang="en", hours=None,
          speaker=lambda r: r["call"]),                                      # earnings calls, many accents (CC BY-SA)
-    dict(name="tedlium", loader="tedlium", repo="kfajdsl/tedlium", lang="en", hours=150,
+    dict(name="tedlium", loader="tedlium", repo="kfajdsl/tedlium", lang="en", hours=300,
          speaker=lambda r: r["talk"]),                                      # TED talks, wide vocabulary (CC BY-NC-ND)
     dict(name="spgi2", loader="spgi2", repo="kensho/SPGISpeech2.0", lang="en", hours=300,
          speaker=lambda r: str(r["spk"])),                                  # earnings calls (Kensho: non-commercial)
@@ -174,7 +174,7 @@ def earnings22_shards(src, seed):
 
 
 def tedlium_shards(src, seed):
-    """kfajdsl/tedlium (mirror of LIUM/tedlium) release 3 legacy train_1 (~300 h of 452, 150 h taken): talk .sph + .stm segments.
+    """kfajdsl/tedlium (mirror of LIUM/tedlium) release 3 legacy train_1 (~300 h of 452, all of it): talk .sph + .stm segments.
     Text fixes as ESB: lowercase, "it 's" -> "it's"; a segment with <unk> (an unknown spoken word) is dropped, not
     kept with the word deleted. Speaker = the talk."""
     import re
