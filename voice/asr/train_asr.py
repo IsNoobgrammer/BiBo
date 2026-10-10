@@ -413,6 +413,9 @@ def main():
     ap.add_argument("--ctc_head", default=None, help="self-conditioned CTC head, readouts per pass: lin_glu, glu_glu, "
                     "lin_glu_glu ... (selfcond_head.py, fused training loss)")
     ap.add_argument("--fused_ctc", action="store_true", help="tkf deterministic CTC loss (voice/asr/fused_ctc.py)")
+    ap.add_argument("--ctc_weight", type=float, default=None, help="hybrid loss = (1-w) RNN-T + w CTC (model default 0.3)")
+    ap.add_argument("--new_vocab", action="store_true", help="with a .nemo --init: switch it to --tok (new CTC/RNN-T "
+                    "output layers, encoder kept)")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--deterministic", action="store_true",
                     help="bitwise same-seed runs (with --fused_ctc): torch deterministic algorithms, cuDNN deterministic")
@@ -436,6 +439,8 @@ def main():
         pl.seed_everything(a.seed)
     if a.init.endswith(".nemo"):                       # a trained run (same vocabulary): A/B arms start identical
         m = nemo_asr.models.ASRModel.restore_from(a.init)
+        if a.new_vocab:
+            m.change_vocabulary(new_tokenizer_dir=a.tok, new_tokenizer_type="bpe")
     else:
         m = nemo_asr.models.ASRModel.from_pretrained(a.init)
         m.change_vocabulary(new_tokenizer_dir=a.tok, new_tokenizer_type="bpe")
@@ -490,6 +495,10 @@ def main():
     if a.fastemit is not None:                                       # fused_joint reads it from the loss config
         with open_dict(m.cfg):
             m.cfg.loss.warprnnt_numba_kwargs.fastemit_lambda = a.fastemit
+    if a.ctc_weight is not None:
+        m.ctc_loss_weight = a.ctc_weight
+        with open_dict(m.cfg):
+            m.cfg.aux_ctc.ctc_loss_weight = a.ctc_weight
     if a.fused_joint:
         import fused_joint
         fused_joint.enable(m)
