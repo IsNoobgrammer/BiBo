@@ -39,7 +39,9 @@ def main():
     alen = torch.full((a.utts,), n, device="cuda")
     with torch.no_grad():
         f, fl = m.preprocessor(input_signal=audio, length=alen)
-    T = (f.shape[-1] + 7) // 8                      # encoder frames after 8x subsampling
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        T = enc(audio_signal=f, length=fl)[0].shape[-1]   # the encoder's real frame count (not a guess: +-1 frame
+                                                          # puts the last frame in its own chunk)
 
     def step(ctx, keep=False):
         enc.att_context_size_all = [ctx]           # sampled context = this one
@@ -54,7 +56,7 @@ def main():
         return out, g
 
     def bench(ctx):
-        for _ in range(3):
+        for _ in range(10):                        # Triton autotune runs once per new context shape
             step(ctx)
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
@@ -69,8 +71,11 @@ def main():
             ("1040 ms [70,13]", [70, 13]), ("full, NeMo attention [-1,-1]", [-1, -1]),
             ("full, fused one chunk [0,T-1]", [0, T - 1])]
     for name, ctx in rows:
-        ms, gb = bench(ctx)
-        print(f"{name:32s} {ms:7.1f} ms/step  peak {gb:5.1f} GB", flush=True)
+        bench(ctx)                                 # pass 1: warm every shape
+    for rep in (1, 2):
+        for name, ctx in rows:
+            ms, gb = bench(ctx)
+            print(f"rep {rep}  {name:32s} {ms:7.1f} ms/step  {a.utts * a.sec / ms * 1000:8.0f} audio-s/s (encoder fwd+bwd)  peak {gb:5.1f} GB", flush=True)
     m.eval()                                       # dropout off: the two paths must match exactly-ish
     (e1, g1), (e2, g2) = step([-1, -1], keep=True), step([0, T - 1], keep=True)
     rel = lambda x, y: ((x - y).norm() / y.norm()).item()
