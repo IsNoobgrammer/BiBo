@@ -24,6 +24,7 @@ import multispk  # noqa: E402
 from prep_train import REPEAT, VAL_SHARE, WINDOWS_ONLY, _copy, clean  # noqa: E402
 
 DEVANAGARI = re.compile(r"[ऀ-ॿ]")
+SPK = re.compile(r"(<spk[1-4]>)")
 VAL_CAP_H = {"phone": 0.5}                     # val hours ceiling per source (default 1 h); phone = 6 speakers, 4 h
 SAME_SPEAKERS = {"ami_ihm": "ami", "ami_sdm": "ami"}   # one recording session, several mics: one val speaker set
 
@@ -64,8 +65,8 @@ def main():
             continue
         rows = [json.loads(l) for l in open(man, encoding="utf-8")]
         rows = [r for r in rows if r.get("lang") == "en" and "unintelligible" not in r["text"].lower()]
-        for r in rows:
-            r["text"] = clean(r["text"])
+        for r in rows:                         # <spkN> turn tags (meeting windows) survive the cleaning
+            r["text"] = " ".join(p if SPK.fullmatch(p) else clean(p) for p in SPK.split(r["text"]) if p.strip()).strip()
         rows = [r for r in rows if r["text"] and not DEVANAGARI.search(r["text"])]
         if not rows:
             continue

@@ -74,6 +74,8 @@ SOURCES = [
          speaker=lambda r: r["talk"]),                                      # TED talks, wide vocabulary (CC BY-NC-ND)
     dict(name="spgi2", loader="spgi2", repo="kensho/SPGISpeech2.0", lang="en", hours=300,
          speaker=lambda r: str(r["spk"])),                                  # earnings calls (Kensho: non-commercial)
+    dict(name="notsofar", loader="notsofar", repo="microsoft/NOTSOFAR", lang="en", hours=None,
+         speaker=lambda r: r["meeting"], extra={"device": "device"}),       # real far-field office meetings, <spk> windows
     # Voices-in-the-Wild (Apache-2.0): LibriSpeech-train / Common Voice sentences re-recorded through simulated
     # acoustics; English rows only (its question field), 24 kHz -> resampled. No speaker ids (each row its own).
     *[dict(name=f"vitw_{s}", repo="zhifeixie/Voices-in-the-Wild-2M", rev="main", prefix=f"data/{s}-", audio="audio",
@@ -272,7 +274,52 @@ def spgi2_shards(src, seed):
     return [(lambda p=p: shard(p)) for p in files]
 
 
-LOADERS = {"earnings22": earnings22_shards, "tedlium": tedlium_shards, "spgi2": spgi2_shards}
+def meeting_windows(segs, max_s=25.0):
+    """Transcript segments [(start, end, speaker, text)] -> [(start, end, [(speaker, text)])]: consecutive segments,
+    a window closes only at a silence (the next segment starts after every open one ended), so no speech crosses a
+    cut unlabelled; a window that cannot close within max_s is dropped."""
+    segs = sorted(segs)
+    out, cur, hi = [], [], 0.0
+    for s in segs:
+        if cur and s[0] >= hi and hi - cur[0][0] > max_s * 0.4:      # silence and long enough: close
+            out.append((cur[0][0], hi, [(x[2], x[3]) for x in cur]))
+            cur = []
+        cur.append(s)
+        hi = max(hi, s[1]) if len(cur) > 1 else s[1]
+    if cur:
+        out.append((cur[0][0], hi, [(x[2], x[3]) for x in cur]))
+    return [w for w in out if w[1] - w[0] <= max_s]
+
+
+def notsofar_shards(src, seed):
+    """microsoft/NOTSOFAR train 240825.1 (72 real office meetings, ~6 min, CC-BY-4.0; the older train releases hold
+    the dev-1 meetings): every far-field device (sc_* and mc_* channel 0, ~9 per meeting) cut into meeting_windows
+    with <spk> turn tags. Speaker = the meeting, so val takes whole meetings across all devices."""
+    from multispk import _text
+    base = "benchmark-datasets/train_set/240825.1_train/MTG/"
+    files = hf(HfApi().list_repo_files, src["repo"], repo_type="dataset")
+    meets = sorted({f[len(base):].split("/")[0] for f in files if f.startswith(base)})
+    random.Random(seed).shuffle(meets)
+
+    def shard(m):
+        gt = json.load(open(hf(hf_hub_download, src["repo"], f"{base}{m}/gt_transcription.json", repo_type="dataset")))
+        segs = [(g["start_time"], g["end_time"], g["speaker_id"], g["text"]) for g in gt]
+        wins = meeting_windows(segs)
+        rows = []
+        for f in sorted(f for f in files if f.startswith(f"{base}{m}/") and f.endswith("/ch0.wav")
+                        and f.split("/")[-2].startswith(("sc_", "mc_"))):
+            local = hf(hf_hub_download, src["repo"], f, repo_type="dataset")
+            x, sr = sf.read(local, dtype="float32")
+            os.remove(os.path.realpath(local))
+            for lo, hi, turns in wins:
+                a, b = max(lo - 0.2, 0.0), hi + 0.2
+                rows.append({"audio": _wav(x[int(a * sr): int(b * sr)], sr), "text": _text(turns), "meeting": m,
+                             "device": f.split("/")[-2]})
+        return rows
+    return [(lambda m=m: shard(m)) for m in meets]
+
+
+LOADERS = {"earnings22": earnings22_shards, "tedlium": tedlium_shards, "spgi2": spgi2_shards, "notsofar": notsofar_shards}
 
 
 def build(src, out, scale, seed):
@@ -370,4 +417,7 @@ if __name__ == "__main__":
     _p = cut_aligned(_w)
     assert [p[2][:2] for p in _p[:2]] == [["a", "b"], ["c", "w0"]] and _p[0][1] == _p[1][0] == 1.2, _p[:2]
     assert all(hi - lo <= 26 for lo, hi, _, _ in _p) and sum(len(p[2]) for p in _p) == len(_w)
+    _s = [(0, 6, "a", "x"), (5, 12, "b", "y"), (13, 20, "a", "z"), (19.5, 40, "c", "long"), (41, 44, "a", "w")]
+    _m = meeting_windows(_s)       # [0,12] closes at the 12->13 silence; [13,40] runs past 25 s and is dropped
+    assert [(lo, hi) for lo, hi, _ in _m] == [(0, 12), (41, 44)] and _m[0][2] == [("a", "x"), ("b", "y")], _m
     main()
