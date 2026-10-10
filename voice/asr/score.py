@@ -36,6 +36,21 @@ def wer(ref, hyp):
     return d[-1] / max(len(ref), 1)
 
 
+def edits(ref, hyp):
+    """(substitutions, deletions, insertions) of one minimum edit-distance alignment; their sum / len(ref) = wer()."""
+    d = [(j, 0, 0, j) for j in range(len(hyp) + 1)]               # (cost, S, D, I) per hyp prefix
+    for i, r in enumerate(ref, 1):
+        prev, d[0] = d[0], (i, 0, i, 0)
+        for j, h in enumerate(hyp, 1):
+            c, s, dl, ins = prev
+            sub = (c + (r != h), s + (r != h), dl, ins)
+            c, s, dl, ins = d[j]
+            dele = (c + 1, s, dl + 1, ins)
+            c, s, dl, ins = d[j - 1]
+            prev, d[j] = d[j], min(sub, dele, (c + 1, s, dl, ins + 1))
+    return d[-1][1:]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ref", required=True)
@@ -49,5 +64,6 @@ def main():
 
 if __name__ == "__main__":
     assert wer(["a", "b", "c"], ["a", "x", "c", "d"]) == 2 / 3
+    assert edits(["a", "b", "c"], ["a", "x", "c", "d"]) == (1, 0, 1) and edits(["a", "b"], ["b"]) == (0, 1, 0)
     assert normalize("Hello, Uh world! <en-US> आँखें पीली हैं।") == ["hello", "world", "आँखें", "पीली", "हैं"]
     main()

@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blank_penalty  # noqa: E402
 import selfcond_head  # noqa: E402
 from ctc_heads import MEETING, encode, set_lookahead  # noqa: E402
-from score import normalize, wer  # noqa: E402
+from score import edits, normalize, wer  # noqa: E402
 
 
 def load(path, head):
@@ -32,6 +32,12 @@ def load(path, head):
         sd = torch.load(t.extractfile(next(n for n in t.getnames() if n.endswith("model_weights.ckpt"))),
                         map_location="cuda", weights_only=False)
     m.load_state_dict(sd, strict=True)
+    if hasattr(m, "joint"):       # RNN-T greedy: a captured CUDA graph would replay the first blank penalty forever
+        from omegaconf import open_dict
+        dec = m.cfg.decoding
+        with open_dict(dec):
+            dec.greedy.use_cuda_graph_decoder = False
+        m.change_decoding_strategy(dec, decoder_type="rnnt")
     return m.cuda().eval()
 
 
@@ -48,8 +54,15 @@ def main():
     torch.set_grad_enabled(False)
     clips = [(sf.read(os.path.join(a.meeting, w))[0].astype(np.float32),
               normalize(open(os.path.join(a.meeting, r), encoding="utf-8").read())) for w, r in MEETING]
-    words = [len(r) for _, r in clips]
-    pooled = lambda res: 100 * sum(w * k for w, k in zip(res, words)) / sum(words)
+    n = sum(len(r) for _, r in clips)
+
+    def report(name, dec, la, bp, hyps):           # per-clip WER, pooled WER and its S / D / I split, hyp words
+        sdi = [edits(ref, h) for (_, ref), h in zip(clips, hyps)]
+        s, d, i = (sum(x[k] for x in sdi) for k in range(3))
+        print(f"MEET {name:24s} {dec:4s} la {la * 80:4d} ms bp {bp:.1f} | pooled {100 * (s + d + i) / n:5.2f} "
+              f"(S {100 * s / n:5.2f} D {100 * d / n:5.2f} I {100 * i / n:5.2f}) | "
+              + " ".join(f"{100 * wer(ref, h):5.1f}" for (_, ref), h in zip(clips, hyps))
+              + f" | hyp/ref words {sum(map(len, hyps))}/{n}", flush=True)
     for path in a.nemo:
         m = load(path, a.head)
         name = os.path.basename(path)[:-5]
@@ -61,25 +74,23 @@ def main():
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 zs = [m.ctc_decoder.head(e).float()[0, : int(el[0])] + lock for e, el in encs]
             for bp in a.bp:
-                res = []
-                for z, (_, ref) in zip(zs, clips):
+                hyps = []
+                for z in zs:
                     z = z.clone()
                     z[:, blank] -= bp
                     ids = z.argmax(-1)
                     keep = (ids != blank) & (ids != F.pad(ids, (1, 0), value=-1)[:-1])
-                    res.append(wer(ref, normalize(m.tokenizer.ids_to_text(ids[keep].tolist()))))
-                print(f"MEET {name:22s} ctc  la {la * 80:4d} ms bp {bp:.1f} | pooled {pooled(res):5.2f} | " +
-                      " ".join(f"{100 * w:5.1f}" for w in res), flush=True)
+                    hyps.append(normalize(m.tokenizer.ids_to_text(ids[keep].tolist())))
+                report(name, "ctc", la, bp, hyps)
                 if a.rnnt:
                     blank_penalty.apply(bp, head="rnnt", mask_ids=lock)
-                    res = []
-                    for (e, el), (_, ref) in zip(encs, clips):
+                    hyps = []
+                    for e, el in encs:
                         hyp = m.decoding.rnnt_decoder_predictions_tensor(encoder_output=e.transpose(1, 2), encoded_lengths=el)
                         hyp = hyp[0] if isinstance(hyp, tuple) else hyp
-                        res.append(wer(ref, normalize(hyp[0].text)))
+                        hyps.append(normalize(hyp[0].text))
                     blank_penalty.apply(0.0, head="rnnt")
-                    print(f"MEET {name:22s} rnnt la {la * 80:4d} ms bp {bp:.1f} | pooled {pooled(res):5.2f} | " +
-                          " ".join(f"{100 * w:5.1f}" for w in res), flush=True)
+                    report(name, "rnnt", la, bp, hyps)
         del m
         torch.cuda.empty_cache()
     print("AB_MEETING_DONE", flush=True)
