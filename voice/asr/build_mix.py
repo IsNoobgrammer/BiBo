@@ -60,10 +60,10 @@ SOURCES = [
     dict(name="nptel", repo="skbose/indian-english-nptel-v0", rev="main", prefix="data/train-", audio="audio",
          text="transcription_normalised", lang="en", hours=None, frac=0.57, speaker=lambda r: r["speaker_name"]),
     # --- English, shared ---
-    dict(name="ami_ihm", repo="edinburghcstr/ami", rev=CONV, prefix="ihm/train/", audio="audio", text="text", lang="en",
+    dict(name="ami_ihm", min_s=0.2, repo="edinburghcstr/ami", rev=CONV, prefix="ihm/train/", audio="audio", text="text", lang="en",
          hours=None, frac=1.0, windows_only=True, speaker=lambda r: r["speaker_id"],
          extra={"meeting": "meeting_id", "begin": "begin_time"}),           # ONLY as full-meeting <spk> windows
-    dict(name="ami_sdm", repo="edinburghcstr/ami", rev=CONV, prefix="sdm/train/", audio="audio", text="text", lang="en",
+    dict(name="ami_sdm", min_s=0.2, repo="edinburghcstr/ami", rev=CONV, prefix="sdm/train/", audio="audio", text="text", lang="en",
          hours=None, frac=1.0, windows_only=True, speaker=lambda r: r["speaker_id"],
          extra={"meeting": "meeting_id", "begin": "begin_time"}),           # same meetings, single distant mic (far-field)
     dict(name="librispeech", repo="openslr/librispeech_asr", rev="main", prefix="all/train.clean.100/", audio="audio",
@@ -327,6 +327,7 @@ def build(src, out, scale, seed):
     budget = src["hours"] * scale * 3600 if src["hours"] else float("inf")
     quota = {k: v * scale * 3600 for k, v in (src.get("quota") or {}).items()}
     max_s = src.get("max_s", MAX_S)
+    min_s = src.get("min_s", MIN_S)  # AMI: keep the <1 s backchannels (yeah / okay) for the meeting windows
     if src.get("loader") == "spotify":
         src = {**src, "audio": "audio", "text": "transcription"}
         shards = [lambda: spotify_rows()]
@@ -368,7 +369,7 @@ def build(src, out, scale, seed):
                 if sr != SR:
                     x = AF.resample(torch.from_numpy(np.ascontiguousarray(x)), sr, SR).numpy()
                 dur = len(x) / SR
-                if not MIN_S <= dur <= max_s:
+                if not min_s <= dur <= max_s:
                     skipped += 1
                     continue
                 p = os.path.join(adir, f"{n:07d}.flac")
