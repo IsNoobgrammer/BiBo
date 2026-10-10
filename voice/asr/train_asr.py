@@ -258,6 +258,66 @@ class GradDiag(Callback):
         pl_module.log_dict(out)
 
 
+class ProfileSteps(Callback):
+    """--profile_steps A:B -- where does a REAL train_asr step go (loader, Lightning, optimizer, logging included)?
+    Steps A..B under torch.profiler (CPU + CUDA): wall ms/step (one sync at each end), GPU kernel ms/step (-> GPU idle
+    share), the top CPU ops by self time (host syncs show up as cudaStreamSynchronize / _local_scalar_dense / item),
+    top CUDA kernels; then ONE more step under torch.cuda sync-debug mode listing every host-sync site (file:line)."""
+
+    def __init__(self, spec):
+        self.a, self.b = map(int, spec.split(":"))
+        self.prof, self.sites, self.t0 = None, None, None
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        g = trainer.global_step
+        if g == self.a:
+            torch.cuda.synchronize()
+            self.prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                           torch.profiler.ProfilerActivity.CUDA])
+            self.prof.__enter__()
+            self.t0 = time.perf_counter()
+        if g == self.b + 1:
+            import collections, traceback, warnings
+            self.sites = collections.Counter()
+
+            def show(msg, cat, fn, ln, file=None, line=None):
+                for fr in reversed(traceback.extract_stack()[:-1]):
+                    if "/torch/" not in fr.filename and "warnings" not in fr.filename:
+                        self.sites[f"{os.path.basename(fr.filename)}:{fr.lineno} {fr.name}"] += 1
+                        return
+            self._old = warnings.showwarning
+            warnings.showwarning = show
+            warnings.simplefilter("always")
+            torch.cuda.set_sync_debug_mode("warn")
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        g = trainer.global_step                         # already incremented for this step
+        if self.prof is not None and g == self.b + 1:
+            torch.cuda.synchronize()
+            wall = (time.perf_counter() - self.t0) / (self.b - self.a + 1) * 1000
+            self.prof.__exit__(None, None, None)
+            ev = self.prof.key_averages()
+            n = self.b - self.a + 1
+            gpu = sum(e.self_device_time_total for e in ev) / n / 1000
+            print(f"[profile] steps {self.a}-{self.b}: wall {wall:.1f} ms/step, GPU kernels {gpu:.1f} ms/step "
+                  f"({100 * gpu / wall:.0f}% busy, {wall - gpu:.1f} ms/step GPU idle)", flush=True)
+            print("[profile] top CPU ops by self time (ms/step):", flush=True)
+            for e in sorted(ev, key=lambda e: -e.self_cpu_time_total)[:25]:
+                print(f"    {e.self_cpu_time_total / n / 1000:7.2f}  x{e.count / n:<6.1f} {e.key[:90]}", flush=True)
+            print("[profile] top CUDA kernels (ms/step):", flush=True)
+            for e in sorted(ev, key=lambda e: -e.self_device_time_total)[:12]:
+                print(f"    {e.self_device_time_total / n / 1000:7.2f}  {e.key[:90]}", flush=True)
+            self.prof = None
+        if self.sites is not None and g == self.b + 2:
+            import warnings
+            torch.cuda.set_sync_debug_mode(0)
+            warnings.showwarning = self._old
+            print(f"[profile] host syncs in one step: {sum(self.sites.values())}", flush=True)
+            for s_, c in self.sites.most_common(30):
+                print(f"    {c:4d}x  {s_}", flush=True)
+            self.sites = None
+
+
 class StopAt(Callback):
     """--stop_step: end a (resumed) run at this global step WITHOUT changing max_steps, so the LR schedule is
     identical to the full run's (replay experiments)."""
@@ -429,6 +489,7 @@ def main():
                          "e.g. 0 0.5 0.5 0.5 0.2")
     ap.add_argument("--grad_diag", type=int, default=0, help="log per-module grad norms + look-ahead every N steps")
     ap.add_argument("--stop_step", type=int, default=None, help="stop at this global step (schedule unchanged)")
+    ap.add_argument("--profile_steps", default=None, help="A:B -- profile real steps A..B (+1 sync-debug step)")
     ap.add_argument("--lr_scale", type=float, default=None, help="multiply the scheduler lrs at train start (resumes)")
     ap.add_argument("--ckpt", default=None, help="resume from this checkpoint (e.g. a --save_steps one, for a decay branch)")
     ap.add_argument("--workers", type=int, default=None, help="loader workers (default: CPU count - 1)")
@@ -583,6 +644,7 @@ def main():
                    *([SaveSteps(a.save_steps, ckpt_dir)] if a.save_steps else []),
                    *([GradDiag(a.grad_diag)] if a.grad_diag else []),
                    *([StopAt(a.stop_step)] if a.stop_step else []),
+                   *([ProfileSteps(a.profile_steps)] if a.profile_steps else []),
                    *([LrScale(a.lr_scale)] if a.lr_scale else []),
                    *([] if a.no_hf else [HFSync(a.run, ckpt_dir)])])
     m.set_trainer(trainer)
