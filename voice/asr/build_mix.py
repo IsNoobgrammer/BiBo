@@ -68,6 +68,12 @@ SOURCES = [
          extra={"meeting": "meeting_id", "begin": "begin_time"}),           # same meetings, single distant mic (far-field)
     dict(name="librispeech", repo="openslr/librispeech_asr", rev="main", prefix="all/train.clean.100/", audio="audio",
          text="text", lang="en", hours=None, frac=1.0, speaker=lambda r: str(r["speaker_id"])),  # read, train-clean-100
+    dict(name="earnings22", loader="earnings22", repo="anton-l/earnings22_baseline_5_gram", lang="en", hours=None,
+         speaker=lambda r: r["call"]),                                      # earnings calls, many accents (CC BY-SA)
+    dict(name="tedlium", loader="tedlium", repo="kfajdsl/tedlium", lang="en", hours=250,
+         speaker=lambda r: r["talk"]),                                      # TED talks, wide vocabulary (CC BY-NC-ND)
+    dict(name="spgi2", loader="spgi2", repo="kensho/SPGISpeech2.0", lang="en", hours=300,
+         speaker=lambda r: str(r["spk"])),                                  # earnings calls (Kensho: non-commercial)
     dict(name="spotify", loader="spotify", repo="SALT-NLP/spotify_podcast_ASR", lang="en", hours=None, max_s=60,
          speaker=lambda r: r["filename"]),                                  # human verbatim podcast talk, 2-3 speakers
     dict(name="phone", repo="sawradip/phone-asr-data", rev="main", prefix="data/", audio="audio", text="transcription",
@@ -135,6 +141,131 @@ def spotify_rows():
     return rows
 
 
+def _wav(x, sr=SR):
+    b = io.BytesIO()
+    sf.write(b, x, sr, format="WAV")
+    return {"bytes": b.getvalue()}
+
+
+DROP_TAGS = ("<inaudible", "<crosstalk", "inaudible", "ignore_time_segment_in_scoring", "<unk>")  # label != audio
+
+
+def earnings22_shards(src, seed):
+    """anton-l/earnings22_baseline_5_gram (the files ESB's earnings22 reads): one tar per call of segment wavs +
+    metadata.csv (cased, punctuated sentence per segment). Speaker = the call (no per-speaker labels)."""
+    meta = {}
+    for r in csv.DictReader(open(hf(hf_hub_download, src["repo"], "metadata.csv", repo_type="dataset"), encoding="utf-8")):
+        meta[r["file"]] = r
+    tars = sorted({f"data/chunked/{r['source_id']}.tar.gz" for r in meta.values()})
+    random.Random(seed).shuffle(tars)
+
+    def shard(path):
+        import tarfile
+        local = hf(hf_hub_download, src["repo"], path, repo_type="dataset")
+        rows = []
+        with tarfile.open(local) as t:
+            for m in t:
+                r = meta.get(m.name.lstrip("./"))
+                if m.isfile() and r and not any(k in r["sentence"].lower() for k in DROP_TAGS):
+                    rows.append({"audio": {"bytes": t.extractfile(m).read()}, "text": r["sentence"], "call": r["source_id"]})
+        os.remove(os.path.realpath(local))
+        return rows
+    return [(lambda p=p: shard(p)) for p in tars]
+
+
+def tedlium_shards(src, seed):
+    """kfajdsl/tedlium (mirror of LIUM/tedlium) release 3 legacy train_1 (~300 h of 452): talk .sph + .stm segments.
+    Text fixes as ESB: lowercase, "it 's" -> "it's"; a segment with <unk> (an unknown spoken word) is dropped, not
+    kept with the word deleted. Speaker = the talk."""
+    import re
+    import tarfile
+    root = os.path.join(src["_out"], "_tedlium_extract")
+    if not os.path.isdir(root):
+        local = hf(hf_hub_download, src["repo"], "TEDLIUM_release3/legacy/train_1.tar.gz", repo_type="dataset")
+        with tarfile.open(local) as t:
+            t.extractall(root)
+        os.remove(os.path.realpath(local))
+    stms = sorted(glob_files(root, ".stm"))
+    random.Random(seed).shuffle(stms)
+
+    def shard(stm):
+        rows, audio = [], {}
+        for line in open(stm, encoding="utf-8"):
+            fn, _ch, spk, t0, t1, _label, text = line.strip().split(" ", 6)
+            text = text.rsplit(" (", 1)[0].lower() if text.endswith(")") else text.lower()
+            if not text or any(k in text for k in DROP_TAGS):
+                continue
+            text = re.sub(r" '(?=[a-z])", "'", text)
+            if fn not in audio:
+                audio[fn], _ = sf.read(os.path.join(os.path.dirname(os.path.dirname(stm)), "sph", fn + ".sph"),
+                                       dtype="float32")
+            x = audio[fn][int(float(t0) * SR): int(float(t1) * SR)]
+            rows.append({"audio": _wav(x), "text": text, "talk": fn})
+        return rows
+    return [(lambda s=s: shard(s)) for s in stms]
+
+
+def glob_files(root, ext):
+    return [os.path.join(d, f) for d, _, fs in os.walk(root) for f in fs if f.endswith(ext)]
+
+
+def cut_aligned(words, max_s=25.0, min_gap=0.15):
+    """Word alignment [(word, start, end, speaker)] -> [(start, end, [words])]: a new piece at every speaker change,
+    and at the first pause >= min_gap once a piece is past 2/3 of max_s (hard cut at max_s). Cut points sit in the
+    middle of the gap, so no piece holds part of a neighbour's word."""
+    pieces, cur = [], []
+    for w in words:
+        if cur:
+            gap, dur = w[1] - cur[-1][2], w[2] - cur[0][1]
+            if w[3] != cur[-1][3] or dur > max_s or (gap >= min_gap and dur > max_s * 2 / 3):
+                pieces.append(cur)
+                cur = []
+        cur.append(w)
+    if cur:
+        pieces.append(cur)
+    out = []
+    for i, p in enumerate(pieces):
+        lo = (pieces[i - 1][-1][2] + p[0][1]) / 2 if i else max(p[0][1] - 0.2, 0.0)
+        hi = (p[-1][2] + pieces[i + 1][0][1]) / 2 if i + 1 < len(pieces) else p[-1][2] + 0.2
+        out.append((lo, max(hi, lo), [w[0] for w in p], p[0][3]))
+    return out
+
+
+def spgi2_shards(src, seed):
+    """kensho/SPGISpeech2.0: ~75 s multi-speaker snippets (cased, punctuated raw_transcript) + per-word alignment
+    (word, start, end, speaker) in supplemental_data/alignment_files.tar.gz. Each snippet is cut by cut_aligned into
+    single-speaker pieces <= 25 s; text = the aligned words. Speaker = the alignment's speaker id."""
+    import tarfile
+    root = os.path.join(src["_out"], "_spgi2_align")
+    if not os.path.isdir(root):
+        local = hf(hf_hub_download, src["repo"], "supplemental_data/alignment_files.tar.gz", repo_type="dataset")
+        with tarfile.open(local) as t:
+            t.extractall(root)
+    files = sorted(f for f in hf(HfApi().list_repo_files, src["repo"], repo_type="dataset")
+                   if f.startswith("data/train_part_") and f.endswith(".parquet"))
+    random.Random(seed).shuffle(files)
+
+    def shard(path):
+        local = hf(hf_hub_download, src["repo"], path, repo_type="dataset")
+        t = pq.read_table(local, columns=["call_id", "snippet_id", "audio"]).to_pylist()
+        os.remove(os.path.realpath(local))
+        rows = []
+        for r in t:
+            ap = os.path.join(root, "alignment_files", str(r["call_id"]), f"{r['snippet_id']}.json")
+            if not os.path.exists(ap):
+                continue
+            al = json.load(open(ap))
+            words = [(w["word"], w["start_time"], w["end_time"], w["speaker"]) for _, w in sorted(al.items(), key=lambda kv: int(kv[0]))]
+            x, sr = sf.read(io.BytesIO(r["audio"]["bytes"]), dtype="float32")
+            for lo, hi, ws, spk in cut_aligned(words):
+                rows.append({"audio": _wav(x[int(lo * sr): int(hi * sr)], sr), "text": " ".join(ws), "spk": spk})
+        return rows
+    return [(lambda p=p: shard(p)) for p in files]
+
+
+LOADERS = {"earnings22": earnings22_shards, "tedlium": tedlium_shards, "spgi2": spgi2_shards}
+
+
 def build(src, out, scale, seed):
     name = src["name"]
     budget = src["hours"] * scale * 3600 if src["hours"] else float("inf")
@@ -143,6 +274,9 @@ def build(src, out, scale, seed):
     if src.get("loader") == "spotify":
         src = {**src, "audio": "audio", "text": "transcription"}
         shards = [lambda: spotify_rows()]
+    elif src.get("loader") in LOADERS:
+        src = {**src, "audio": "audio", "text": "text", "_out": out}
+        shards = LOADERS[src["loader"]](src, seed)
     else:
         files = sorted(f for f in hf(HfApi().list_repo_files, src["repo"], repo_type="dataset", revision=src["rev"])
                        if f.startswith(src["prefix"]) and f.endswith(".parquet"))
@@ -223,4 +357,8 @@ def main():
 
 
 if __name__ == "__main__":
+    _w = [("a", 0.0, 0.5, 1), ("b", 0.6, 1.0, 1), ("c", 1.4, 1.8, 2)] + [(f"w{i}", 2 + i, 2.9 + i, 2) for i in range(30)]
+    _p = cut_aligned(_w)
+    assert [p[2][:2] for p in _p[:2]] == [["a", "b"], ["c", "w0"]] and _p[0][1] == _p[1][0] == 1.2, _p[:2]
+    assert all(hi - lo <= 26 for lo, hi, _, _ in _p) and sum(len(p[2]) for p in _p) == len(_w)
     main()
