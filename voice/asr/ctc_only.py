@@ -45,7 +45,9 @@ def enable(model):
                             predictions_lengths=encoded_len)
         wer, num, den = self.ctc_wer.compute()
         self.ctc_wer.reset()
-        logs.update(val_wer=wer, val_wer_num=num, val_wer_denom=den)
+        # the hybrid's multi_validation_epoch_end also reads the *_ctc keys: CTC is the only head, same numbers
+        logs.update(val_wer=wer, val_wer_num=num, val_wer_denom=den, val_wer_ctc=wer, val_wer_num_ctc=num,
+                    val_wer_denom_ctc=den)
         return logs
 
     model.training_step = types.MethodType(training_step, model)
