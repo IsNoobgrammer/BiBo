@@ -304,7 +304,7 @@ def notsofar_shards(src, seed):
     def shard(m):
         gt = json.load(open(hf(hf_hub_download, src["repo"], f"{base}{m}/gt_transcription.json", repo_type="dataset")))
         segs = [(g["start_time"], g["end_time"], g["speaker_id"], g["text"]) for g in gt]
-        wins = meeting_windows(segs)
+        wins = [w for w in meeting_windows(segs) if len({s for s, _ in w[2]}) <= 4]   # <spk1..4> only (4-8 attend)
         rows = []
         for f in sorted(f for f in files if f.startswith(f"{base}{m}/") and f.endswith("/ch0.wav")
                         and f.split("/")[-2].startswith(("sc_", "mc_"))):
