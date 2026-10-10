@@ -296,6 +296,41 @@ class ProfileSteps(Callback):
                     return r
                 sub.step, sub._phase_wrapped = step, True
 
+    MODS = ("encoder", "decoder", "joint", "ctc_decoder")        # forward ranges per top-level module
+    BWD = {"_RNNTJointBackward": "joint (fused joint + RNN-T loss)", "CudnnRnnBackward0": "decoder (pred-net LSTM)",
+           "EmbeddingBackward0": "decoder (pred-net LSTM)", "_PassBackward": "ctc_decoder", "_CTCBackward": "ctc loss"}
+
+    def _hook_modules(self, pl_module):
+        self._hooks, self._open = [], {}
+        for name in self.MODS:
+            mod = getattr(pl_module, name, None)
+            if mod is None:
+                continue
+
+            def pre(m, args, _n=name):
+                r = torch.autograd.profiler.record_function(f"mod:{_n}")
+                r.__enter__()
+                self._open.setdefault(_n, []).append(r)
+
+            def post(m, args, out, _n=name):
+                self._open[_n].pop().__exit__(None, None, None)
+            self._hooks += [mod.register_forward_pre_hook(pre), mod.register_forward_hook(post)]
+
+    def _by_module(self, n):
+        """GPU ms/step per component: forward = kernels under each module's range; backward = kernels under each
+        autograd node, classified by node name (everything unlisted is the encoder / glue)."""
+        fwd, bwd = {}, {}
+        for e in self.prof.events():
+            if e.name.startswith("mod:"):
+                fwd[e.name[4:]] = fwd.get(e.name[4:], 0.0) + e.device_time_total
+            elif e.name.startswith("autograd::engine::evaluate_function: "):
+                k = self.BWD.get(e.name.split(": ", 1)[1], "encoder + rest")
+                bwd[k] = bwd.get(k, 0.0) + e.device_time_total
+        print("[profile] GPU ms/step by component (forward ranges / backward autograd nodes):", flush=True)
+        for tag, d in (("fwd", fwd), ("bwd", bwd)):
+            for k, v in sorted(d.items(), key=lambda kv: -kv[1]):
+                print(f"    {tag} {v / n / 1000:7.2f}  {k}", flush=True)
+
     def on_before_backward(self, trainer, pl_module, loss):
         self._ev("backward")
 
@@ -312,6 +347,7 @@ class ProfileSteps(Callback):
             self._ev("forward")
         if g == self.a:
             opts = trainer.optimizers
+            self._hook_modules(pl_module)
             print(f"[profile] optimizer: {[type(o).__name__ for o in opts]}, groups fused / foreach: "
                   f"{[(gr.get('fused'), gr.get('foreach')) for o in opts for gr in o.param_groups]}", flush=True)
             torch.cuda.synchronize()
@@ -351,8 +387,11 @@ class ProfileSteps(Callback):
             torch.cuda.synchronize()
             wall = (time.perf_counter() - self.t0) / (self.b - self.a + 1) * 1000
             self.prof.__exit__(None, None, None)
+            for h in self._hooks:
+                h.remove()
             ev = self.prof.key_averages()
             n = self.b - self.a + 1
+            self._by_module(n)
             from torch.autograd import DeviceType
             cpu_names = {e.key for e in ev if e.self_cpu_time_total > 0}  # a CUDA-side copy of a CPU range (e.g.
             kern = [e for e in self.prof.events() if e.device_type == DeviceType.CUDA   # Optimizer.step) is no kernel
@@ -367,7 +406,7 @@ class ProfileSteps(Callback):
             agg = {}
             for e in kern:
                 agg[e.name] = agg.get(e.name, 0.0) + e.device_time
-            for k, v in sorted(agg.items(), key=lambda kv: -kv[1])[:12]:
+            for k, v in sorted(agg.items(), key=lambda kv: -kv[1])[:25]:
                 print(f"    {v / n / 1000:7.2f}  {k[:90]}", flush=True)
             self.prof = None
         if self.sites is not None and g == self.b + 2:
