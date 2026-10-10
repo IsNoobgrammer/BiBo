@@ -193,6 +193,8 @@ def tedlium_shards(src, seed):
         os.remove(os.path.realpath(local))
     stms = sorted(glob_files(root, ".stm"))
     random.Random(seed).shuffle(stms)
+    # this mirror's tar holds train/<talk>.sph/<talk>.sph (a folder per file): index the audio by talk name
+    sph = {os.path.basename(p)[:-4]: p for p in glob_files(root, ".sph")}
 
     def shard(stm):
         rows, audio = [], {}
@@ -202,9 +204,10 @@ def tedlium_shards(src, seed):
             if not text or any(k in text for k in DROP_TAGS):
                 continue
             text = re.sub(r" '(?=[a-z])", "'", text)
+            if fn not in sph:
+                continue
             if fn not in audio:
-                audio[fn], _ = sf.read(os.path.join(os.path.dirname(os.path.dirname(stm)), "sph", fn + ".sph"),
-                                       dtype="float32")
+                audio[fn], _ = sf.read(sph[fn], dtype="float32")
             x = audio[fn][int(float(t0) * SR): int(float(t1) * SR)]
             rows.append({"audio": _wav(x), "text": text, "talk": fn})
         return rows
