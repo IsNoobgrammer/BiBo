@@ -28,7 +28,8 @@ DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 SPK = re.compile(r"<spk[1-9]>")
 VAL_CAP_H = {"phone": 0.5}                     # val hours ceiling per source (default 1 h); phone = 6 speakers, 4 h
 TRAIN_HOURS = {"nptel": 150}                   # cap a source (prep_train.pool_split = HF data/nptel/core150)
-SAME_SPEAKERS = {"ami_ihm": "ami", "ami_sdm": "ami"}   # one recording session, several mics: one val speaker set
+SAME_SPEAKERS = {"ami_ihm": "ami", "ami_sdm": "ami",                 # one recording / several copies: one val set
+                 **{f"{b}{k}": b for b in ("medical", "spotify", "svarah") for k in ("", "_phone", "_room")}}   # one recording session, several mics: one val speaker set
 
 
 def split_val(rows, share, cap_h, rng):
