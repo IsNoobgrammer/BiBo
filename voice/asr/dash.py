@@ -30,6 +30,8 @@ def lane_srcs(name):          # the lane lists straight from par_en.sh
     except Exception:
         return []
 LANES = {"A": lane_srcs("A"), "B": lane_srcs("B")}
+if os.path.exists(f"{L}/C.srcs"):              # extra lanes started by hand (e.g. the AMI <1 s rebuild)
+    LANES["C"] = open(f"{L}/C.srcs").read().split()
 pat = re.compile(r"^(\w+):\s+([\d.]+) / (\S+) h\s+(\d+) utts\s+(\d+) skipped(?:\s+(\d+) dropped)?(.*)$")
 def tail(p, n=200000):
     try:
@@ -145,7 +147,7 @@ code{font-size:12px;color:var(--muted)}
 <div class="grid" id="lanes"></div>
 </div>
 <script>
-const LANE_NAMES={A:"Lane A (restore old English, AMI-sdm, LibriSpeech, Earnings-22, NOTSOFAR, VITW x4)",B:"Lane B (SPGISpeech 2.0, TED-LIUM, VITW x4)"};
+const LANE_NAMES={A:"Lane A (restore old English, AMI-sdm, LibriSpeech, Earnings-22, NOTSOFAR, VITW x4)",B:"Lane B (SPGISpeech 2.0, TED-LIUM, VITW x4)",C:"Lane C (AMI rebuild, clips down to 0.2 s)"};
 const esc=s=>String(s??"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 function pill(st){if(st===null||st===undefined)return '<span class="pill run">running</span>';return st==="0"?'<span class="pill ok">done</span>':'<span class="pill bad">failed ('+esc(st)+')</span>';}
 const HIST={};let LAST=null,AT=0;
