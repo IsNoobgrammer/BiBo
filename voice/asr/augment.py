@@ -110,7 +110,7 @@ def room(x, babble_paths, seed):
     else:
         noise = _colored(len(y), rng.choice(["white", "pink", "brown"]), rng)
     y = _at_snr(y, noise, rng.uniform(0, 15))
-    y = _gaps(y, rng, int(rng.integers(2, 7) * max(len(y) / SR / 10, 0.3)), 30, 150)
+    y = _gaps(y, rng, max(1, round(rng.integers(2, 7) * len(y) / SR / 10)), 30, 150)   # 2-6 per 10 s, >= 1
     peak = np.abs(y).max()
     return (y / peak * 0.95 if peak > 1 else y).astype(np.float32)
 
@@ -137,5 +137,5 @@ if __name__ == "__main__":
     f = np.fft.rfftfreq(len(p), 1 / SR)
     assert len(p) == len(x) and spec[f > 4000].sum() < 1e-3 * spec.sum()      # nothing above the phone band
     r = room(x, [], 3)
-    assert len(r) == len(x) and np.isfinite(r).all() and np.abs(r).max() <= 1.0 and (r == 0).sum() > SR * 0.03
+    assert len(r) == len(x) and np.isfinite(r).all() and np.abs(r).max() <= 1.0 and (r == 0).sum() >= SR * 0.03
     print("augment ok")
