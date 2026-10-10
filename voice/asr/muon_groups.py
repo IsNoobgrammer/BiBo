@@ -7,6 +7,8 @@ bitwise equal to a real parameter of that shape):
   muon       2D Linear weights: encoder FFN / attention (q k v out pos), pre-encode output projection, joint enc /
              pred projections, CTC-head GLU up / down (gate+value stacked = ONE matrix, as the LLM's gate_up)
   muon_flat  pointwise convs (out, in, 1[, 1]) -> muon_rc (out, in)
+  muon_head  (heads=H) attention q / k / v / pos (512, 512) -> muon_rc (512/H, 512): PER HEAD, each head's features
+             orthogonal among themselves, no constraint across heads (rows of the output are head-major)
   muon_gate  prediction-net LSTM weight_ih / weight_hh (4H, in), gates i f g o stacked -> muon_rc (H, in): PER GATE
   adamw      1D (biases, LayerNorm, BatchNorm); depthwise / spatial convs (per-channel filters); pos_bias_u/v (per-head
              vectors stored as (H, d)); vocab embeddings and output heads (joint output, CTC readout, CTC
@@ -31,8 +33,9 @@ ADAMW_NAMES = [                                    # 2D+ parameters that are hea
 ]
 
 
-def assign(model):
-    """[(name, param, group, why)] for every trainable parameter; sets p.muon_rc where the matrix is reshaped."""
+def assign(model, heads=0):
+    """[(name, param, group, why)] for every trainable parameter; sets p.muon_rc where the matrix is reshaped.
+    heads > 0: attention q / k / v / pos are orthogonalised per head (else as one matrix)."""
     out = []
     for n, p in model.named_parameters():
         if not p.requires_grad:
@@ -46,6 +49,10 @@ def assign(model):
             H = p.shape[0] // 4
             p.muon_rc = (H, p.shape[1])
             g, why = "muon_gate", f"LSTM gates i f g o: 4 x ({H}, {p.shape[1]})"
+        elif heads and re.search(r"\.self_attn\.linear_(q|k|v|pos)\.weight$", n):
+            d = p.shape[0] // heads
+            p.muon_rc = (d, p.shape[1])
+            g, why = "muon_head", f"attention per head: {heads} x ({d}, {p.shape[1]})"
         elif p.ndim == 2:
             g, why = "muon", "2D matrix"
         elif p.ndim in (3, 4) and all(s == 1 for s in p.shape[2:]) and p.shape[1] > 1:
@@ -141,11 +148,11 @@ class Combined(__import__("torch").optim.Optimizer):
         return "Combined(" + ", ".join(type(o).__name__ for o in self.opts) + ")"
 
 
-def build(model, lr, muon_lr=None, wd=1e-3, muon_wd=None, momentum=0.95, variant="muown", ns="ns8", rows=None):
+def build(model, lr, muon_lr=None, wd=1e-3, muon_wd=None, momentum=0.95, variant="muown", ns="ns8", rows=None, heads=0):
     """FusedMuon (tkf sm120, variant muown, scale "adam": update RMS 0.2 so the AdamW lr band applies) on the muon*
     groups + fused AdamW on the rest, as one Combined optimizer. Prints the assignment."""
     import torch
-    rows = report(model, rows)
+    rows = report(model, rows or assign(model, heads))
     tkf = os.environ.get("TKF", "/home/marimo/work/triton-kernel-fused")
     sys.path.insert(0, tkf)
     from kernels.sm120.muon import FusedMuon

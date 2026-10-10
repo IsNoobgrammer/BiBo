@@ -540,6 +540,7 @@ def main():
                     help="muown = tkf FusedMuon on the weight matrices + AdamW on the rest (muon_groups.py)")
     ap.add_argument("--muon_lr", type=float, default=None, help="Muon lr (scale adam: same band as AdamW); default --lr")
     ap.add_argument("--muon_variant", default="muown", help="FusedMuon variant: muown | aurora | normuon")
+    ap.add_argument("--muon_heads", action="store_true", help="Muon on attention q/k/v/pos PER HEAD: (512,512) -> 8 x (64,512)")
     ap.add_argument("--muon_ns", default="ns8", help="Newton-Schulz preset: ns8 (6 quintic + 2 finishing, the BiBo board default) | ns6 | dsv4 (10)")
     ap.add_argument("--decay_frac", type=float, default=0.2)
     ap.add_argument("--lookahead_probs", nargs="*", default=None,
@@ -741,7 +742,8 @@ def main():
     if a.optim == "muown":               # FusedMuon(muown) on the matrices + fused AdamW on the rest (muon_groups.py)
         assert not a.bf16_master and a.sched == "cosine", "--optim muown: autocast + cosine only"
         import muon_groups
-        opt = muon_groups.build(m, a.lr, muon_lr=a.muon_lr, wd=1e-3, variant=a.muon_variant, ns=a.muon_ns)
+        opt = muon_groups.build(m, a.lr, muon_lr=a.muon_lr, wd=1e-3, variant=a.muon_variant, ns=a.muon_ns,
+                                heads=m.encoder.layers[0].self_attn.h if a.muon_heads else 0)
         sch = muon_groups.warmup_cosine(opt, a.warmup, max_steps, 1e-5)
         m._optimizer, m._scheduler = opt, sch
         m.configure_optimizers = lambda: ([opt], [{"scheduler": sch, "interval": "step", "frequency": 1}])
