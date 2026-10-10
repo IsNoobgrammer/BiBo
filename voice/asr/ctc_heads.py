@@ -247,9 +247,11 @@ class SelfCondN(nn.Module):
         self.auxs = list(zip(zs[:-1], self.w[:-1]))
         return zs[-1]
 
-    def fused_loss(self, h, hl, tgt, tlen, blank):
-        """Training loss via tkf's fused pass (kernels/sm120/selfcond_ctc.py): sum_i w_i * CTC_i with ctc()'s
-        normalisation (nll / target length, batch mean). Same parameters and maths as forward() + ctc()."""
+    def fused_loss(self, h, hl, tgt, tlen, blank, reduce=None, return_logits=False):
+        """Training loss via tkf's fused pass (kernels/sm120/selfcond_ctc.py): sum_i w_i * reduce(nll_i, tlen), reduce
+        default = ctc()'s normalisation (nll / target length, batch mean). Same parameters and maths as forward() +
+        ctc(). return_logits: also the last pass's logits (bf16, no grad) for batch WER."""
+        reduce = reduce or (lambda nll, tl_: (nll / tl_.clamp(min=1)).mean())
         from kernels.sm120.selfcond_ctc import selfcond_ctc_pass
         d, T = h.shape[-1], h.shape[1]
         loss, q = 0.0, None
@@ -259,9 +261,9 @@ class SelfCondN(nn.Module):
             x, lin = (h, r) if isinstance(r, nn.Linear) else (r.hidden(h), r.out)
             wf = (torch.cat([self.cond[i]["cur"].weight, self.cond[i]["prev"].weight], 0)
                   if i < self.npass - 1 else None)
-            nll, q = selfcond_ctc_pass(x, lin.weight, lin.bias, wf, tgt, hl, tlen, blank)
-            loss = loss + self.w[i] * (nll / tlen.clamp(min=1)).mean()
-        return loss
+            nll, q, z = selfcond_ctc_pass(x, lin.weight, lin.bias, wf, tgt, hl, tlen, blank)
+            loss = loss + self.w[i] * reduce(nll, tlen)
+        return (loss, z) if return_logits else loss
 
 
 class SelfCond(nn.Module):
