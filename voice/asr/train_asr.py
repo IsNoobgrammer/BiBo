@@ -599,6 +599,82 @@ class HFSync(Callback):
         self._push()
 
 
+OOD_LIKE = ("val_notsofar", "val_ami_sdm", "val_medical_room", "val_spotify_room", "val_svarah_room")
+
+
+def bp_metrics(m, bp):
+    """val_wer_ctcbp / val_wer_rnntbp: each head's greedy WER with `bp` subtracted from blank -- how the app decodes
+    (blank penalty 1.0 won at every streaming look-ahead on the meeting clips, Oct 12 2026). The plain val_wer /
+    val_wer_ctc and the validation losses are unchanged: each WER metric's update runs twice in validation, first
+    with the penalty on (its num / den kept, then the metric reset), then plainly as NeMo expects. RNN-T: the penalty
+    is a flag read by this model's joint (greedy decoding runs without CUDA graphs here, so the flag is honoured)."""
+    last, state = {}, {"bp": 0.0}
+    jap = m.joint.joint_after_projection
+
+    def joint_after_projection(f, g):
+        out = jap(f, g)
+        if state["bp"] and not m.training:
+            out = out.clone()
+            out[..., -1] -= state["bp"]
+        return out
+    m.joint.joint_after_projection = joint_after_projection
+
+    def twice(metric, tag, penalise):
+        upd = metric.update
+
+        def update(*args, **kw):
+            if not m.training:
+                with torch.no_grad():
+                    penalise(args, kw, True)
+                    upd(*args, **kw)
+                    _, last[f"num_{tag}"], last[f"den_{tag}"] = metric.compute()
+                    metric.reset()
+                    penalise(args, kw, False)
+            return upd(*args, **kw)
+        metric.update = update
+
+    def rnnt_pen(args, kw, on):
+        state["bp"] = bp if on else 0.0
+
+    # CTC: penalise a copy of the log-probs for the extra pass
+    cu = m.ctc_wer.update
+    def ctc_update(*args, **kw):
+        if m.training:
+            return cu(*args, **kw)
+        orig = kw["predictions"]
+        p = orig.clone()
+        p[..., -1] -= bp
+        with torch.no_grad():
+            cu(*args, **{**kw, "predictions": p})
+            _, last["num_ctcbp"], last["den_ctcbp"] = m.ctc_wer.compute()
+            m.ctc_wer.reset()
+        return cu(*args, **kw)
+    m.ctc_wer.update = ctc_update
+    twice(m.wer, "rnntbp", rnnt_pen)
+    vpass, vend = m.validation_pass, m.multi_validation_epoch_end
+
+    def validation_pass(batch, batch_idx, dataloader_idx=0):
+        last.clear()
+        out = vpass(batch, batch_idx, dataloader_idx)
+        if isinstance(out, dict):
+            for tag in ("ctcbp", "rnntbp"):
+                if f"num_{tag}" in last:
+                    out[f"val_wer_num_{tag}"], out[f"val_wer_denom_{tag}"] = last[f"num_{tag}"], last[f"den_{tag}"]
+        return out
+
+    def multi_validation_epoch_end(outputs, dataloader_idx=0):
+        res = vend(outputs, dataloader_idx)
+        for tag in ("ctcbp", "rnntbp"):
+            if outputs and all(isinstance(x, dict) and f"val_wer_num_{tag}" in x for x in outputs):
+                num = torch.stack([x[f"val_wer_num_{tag}"] for x in outputs]).sum()
+                den = torch.stack([x[f"val_wer_denom_{tag}"] for x in outputs]).sum()
+                res.setdefault("log", {})[f"val_wer_{tag}"] = num.float() / den
+        return res
+    m.validation_pass, m.multi_validation_epoch_end = validation_pass, multi_validation_epoch_end
+    print(f"[run] validation also reports both heads at blank penalty {bp} (val_wer_ctcbp / val_wer_rnntbp); "
+          f"checkpoints select on the CTC one's aggregate", flush=True)
+
+
 class ValAggregate(Callback):
     """val_wer_all / _en / _hi = per-source WERs weighted by reference words (= corpus WER over the sources, given
     each source's WER). multispk and FLEURS are reported on their own, not in the aggregate."""
@@ -629,8 +705,16 @@ class ValAggregate(Callback):
             # English-only 20.6 %): never publish an aggregate over a subset of the sources
             print(f"[run] partial validation at step {trainer.global_step}: aggregate not logged", flush=True)
             trainer.callback_metrics["val_wer_all"] = torch.tensor(float("inf"))  # ModelCheckpoint raises if missing
+            trainer.callback_metrics["val_wer_ctcbp_all"] = torch.tensor(float("inf"))
             return
         out = {f"val_wer_{k}": e / n for k, (e, n) in acc.items() if n}
+        for metric in ("val_wer", "val_wer_ctc", "val_wer_ctcbp", "val_wer_rnntbp"):   # each head, plain / penalised
+            for name, stems in (("all", list(self.sets)), ("ood", [x for x in OOD_LIKE if x in self.sets])):
+                got = [(float(cm[f"{x}_{metric}"]), self.sets[x][1]) for x in stems if f"{x}_{metric}" in cm]
+                if got and len(got) == len(stems):
+                    out[f"{metric}_{name}"] = sum(w * n for w, n in got) / sum(n for _, n in got)
+        for k in ("val_wer_ctcbp_all",):                          # ModelCheckpoint raises if its monitor is missing
+            out.setdefault(k, float("inf"))
         for k, v in out.items():
             trainer.callback_metrics[k] = torch.tensor(v)
         trainer.logger.log_metrics(out, step=trainer.global_step)
@@ -695,6 +779,8 @@ def main():
     ap.add_argument("--lookaheads", type=int, nargs="*", default=None,
                     help="replace the trained look-ahead set: RIGHT contexts in 80 ms frames, e.g. 13 6 3 1 0 -1 "
                          "(-1 = full context; left context 70 kept)")
+    ap.add_argument("--val_blank_penalty", type=float, default=1.0,
+                    help="blank penalty of the extra CTC validation metric val_wer_ctcbp (checkpoint selection)")
     ap.add_argument("--validate_only", action="store_true",
                     help="run validation on --ckpt and exit (with a new --run name and --no_hf)")
     ap.add_argument("--val_lookahead", type=int, default=3,
@@ -842,6 +928,8 @@ def main():
     if a.ctc_head:                       # after fused_ctc: the eval-time CTC loss still goes through it
         import selfcond_head
         selfcond_head.enable(m, a.ctc_head)
+    if hasattr(m, "ctc_wer"):                # hybrid model: + the CTC head's WER at the app's blank penalty
+        bp_metrics(m, a.val_blank_penalty)
     # Exact resume: a 1-layer nn.LSTM ignores its `dropout` (applied only between layers), but with dropout > 0 the
     # first call per process makes cuDNN's dropout state, drawing a seed from the CUDA generator -- at step 1 in an
     # uninterrupted run, at the first step after a resume in a resumed one, so every later dropout mask differed
@@ -874,8 +962,8 @@ def main():
         num_sanity_val_steps=0, gradient_clip_val=None if a.bf16_master else 1.0, log_every_n_steps=50,
         use_distributed_sampler=False, logger=logger, enable_checkpointing=True, benchmark=False,
         callbacks=[AudioMeter(), RngState(), EpochShuffle(a.aug_schedule, m), TQDMProgressBar(refresh_rate=50), ValAggregate(a.val), LearningRateMonitor("step"),
-                   ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer_all", mode="min", save_top_k=2,
-                                   save_last=True, filename="{step}-{val_wer_all:.4f}", save_on_train_epoch_end=False),
+                   ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer_ctcbp_all", mode="min", save_top_k=2,
+                                   save_last=True, filename="{step}-{val_wer_ctcbp_all:.4f}", save_on_train_epoch_end=False),
                    *([SaveSteps(a.save_steps, ckpt_dir)] if a.save_steps else []),
                    *([StepTrace(a.trace)] if a.trace else []),
                    *([GradDiag(a.grad_diag)] if a.grad_diag else []),

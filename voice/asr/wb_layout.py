@@ -36,14 +36,21 @@ _EXACT = {
     "val_wer_all": "core/val_wer",
     "val_wer_en": "core/val_wer_en",
     "val_wer_hi": "core/val_wer_hi",
+    "val_wer_ctc_all": "core/val_wer_ctc",
+    "val_wer_ctcbp_all": "core/val_wer_ctc_bp",
+    "val_wer_ctc_ood": "core/val_wer_ctc_ood",
+    "val_wer_ctcbp_ood": "core/val_wer_ctc_bp_ood",
+    "val_wer_ood": "core/val_wer_ood",
+    "val_wer_rnntbp_all": "core/val_wer_rnnt_bp",
+    "val_wer_rnntbp_ood": "core/val_wer_rnnt_bp_ood",
     "global_step": "misc/global_step",
     "epoch": "misc/eval_interval",
 }
 # NeMo per-dataloader metric suffixes -> our metric names
-_SUFFIX = {"val_wer": "wer", "val_wer_ctc": "wer_ctc", "val_loss": "loss", "val_rnnt_loss": "loss_rnnt",
+_SUFFIX = {"val_wer": "wer", "val_wer_ctc": "wer_ctc", "val_wer_ctcbp": "wer_ctc_bp", "val_wer_rnntbp": "wer_rnnt_bp", "val_loss": "loss", "val_rnnt_loss": "loss_rnnt",
            "val_ctc_loss": "loss_ctc"}
 _KEEP = ("core/", "val/", "eval/", "speed/", "optim/", "misc/")
-_SET = re.compile(r"^(val_|fleurs_)?(.+?)_(val_wer_ctc|val_wer|val_loss|val_rnnt_loss|val_ctc_loss)$")
+_SET = re.compile(r"^(val_|fleurs_)?(.+?)_(val_wer_ctcbp|val_wer_rnntbp|val_wer_ctc|val_wer|val_loss|val_rnnt_loss|val_ctc_loss)$")
 
 
 def wb_key(k):
