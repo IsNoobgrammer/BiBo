@@ -2,6 +2,7 @@
 
     python voice/asr/ckpt_to_nemo.py --ckpt asr/hf_ckpt/run5/last.ckpt --tok asr/run1/tok/tokenizer_spe_bpe_v4096 \
         --lookaheads 13 6 3 1 0 --out asr/exp/run5/run5.eval.nemo
+    run6+ (self-conditioned CTC head): add --head glu_glu and the en3 tokenizer.
 
 Same base model / tokenizer / look-ahead config as train_asr.py; the saved look-ahead set is the loadable
 [left - left % (r+1), r] form (= nemo_ctx_fix.py), so the result is directly usable for streaming eval and --init.
@@ -20,6 +21,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--init", default="stt_en_fastconformer_hybrid_large_streaming_multi")
     ap.add_argument("--lookaheads", type=int, nargs="*", default=None)
+    ap.add_argument("--head", default="none", help="self-conditioned CTC head kind of the run (glu_glu for run6+); none = stock")
     a = ap.parse_args()
     import nemo.collections.asr as nemo_asr
     m = nemo_asr.models.ASRModel.from_pretrained(a.init, map_location="cpu")
@@ -30,6 +32,11 @@ def main():
         m.encoder.set_default_att_context_size([left, a.lookaheads[0]])
         with open_dict(m.cfg):
             m.cfg.encoder.att_context_size = [[left - left % (r + 1), r] for r in a.lookaheads]
+    if a.head != "none":                                # the run's CTC head, as train_asr / ab_meeting attach it
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import selfcond_head
+        selfcond_head.enable(m, a.head)
     ck = torch.load(a.ckpt, map_location="cpu", weights_only=False)
     m.load_state_dict(ck["state_dict"], strict=True)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
