@@ -90,6 +90,25 @@ class ManifestIndex:
         assert m.shape == self.rows.shape, (m.shape, self.rows.shape)
         return ManifestIndex(self.a, self.sources, self.path_blob, self.rows[m])
 
+    def reweight(self, weights, seed=23):
+        """Per-source mix weights by row repetition (no new audio): {source glob: w}. w = 3 lists each row 3x per
+        epoch, w = 2.5 lists it 2x plus once more with p 0.5, w = 0.5 keeps half. Deterministic in seed, so a
+        resumed run sees the same epochs. Every pattern must match a source."""
+        import fnmatch
+        w = np.ones(len(self.rows))
+        src = self.col("src")
+        for pat, x in weights.items():
+            names = [n for n in self.sources if fnmatch.fnmatch(n, pat)]
+            assert names, f"--source_weight {pat}: no such source in {self.sources}"
+            for n in names:
+                w[src == self.src_id(n)] = x
+        k = np.floor(w).astype(np.int64) + (np.random.default_rng(seed).random(len(w)) < w - np.floor(w))
+        return ManifestIndex(self.a, self.sources, self.path_blob, np.repeat(self.rows, k))
+
+    def hours_by_source(self):
+        h = np.bincount(self.col("src").astype(np.int64), weights=self.col("dur"), minlength=len(self.sources))
+        return {n: h[i] / 3600 for i, n in enumerate(self.sources) if h[i] > 0}
+
     def with_column(self, name, fn):
         """A new per-row column x_<name> from fn(view) (vectorized); rows outside this view get 0."""
         full = np.zeros(len(self.a["dur"]), dtype=np.asarray(fn(self)).dtype)

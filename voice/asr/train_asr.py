@@ -133,6 +133,14 @@ def wrap_train_sampler(m, a=None):
         import fast_loader
         ix = fast_loader.ManifestIndex.load(a.train, os.path.join(a.tok, "tokenizer.model"))
         ix = ix.filter(lambda v: (v.col("dur") >= 0.1) & (v.col("dur") <= 30.0))   # NeMo's train_ds limits
+        if a.source_weight:                            # per-source mix weights (row repetition, no new audio)
+            w = {k: float(v) for k, v in (x.rsplit(":", 1) for x in a.source_weight)}
+            h0 = ix.hours_by_source()
+            ix = ix.reweight(w, 23 if a.seed is None else a.seed)
+            h1, T = ix.hours_by_source(), sum(ix.hours_by_source().values())
+            print("[mix] " + " | ".join(f"{n} {h0[n]:.0f}->{h1.get(n, 0):.0f} h ({100 * h1.get(n, 0) / T:.1f}%)"
+                                        for n in sorted(h0, key=lambda n: -h1.get(n, 0))) + f" | total {T:.0f} h",
+                  flush=True)
         dl, plan = fast_loader.loader(ix, a.batch_sec, a.buckets, 23 if a.seed is None else a.seed, a.workers)
         st = plan.stats()
         print(f"[preflight] fast loader: {len(ix)} clips, {st['batches']} batches/epoch, fill {100 * st['fill']:.1f}% "
@@ -661,6 +669,9 @@ def main():
     ap.add_argument("--buckets", type=int, default=30, help="Lhotse length buckets (more = less padding)")
     ap.add_argument("--sampler", choices=["packed", "lhotse"], default="packed",
                     help="packed = our exact bucketing sampler (packed_sampler.py); lhotse = NeMo's buffered one")
+    ap.add_argument("--source_weight", nargs="*", default=[],
+                    help="per-source mix weights SOURCE_GLOB:W, e.g. notsofar:3 'svarah*':4 librispeech:0.5 (fast loader;"
+                         " rows repeated / subsampled, no new audio)")
     ap.add_argument("--loader", choices=["fast", "nemo"], default="fast",
                     help="fast = fast_loader.py (numpy index, exact batches, int16 pinned); nemo = NeMo/Lhotse loader")
     ap.add_argument("--total_hours", type=float, default=3200, help="audio hours to train on (~7 x 460 h)")
