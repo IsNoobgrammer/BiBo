@@ -36,7 +36,15 @@ bad = [s for s in steps if ta.get(s) != tb[s]]
 print(f"trace: B has {len(steps)} steps after $MID (A has {sum(1 for s in ta if $MID < s <= $STOP)}); differing: {len(bad)}", flush=True)
 for s in steps[:3]:
     fa, fb = (ta.get(s) or {}).get("fp") or {}, tb[s].get("fp") or {}
-    print("  fingerprint step", s, {k: ("same" if fa.get(k) == fb.get(k) else f"A {fa.get(k)} B {fb.get(k)}") for k in set(fa) | set(fb)}, flush=True)
+    d = {k: "same" for k in set(fa) | set(fb) if fa.get(k) == fb.get(k)}
+    for k in set(fa) | set(fb):
+        if fa.get(k) != fb.get(k):
+            if isinstance(fa.get(k), dict):
+                ks = set(fa.get(k) or {}) | set(fb.get(k) or {})
+                d[k] = "differ: " + str([x for x in ks if (fa.get(k) or {}).get(x) != (fb.get(k) or {}).get(x)][:8])
+            else:
+                d[k] = f"A {fa.get(k)} B {fb.get(k)}"
+    print("  fingerprint step", s, d, flush=True)
 for s in bad[:5]:
     print("  step", s, "A", ta.get(s), "| B", tb[s], flush=True)
 def diff(a, b, path=""):

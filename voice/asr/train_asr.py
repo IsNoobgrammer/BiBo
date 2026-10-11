@@ -439,7 +439,8 @@ class StepTrace(Callback):
             "rng_py": h(random.getstate()), "rng_np": h(np.random.get_state()[1].tobytes()),
             "rng_torch": h(torch.get_rng_state().numpy().tobytes()),
             "rng_cuda": h(b"".join(s.numpy().tobytes() for s in torch.cuda.get_rng_state_all())),
-            "w": float(sum(p.detach().double().sum().item() for p in list(pl_module.parameters())[::25])),
+            "w": h(b"".join(p.detach().float().cpu().numpy().tobytes() for p in pl_module.parameters())),
+            "buf": {n: h(b.detach().float().cpu().numpy().tobytes()) for n, b in pl_module.named_buffers()},
             "batch": h(b"".join(t.cpu().numpy().tobytes() for t in batch if torch.is_tensor(t))[:4096 * 16]),
         }
 
