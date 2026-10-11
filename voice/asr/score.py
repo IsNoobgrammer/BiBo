@@ -19,6 +19,22 @@ def normalize(text):
     return [w for w in text.split() if w not in FILLERS]
 
 
+# Meeting scoring v2 (Oct 12 2026): contractions are expanded on BOTH sides, so "I'm" (ref) and "I am" (hyp) match
+# instead of scoring "i m" vs "i am" as a substitution + insertion (14 of 317 errors on the meeting clips were this);
+# possessive 's becomes "is" on both sides too, which is symmetric and so does not change the error count.
+_CONTRACT = [(r"\bwon't\b", "will not"), (r"\bcan't\b", "can not"), (r"\bcannot\b", "can not"),
+             (r"n't\b", " not"), (r"'m\b", " am"), (r"'re\b", " are"), (r"'ve\b", " have"), (r"'ll\b", " will"),
+             (r"'d\b", " would"), (r"'s\b", " is")]
+_SPELL = {"ok": "okay", "cuz": "because", "cos": "because", "coz": "because"}
+
+
+def normalize_v2(text):
+    text = text.lower().replace("’", "'").replace("‘", "'")
+    for pat, rep in _CONTRACT:
+        text = re.sub(pat, rep, text)
+    return [_SPELL.get(w, w) for w in normalize(text)]
+
+
 def read_hyp(path):
     if path.endswith(".txt"):
         return open(path, encoding="utf-8").read()

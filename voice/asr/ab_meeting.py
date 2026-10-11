@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blank_penalty  # noqa: E402
 import selfcond_head  # noqa: E402
 from ctc_heads import MEETING, encode, set_lookahead  # noqa: E402
-from score import edits, normalize, wer  # noqa: E402
+from score import edits, normalize, normalize_v2, wer  # noqa: E402
 
 
 def load(path, head, ckpt=None):
@@ -56,6 +56,12 @@ def main():
     ap.add_argument("--head", default="glu_glu", help="self-conditioned head kind, or none for a stock-CTC run (run5)")
     ap.add_argument("--ckpt", nargs="+", default=None,
                     help="Lightning .ckpt whose weights replace the .nemo's (same architecture); several = their average")
+    ap.add_argument("--norm", choices=["v1", "v2"], default="v2",
+                    help="v2 (default since Oct 12 2026): contractions expanded on both sides; v1 = the old numbers")
+    ap.add_argument("--clips", nargs="+", default=["clip16k.wav", "g5_16k.wav"],
+                    help="meeting clips to score; default the 2 distinct recordings (c2m.wav is an excerpt of "
+                         "clip16k.wav, so it double-counted); 'all' = the old 3")
+    ap.add_argument("--logits", default=None, help="save the CTC logits (per look-ahead / clip, fp16) to this .npz")
     ap.add_argument("--dump", default=None, help="write every CTC hypothesis (per look-ahead / penalty / clip) to this JSON")
     ap.add_argument("--rnnt", action="store_true", help="also decode the RNN-T head (hybrid runs)")
     ap.add_argument("--bp", type=float, nargs="+", default=[0.0, 0.5, 1.0])
@@ -64,8 +70,11 @@ def main():
     ap.add_argument("--tok", default="/home/marimo/work/asr/en3/tok/tokenizer_spe_bpe_v2047/tokenizer.model")
     a = ap.parse_args()
     torch.set_grad_enabled(False)
+    global normalize
+    normalize = normalize_v2 if a.norm == "v2" else normalize
+    meeting = [(w, r) for w, r in MEETING if "all" in a.clips or w in a.clips]
     clips = [(sf.read(os.path.join(a.meeting, w))[0].astype(np.float32),
-              normalize(open(os.path.join(a.meeting, r), encoding="utf-8").read())) for w, r in MEETING]
+              normalize(open(os.path.join(a.meeting, r), encoding="utf-8").read())) for w, r in meeting]
     n = sum(len(r) for _, r in clips)
 
     def report(name, dec, la, bp, hyps):           # per-clip WER, pooled WER and its S / D / I split, hyp words
@@ -75,7 +84,7 @@ def main():
               f"(S {100 * s / n:5.2f} D {100 * d / n:5.2f} I {100 * i / n:5.2f}) | "
               + " ".join(f"{100 * wer(ref, h):5.1f}" for (_, ref), h in zip(clips, hyps))
               + f" | hyp/ref words {sum(map(len, hyps))}/{n}", flush=True)
-    dump = {}
+    dump, saved = {}, {}
     for path in a.nemo:
         m = load(path, a.head, a.ckpt)
         name = os.path.basename(path)[:-5] + (f":avg{len(a.ckpt)}" if a.ckpt and len(a.ckpt) > 1 else
@@ -88,6 +97,8 @@ def main():
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 ctc = (lambda e: m.ctc_decoder(encoder_output=e.transpose(1, 2))) if a.head == "none" else m.ctc_decoder.head
                 zs = [ctc(e).float()[0, : int(el[0])] + lock for e, el in encs]
+            if a.logits:
+                saved.update({f"{name}|{la}|{i}": z.half().cpu().numpy() for i, z in enumerate(zs)})
             for bp in a.bp:
                 hyps = []
                 for z in zs:
@@ -109,8 +120,12 @@ def main():
                     report(name, "rnnt", la, bp, hyps)
         del m
         torch.cuda.empty_cache()
+    if a.logits:
+        np.savez(a.logits, **saved, blank=np.array(blank), clips=np.array([w for w, _ in meeting]),
+                 refs=np.array([" ".join(r) for _, r in clips]))
+        print(f"logits -> {a.logits}", flush=True)
     if a.dump:
-        json.dump({"refs": [" ".join(r) for _, r in clips], "clips": [w for w, _ in MEETING], "hyps": dump},
+        json.dump({"refs": [" ".join(r) for _, r in clips], "clips": [w for w, _ in meeting], "hyps": dump},
                   open(a.dump, "w", encoding="utf-8"))
         print(f"dumped -> {a.dump}", flush=True)
     print("AB_MEETING_DONE", flush=True)
