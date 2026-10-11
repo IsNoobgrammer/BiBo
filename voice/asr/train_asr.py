@@ -427,6 +427,22 @@ class StepTrace(Callback):
     def __init__(self, path):
         self.path, self.gn = path, None
 
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        # fingerprints BEFORE the forward: which state differs first tells a non-exact resume's cause
+        import hashlib
+        import random
+        import numpy as np
+
+        def h(x):
+            return hashlib.md5(repr(x).encode() if not isinstance(x, bytes) else x).hexdigest()[:10]
+        self.fp = {
+            "rng_py": h(random.getstate()), "rng_np": h(np.random.get_state()[1].tobytes()),
+            "rng_torch": h(torch.get_rng_state().numpy().tobytes()),
+            "rng_cuda": h(b"".join(s.numpy().tobytes() for s in torch.cuda.get_rng_state_all())),
+            "w": float(sum(p.detach().double().sum().item() for p in list(pl_module.parameters())[::25])),
+            "batch": h(b"".join(t.cpu().numpy().tobytes() for t in batch if torch.is_tensor(t))[:4096 * 16]),
+        }
+
     def on_before_optimizer_step(self, trainer, pl_module, optimizer):
         g = [p.grad.float().norm() for p in pl_module.parameters() if p.grad is not None]
         self.gn = torch.stack(g).norm().item() if g else 0.0
@@ -435,7 +451,8 @@ class StepTrace(Callback):
         loss = outputs["loss"] if isinstance(outputs, dict) else outputs
         ctx = getattr(pl_module.encoder, "_fused_ctx", None)
         rec = {"step": trainer.global_step, "loss": float(loss), "grad_norm": self.gn,
-               "lr": [g["lr"] for g in trainer.optimizers[0].param_groups][:2], "ctx": ctx[0] if ctx else None}
+               "lr": [g["lr"] for g in trainer.optimizers[0].param_groups][:2], "ctx": ctx[0] if ctx else None,
+               "fp": getattr(self, "fp", None)}
         with open(self.path, "a") as f:
             f.write(json.dumps(rec) + "\n")
 

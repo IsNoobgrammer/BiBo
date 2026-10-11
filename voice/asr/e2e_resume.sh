@@ -8,6 +8,7 @@
 #   bash voice/asr/e2e_resume.sh      -> last line REPRO_EXACT or REPRO_MISMATCH
 set -uo pipefail
 A=/home/marimo/work/asr; E3=$A/en3; P=/home/marimo/asrenv/bin/python; O=$A/exp_repro_$(date +%Y%m%d_%H%M%S)   # fresh dir: a leftover last.ckpt would be RESUMED
+STOP=${STOP:-500}; MID=${MID:-300}   # STOP=310 MID=300: a quick diagnosis run
 mkdir -p $O && cd /home/marimo/work/BiBo
 for f in $O/traceA.jsonl $O/traceA2.jsonl $O/traceB.jsonl; do : > $f; done      # empty the traces (they append)
 COMMON="--project bibo-asr-test --no_hf --deterministic --seed 23 --new_vocab --train $E3/train.jsonl
@@ -16,11 +17,11 @@ COMMON="--project bibo-asr-test --no_hf --deterministic --seed 23 --new_vocab --
   --lookaheads 13 6 3 1 0 -1 --lookahead_probs 0:0.05 1:0.15 3:0.35 6:0.10 13:0.15 full:0.20
   --fused_joint --fused_layer --fused_attn --fused_conv --fused_ctc --out $O"
 T="env TKF=/home/marimo/work/tkf_ctc $P voice/asr/train_asr.py"
-$T $COMMON --run reproA --stop_step 500 --save_steps 300 500 --trace $O/traceA.jsonl > $A/reproA.out 2>&1; echo "A rc $?"
+$T $COMMON --run reproA --stop_step $STOP --save_steps $MID $STOP --trace $O/traceA.jsonl > $A/reproA.out 2>&1; echo "A rc $?"
 grep -h "max_steps\|warm-up" $A/reproA.out | cut -c1-120
 # control: a second fresh run must repeat A bit for bit (else the deterministic mode itself is not deterministic)
-$T $COMMON --run reproA2 --stop_step 320 --trace $O/traceA2.jsonl > $A/reproA2.out 2>&1; echo "A2 rc $?"
-$T $COMMON --run reproB --stop_step 500 --save_steps 500 --ckpt $O/reproA/step300.ckpt --trace $O/traceB.jsonl \
+$T $COMMON --run reproA2 --stop_step $((MID + 20 < STOP ? MID + 20 : STOP)) --trace $O/traceA2.jsonl > $A/reproA2.out 2>&1; echo "A2 rc $?"
+$T $COMMON --run reproB --stop_step $STOP --save_steps $STOP --ckpt $O/reproA/step$MID.ckpt --trace $O/traceB.jsonl \
   > $A/reproB.out 2>&1; echo "B rc $?"
 grep -h "RNG states restored\|legacy\|resume:" $A/reproB.out
 $P - <<EOF
@@ -30,9 +31,12 @@ tb = {r["step"]: r for r in map(json.loads, open("$O/traceB.jsonl"))}
 t2 = {r["step"]: r for r in map(json.loads, open("$O/traceA2.jsonl"))}
 cbad = [s for s in sorted(t2) if ta.get(s) != t2[s]]
 print(f"control (fresh A2 vs A, steps 1..{max(t2)}): differing {len(cbad)}" + (f", first at step {cbad[0]}: A {ta.get(cbad[0])} | A2 {t2[cbad[0]]}" if cbad else ""), flush=True)
-steps = sorted(s for s in tb if 300 < s <= 500)
+steps = sorted(s for s in tb if $MID < s <= $STOP)
 bad = [s for s in steps if ta.get(s) != tb[s]]
-print(f"trace: B has {len(steps)} steps in 301..500 (A has {sum(1 for s in ta if 300 < s <= 500)}); differing: {len(bad)}", flush=True)
+print(f"trace: B has {len(steps)} steps after $MID (A has {sum(1 for s in ta if $MID < s <= $STOP)}); differing: {len(bad)}", flush=True)
+for s in steps[:3]:
+    fa, fb = (ta.get(s) or {}).get("fp") or {}, tb[s].get("fp") or {}
+    print("  fingerprint step", s, {k: ("same" if fa.get(k) == fb.get(k) else f"A {fa.get(k)} B {fb.get(k)}") for k in set(fa) | set(fb)}, flush=True)
 for s in bad[:5]:
     print("  step", s, "A", ta.get(s), "| B", tb[s], flush=True)
 def diff(a, b, path=""):
@@ -43,11 +47,11 @@ def diff(a, b, path=""):
     if isinstance(a, (list, tuple)):
         return [x for i, (u, v) in enumerate(zip(a, b)) for x in diff(u, v, f"{path}[{i}]")] if len(a) == len(b) else [path]
     return [] if a == b else [path]
-ca = torch.load("$O/reproA/step500.ckpt", map_location="cpu", weights_only=False)
-cb = torch.load("$O/reproB/step500.ckpt", map_location="cpu", weights_only=False)
+ca = torch.load("$O/reproA/step$STOP.ckpt", map_location="cpu", weights_only=False)
+cb = torch.load("$O/reproB/step$STOP.ckpt", map_location="cpu", weights_only=False)
 w = diff(ca["state_dict"], cb["state_dict"], "w")
 o = diff(ca["optimizer_states"], cb["optimizer_states"], "opt")
-print(f"step-500 checkpoint: weights differing {len(w)} {w[:4]} | optimizer state differing {len(o)} {o[:4]}", flush=True)
-ok = len(steps) == 200 and not bad and not w and not o and not cbad
+print(f"step-$STOP checkpoint: weights differing {len(w)} {w[:4]} | optimizer state differing {len(o)} {o[:4]}", flush=True)
+ok = len(steps) == $STOP - $MID and not bad and not w and not o and not cbad
 print("REPRO_EXACT" if ok else "REPRO_MISMATCH", flush=True)
 EOF
