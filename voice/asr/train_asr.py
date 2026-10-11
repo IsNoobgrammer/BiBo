@@ -607,7 +607,8 @@ def to_tdt(m, durations, sigma, omega):
     from omegaconf import open_dict
     from nemo.collections.asr.losses.rnnt import RNNTLoss
     jc = m.joint.to_config_dict()
-    jc["num_extra_outputs"] = len(durations)
+    with open_dict(jc):                                          # struct config: a new key needs open_dict
+        jc["num_extra_outputs"] = len(durations)
     dev = next(m.encoder.parameters()).device
     m.joint = type(m).from_config_dict(jc).to(dev)
     kw = {"durations": list(durations), "sigma": sigma, "omega": omega, "fastemit_lambda": 0.0}
