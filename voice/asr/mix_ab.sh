@@ -35,7 +35,7 @@ for arm in ${ARMS:-la}; do                           # B first; A (mix) only whe
   TKF=$T $P voice/asr/train_asr.py --project asr-mix --run $R --ctc_weight $W $COMMON --lookahead_probs $LA \
     --source_weight $MIX --out $A/exp_mix > $A/$R.out 2>&1
   rc=$?; echo "ARM $R TRAIN rc $rc"
-  [ $rc -eq 0 ] && TKF=$T $P voice/asr/ab_meeting.py --rnnt --head glu_glu --las 3 13 -1 --bp 0 0.5 1.0 \
+  [ $rc -eq 0 ] && TKF=$T $P voice/asr/ab_meeting.py --rnnt --head glu_glu --las 3 13 -1 --bp 0 0.5 1.0 1.25 1.5 \
     --nemo $A/exp_mix/$R/$R.nemo > $A/meet_$R.out 2>&1; echo "ARM $R MEET rc $?"
 done
 echo "MIXAB_DONE"
