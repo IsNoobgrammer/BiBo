@@ -419,6 +419,28 @@ class ProfileSteps(Callback):
             self.sites = None
 
 
+class RngState(Callback):
+    """Resume continues the RANDOM stream too: Python random (NeMo's per-batch look-ahead choice), NumPy, torch CPU
+    (the fused dropout kernels draw their seeds from it) and CUDA generators ride in the checkpoint. Without this a
+    resume reseeded from --seed, so every resume of a run replayed the same dropout masks / look-ahead draws (run6 vs
+    run6r, Oct 11 2026: the two resumes tracked each other, not the uninterrupted run)."""
+
+    def state_dict(self):
+        import random
+        import numpy as np
+        return {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all()}
+
+    def load_state_dict(self, state):
+        import random
+        import numpy as np
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch"])
+        torch.cuda.set_rng_state_all(state["cuda"])
+        print("[run] resume: RNG states restored (python / numpy / torch / cuda)", flush=True)
+
+
 class StopAt(Callback):
     """--stop_step: end a (resumed) run at this global step WITHOUT changing max_steps, so the LR schedule is
     identical to the full run's (replay experiments)."""
@@ -749,7 +771,7 @@ def main():
         val_check_interval=eval_steps, check_val_every_n_epoch=None if eval_steps else 1,
         num_sanity_val_steps=0, gradient_clip_val=None if a.bf16_master else 1.0, log_every_n_steps=50,
         use_distributed_sampler=False, logger=logger, enable_checkpointing=True, benchmark=False,
-        callbacks=[AudioMeter(), EpochShuffle(a.aug_schedule, m), TQDMProgressBar(refresh_rate=50), ValAggregate(a.val), LearningRateMonitor("step"),
+        callbacks=[AudioMeter(), RngState(), EpochShuffle(a.aug_schedule, m), TQDMProgressBar(refresh_rate=50), ValAggregate(a.val), LearningRateMonitor("step"),
                    ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer_all", mode="min", save_top_k=2,
                                    save_last=True, filename="{step}-{val_wer_all:.4f}", save_on_train_epoch_end=False),
                    *([SaveSteps(a.save_steps, ckpt_dir)] if a.save_steps else []),
