@@ -49,7 +49,9 @@ def _patch(cls, name, delta, mask_ids=None, ilm=0.0):
             out = torch.cat([labels, blank], -1)
         else:
             out = out.clone()
-        out[..., -1] -= delta
+        b = (self.num_classes_with_blank - 1 - getattr(self, "num_extra_outputs", 0)   # RNN-T joint: blank is last
+             if hasattr(self, "num_classes_with_blank") and hasattr(self, "joint_net") else -1)   # TDT: durations after
+        out[..., b] -= delta
         if mask_ids is not None:                  # script lock: these tokens can never be emitted
             # an additive bias built on the device once (devanagari_ids): RNN-T greedy decoding runs under CUDA-graph
             # capture, which refuses host->device copies -- and out[..., ids] = -1e4 copies the scalar from the host

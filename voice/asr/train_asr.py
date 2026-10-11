@@ -599,6 +599,37 @@ class HFSync(Callback):
         self._push()
 
 
+def to_tdt(m, durations, sigma, omega):
+    """RNN-T -> TDT partner head (Token-and-Duration Transducer): the joint gets len(durations) extra outputs (the
+    duration logits, after blank), the loss becomes NeMo's TDT loss, greedy decoding TDT. change_vocabulary (--new_vocab)
+    already rebuilt the joint and prediction net from scratch, so RNN-T and TDT arms start equally (only the joint's
+    output layer is wider). NeMo's TDT loss, not tkf's fused RNN-T joint (no duration outputs): --fused_joint is off."""
+    from omegaconf import open_dict
+    from nemo.collections.asr.losses.rnnt import RNNTLoss
+    jc = m.joint.to_config_dict()
+    jc["num_extra_outputs"] = len(durations)
+    dev = next(m.encoder.parameters()).device
+    m.joint = type(m).from_config_dict(jc).to(dev)
+    kw = {"durations": list(durations), "sigma": sigma, "omega": omega, "fastemit_lambda": 0.0}
+    with open_dict(m.cfg):
+        m.cfg.joint = jc
+        if "model_defaults" in m.cfg:
+            m.cfg.model_defaults.tdt_durations = list(durations)
+        m.cfg.loss.loss_name = "tdt"
+        m.cfg.loss.tdt_kwargs = kw
+        m.cfg.decoding.model_type = "tdt"
+        m.cfg.decoding.durations = list(durations)
+    red = getattr(m.loss, "reduction", "mean_batch")
+    m.loss = RNNTLoss(num_classes=m.joint.num_classes_with_blank - 1 - len(durations), loss_name="tdt",
+                      loss_kwargs=kw, reduction=red)
+    m.change_decoding_strategy(m.cfg.decoding, decoder_type="rnnt")
+    if m.joint.fuse_loss_wer:
+        m.joint.set_loss(m.loss)
+        m.joint.set_wer(m.wer)
+    print(f"[run] partner head TDT: durations {list(durations)}, sigma {sigma}, omega {omega}; joint outputs "
+          f"{m.joint.num_classes_with_blank} (vocab + blank + {len(durations)} durations), reduction {red}", flush=True)
+
+
 OOD_LIKE = ("val_notsofar", "val_ami_sdm", "val_medical_room", "val_spotify_room", "val_svarah_room")
 
 
@@ -624,7 +655,7 @@ def bp_metrics(m, bp):
         out = jap(self, f, g)
         if state["bp"] and not self.training:
             out = out.clone()
-            out[..., self.num_classes_with_blank - 1] -= state["bp"]   # blank (TDT: duration logits follow it)
+            out[..., self.num_classes_with_blank - 1 - self.num_extra_outputs] -= state["bp"]   # blank (TDT: durations follow)
         return out
     cls.joint_after_projection = joint_after_projection
 
@@ -802,6 +833,10 @@ def main():
     ap.add_argument("--fastemit", type=float, default=0.0,
                     help="FastEmit lambda: 0 since Oct 12 2026 (vs 0.01: validation tied, meeting CTC 1040 ms 19.66 vs "
                          "22.12, 480 ms 20.72 vs 21.70); the pretrained model's own default is 0.005")
+    ap.add_argument("--aux", choices=["rnnt", "tdt"], default="rnnt", help="the CTC head's training partner")
+    ap.add_argument("--tdt_durations", type=int, nargs="+", default=[0, 1, 2, 3, 4])
+    ap.add_argument("--tdt_sigma", type=float, default=0.05)
+    ap.add_argument("--tdt_omega", type=float, default=0.1)
     ap.add_argument("--dropout_all", type=float, default=None,
                     help="set EVERY nn.Dropout (encoder residual / attention / pre-encoder / pos-emb, joint, prednet) to "
                          "this p; the fused kernels read p from the modules at each call (pretrained: 0.1, joint 0.2)")
@@ -957,6 +992,9 @@ def main():
     if a.ctc_head:                       # after fused_ctc: the eval-time CTC loss still goes through it
         import selfcond_head
         selfcond_head.enable(m, a.ctc_head)
+    if a.aux == "tdt":
+        assert not a.fused_joint, "--aux tdt: tkf's fused joint is RNN-T only (no duration outputs); drop --fused_joint"
+        to_tdt(m, a.tdt_durations, a.tdt_sigma, a.tdt_omega)
     if hasattr(m, "ctc_wer") and a.val_blank_penalty > 0:   # hybrid model: + both heads at the app's blank penalty
         bp_metrics(m, a.val_blank_penalty)
     # Exact resume: a 1-layer nn.LSTM ignores its `dropout` (applied only between layers), but with dropout > 0 the
