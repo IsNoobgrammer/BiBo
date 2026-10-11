@@ -143,6 +143,10 @@ class Combined(__import__("torch").optim.Optimizer):
     def load_state_dict(self, sd):
         for o, s in zip(self.opts, sd["combined"]):
             o.load_state_dict(s)
+        # torch's load_state_dict gives each sub-optimizer NEW group dicts: re-point ours (in place) at them, or the LR
+        # schedule (stepping this object) writes dead dicts and a resumed run trains on at the checkpoint's lr
+        # (Oct 11 2026: e2e_resume matched at the first resumed step and diverged from the second)
+        self.param_groups[:] = [g for o in self.opts for g in o.param_groups]
         # checkpoints from before tkf saved FusedMuon's step counter (run6 and earlier): take it from AdamW's step
         # (both step once per training step) so Muown's Adam bias correction does not restart at t = 0
         legacy = [o for o, s in zip(self.opts, sd["combined"]) if hasattr(o, "_step_count") and "fused_muon" not in s]
