@@ -1,7 +1,7 @@
 #!/bin/bash
 # Hard-set mix and look-ahead mix A/B (user, Oct 11 2026), from NVIDIA's stock model, seed 23, 11,250 steps (the CTC A/B's budget, so
 # equal compute: ~1.65 passes over the bigger mix), 5% warm-up, validation at 240 ms (--val_lookahead default).
-#   CTCW=0.6 nohup bash voice/asr/mix_ab.sh > /home/marimo/work/asr/mix_ab.out 2>&1 &
+#   CTCW=0.6 [ARMS=la|mix|"la mix"] nohup bash voice/asr/mix_ab.sh > /home/marimo/work/asr/mix_ab.out 2>&1 &
 #   0. re-validate the two CTC-weight arms at 240 ms (they validated at 1040 ms) -> the baseline for arms A/B
 #   A. mix-w*      : hard sets up-weighted (NOTSOFAR x3, AMI windows x2, Spotify/Svarah/Medical x4, phone x6, NPTEL x0.5)
 #   B. la-w*       : OLD data mix, look-ahead mix 0:10% 80ms:23% 240ms:32% 480ms:15% 1040ms:0% full:20%
@@ -28,7 +28,7 @@ for w in 0.4 0.6; do                                     # 0. baselines at 240 m
   TKF=$T $P voice/asr/train_asr.py --project asr-ctc-weight --run $V --no_hf --validate_only --ckpt $CK $COMMON \
     --ctc_weight $w --lookahead_probs $LA_OLD --out $A/exp_val240 > $A/$V.out 2>&1; echo "VAL $V rc $?"
 done
-for arm in mix la; do
+for arm in ${ARMS:-la}; do                           # B first; A (mix) only when asked: ARMS=mix
   R=$arm-w${W/./}
   if [ $arm = mix ]; then LA=$LA_OLD; SW="--source_weight $MIX"; else LA=$LA_NEW; SW=""; fi
   [ -f $A/exp_mix/$R/$R.nemo ] && { echo "ARM $R already done"; continue; }
