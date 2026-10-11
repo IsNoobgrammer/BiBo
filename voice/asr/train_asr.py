@@ -624,7 +624,7 @@ def bp_metrics(m, bp):
         out = jap(self, f, g)
         if state["bp"] and not self.training:
             out = out.clone()
-            out[..., -1] -= state["bp"]
+            out[..., self.num_classes_with_blank - 1] -= state["bp"]   # blank (TDT: duration logits follow it)
         return out
     cls.joint_after_projection = joint_after_projection
 
@@ -799,7 +799,12 @@ def main():
     ap.add_argument("--val_lookahead", type=int, default=3,
                     help="look-ahead (80 ms frames) validation runs at: 3 = 240 ms (default since Oct 11 2026; runs "
                          "before then validated at 13 = 1040 ms), -1 = full context")
-    ap.add_argument("--fastemit", type=float, default=None, help="FastEmit lambda (model default 0.005)")
+    ap.add_argument("--fastemit", type=float, default=0.0,
+                    help="FastEmit lambda: 0 since Oct 12 2026 (vs 0.01: validation tied, meeting CTC 1040 ms 19.66 vs "
+                         "22.12, 480 ms 20.72 vs 21.70); the pretrained model's own default is 0.005")
+    ap.add_argument("--dropout_all", type=float, default=None,
+                    help="set EVERY nn.Dropout (encoder residual / attention / pre-encoder / pos-emb, joint, prednet) to "
+                         "this p; the fused kernels read p from the modules at each call (pretrained: 0.1, joint 0.2)")
     ap.add_argument("--save_steps", type=int, nargs="*", default=[],
                     help="also save a full checkpoint at these global steps (WSD: branch decays from the stable phase)")
     ap.add_argument("--aug_schedule", type=float, nargs="*", default=None,
@@ -917,6 +922,12 @@ def main():
         m.ctc_loss_weight = a.ctc_weight
         with open_dict(m.cfg):
             m.cfg.aux_ctc.ctc_loss_weight = a.ctc_weight
+    if a.dropout_all is not None:
+        n = 0
+        for mod in m.modules():
+            if isinstance(mod, torch.nn.Dropout):
+                mod.p, n = a.dropout_all, n + 1
+        print(f"[run] dropout_all: {n} Dropout modules -> p {a.dropout_all}", flush=True)
     if a.joint_dropout is not None:          # the joint's Dropout (config 0.2); before fused_joint, which reads it
         for mod in m.joint.joint_net:
             if isinstance(mod, torch.nn.Dropout):
