@@ -8,6 +8,7 @@ same penalty / lock via blank_penalty.apply.
     python voice/asr/ab_meeting.py --nemo exp_ab/ab-ctc_only/ab-ctc_only.nemo --head glu_glu --bp 0 0.5 1.0
 """
 import argparse
+import json
 import os
 import sys
 import tarfile
@@ -34,7 +35,12 @@ def load(path, head, ckpt=None):
                             map_location="cuda", weights_only=False)
         m.load_state_dict(sd, strict=True)
     if ckpt:                                            # score another checkpoint of the same run (e.g. an earlier epoch)
-        m.load_state_dict(torch.load(ckpt, map_location="cuda", weights_only=False)["state_dict"], strict=True)
+        cks = ckpt if isinstance(ckpt, (list, tuple)) else [ckpt]
+        sds = [torch.load(c, map_location="cpu", weights_only=False)["state_dict"] for c in cks]
+        sd = sds[0] if len(sds) == 1 else {   # --ckpt A B C: uniform weight average (float tensors; buffers like
+            k: (sum(d[k].float() for d in sds) / len(sds)).to(v.dtype) if v.is_floating_point() else v   # step counts
+            for k, v in sds[-1].items()}                                                                # from the last)
+        m.load_state_dict(sd, strict=True)
     if hasattr(m, "joint"):       # RNN-T greedy: a captured CUDA graph would replay the first blank penalty forever
         from omegaconf import open_dict
         dec = m.cfg.decoding
@@ -48,7 +54,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--nemo", nargs="+", required=True)
     ap.add_argument("--head", default="glu_glu", help="self-conditioned head kind, or none for a stock-CTC run (run5)")
-    ap.add_argument("--ckpt", default=None, help="Lightning .ckpt whose weights replace the .nemo's (same architecture)")
+    ap.add_argument("--ckpt", nargs="+", default=None,
+                    help="Lightning .ckpt whose weights replace the .nemo's (same architecture); several = their average")
+    ap.add_argument("--dump", default=None, help="write every CTC hypothesis (per look-ahead / penalty / clip) to this JSON")
     ap.add_argument("--rnnt", action="store_true", help="also decode the RNN-T head (hybrid runs)")
     ap.add_argument("--bp", type=float, nargs="+", default=[0.0, 0.5, 1.0])
     ap.add_argument("--las", type=int, nargs="+", default=[0, 1, 3, 6, 13])
@@ -63,13 +71,15 @@ def main():
     def report(name, dec, la, bp, hyps):           # per-clip WER, pooled WER and its S / D / I split, hyp words
         sdi = [edits(ref, h) for (_, ref), h in zip(clips, hyps)]
         s, d, i = (sum(x[k] for x in sdi) for k in range(3))
-        print(f"MEET {name:24s} {dec:4s} la {'full' if la < 0 else str(la * 80) + ' ms':>7s} bp {bp:.1f} | pooled {100 * (s + d + i) / n:5.2f} "
+        print(f"MEET {name:24s} {dec:4s} la {'full' if la < 0 else str(la * 80) + ' ms':>7s} bp {bp:.2f} | pooled {100 * (s + d + i) / n:5.2f} "
               f"(S {100 * s / n:5.2f} D {100 * d / n:5.2f} I {100 * i / n:5.2f}) | "
               + " ".join(f"{100 * wer(ref, h):5.1f}" for (_, ref), h in zip(clips, hyps))
               + f" | hyp/ref words {sum(map(len, hyps))}/{n}", flush=True)
+    dump = {}
     for path in a.nemo:
         m = load(path, a.head, a.ckpt)
-        name = os.path.basename(path)[:-5] + (":" + os.path.basename(os.path.dirname(a.ckpt)) if a.ckpt else "")
+        name = os.path.basename(path)[:-5] + (f":avg{len(a.ckpt)}" if a.ckpt and len(a.ckpt) > 1 else
+                                              ":" + os.path.basename(os.path.dirname(a.ckpt[0])) if a.ckpt else "")
         lock = blank_penalty.devanagari_ids(a.tok)
         blank = m.ctc_decoder.num_classes_with_blank - 1
         for la in a.las:
@@ -87,6 +97,7 @@ def main():
                     keep = (ids != blank) & (ids != F.pad(ids, (1, 0), value=-1)[:-1])
                     hyps.append(normalize(m.tokenizer.ids_to_text(ids[keep].tolist())))
                 report(name, "ctc", la, bp, hyps)
+                dump.setdefault(name, {}).setdefault(str(la), {})[f"{bp:.2f}"] = [" ".join(h) for h in hyps]
                 if a.rnnt:
                     blank_penalty.apply(bp, head="rnnt", mask_ids=lock)
                     hyps = []
@@ -98,6 +109,10 @@ def main():
                     report(name, "rnnt", la, bp, hyps)
         del m
         torch.cuda.empty_cache()
+    if a.dump:
+        json.dump({"refs": [" ".join(r) for _, r in clips], "clips": [w for w, _ in MEETING], "hyps": dump},
+                  open(a.dump, "w", encoding="utf-8"))
+        print(f"dumped -> {a.dump}", flush=True)
     print("AB_MEETING_DONE", flush=True)
 
 
