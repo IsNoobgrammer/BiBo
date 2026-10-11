@@ -60,6 +60,9 @@ def main():
     torch.save({"opt": opt_b.state_dict(), "model": b.state_dict()}, buf)
     buf.seek(0)
     ck = torch.load(buf, weights_only=False)
+    if os.environ.get("LEGACY"):                        # a checkpoint from before tkf saved FusedMuon's step counter
+        for s in ck["opt"]["combined"]:
+            s.pop("fused_muon", None)
     b2 = copy.deepcopy(base)
     b2.load_state_dict(ck["model"])
     opt_b2 = muon_groups.build(b2, 5e-4, wd=1e-3)
