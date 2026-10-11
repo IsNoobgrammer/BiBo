@@ -33,8 +33,8 @@ for w in 0.4 0.6; do                                     # 0. baselines at 240 m
 done
 for arm in ${ARMS:-la}; do                           # B first; A (mix) only when asked: ARMS=mix
   R=$arm-w${W/./}
-  LA=$LA_OLD; SW=""; FE=0.01
-  case $arm in mix) SW="--source_weight $MIX";; la) LA=$LA_NEW;; fe0) FE=0;; *) echo "unknown arm $arm"; exit 1;; esac
+  LA=$LA_OLD; SW=""; FE=0.01             # la -> run laonly-*: la-w04 (HF, W&B) is the mislabelled mix+look-ahead run
+  case $arm in mix) SW="--source_weight $MIX";; la) LA=$LA_NEW; R=laonly-w${W/./};; fe0) FE=0;; *) echo "unknown arm $arm"; exit 1;; esac
   [ -f $A/exp_mix/$R/$R.nemo ] && { echo "ARM $R already done"; continue; }
   TKF=$T $P voice/asr/train_asr.py --project asr-mix --run $R --ctc_weight $W $COMMON --lookahead_probs $LA --fastemit $FE \
     $SW --out $A/exp_mix > $A/$R.out 2>&1
