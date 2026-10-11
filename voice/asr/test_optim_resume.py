@@ -47,6 +47,12 @@ def main():
     opt_a = muon_groups.build(a, 5e-4, wd=1e-3)
     run(a, opt_a, 10, 0)
 
+    if os.environ.get("CONTROL"):                       # two fresh optimizers, 10 straight steps each: same bits?
+        c = copy.deepcopy(base)
+        opt_c = muon_groups.build(c, 5e-4, wd=1e-3)
+        run(c, opt_c, 10, 0)
+        dc = max((x - y).abs().max().item() for x, y in zip(a.parameters(), c.parameters()))
+        print(f"CONTROL straight vs straight (fresh optimizer): worst {dc:.3e}", flush=True)
     b = copy.deepcopy(base)
     opt_b = muon_groups.build(b, 5e-4, wd=1e-3)
     run(b, opt_b, 5, 0)
