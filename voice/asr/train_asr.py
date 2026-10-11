@@ -609,15 +609,16 @@ def bp_metrics(m, bp):
     with the penalty on (its num / den kept, then the metric reset), then plainly as NeMo expects. RNN-T: the penalty
     is a flag read by this model's joint (greedy decoding runs without CUDA graphs here, so the flag is honoured)."""
     last, state = {}, {"bp": 0.0}
-    jap = m.joint.joint_after_projection
+    cls = type(m.joint)                 # CLASS-level, as blank_penalty.py: greedy RNN-T decoding does not reach an
+    jap = cls.joint_after_projection    # instance attribute (a test showed the penalised WER == the plain one)
 
-    def joint_after_projection(f, g):
-        out = jap(f, g)
-        if state["bp"] and not m.training:
+    def joint_after_projection(self, f, g):
+        out = jap(self, f, g)
+        if state["bp"] and not self.training:
             out = out.clone()
             out[..., -1] -= state["bp"]
         return out
-    m.joint.joint_after_projection = joint_after_projection
+    cls.joint_after_projection = joint_after_projection
 
     def twice(metric, tag, penalise):
         upd = metric.update
@@ -780,7 +781,8 @@ def main():
                     help="replace the trained look-ahead set: RIGHT contexts in 80 ms frames, e.g. 13 6 3 1 0 -1 "
                          "(-1 = full context; left context 70 kept)")
     ap.add_argument("--val_blank_penalty", type=float, default=1.0,
-                    help="blank penalty of the extra CTC validation metric val_wer_ctcbp (checkpoint selection)")
+                    help="blank penalty of the extra validation metrics val_wer_ctcbp / val_wer_rnntbp (checkpoints select on the "
+                         "CTC one); 0 = off (no extra decoding passes; checkpoints then select on val_wer_all)")
     ap.add_argument("--validate_only", action="store_true",
                     help="run validation on --ckpt and exit (with a new --run name and --no_hf)")
     ap.add_argument("--val_lookahead", type=int, default=3,
@@ -928,7 +930,7 @@ def main():
     if a.ctc_head:                       # after fused_ctc: the eval-time CTC loss still goes through it
         import selfcond_head
         selfcond_head.enable(m, a.ctc_head)
-    if hasattr(m, "ctc_wer"):                # hybrid model: + the CTC head's WER at the app's blank penalty
+    if hasattr(m, "ctc_wer") and a.val_blank_penalty > 0:   # hybrid model: + both heads at the app's blank penalty
         bp_metrics(m, a.val_blank_penalty)
     # Exact resume: a 1-layer nn.LSTM ignores its `dropout` (applied only between layers), but with dropout > 0 the
     # first call per process makes cuDNN's dropout state, drawing a seed from the CUDA generator -- at step 1 in an
@@ -956,14 +958,15 @@ def main():
         wandb_fork(logger, a.project, wid, torch.load(resume, map_location="cpu", mmap=True, weights_only=False)["global_step"])
     if not a.no_hf:
         hf_sync.push(a.run, tok_dir=a.tok, wandb_id=logger.experiment.id, block=True)
+    MON = "val_wer_ctcbp_all" if a.val_blank_penalty > 0 else "val_wer_all"
     trainer = pl.Trainer(
         devices=1, accelerator="gpu", precision="32-true" if a.bf16_master else "bf16-mixed", max_steps=max_steps, max_epochs=-1,
         val_check_interval=eval_steps, check_val_every_n_epoch=None if eval_steps else 1,
         num_sanity_val_steps=0, gradient_clip_val=None if a.bf16_master else 1.0, log_every_n_steps=50,
         use_distributed_sampler=False, logger=logger, enable_checkpointing=True, benchmark=False,
         callbacks=[AudioMeter(), RngState(), EpochShuffle(a.aug_schedule, m), TQDMProgressBar(refresh_rate=50), ValAggregate(a.val), LearningRateMonitor("step"),
-                   ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer_ctcbp_all", mode="min", save_top_k=2,
-                                   save_last=True, filename="{step}-{val_wer_ctcbp_all:.4f}", save_on_train_epoch_end=False),
+                   ModelCheckpoint(dirpath=ckpt_dir, monitor=MON, mode="min", save_top_k=2,
+                                   save_last=True, filename="{step}-{" + MON + ":.4f}", save_on_train_epoch_end=False),
                    *([SaveSteps(a.save_steps, ckpt_dir)] if a.save_steps else []),
                    *([StepTrace(a.trace)] if a.trace else []),
                    *([GradDiag(a.grad_diag)] if a.grad_diag else []),
