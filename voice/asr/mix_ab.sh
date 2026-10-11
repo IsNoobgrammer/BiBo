@@ -4,6 +4,8 @@
 #   CTCW=0.4 [ARMS="la mix fe0"] nohup bash voice/asr/mix_ab.sh > /home/marimo/work/asr/mix_ab.out 2>&1 &
 #   0. re-validate the two CTC-weight arms at 240 ms (they validated at 1040 ms) -> the baseline for arms A/B
 #   A. mix-w*      : hard sets up-weighted (NOTSOFAR x3, AMI windows x2, Spotify/Svarah/Medical x4, phone x6, NPTEL x0.5)
+#   (la-w04 of Oct 11 ran with the hard-set mix too -- a hard-coded --source_weight went to every arm -- so it is
+#    the mix + look-ahead arm, renamed mixla-w04 in W&B; look-ahead effect = mixla - mix)
 #   B. la-w*       : OLD data mix, look-ahead mix 0:10% 80ms:23% 240ms:32% 480ms:15% 1040ms:0% full:20%
 #   C. fe0-w*      : old data mix, old look-ahead mix, --fastemit 0 (baseline 0.01; never ablated)
 #   Each arm changes ONE thing against the CTC-weight winner's arm (the baseline, already trained).
@@ -35,7 +37,7 @@ for arm in ${ARMS:-la}; do                           # B first; A (mix) only whe
   case $arm in mix) SW="--source_weight $MIX";; la) LA=$LA_NEW;; fe0) FE=0;; *) echo "unknown arm $arm"; exit 1;; esac
   [ -f $A/exp_mix/$R/$R.nemo ] && { echo "ARM $R already done"; continue; }
   TKF=$T $P voice/asr/train_asr.py --project asr-mix --run $R --ctc_weight $W $COMMON --lookahead_probs $LA --fastemit $FE \
-    --source_weight $MIX --out $A/exp_mix > $A/$R.out 2>&1
+    $SW --out $A/exp_mix > $A/$R.out 2>&1
   rc=$?; echo "ARM $R TRAIN rc $rc"
   [ $rc -eq 0 ] && TKF=$T $P voice/asr/ab_meeting.py --rnnt --head glu_glu --las 3 13 -1 --bp 0 0.5 1.0 1.25 1.5 \
     --nemo $A/exp_mix/$R/$R.nemo > $A/meet_$R.out 2>&1; echo "ARM $R MEET rc $?"
