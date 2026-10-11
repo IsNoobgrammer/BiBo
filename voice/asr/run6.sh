@@ -1,6 +1,7 @@
 #!/bin/bash
 # run6: 10 epochs of en3 from NVIDIA's pretrained streaming FastConformer (train_asr's default --init), Muown cosine
 # (the default optimizer), CTC 0.6 / RNN-T 0.4, glu_glu self-conditioned CTC head, all lookaheads + full context.
+# --warmup 200 is pinned: run6 started with it, and a resume must keep the same schedule (new runs default to 5%).
 # Re-running resumes from the latest checkpoint (local, else HF bibo-asr-ckpt/run6). Needs setup_en3.sh's EN3_READY.
 #   nohup bash voice/asr/run6.sh > /home/marimo/work/asr/run6.out 2>&1 &
 set -uo pipefail

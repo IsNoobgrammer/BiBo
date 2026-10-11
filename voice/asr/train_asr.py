@@ -572,7 +572,8 @@ def main():
     ap.add_argument("--eval_hours", type=float, default=150,
                     help="evaluate every this many audio hours (must be < one data epoch); 0 = every data epoch")
     ap.add_argument("--lr", type=float, default=5e-4)
-    ap.add_argument("--warmup", type=int, default=1000)
+    ap.add_argument("--warmup", type=int, default=None, help="warm-up steps; default --warmup_frac of max_steps")
+    ap.add_argument("--warmup_frac", type=float, default=0.05, help="warm-up budget as a fraction of max_steps (5%%: user default from Oct 11 2026 -- a fixed 200 steps was 0.36%% of a 10-epoch run)")
     ap.add_argument("--sched", choices=["cosine", "wsd"], default="cosine",
                     help="wsd = linear warm-up, flat at --lr, linear decay over the last --decay_frac to 1e-5")
     ap.add_argument("--optim", choices=["adamw", "muown"], default="muown",
@@ -633,6 +634,9 @@ def main():
     # rebuilt the iterator -> with a fixed shard_seed, the same batches every segment.) eval_hours 0 = every data epoch.
     eval_steps = int(a.eval_hours * 3600 / a.batch_sec) or None
     max_steps = int(a.total_hours * 3600 / a.batch_sec)
+    if a.warmup is None:
+        a.warmup = max(1, round(a.warmup_frac * max_steps))
+    print(f"[run] warm-up {a.warmup} steps = {100 * a.warmup / max_steps:.1f}% of {max_steps}", flush=True)
 
     if a.seed is not None:
         pl.seed_everything(a.seed)
