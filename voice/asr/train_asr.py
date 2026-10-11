@@ -788,6 +788,9 @@ def main():
     ap.add_argument("--lookaheads", type=int, nargs="*", default=None,
                     help="replace the trained look-ahead set: RIGHT contexts in 80 ms frames, e.g. 13 6 3 1 0 -1 "
                          "(-1 = full context; left context 70 kept)")
+    ap.add_argument("--joint_dropout", type=float, default=None, help="RNN-T joint dropout (pretrained config: 0.2)")
+    ap.add_argument("--muon_wd", type=float, default=None,
+                    help="weight decay of the Muown (matrix) group; default = the AdamW group's 1e-3")
     ap.add_argument("--val_blank_penalty", type=float, default=1.0,
                     help="blank penalty of the extra validation metrics val_wer_ctcbp / val_wer_rnntbp (checkpoints select on the "
                          "CTC one); 0 = off (no extra decoding passes; checkpoints then select on val_wer_all)")
@@ -914,6 +917,11 @@ def main():
         m.ctc_loss_weight = a.ctc_weight
         with open_dict(m.cfg):
             m.cfg.aux_ctc.ctc_loss_weight = a.ctc_weight
+    if a.joint_dropout is not None:          # the joint's Dropout (config 0.2); before fused_joint, which reads it
+        for mod in m.joint.joint_net:
+            if isinstance(mod, torch.nn.Dropout):
+                print(f"[run] RNN-T joint dropout {mod.p} -> {a.joint_dropout}", flush=True)
+                mod.p = a.joint_dropout
     if a.fused_joint:
         import fused_joint
         fused_joint.enable(m)
@@ -1009,7 +1017,7 @@ def main():
     if a.optim == "muown":               # FusedMuon(muown) on the matrices + fused AdamW on the rest (muon_groups.py)
         assert not a.bf16_master, "--optim muown: autocast only"
         import muon_groups
-        opt = muon_groups.build(m, a.lr, muon_lr=a.muon_lr, wd=1e-3, variant=a.muon_variant, ns=a.muon_ns,
+        opt = muon_groups.build(m, a.lr, muon_lr=a.muon_lr, wd=1e-3, muon_wd=a.muon_wd, variant=a.muon_variant, ns=a.muon_ns,
                                 heads=m.encoder.layers[0].self_attn.h if a.muon_heads else 0)
         sch = (torch.optim.lr_scheduler.LambdaLR(opt, wsd_lambda(a.warmup, max_steps, a.decay_frac, 1e-5 / a.lr))
                if a.sched == "wsd" else muon_groups.warmup_cosine(opt, a.warmup, max_steps, 1e-5))
