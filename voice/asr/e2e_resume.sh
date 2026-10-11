@@ -9,7 +9,7 @@
 set -uo pipefail
 A=/home/marimo/work/asr; E3=$A/en3; P=/home/marimo/asrenv/bin/python; O=$A/exp_repro
 mkdir -p $O && cd /home/marimo/work/BiBo
-for f in $O/traceA.jsonl $O/traceB.jsonl; do : > $f; done      # empty the traces (they append)
+for f in $O/traceA.jsonl $O/traceA2.jsonl $O/traceB.jsonl; do : > $f; done      # empty the traces (they append)
 COMMON="--project bibo-asr-test --no_hf --deterministic --seed 23 --new_vocab --train $E3/train.jsonl
   --tok $E3/tok/tokenizer_spe_bpe_v2047 --val $E3/val_phone.jsonl --lr 5e-4 --total_hours 333.33334 --eval_hours 100000
   --ctc_head glu_glu --ctc_weight 0.6 --fastemit 0.01 --batch_sec 1200
@@ -18,6 +18,8 @@ COMMON="--project bibo-asr-test --no_hf --deterministic --seed 23 --new_vocab --
 T="env TKF=/home/marimo/work/tkf_ctc $P voice/asr/train_asr.py"
 $T $COMMON --run reproA --stop_step 500 --save_steps 300 500 --trace $O/traceA.jsonl > $A/reproA.out 2>&1; echo "A rc $?"
 grep -h "max_steps\|warm-up" $A/reproA.out | cut -c1-120
+# control: a second fresh run must repeat A bit for bit (else the deterministic mode itself is not deterministic)
+$T $COMMON --run reproA2 --stop_step 320 --trace $O/traceA2.jsonl > $A/reproA2.out 2>&1; echo "A2 rc $?"
 $T $COMMON --run reproB --stop_step 500 --save_steps 500 --ckpt $O/reproA/step300.ckpt --trace $O/traceB.jsonl \
   > $A/reproB.out 2>&1; echo "B rc $?"
 grep -h "RNG states restored\|legacy\|resume:" $A/reproB.out
@@ -25,6 +27,9 @@ $P - <<EOF
 import json, torch
 ta = {r["step"]: r for r in map(json.loads, open("$O/traceA.jsonl"))}
 tb = {r["step"]: r for r in map(json.loads, open("$O/traceB.jsonl"))}
+t2 = {r["step"]: r for r in map(json.loads, open("$O/traceA2.jsonl"))}
+cbad = [s for s in sorted(t2) if ta.get(s) != t2[s]]
+print(f"control (fresh A2 vs A, steps 1..{max(t2)}): differing {len(cbad)}" + (f", first at step {cbad[0]}: A {ta.get(cbad[0])} | A2 {t2[cbad[0]]}" if cbad else ""), flush=True)
 steps = sorted(s for s in tb if 300 < s <= 500)
 bad = [s for s in steps if ta.get(s) != tb[s]]
 print(f"trace: B has {len(steps)} steps in 301..500 (A has {sum(1 for s in ta if 300 < s <= 500)}); differing: {len(bad)}", flush=True)
@@ -43,6 +48,6 @@ cb = torch.load("$O/reproB/step500.ckpt", map_location="cpu", weights_only=False
 w = diff(ca["state_dict"], cb["state_dict"], "w")
 o = diff(ca["optimizer_states"], cb["optimizer_states"], "opt")
 print(f"step-500 checkpoint: weights differing {len(w)} {w[:4]} | optimizer state differing {len(o)} {o[:4]}", flush=True)
-ok = len(steps) == 200 and not bad and not w and not o
+ok = len(steps) == 200 and not bad and not w and not o and not cbad
 print("REPRO_EXACT" if ok else "REPRO_MISMATCH", flush=True)
 EOF

@@ -452,14 +452,24 @@ class RngState(Callback):
         return {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state(),
                 "cuda": torch.cuda.get_rng_state_all()}
 
+    # Restored at the FIRST training batch, not at checkpoint load: between the load and that batch Lightning builds
+    # the dataloader iterators (each draws a base seed from torch's CPU generator) and runs the sanity validation,
+    # which moved the stream a few draws ahead of the uninterrupted run (e2e_resume.sh: step 301 already differed).
     def load_state_dict(self, state):
+        self.pending = state
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        state = getattr(self, "pending", None)
+        if state is None:
+            return
         import random
         import numpy as np
         random.setstate(state["python"])
         np.random.set_state(state["numpy"])
         torch.set_rng_state(state["torch"])
         torch.cuda.set_rng_state_all(state["cuda"])
-        print("[run] resume: RNG states restored (python / numpy / torch / cuda)", flush=True)
+        self.pending = None
+        print(f"[run] resume: RNG states restored at step {trainer.global_step} (python / numpy / torch / cuda)", flush=True)
 
 
 class StopAt(Callback):
