@@ -608,6 +608,14 @@ def bp_metrics(m, bp):
     val_wer_ctc and the validation losses are unchanged: each WER metric's update runs twice in validation, first
     with the penalty on (its num / den kept, then the metric reset), then plainly as NeMo expects. RNN-T: the penalty
     is a flag read by this model's joint (greedy decoding runs without CUDA graphs here, so the flag is honoured)."""
+    # RNN-T greedy decoding captures a CUDA graph on its first call and replays it: the first call's penalty leaked
+    # into the plain WER (test: plain == penalised == 21.48, 21.56 with the extra pass off). Graphs off for decoding;
+    # change_decoding_strategy rebuilds m.wer, so this runs before the metrics are wrapped.
+    from omegaconf import open_dict
+    dec = m.cfg.decoding
+    with open_dict(dec):
+        dec.greedy.use_cuda_graph_decoder = False
+    m.change_decoding_strategy(dec, decoder_type="rnnt")
     last, state = {}, {"bp": 0.0}
     cls = type(m.joint)                 # CLASS-level, as blank_penalty.py: greedy RNN-T decoding does not reach an
     jap = cls.joint_after_projection    # instance attribute (a test showed the penalised WER == the plain one)
