@@ -694,7 +694,12 @@ def main():
                          "e.g. 0:0.2 1:0.4 6:0.2 13:0.2 full:0.2 (full = the -1 look-ahead; NeMo default: uniform)")
     ap.add_argument("--lookaheads", type=int, nargs="*", default=None,
                     help="replace the trained look-ahead set: RIGHT contexts in 80 ms frames, e.g. 13 6 3 1 0 -1 "
-                         "(-1 = full context; the FIRST is the default = validation context; left context 70 kept)")
+                         "(-1 = full context; left context 70 kept)")
+    ap.add_argument("--validate_only", action="store_true",
+                    help="run validation on --ckpt and exit (with a new --run name and --no_hf)")
+    ap.add_argument("--val_lookahead", type=int, default=3,
+                    help="look-ahead (80 ms frames) validation runs at: 3 = 240 ms (default since Oct 11 2026; runs "
+                         "before then validated at 13 = 1040 ms), -1 = full context")
     ap.add_argument("--fastemit", type=float, default=None, help="FastEmit lambda (model default 0.005)")
     ap.add_argument("--save_steps", type=int, nargs="*", default=[],
                     help="also save a full checkpoint at these global steps (WSD: branch decays from the stable phase)")
@@ -787,13 +792,16 @@ def main():
         ctx = lambda r: [-1, -1] if r < 0 else [left, r]                   # -1 = full context (offline)
         m.encoder.att_context_size_all = [ctx(r) for r in a.lookaheads]
         m.encoder.att_context_probs = [1.0 / len(a.lookaheads)] * len(a.lookaheads)
-        m.encoder.set_default_att_context_size(ctx(a.lookaheads[0]))
+        # validation (and the training default) context: --val_lookahead, 240 ms unless asked (user, Oct 11 2026)
+        assert a.val_lookahead in a.lookaheads, f"--val_lookahead {a.val_lookahead} not in --lookaheads {a.lookaheads}"
+        m.encoder.set_default_att_context_size(ctx(a.val_lookahead))
         with open_dict(m.cfg):                                       # saved .nemo / GGUF export see the new set
             # NeMo's constructor demands left % (r+1) == 0; the mask uses left // (r+1) chunks anyway, so
             # [70 - 70 % (r+1), r] is the SAME mask ([70,3] made run5.nemo unloadable for streaming eval)
             m.cfg.encoder.att_context_size = [[-1, -1] if r < 0 else [left - left % (r + 1), r] for r in a.lookaheads]
             m.cfg.encoder.att_context_probs = m.encoder.att_context_probs
-        print(f"[run] look-ahead set {m.encoder.att_context_size_all}", flush=True)
+        print(f"[run] look-ahead set {m.encoder.att_context_size_all}, validation at "
+              f"{'full context' if a.val_lookahead < 0 else f'{a.val_lookahead * 80} ms'}", flush=True)
     if a.lookahead_probs:
         want = {(-1 if r == "full" else int(r)): float(p) for r, p in (x.split(":") for x in a.lookahead_probs)}
         ctxs = [list(c) for c in m.encoder.att_context_size_all]
@@ -925,6 +933,11 @@ def main():
     print(f"[run] {a.run}: max_steps {max_steps}, eval every {eval_steps} steps (~{a.eval_hours} h), "
           f"batch {a.batch_sec} s, val {[os.path.basename(v) for v in a.val]}", flush=True)
     print(f"[run] resume from {resume}", flush=True)
+    if a.validate_only:     # re-score a finished checkpoint (e.g. at a new --val_lookahead) without training; use a
+        assert resume, "--validate_only needs --ckpt"           # NEW --run name + --no_hf so nothing is overwritten
+        trainer.validate(m, ckpt_path=resume)
+        print("VALIDATE_DONE", flush=True)
+        return
     trainer.fit(m, ckpt_path=resume)
     trainer.validate(m)                                         # the final model, wherever the last eval fell
     m.save_to(os.path.join(ckpt_dir, f"{a.run}.nemo"))
