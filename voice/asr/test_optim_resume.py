@@ -8,11 +8,15 @@ The toy model has every Muon group the ASR model has (2D, pointwise conv muon_rc
 params (bias, norm, embedding).
 
     TKF=/home/marimo/work/tkf_ctc /home/marimo/asrenv/bin/python voice/asr/test_optim_resume.py
+    XPROC=1 ...   the resumed half runs in a FRESH PROCESS, as a real resume does: per-process state (NS-router
+                  decisions, kernel caches, cuDNN seeds) starts empty there and not in the in-process B above
 """
 import copy
 import io
 import os
+import subprocess
 import sys
+import tempfile
 
 import torch
 
@@ -45,7 +49,31 @@ def run(model, opt, steps, start):
 TOTAL, SPLIT = int(os.environ.get("TOTAL", 20)), int(os.environ.get("SPLIT", 12))
 
 
+def child(path):
+    """XPROC: the resumed half, in a fresh process -- load base + checkpoint, run the rest, compare with the straight run."""
+    d = torch.load(path, weights_only=False)
+    b2 = Toy().cuda()
+    b2.load_state_dict(d["ck"]["model"])
+    opt_b2 = muon_groups.build(b2, 5e-4, wd=1e-3)
+    opt_b2.load_state_dict(d["ck"]["opt"])
+    run(b2, opt_b2, TOTAL - SPLIT, SPLIT)
+    return compare(d["a"], b2)
+
+
+def compare(a_sd, b2):
+    worst = 0.0
+    for n, pb in b2.named_parameters():
+        d = (a_sd[n] - pb).abs().max().item()
+        worst = max(worst, d)
+        if d > 0:
+            print(f"  DIFF {n}: max |straight - resumed| = {d:.3e} (|w| {a_sd[n].abs().max().item():.3e})", flush=True)
+    print("RESUME EXACT" if worst == 0 else f"RESUME MISMATCH: worst {worst:.3e}", flush=True)
+    return worst
+
+
 def main():
+    if os.environ.get("XPROC_CHILD"):
+        sys.exit(0 if child(os.environ["XPROC_CHILD"]) == 0 else 1)
     torch.manual_seed(0)
     base = Toy().cuda()
     a = copy.deepcopy(base)
@@ -65,6 +93,12 @@ def main():
     torch.save({"opt": opt_b.state_dict(), "model": b.state_dict()}, buf)
     buf.seek(0)
     ck = torch.load(buf, weights_only=False)
+    if os.environ.get("XPROC"):
+        path = os.path.join(tempfile.mkdtemp(), "xproc.pt")
+        torch.save({"ck": ck, "a": {n: q.detach().clone() for n, q in a.named_parameters()}}, path)
+        print(f"XPROC: resuming at step {SPLIT} in a fresh process", flush=True)
+        sys.exit(subprocess.run([sys.executable, os.path.abspath(__file__)],
+                                env={**os.environ, "XPROC_CHILD": path}).returncode)
     if os.environ.get("LEGACY"):                        # a checkpoint from before tkf saved FusedMuon's step counter
         for s in ck["opt"]["combined"]:
             s.pop("fused_muon", None)
@@ -97,14 +131,7 @@ def main():
         extra = [k for k in vars(o1) if k.startswith("_") and not callable(getattr(o1, k))]
         print("  FusedMuon private attrs:", {k: type(getattr(o1, k)).__name__ for k in extra}, flush=True)
     run(b2, opt_b2, TOTAL - SPLIT, SPLIT)
-
-    worst = 0.0
-    for (n, pa), (_, pb) in zip(a.named_parameters(), b2.named_parameters()):
-        d = (pa - pb).abs().max().item()
-        worst = max(worst, d)
-        if d > 0:
-            print(f"  DIFF {n}: max |straight - resumed| = {d:.3e} (|w| {pa.abs().max().item():.3e})", flush=True)
-    print("RESUME EXACT" if worst == 0 else f"RESUME MISMATCH: worst {worst:.3e}", flush=True)
+    worst = compare({n: q.detach() for n, q in a.named_parameters()}, b2)
     sys.exit(0 if worst == 0 else 1)
 
 
