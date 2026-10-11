@@ -26,12 +26,13 @@ from score import edits, normalize, wer  # noqa: E402
 
 def load(path, head):
     import nemo.collections.asr as nemo_asr
-    m = nemo_asr.models.ASRModel.restore_from(path, map_location="cuda", strict=False)
-    selfcond_head.enable(m, head)
-    with tarfile.open(path) as t:
-        sd = torch.load(t.extractfile(next(n for n in t.getnames() if n.endswith("model_weights.ckpt"))),
-                        map_location="cuda", weights_only=False)
-    m.load_state_dict(sd, strict=True)
+    m = nemo_asr.models.ASRModel.restore_from(path, map_location="cuda", strict=head == "none")
+    if head != "none":                                  # "none": a stock-CTC run (run5), loaded as saved
+        selfcond_head.enable(m, head)
+        with tarfile.open(path) as t:
+            sd = torch.load(t.extractfile(next(n for n in t.getnames() if n.endswith("model_weights.ckpt"))),
+                            map_location="cuda", weights_only=False)
+        m.load_state_dict(sd, strict=True)
     if hasattr(m, "joint"):       # RNN-T greedy: a captured CUDA graph would replay the first blank penalty forever
         from omegaconf import open_dict
         dec = m.cfg.decoding
@@ -44,7 +45,7 @@ def load(path, head):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--nemo", nargs="+", required=True)
-    ap.add_argument("--head", default="glu_glu")
+    ap.add_argument("--head", default="glu_glu", help="self-conditioned head kind, or none for a stock-CTC run (run5)")
     ap.add_argument("--rnnt", action="store_true", help="also decode the RNN-T head (hybrid runs)")
     ap.add_argument("--bp", type=float, nargs="+", default=[0.0, 0.5, 1.0])
     ap.add_argument("--las", type=int, nargs="+", default=[0, 1, 3, 6, 13])
@@ -72,7 +73,8 @@ def main():
             set_lookahead(m.encoder, la)
             encs = [encode(m, torch.from_numpy(x)[None].cuda(), torch.tensor([len(x)]).cuda()) for x, _ in clips]
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                zs = [m.ctc_decoder.head(e).float()[0, : int(el[0])] + lock for e, el in encs]
+                ctc = (lambda e: m.ctc_decoder(encoder_output=e.transpose(1, 2))) if a.head == "none" else m.ctc_decoder.head
+                zs = [ctc(e).float()[0, : int(el[0])] + lock for e, el in encs]
             for bp in a.bp:
                 hyps = []
                 for z in zs:
