@@ -15,6 +15,7 @@ import argparse
 import glob
 import json
 import os
+import time
 from multiprocessing import Pool
 
 import pyarrow.parquet as pq
@@ -60,8 +61,20 @@ def main():
     if os.path.exists(done) or (glob.glob(os.path.join(a.mix, "*.jsonl")) and not a.merge):
         print(f"fetch_mix: {a.mix} already restored / has manifests, skipping", flush=True)
         return
-    d = snapshot_download(a.repo, repo_type="dataset", max_workers=16,
-                          local_dir=os.path.join(os.path.dirname(a.mix), "hf_mix", a.repo.replace("/", "__")))
+    # HF answers 5xx now and then (Oct 12 2026: a 504 on asr-english-v2's xet read token killed a box's setup):
+    # retry with backoff; snapshot_download resumes, skipping the files it already has
+    for attempt in range(8):
+        try:
+            d = snapshot_download(a.repo, repo_type="dataset", max_workers=16,
+                                  local_dir=os.path.join(os.path.dirname(a.mix), "hf_mix", a.repo.replace("/", "__")))
+            break
+        except Exception as e:                                  # HfHubHTTPError, timeouts, connection resets
+            if attempt == 7:
+                raise
+            wait = min(300, 15 * 2 ** attempt)
+            print(f"fetch_mix: {a.repo} download failed ({type(e).__name__}: {str(e)[:120]}), retry in {wait} s",
+                  flush=True)
+            time.sleep(wait)
     for man in sorted(glob.glob(os.path.join(d, "manifests", "*.jsonl"))):
         for l in open(man, encoding="utf-8"):
             r = json.loads(l)
