@@ -16,7 +16,7 @@ COMMON="--project bibo-asr-test --no_hf --deterministic --seed 23 --new_vocab --
   --ctc_head glu_glu --ctc_weight 0.6 --fastemit 0.01 --batch_sec 1200
   --lookaheads 13 6 3 1 0 -1 --lookahead_probs 0:0.05 1:0.15 3:0.35 6:0.10 13:0.15 full:0.20
   --fused_joint --fused_layer --fused_attn --fused_conv --fused_ctc --out $O"
-T="env TKF=/home/marimo/work/tkf_ctc $P voice/asr/train_asr.py"
+T="env TKF=/home/marimo/work/tkf_ctc TRACE_MODULES=$((MID + 1)) $P voice/asr/train_asr.py"
 $T $COMMON --run reproA --stop_step $STOP --save_steps $MID $STOP --trace $O/traceA.jsonl > $A/reproA.out 2>&1; echo "A rc $?"
 grep -h "max_steps\|warm-up" $A/reproA.out | cut -c1-120
 # control: a second fresh run must repeat A bit for bit (else the deterministic mode itself is not deterministic)
@@ -45,6 +45,12 @@ for s in steps[:3]:
             else:
                 d[k] = f"A {fa.get(k)} B {fb.get(k)}"
     print("  fingerprint step", s, d, flush=True)
+    ma, mb = (ta.get(s) or {}).get("mods") or [], tb[s].get("mods") or []
+    if ma or mb:
+        first = next(((x, y) for x, y in zip(ma, mb) if x[1:] != y[1:]), None)
+        print(f"  modules step {s}: {len(ma)} vs {len(mb)} calls; first differing call:", first, flush=True)
+        for x, y in list(zip(ma, mb))[:40]:
+            print("     ", x[0], "out", "same" if x[1] == y[1] else "DIFF", "| rng after", "same" if x[2] == y[2] else "DIFF", flush=True)
 for s in bad[:5]:
     print("  step", s, "A", ta.get(s), "| B", tb[s], flush=True)
 def diff(a, b, path=""):

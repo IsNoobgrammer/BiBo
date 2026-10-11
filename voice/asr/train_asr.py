@@ -443,6 +443,30 @@ class StepTrace(Callback):
             "buf": {n: h(b.detach().float().cpu().numpy().tobytes()) for n, b in pl_module.named_buffers()},
             "batch": h(b"".join(t.cpu().numpy().tobytes() for t in batch if torch.is_tensor(t))[:4096 * 16]),
         }
+        # module-level fingerprints for the steps named in TRACE_MODULES (e.g. "301,302"): each module's output hash
+        # and the CUDA RNG right after it -> the first module whose output differs between two runs is the culprit
+        want = {int(x) for x in os.environ.get("TRACE_MODULES", "").split(",") if x.strip()}
+        for hk in getattr(self, "hooks", []):
+            hk.remove()
+        self.hooks, self.mods = [], []
+        if trainer.global_step + 1 in want:
+            def tens(o):
+                if torch.is_tensor(o):
+                    return [o]
+                if isinstance(o, (list, tuple)):
+                    return [t for x in o for t in tens(x)]
+                if isinstance(o, dict):
+                    return [t for x in o.values() for t in tens(x)]
+                return []
+            named = [("pre_encode", pl_module.encoder.pre_encode)]
+            named += [(f"layer{i}", l) for i, l in enumerate(pl_module.encoder.layers)]
+            named += [(n, getattr(pl_module, n)) for n in ("ctc_decoder", "decoder", "joint") if hasattr(pl_module, n)]
+            for n, mod in named:
+                def hook(m, inp, out, _n=n):
+                    ts = tens(out)
+                    self.mods.append((_n, h(b"".join(t.detach().float().cpu().numpy().tobytes() for t in ts)),
+                                      h(b"".join(s.numpy().tobytes() for s in torch.cuda.get_rng_state_all()))))
+                self.hooks.append(mod.register_forward_hook(hook))
 
     def on_before_optimizer_step(self, trainer, pl_module, optimizer):
         g = [p.grad.float().norm() for p in pl_module.parameters() if p.grad is not None]
@@ -453,7 +477,7 @@ class StepTrace(Callback):
         ctx = getattr(pl_module.encoder, "_fused_ctx", None)
         rec = {"step": trainer.global_step, "loss": float(loss), "grad_norm": self.gn,
                "lr": [g["lr"] for g in trainer.optimizers[0].param_groups][:2], "ctx": ctx[0] if ctx else None,
-               "fp": getattr(self, "fp", None)}
+               "fp": getattr(self, "fp", None), "mods": getattr(self, "mods", None) or None}
         with open(self.path, "a") as f:
             f.write(json.dumps(rec) + "\n")
 
