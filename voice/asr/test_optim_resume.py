@@ -39,11 +39,19 @@ def grads(model, step):
         p.grad = torch.randn(p.shape, device="cuda", generator=g) * 0.01
 
 
-def run(model, opt, steps, start):
+def sched(opt):
+    """A per-step LR schedule on the Combined optimizer, stepped after opt.step() and checkpointed, as Lightning does
+    (a constant lr hid the Oct 11 bug: load_state_dict gave the sub-optimizers new group dicts, the schedule kept
+    writing the old ones, so a resumed run trained on at the checkpoint's lr)."""
+    return torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0 - 0.03 * s)
+
+
+def run(model, opt, steps, start, sch):
     for s in range(start, start + steps):
         grads(model, s)
         opt.step()
         opt.zero_grad()
+        sch.step()
 
 
 TOTAL, SPLIT = int(os.environ.get("TOTAL", 20)), int(os.environ.get("SPLIT", 12))
@@ -55,8 +63,10 @@ def child(path):
     b2 = Toy().cuda()
     b2.load_state_dict(d["ck"]["model"])
     opt_b2 = muon_groups.build(b2, 5e-4, wd=1e-3)
+    sch_b2 = sched(opt_b2)                      # Lightning's order: configure_optimizers, then restore both
     opt_b2.load_state_dict(d["ck"]["opt"])
-    run(b2, opt_b2, TOTAL - SPLIT, SPLIT)
+    sch_b2.load_state_dict(d["ck"]["sched"])
+    run(b2, opt_b2, TOTAL - SPLIT, SPLIT, sch_b2)
     return compare(d["a"], b2)
 
 
@@ -78,19 +88,20 @@ def main():
     base = Toy().cuda()
     a = copy.deepcopy(base)
     opt_a = muon_groups.build(a, 5e-4, wd=1e-3)
-    run(a, opt_a, TOTAL, 0)
+    run(a, opt_a, TOTAL, 0, sched(opt_a))
 
     if os.environ.get("CONTROL"):                       # two fresh optimizers, 10 straight steps each: same bits?
         c = copy.deepcopy(base)
         opt_c = muon_groups.build(c, 5e-4, wd=1e-3)
-        run(c, opt_c, TOTAL, 0)
+        run(c, opt_c, TOTAL, 0, sched(opt_c))
         dc = max((x - y).abs().max().item() for x, y in zip(a.parameters(), c.parameters()))
         print(f"CONTROL straight vs straight (fresh optimizer, {TOTAL} steps): worst {dc:.3e}", flush=True)
     b = copy.deepcopy(base)
     opt_b = muon_groups.build(b, 5e-4, wd=1e-3)
-    run(b, opt_b, SPLIT, 0)
+    sch_b = sched(opt_b)
+    run(b, opt_b, SPLIT, 0, sch_b)
     buf = io.BytesIO()
-    torch.save({"opt": opt_b.state_dict(), "model": b.state_dict()}, buf)
+    torch.save({"opt": opt_b.state_dict(), "model": b.state_dict(), "sched": sch_b.state_dict()}, buf)
     buf.seek(0)
     ck = torch.load(buf, weights_only=False)
     if os.environ.get("XPROC"):
@@ -105,7 +116,9 @@ def main():
     b2 = copy.deepcopy(base)
     b2.load_state_dict(ck["model"])
     opt_b2 = muon_groups.build(b2, 5e-4, wd=1e-3)
+    sch_b2 = sched(opt_b2)
     opt_b2.load_state_dict(ck["opt"])
+    sch_b2.load_state_dict(ck["sched"])
     if os.environ.get("FIX_STEP"):                      # diagnosis: restore FusedMuon's step counter by hand
         opt_b2.opts[0]._step_count = opt_b.opts[0]._step_count
     print("step counters: straight", [getattr(o, "_step_count", None) for o in opt_a.opts],
@@ -130,7 +143,7 @@ def main():
                       + ("" if same else f" ({type(a_).__name__} vs {type(b_).__name__})"), flush=True)
         extra = [k for k in vars(o1) if k.startswith("_") and not callable(getattr(o1, k))]
         print("  FusedMuon private attrs:", {k: type(getattr(o1, k)).__name__ for k in extra}, flush=True)
-    run(b2, opt_b2, TOTAL - SPLIT, SPLIT)
+    run(b2, opt_b2, TOTAL - SPLIT, SPLIT, sch_b2)
     worst = compare({n: q.detach() for n, q in a.named_parameters()}, b2)
     sys.exit(0 if worst == 0 else 1)
 
