@@ -62,6 +62,25 @@ def main():
         opt_b2.opts[0]._step_count = opt_b.opts[0]._step_count
     print("step counters: straight", [getattr(o, "_step_count", None) for o in opt_a.opts],
           "| resumed", [getattr(o, "_step_count", None) for o in opt_b2.opts], flush=True)
+    if os.environ.get("DIAG"):                          # which FusedMuon state survives the round trip?
+        o1, o2 = opt_b.opts[0], opt_b2.opts[0]
+        p1 = [q for g in o1.param_groups for q in g["params"]]
+        p2 = [q for g in o2.param_groups for q in g["params"]]
+        def flat(st, pre=""):
+            for k, v in st.items():
+                if isinstance(v, dict):
+                    yield from flat(v, pre + k + ".")
+                else:
+                    yield pre + k, v
+        for i, (q1, q2) in enumerate(zip(p1, p2)):
+            s1, s2 = dict(flat(o1.state.get(q1, {}))), dict(flat(o2.state.get(q2, {})))
+            for k in sorted(set(s1) | set(s2)):
+                a_, b_ = s1.get(k), s2.get(k)
+                same = (a_ is not None and b_ is not None and (torch.equal(a_, b_) if torch.is_tensor(a_) else a_ == b_))
+                print(f"  param {i} {tuple(q1.shape)} {k}: {'same' if same else 'DIFFERS'}"
+                      + ("" if same else f" ({type(a_).__name__} vs {type(b_).__name__})"), flush=True)
+        extra = [k for k in vars(o1) if k.startswith("_") and not callable(getattr(o1, k))]
+        print("  FusedMuon private attrs:", {k: type(getattr(o1, k)).__name__ for k in extra}, flush=True)
     run(b2, opt_b2, 5, 5)
 
     worst = 0.0
