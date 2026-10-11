@@ -58,6 +58,8 @@ def main():
     b2.load_state_dict(ck["model"])
     opt_b2 = muon_groups.build(b2, 5e-4, wd=1e-3)
     opt_b2.load_state_dict(ck["opt"])
+    if os.environ.get("FIX_STEP"):                      # diagnosis: restore FusedMuon's step counter by hand
+        opt_b2.opts[0]._step_count = opt_b.opts[0]._step_count
     print("step counters: straight", [getattr(o, "_step_count", None) for o in opt_a.opts],
           "| resumed", [getattr(o, "_step_count", None) for o in opt_b2.opts], flush=True)
     run(b2, opt_b2, 5, 5)
