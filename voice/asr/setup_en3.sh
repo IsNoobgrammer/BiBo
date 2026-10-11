@@ -19,10 +19,16 @@ echo "run5.nemo ok"
 if [ ! -f "$M/fetch" ]; then
   # en3's sources live in THREE repos (base / v2: meetings, far-field, read, VITW / nc: SPGI 2.0, TED-LIUM), merged
   # into one mix dir. Oct 10: fetching only asr-english left most of en3's rows without audio.
+  # The three repos are fetched AT THE SAME TIME (Oct 12 2026; they ran one after another), each restoring its parquet
+  # shards with 8 worker processes (fetch_mix.py); each downloads into its own hf_mix/<repo> folder.
+  pids=()
   for R in asr-english asr-english-v2 asr-english-nc; do
-    (cd $W/BiBo && HF_HUB_ENABLE_HF_TRANSFER=1 $P voice/asr/fetch_mix.py --repo fhai50032/$R --mix $A/mix_en --merge) \
-      || { echo "FETCH FAILED $R"; exit 1; }
+    (cd $W/BiBo && HF_HUB_ENABLE_HF_TRANSFER=1 $P voice/asr/fetch_mix.py --repo fhai50032/$R --mix $A/mix_en --merge       --workers 8 > $A/fetch_$R.log 2>&1; rc=$?; tail -n 1 $A/fetch_$R.log; exit $rc) &
+    pids+=($!)
   done
+  ok=1
+  for i in 0 1 2; do wait ${pids[$i]} || { echo "FETCH FAILED (job $i, see $A/fetch_*.log)"; ok=0; }; done
+  [ $ok = 1 ] || exit 1
   touch "$M/fetch"
 fi
 echo "mix_en ok"
