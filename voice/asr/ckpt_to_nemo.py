@@ -28,10 +28,10 @@ def main():
     m.change_vocabulary(new_tokenizer_dir=a.tok, new_tokenizer_type="bpe")
     if a.lookaheads:
         left = m.encoder.att_context_size_all[0][0]
-        m.encoder.att_context_size_all = [[left, r] for r in a.lookaheads]
-        m.encoder.set_default_att_context_size([left, a.lookaheads[0]])
+        m.encoder.att_context_size_all = [[-1, -1] if r < 0 else [left, r] for r in a.lookaheads]   # -1 = full context
+        m.encoder.set_default_att_context_size([-1, -1] if a.lookaheads[0] < 0 else [left, a.lookaheads[0]])
         with open_dict(m.cfg):
-            m.cfg.encoder.att_context_size = [[left - left % (r + 1), r] for r in a.lookaheads]
+            m.cfg.encoder.att_context_size = [[-1, -1] if r < 0 else [left - left % (r + 1), r] for r in a.lookaheads]
     if a.head != "none":                                # the run's CTC head, as train_asr / ab_meeting attach it
         import sys
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
