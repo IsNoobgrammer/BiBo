@@ -24,7 +24,7 @@ from ctc_heads import MEETING, encode, set_lookahead  # noqa: E402
 from score import edits, normalize, wer  # noqa: E402
 
 
-def load(path, head):
+def load(path, head, ckpt=None):
     import nemo.collections.asr as nemo_asr
     m = nemo_asr.models.ASRModel.restore_from(path, map_location="cuda", strict=head == "none")
     if head != "none":                                  # "none": a stock-CTC run (run5), loaded as saved
@@ -33,6 +33,8 @@ def load(path, head):
             sd = torch.load(t.extractfile(next(n for n in t.getnames() if n.endswith("model_weights.ckpt"))),
                             map_location="cuda", weights_only=False)
         m.load_state_dict(sd, strict=True)
+    if ckpt:                                            # score another checkpoint of the same run (e.g. an earlier epoch)
+        m.load_state_dict(torch.load(ckpt, map_location="cuda", weights_only=False)["state_dict"], strict=True)
     if hasattr(m, "joint"):       # RNN-T greedy: a captured CUDA graph would replay the first blank penalty forever
         from omegaconf import open_dict
         dec = m.cfg.decoding
@@ -46,6 +48,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--nemo", nargs="+", required=True)
     ap.add_argument("--head", default="glu_glu", help="self-conditioned head kind, or none for a stock-CTC run (run5)")
+    ap.add_argument("--ckpt", default=None, help="Lightning .ckpt whose weights replace the .nemo's (same architecture)")
     ap.add_argument("--rnnt", action="store_true", help="also decode the RNN-T head (hybrid runs)")
     ap.add_argument("--bp", type=float, nargs="+", default=[0.0, 0.5, 1.0])
     ap.add_argument("--las", type=int, nargs="+", default=[0, 1, 3, 6, 13])
@@ -65,8 +68,8 @@ def main():
               + " ".join(f"{100 * wer(ref, h):5.1f}" for (_, ref), h in zip(clips, hyps))
               + f" | hyp/ref words {sum(map(len, hyps))}/{n}", flush=True)
     for path in a.nemo:
-        m = load(path, a.head)
-        name = os.path.basename(path)[:-5]
+        m = load(path, a.head, a.ckpt)
+        name = os.path.basename(path)[:-5] + (":" + os.path.basename(os.path.dirname(a.ckpt)) if a.ckpt else "")
         lock = blank_penalty.devanagari_ids(a.tok)
         blank = m.ctc_decoder.num_classes_with_blank - 1
         for la in a.las:
