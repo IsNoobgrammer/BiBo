@@ -143,6 +143,16 @@ class Combined(__import__("torch").optim.Optimizer):
     def load_state_dict(self, sd):
         for o, s in zip(self.opts, sd["combined"]):
             o.load_state_dict(s)
+        # checkpoints from before tkf saved FusedMuon's step counter (run6 and earlier): take it from AdamW's step
+        # (both step once per training step) so Muown's Adam bias correction does not restart at t = 0
+        legacy = [o for o, s in zip(self.opts, sd["combined"]) if hasattr(o, "_step_count") and "fused_muon" not in s]
+        steps = [int(st["step"]) for o in self.opts if not hasattr(o, "_step_count")
+                 for st in o.state.values() if "step" in st]
+        for o in legacy:
+            if steps:
+                o._step_count = max(steps)
+                print(f"[muon_groups] legacy checkpoint: FusedMuon step counter restored from AdamW = {o._step_count}",
+                      flush=True)
 
     def __repr__(self):
         return "Combined(" + ", ".join(type(o).__name__ for o in self.opts) + ")"

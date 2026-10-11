@@ -97,6 +97,7 @@ def main():
         if d > 0:
             print(f"  DIFF {n}: max |straight - resumed| = {d:.3e} (|w| {pa.abs().max().item():.3e})", flush=True)
     print("RESUME EXACT" if worst == 0 else f"RESUME MISMATCH: worst {worst:.3e}", flush=True)
+    sys.exit(0 if worst == 0 else 1)
 
 
 if __name__ == "__main__":
