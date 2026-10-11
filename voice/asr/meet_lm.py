@@ -25,7 +25,7 @@ def _init(a, labels):
     from pyctcdecode import build_ctcdecoder
     uni = [w.strip() for w in open(a.unigrams, encoding="utf-8")] if a.unigrams else None
     G["dec"] = {al: build_ctcdecoder(labels, kenlm_model_path=a.lm if al > 0 else None, unigrams=uni if al > 0 else None,
-                                     alpha=al, beta=0.0) for al in a.alpha}
+                                     alpha=al, beta=0.0, unk_score_offset=a.unk) for al in a.alpha}
     G["a"] = a
 
 
@@ -54,6 +54,7 @@ def main():
     ap.add_argument("--hotwords", nargs="*", default=None)
     ap.add_argument("--hw_weight", type=float, default=8.0)
     ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--unk", type=float, default=-10.0, help="LM score offset of a word outside the unigrams")
     ap.add_argument("--tag", default="")
     a = ap.parse_args()
     if not a.lm:
