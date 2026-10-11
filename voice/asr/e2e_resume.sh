@@ -7,7 +7,7 @@
 #   bitwise equal (weights + optimizer state + RNG states).
 #   bash voice/asr/e2e_resume.sh      -> last line REPRO_EXACT or REPRO_MISMATCH
 set -uo pipefail
-A=/home/marimo/work/asr; E3=$A/en3; P=/home/marimo/asrenv/bin/python; O=$A/exp_repro
+A=/home/marimo/work/asr; E3=$A/en3; P=/home/marimo/asrenv/bin/python; O=$A/exp_repro_$(date +%Y%m%d_%H%M%S)   # fresh dir: a leftover last.ckpt would be RESUMED
 mkdir -p $O && cd /home/marimo/work/BiBo
 for f in $O/traceA.jsonl $O/traceA2.jsonl $O/traceB.jsonl; do : > $f; done      # empty the traces (they append)
 COMMON="--project bibo-asr-test --no_hf --deterministic --seed 23 --new_vocab --train $E3/train.jsonl
