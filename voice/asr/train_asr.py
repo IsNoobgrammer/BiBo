@@ -823,6 +823,15 @@ def main():
     if a.ctc_head:                       # after fused_ctc: the eval-time CTC loss still goes through it
         import selfcond_head
         selfcond_head.enable(m, a.ctc_head)
+    # Exact resume: a 1-layer nn.LSTM ignores its `dropout` (applied only between layers), but with dropout > 0 the
+    # first call per process makes cuDNN's dropout state, drawing a seed from the CUDA generator -- at step 1 in an
+    # uninterrupted run, at the first step after a resume in a resumed one, so every later dropout mask differed
+    # (e2e_resume.sh: the prediction net was the first module to diverge). Zero it: same outputs, no hidden draw.
+    for mod in m.modules():
+        if isinstance(mod, torch.nn.LSTM) and mod.num_layers == 1 and mod.dropout > 0:
+            print(f"[run] 1-layer LSTM dropout {mod.dropout} -> 0 (it never applied; it only drew a hidden RNG seed)",
+                  flush=True)
+            mod.dropout = 0.0
 
     ckpt_dir = os.path.join(a.out, a.run)
     os.makedirs(ckpt_dir, exist_ok=True)
