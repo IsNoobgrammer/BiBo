@@ -24,7 +24,7 @@ for W in ${ARMS:-0.4 0.6}; do
     --lookaheads 13 6 3 1 0 -1 --lookahead_probs 0:0.05 1:0.15 3:0.35 6:0.10 13:0.15 full:0.20 \
     --fused_joint --fused_layer --fused_attn --fused_conv --fused_ctc --out $A/exp_ctcab_$TAG > $A/$R.out 2>&1
   rc=$?; echo "ARM $R TRAIN rc $rc"
-  [ $rc -eq 0 ] && $P voice/asr/ab_meeting.py --rnnt --head glu_glu --las 3 13 -1 --bp 0 0.5 1.0 \
+  [ $rc -eq 0 ] && $P voice/asr/ab_meeting.py --rnnt --head glu_glu --las 3 13 -1 --bp 0 0.5 0.75 1.0 1.25 1.5 \
     --nemo $A/exp_ctcab_$TAG/$R/$R.nemo > $A/meet_$R.out 2>&1; echo "ARM $R MEET rc $?"
 done
 echo "CTCAB_DONE"
