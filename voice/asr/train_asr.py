@@ -419,6 +419,27 @@ class ProfileSteps(Callback):
             self.sites = None
 
 
+class StepTrace(Callback):
+    """--trace FILE: one JSON line per training step (step, loss, grad norm, lr, and the step's look-ahead) -- the
+    every-step record a reproducibility check compares (W&B only keeps every 50th). Appends, so a resumed run
+    writes after the steps it continues from. Costs a host sync per step: tests only."""
+
+    def __init__(self, path):
+        self.path, self.gn = path, None
+
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer):
+        g = [p.grad.float().norm() for p in pl_module.parameters() if p.grad is not None]
+        self.gn = torch.stack(g).norm().item() if g else 0.0
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        loss = outputs["loss"] if isinstance(outputs, dict) else outputs
+        ctx = getattr(pl_module.encoder, "_fused_ctx", None)
+        rec = {"step": trainer.global_step, "loss": float(loss), "grad_norm": self.gn,
+               "lr": [g["lr"] for g in trainer.optimizers[0].param_groups][:2], "ctx": ctx[0] if ctx else None}
+        with open(self.path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+
 class RngState(Callback):
     """Resume continues the RANDOM stream too: Python random (NeMo's per-batch look-ahead choice), NumPy, torch CPU
     (the fused dropout kernels draw their seeds from it) and CUDA generators ride in the checkpoint. Without this a
@@ -621,6 +642,7 @@ def main():
     ap.add_argument("--stop_step", type=int, default=None, help="stop at this global step (schedule unchanged)")
     ap.add_argument("--profile_steps", default=None, help="A:B -- profile real steps A..B (+1 sync-debug step)")
     ap.add_argument("--lr_scale", type=float, default=None, help="multiply the scheduler lrs at train start (resumes)")
+    ap.add_argument("--trace", default=None, help="per-step JSONL (loss, grad norm, lr, look-ahead) for reproducibility checks")
     ap.add_argument("--ckpt", default=None, help="resume from this checkpoint (e.g. a --save_steps one, for a decay branch)")
     ap.add_argument("--workers", type=int, default=None, help="loader workers (default: CPU count - 1)")
     ap.add_argument("--compile_layers", action="store_true")
@@ -775,6 +797,7 @@ def main():
                    ModelCheckpoint(dirpath=ckpt_dir, monitor="val_wer_all", mode="min", save_top_k=2,
                                    save_last=True, filename="{step}-{val_wer_all:.4f}", save_on_train_epoch_end=False),
                    *([SaveSteps(a.save_steps, ckpt_dir)] if a.save_steps else []),
+                   *([StepTrace(a.trace)] if a.trace else []),
                    *([GradDiag(a.grad_diag)] if a.grad_diag else []),
                    *([StopAt(a.stop_step)] if a.stop_step else []),
                    *([ProfileSteps(a.profile_steps)] if a.profile_steps else []),
