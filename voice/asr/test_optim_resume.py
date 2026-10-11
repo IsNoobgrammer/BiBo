@@ -1,7 +1,9 @@
 """Does the Muown (+ AdamW) Combined optimizer resume EXACTLY? (train_asr --optim muown, muon_groups.build)
 
-Run A: 10 steps straight. Run B: 5 steps, state_dict() -> torch.save/load (as a Lightning checkpoint does) -> FRESH
-model copy + fresh optimizer + load_state_dict -> 5 more steps with the same grads. A and B must end bitwise equal.
+Run A: TOTAL (20) steps straight. Run B: SPLIT steps, state_dict() -> torch.save/load (as a Lightning checkpoint does)
+-> FRESH model copy + fresh optimizer + load_state_dict -> the rest with the same grads. A and B must end bitwise equal.
+SPLIT defaults to 12, past FusedMuon's 10-step NS-router probe window (a split inside it, e.g. SPLIT=5, never saw the
+router's locked choices go missing on resume: Oct 11 2026, the e2e run diverged from its 2nd resumed step).
 The toy model has every Muon group the ASR model has (2D, pointwise conv muon_rc, LSTM per-gate muon_rc) + AdamW
 params (bias, norm, embedding).
 
@@ -40,22 +42,25 @@ def run(model, opt, steps, start):
         opt.zero_grad()
 
 
+TOTAL, SPLIT = int(os.environ.get("TOTAL", 20)), int(os.environ.get("SPLIT", 12))
+
+
 def main():
     torch.manual_seed(0)
     base = Toy().cuda()
     a = copy.deepcopy(base)
     opt_a = muon_groups.build(a, 5e-4, wd=1e-3)
-    run(a, opt_a, 10, 0)
+    run(a, opt_a, TOTAL, 0)
 
     if os.environ.get("CONTROL"):                       # two fresh optimizers, 10 straight steps each: same bits?
         c = copy.deepcopy(base)
         opt_c = muon_groups.build(c, 5e-4, wd=1e-3)
-        run(c, opt_c, 10, 0)
+        run(c, opt_c, TOTAL, 0)
         dc = max((x - y).abs().max().item() for x, y in zip(a.parameters(), c.parameters()))
-        print(f"CONTROL straight vs straight (fresh optimizer): worst {dc:.3e}", flush=True)
+        print(f"CONTROL straight vs straight (fresh optimizer, {TOTAL} steps): worst {dc:.3e}", flush=True)
     b = copy.deepcopy(base)
     opt_b = muon_groups.build(b, 5e-4, wd=1e-3)
-    run(b, opt_b, 5, 0)
+    run(b, opt_b, SPLIT, 0)
     buf = io.BytesIO()
     torch.save({"opt": opt_b.state_dict(), "model": b.state_dict()}, buf)
     buf.seek(0)
@@ -91,7 +96,7 @@ def main():
                       + ("" if same else f" ({type(a_).__name__} vs {type(b_).__name__})"), flush=True)
         extra = [k for k in vars(o1) if k.startswith("_") and not callable(getattr(o1, k))]
         print("  FusedMuon private attrs:", {k: type(getattr(o1, k)).__name__ for k in extra}, flush=True)
-    run(b2, opt_b2, 5, 5)
+    run(b2, opt_b2, TOTAL - SPLIT, SPLIT)
 
     worst = 0.0
     for (n, pa), (_, pb) in zip(a.named_parameters(), b2.named_parameters()):
