@@ -83,7 +83,8 @@ def main():
             for k in sorted(set(s1) | set(s2)):
                 a_, b_ = s1.get(k), s2.get(k)
                 same = (a_ is not None and b_ is not None and (torch.equal(a_, b_) if torch.is_tensor(a_) else a_ == b_))
-                print(f"  param {i} {tuple(q1.shape)} {k}: {'same' if same else 'DIFFERS'}"
+                dt = f" dtype {getattr(a_, 'dtype', None)} -> {getattr(b_, 'dtype', None)}"
+                print(f"  param {i} {tuple(q1.shape)} {k}: {'same' if same else 'DIFFERS'}{dt}"
                       + ("" if same else f" ({type(a_).__name__} vs {type(b_).__name__})"), flush=True)
         extra = [k for k in vars(o1) if k.startswith("_") and not callable(getattr(o1, k))]
         print("  FusedMuon private attrs:", {k: type(getattr(o1, k)).__name__ for k in extra}, flush=True)
