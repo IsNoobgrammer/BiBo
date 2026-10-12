@@ -47,6 +47,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--drop_sources", default=None, help="regex of sources to drop whole, e.g. our synthetic "
                     "augmentation copies '_(room|phone)$' (vitw_* are real re-recordings: keep)")
+    ap.add_argument("--dedupe_sources", default=None, help="regex of sources whose repeated transcripts (>= 5 words: the "
+                    "same speech from several devices / channels) keep ONE row, chosen by a seeded hash")
     ap.add_argument("--drop_empty", action="store_true", help="drop rows whose reference is blank after normalize_v2")
     ap.add_argument("--ratio", type=float, default=1.5)
     ap.add_argument("--extra", type=int, default=5)
@@ -77,8 +79,21 @@ def main():
             return f
 
         drop_src = re.compile(a.drop_sources) if a.drop_sources else None
-        n_src = n_empty = 0
-        h_src = h_empty = 0.0
+        n_src = n_empty = n_dup = 0
+        h_src = h_empty = h_dup = 0.0
+        dedupe = re.compile(a.dedupe_sources) if a.dedupe_sources else None
+        keeper = {}                          # (source, transcript) -> the one file kept: seeded hash, so the device /
+        if dedupe:                           # channel varies across utterances (near and far field both stay)
+            import hashlib
+            for r in rows:
+                if dedupe.search(r.get("source") or ""):
+                    w = words(r["text"])
+                    if len(w) >= 5:
+                        fn = os.path.basename(r["audio_filepath"])
+                        hv = hashlib.sha1(f"23|{fn}".encode()).hexdigest()
+                        k = (r["source"], " ".join(w))
+                        if k not in keeper or hv < keeper[k][0]:
+                            keeper[k] = (hv, fn)
         for r in rows:
             s = by[r.get("source", "?")]
             s[0] += 1
@@ -91,6 +106,12 @@ def main():
                 n_empty += 1
                 h_empty += r["duration"]
                 continue
+            if dedupe and dedupe.search(r.get("source") or ""):         # our multi-device / multi-channel copies
+                k = (r["source"], " ".join(words(r["text"])))
+                if k in keeper and keeper[k][1] != os.path.basename(r["audio_filepath"]):
+                    n_dup += 1
+                    h_dup += r["duration"]
+                    continue
             f = flag(r.get("source"), os.path.basename(r["audio_filepath"]))
             if f is None:
                 s[4] += 1
@@ -107,7 +128,7 @@ def main():
         for src, s in sorted(by.items(), key=lambda kv: -kv[1][1]):
             print(f"{src:<22}{s[0]:>8}{s[1] / 3600:>8.1f}{s[2] / 3600:>11.2f}{s[3] / 3600:>11.2f}{s[4]:>9}")
         print(f"dropped sources /{a.drop_sources}/: {n_src} clips {h_src / 3600:.1f} h; blank references: {n_empty} clips "
-              f"{h_empty / 3600:.2f} h")
+              f"{h_empty / 3600:.2f} h; duplicate copies /{a.dedupe_sources}/: {n_dup} clips {h_dup / 3600:.1f} h")
         print(f"kept {len(keep)} of {len(rows)} clips ({sum(r['duration'] for r in keep) / 3600:.1f} h) -> {a.out}")
         return
     hyp = {}
