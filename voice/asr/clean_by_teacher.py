@@ -1,0 +1,89 @@
+"""Drop training clips whose reference disagrees with a strong teacher's transcript (teacher_transcribe.py output):
+  missing speech : teacher words >= --ratio x reference words AND >= --extra more words (untranscribed speech -> the
+                   model learns deletions)
+  garbage        : WER(reference vs teacher) > --max_wer with >= --min_words reference words
+Both after score.py's normalize_v2 (lowercase, contractions expanded, punctuation and fillers dropped). Writes the clean manifest and a
+per-source table (clips / hours dropped by reason), plus a TSV of the dropped rows for inspection.
+
+    python voice/asr/clean_by_teacher.py --manifest en3/train.jsonl --hyp en3/teacher_pk --out en3/train_clean.jsonl
+"""
+import argparse
+import collections
+import glob
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from score import normalize_v2 as normalize  # noqa: E402  (v2: fillers dropped both sides)
+
+
+def wer_counts(ref, hyp):
+    """word-level Levenshtein: (errors, ref words)"""
+    r, h = ref, hyp
+    prev = list(range(len(h) + 1))
+    for i in range(1, len(r) + 1):
+        cur = [i] + [0] * len(h)
+        ri = r[i - 1]
+        for j in range(1, len(h) + 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ri != h[j - 1]))
+        prev = cur
+    return prev[-1], len(r)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--manifest", required=True)
+    ap.add_argument("--hyp", required=True, help="teacher_transcribe.py --out dir (hyp_*.tsv)")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--ratio", type=float, default=1.5)
+    ap.add_argument("--extra", type=int, default=5)
+    ap.add_argument("--max_wer", type=float, default=0.6)
+    ap.add_argument("--min_words", type=int, default=4)
+    a = ap.parse_args()
+    rows = [json.loads(l) for l in open(a.manifest, encoding="utf-8")]
+    hyp = {}
+    for p in glob.glob(os.path.join(a.hyp, "hyp_*.tsv")):
+        for l in open(p, encoding="utf-8"):
+            i, _, t = l.rstrip("\n").partition("\t")
+            hyp[int(i)] = t
+    keep, stats = [], collections.defaultdict(lambda: [0, 0.0, 0, 0.0, 0, 0.0, 0, 0.0])
+    drop_f = open(a.out + ".dropped.tsv", "w", encoding="utf-8")
+    for i, r in enumerate(rows):
+        s = stats[r.get("source", "?")]
+        s[0] += 1
+        s[1] += r["duration"]
+        if i not in hyp:                                    # not transcribed (e.g. over max_dur): keep, count
+            s[6] += 1
+            s[7] += r["duration"]
+            keep.append(r)
+            continue
+        ref, h = normalize(r["text"]).split(), normalize(hyp[i]).split()
+        missing = len(h) >= a.ratio * max(len(ref), 1) and len(h) - len(ref) >= a.extra
+        e, n = wer_counts(ref, h) if not missing else (0, len(ref))
+        garbage = not missing and n >= a.min_words and e / n > a.max_wer
+        if missing or garbage:
+            k = 2 if missing else 4
+            s[k] += 1
+            s[k + 1] += r["duration"]
+            drop_f.write(f"{'missing' if missing else 'garbage'}\t{r.get('source')}\t{r['duration']:.2f}\t{len(ref)}\t{len(h)}"
+                         f"\t{r['text'][:160]}\t{hyp[i][:160]}\n")
+        else:
+            keep.append(r)
+    drop_f.close()
+    with open(a.out, "w", encoding="utf-8") as f:
+        for r in keep:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    print(f"{'source':<22}{'clips':>8}{'hours':>8}{'missing h':>11}{'missing %':>10}{'garbage h':>11}{'garbage %':>10}{'untested h':>11}")
+    T = [0, 0.0, 0, 0.0, 0, 0.0, 0, 0.0]
+    for src, s in sorted(stats.items(), key=lambda kv: -kv[1][1]):
+        T = [x + y for x, y in zip(T, s)]
+        print(f"{src:<22}{s[0]:>8}{s[1] / 3600:>8.1f}{s[3] / 3600:>11.2f}{100 * s[3] / s[1]:>9.1f}%{s[5] / 3600:>11.2f}"
+              f"{100 * s[5] / s[1]:>9.1f}%{s[7] / 3600:>11.2f}")
+    print(f"{'ALL':<22}{T[0]:>8}{T[1] / 3600:>8.1f}{T[3] / 3600:>11.2f}{100 * T[3] / T[1]:>9.1f}%{T[5] / 3600:>11.2f}"
+          f"{100 * T[5] / T[1]:>9.1f}%{T[7] / 3600:>11.2f}")
+    print(f"kept {len(keep)} of {len(rows)} clips -> {a.out}; dropped rows -> {a.out}.dropped.tsv")
+
+
+if __name__ == "__main__":
+    main()
