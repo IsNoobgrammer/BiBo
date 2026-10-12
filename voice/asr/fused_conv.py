@@ -27,7 +27,8 @@ def enable(model):
             return self._nemo_forward(x, pad_mask=pad_mask, cache=cache)
         g = self._apply_pointwise(x, self.pointwise_conv1)
         dc = self.depthwise_conv
-        y = conv_module(g, pad_mask, dc.weight, dc.bias, self.batch_norm.weight, self.batch_norm.bias,
+        y = conv_module(g, pad_mask, dc.weight, dc.bias if dc.bias is not None else self._fused_zero_b,
+                        self.batch_norm.weight, self.batch_norm.bias,
                         self.batch_norm.eps, dc._left_padding,
                         out_dtype=torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None)
         return self._apply_pointwise(y, self.pointwise_conv2)
@@ -40,9 +41,13 @@ def enable(model):
     for layer in model.encoder.layers:
         c = layer.conv
         dc = c.depthwise_conv
-        if (c.norm_type == "layer_norm" and c.pointwise_activation == "glu_" and dc.bias is not None
+        if (c.norm_type == "layer_norm" and c.pointwise_activation == "glu_" and c.batch_norm.bias is not None
                 and dc.stride == (1,) and dc.dilation == (1,) and dc._left_padding + dc._right_padding == dc.kernel_size[0] - 1):
             c._nemo_forward = c.forward
+            # bias-free convs (Nemotron / Parakeet use_bias false): a zero bias adds exactly 0 in fp32, no grad
+            if dc.bias is None:                  # non-persistent buffer: follows .cuda(), not in state_dict
+                c.register_buffer("_fused_zero_b", torch.zeros(dc.out_channels, dtype=dc.weight.dtype,
+                                                               device=dc.weight.device), persistent=False)
             c.forward = types.MethodType(conv_forward, c)
             nc += 1
         for ff in (layer.feed_forward1, layer.feed_forward2):
@@ -56,7 +61,9 @@ def enable(model):
 def _check():
     """run1 model, eval mode (no dropout), bf16 autocast: each conv module / FFN NeMo vs fused on the same input."""
     import nemo.collections.asr as nemo_asr
-    m = nemo_asr.models.ASRModel.restore_from("/home/marimo/work/asr/exp/run1/run1.nemo").cuda().eval()
+    src = os.environ.get("CHECK_MODEL", "/home/marimo/work/asr/exp/run1/run1.nemo")     # .nemo path or a hub id
+    m = (nemo_asr.models.ASRModel.restore_from(src) if src.endswith(".nemo")
+         else nemo_asr.models.ASRModel.from_pretrained(src)).cuda().eval()
     c0 = m.encoder.layers[0].conv
     print("conv:", c0.norm_type, "K", c0.depthwise_conv.kernel_size, "pad", c0.depthwise_conv._left_padding,
           c0.depthwise_conv._right_padding, flush=True)
