@@ -97,16 +97,33 @@ def _check():
         L.conv.train(L.conv.norm_type == "batch_norm")   # BN: training mode (batch stats) on both sides
         for name, mod, call in (("conv", L.conv, lambda f, x: f(x, pad_mask=pm)), ("ff1", L.feed_forward1, lambda f, x: f(x))):
             res = {}
+            Wt = None
+            for which in ("nemo", "fused", "fp64"):
+                if which == "fp64":                       # ground truth: the module in fp64, NeMo's own forward
+                    import copy
+                    m64 = copy.deepcopy(mod).double()
+                    m64.zero_grad()
+                    x = x0.double().clone().requires_grad_()
+                    y = type(mod).forward(m64, x, pad_mask=pm) if name == "conv" else type(mod).forward(m64, x)
+                    params = m64.parameters()
+                else:
+                    mod.zero_grad()
+                    x = x0.clone().requires_grad_()
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        y = call(mod._nemo_forward if which == "nemo" else mod.forward, x)
+                    params = mod.parameters()
+                if Wt is None:                            # a random fixed output weight (a constant per channel is a
+                    gen = torch.Generator(device="cuda").manual_seed(0)   # degenerate case for BatchNorm's backward)
+                    Wt = torch.randn(y.shape, device="cuda", generator=gen)
+                (y.double() * Wt.double()).sum().backward()
+                res[which] = [y.detach(), x.grad] + [q.grad.clone() for q in params]
+            t = res["fp64"]
             for which in ("nemo", "fused"):
-                mod.zero_grad()
-                x = x0.clone().requires_grad_()
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    y = call(mod._nemo_forward if which == "nemo" else mod.forward, x)
-                (y.float() * torch.linspace(-1, 1, y.shape[-1], device="cuda")).sum().backward()
-                res[which] = [y.detach(), x.grad] + [p.grad.clone() for p in mod.parameters()]
-            print(f"layer {i} {name}: out {rel(res['fused'][0], res['nemo'][0]):.1e}  dx {rel(res['fused'][1], res['nemo'][1]):.1e}  "
-                  f"worst param grad {max(rel(f, n) for f, n in zip(res['fused'][2:], res['nemo'][2:])):.1e}", flush=True)
-
+                r = res[which]
+                print(f"layer {i} {name} {which:>5} vs fp64: out {rel(r[0], t[0]):.1e}  dx {rel(r[1], t[1]):.1e}  "
+                      f"worst param grad {max(rel(f, n) for f, n in zip(r[2:], t[2:])):.1e}", flush=True)
+            print(f"layer {i} {name} fused vs nemo: out {rel(res['fused'][0], res['nemo'][0]):.1e}  "
+                  f"dx {rel(res['fused'][1], res['nemo'][1]):.1e}", flush=True)
 
 if __name__ == "__main__" and "--check" in sys.argv:
     _check()
