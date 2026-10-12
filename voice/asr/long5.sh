@@ -23,6 +23,7 @@ if [ ! -f $O/$R/$R.nemo ]; then
   echo "TRAIN $R rc $?"
 fi
 [ -f $O/$R/$R.nemo ] || { echo "no final model"; exit 1; }
+$P voice/asr/restore_steps.py --run $R --dir $O/$R --steps 5625 11250 16875 22500   # a dead box lost them
 for s in 5625 11250 16875 22500 final; do
   CK=""; [ $s != final ] && { [ -f $O/$R/step$s.ckpt ] && CK="--ckpt $O/$R/step$s.ckpt" || { echo "no step$s.ckpt"; continue; }; }
   TKF=$T $P voice/asr/ab_meeting.py --head glu_glu --las 0 1 3 6 13 -1 --bp 0 0.5 0.75 1.0 1.25 1.5 2.0 \
