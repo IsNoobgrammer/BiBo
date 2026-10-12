@@ -791,6 +791,8 @@ def main():
     ap.add_argument("--val", nargs="+", required=True)
     ap.add_argument("--out", default="/home/marimo/work/asr/exp")
     ap.add_argument("--init", default="stt_en_fastconformer_hybrid_large_streaming_multi")
+    ap.add_argument("--init_weights", default=None, help="fine-tune: load every weight of this .nemo / Lightning .ckpt "
+                    "(a run with the same --new_vocab / --ctc_head) over the freshly built model; fresh optimizer + schedule")
     ap.add_argument("--batch_sec", type=float, default=1200, help="real audio seconds per batch (Lhotse bucketing)")
     ap.add_argument("--buckets", type=int, default=30, help="Lhotse length buckets (more = less padding)")
     ap.add_argument("--sampler", choices=["packed", "lhotse"], default="packed",
@@ -1000,6 +1002,19 @@ def main():
         selfcond_head.enable(m, a.ctc_head)
     if hasattr(m, "ctc_wer") and a.val_blank_penalty > 0:   # hybrid model: + both heads at the app's blank penalty
         bp_metrics(m, a.val_blank_penalty)
+    if a.init_weights:                   # fine-tune from a trained run: the model is built as that run was (stock
+        import tarfile                   # --init + --new_vocab + --ctc_head), then EVERY weight is loaded over it
+        if a.init_weights.endswith(".nemo"):
+            with tarfile.open(a.init_weights) as t:
+                sd = torch.load(t.extractfile(next(n for n in t.getnames() if n.endswith("model_weights.ckpt"))),
+                                map_location="cpu", weights_only=False)
+        else:
+            sd = torch.load(a.init_weights, map_location="cpu", weights_only=False)["state_dict"]
+        miss, unexp = m.load_state_dict(sd, strict=False)
+        params = {n for n, _ in m.named_parameters()}
+        assert not [k for k in miss if k in params], f"--init_weights: parameters not in the checkpoint: {miss[:8]}"
+        print(f"[run] init_weights {a.init_weights}: {len(sd)} tensors loaded, all {len(params)} parameters "
+              f"(missing buffers {len(miss)}, unused {len(unexp)})", flush=True)
     # Exact resume: a 1-layer nn.LSTM ignores its `dropout` (applied only between layers), but with dropout > 0 the
     # first call per process makes cuDNN's dropout state, drawing a seed from the CUDA generator -- at step 1 in an
     # uninterrupted run, at the first step after a resume in a resumed one, so every later dropout mask differed
