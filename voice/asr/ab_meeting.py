@@ -46,7 +46,7 @@ def load(path, head, ckpt=None):
         dec = m.cfg.decoding
         with open_dict(dec):
             dec.greedy.use_cuda_graph_decoder = False
-        m.change_decoding_strategy(dec, decoder_type="rnnt")
+        m.change_decoding_strategy(dec, **({"decoder_type": "rnnt"} if hasattr(m, "ctc_decoder") else {}))   # hybrids only
     return m.cuda().eval()
 
 

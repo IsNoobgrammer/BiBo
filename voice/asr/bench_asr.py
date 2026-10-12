@@ -73,7 +73,7 @@ def run_nemo(name, la, paths, sec, bps, head="rnnt", sc_head="none"):
         dec = m.cfg.decoding
         with open_dict(dec):
             dec.greedy.use_cuda_graph_decoder = False
-        m.change_decoding_strategy(dec, decoder_type="rnnt")
+        m.change_decoding_strategy(dec, **({"decoder_type": "rnnt"} if hasattr(m, "ctc_decoder") else {}))   # hybrids only
     if la is not None:
         ctx = [-1, -1] if la < 0 else [70 - 70 % (la + 1), la]    # the training mask (ctc_heads.set_lookahead): 240 ms = [68, 3]
         try:
