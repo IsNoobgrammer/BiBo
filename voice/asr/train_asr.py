@@ -1088,7 +1088,7 @@ def main():
         opt = muon_groups.build(m, a.lr, muon_lr=a.muon_lr, wd=1e-3, muon_wd=a.muon_wd, variant=a.muon_variant, ns=a.muon_ns,
                                 heads=m.encoder.layers[0].self_attn.h if a.muon_heads else 0)
         sch = (torch.optim.lr_scheduler.LambdaLR(opt, wsd_lambda(a.warmup, max_steps, a.decay_frac, 1e-5 / a.lr))
-               if a.sched == "wsd" else muon_groups.warmup_cosine(opt, a.warmup, max_steps, 1e-5))
+               if a.sched == "wsd" else muon_groups.warmup_cosine(opt, a.warmup, max_steps, a.min_lr))
         m._optimizer, m._scheduler = opt, sch
         m.configure_optimizers = lambda: ([opt], [{"scheduler": sch, "interval": "step", "frequency": 1}])
     if a.bf16_master:
