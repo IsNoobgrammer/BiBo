@@ -58,12 +58,22 @@ def batches(paths, sec):
         yield cur
 
 
-def run_nemo(name, la, paths, sec, bps, head="rnnt"):
+def run_nemo(name, la, paths, sec, bps, head="rnnt", sc_head="none"):
     """{bp: hyps}: one model load, one decode per blank penalty (blank_penalty.py patches the RNN-T / TDT joint)."""
     import nemo.collections.asr as nemo_asr
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import blank_penalty
-    m = nemo_asr.models.ASRModel.from_pretrained(NEMO[name]).cuda().eval()
+    if name.endswith(".nemo"):          # one of our trained runs (our self-conditioned CTC head: --ctc_head glu_glu)
+        from ab_meeting import load
+        m = load(name, sc_head)
+    else:
+        m = nemo_asr.models.ASRModel.from_pretrained(NEMO[name]).cuda().eval()
+    if hasattr(m, "joint"):             # RNN-T/TDT greedy: a captured CUDA graph would keep the first blank penalty
+        from omegaconf import open_dict
+        dec = m.cfg.decoding
+        with open_dict(dec):
+            dec.greedy.use_cuda_graph_decoder = False
+        m.change_decoding_strategy(dec, decoder_type="rnnt")
     if la is not None:
         ctx = [-1, -1] if la < 0 else [70, la]
         try:
@@ -145,12 +155,13 @@ def run_hf(name, paths, sec):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True, choices=list(NEMO) + list(HF))
+    ap.add_argument("--model", required=True, help=f"{list(NEMO) + list(HF)} or a trained .nemo")
     ap.add_argument("--la", type=int, default=None, help="nemotron: right context in 80 ms frames (0 1 6 13), -1 full")
     ap.add_argument("--out", required=True)
     ap.add_argument("--val", default=f"{A}/en3/val_*.jsonl")
     ap.add_argument("--batch_sec", type=float, default=400.0)
     ap.add_argument("--meeting_only", action="store_true")
+    ap.add_argument("--ctc_head", default="none", help="a trained .nemo with our self-conditioned CTC head: glu_glu")
     ap.add_argument("--head", choices=["rnnt", "ctc"], default="rnnt", help="NeMo hybrid models: which decoder")
     ap.add_argument("--bps", type=float, nargs="*", default=None,
                     help="blank penalties: NeMo RNN-T/TDT (blank_penalty.py) and Granite CTC; one OUT_bp<x> dir each")
@@ -159,12 +170,12 @@ def main():
     its = items(mset, "/nonexistent" if a.meeting_only else a.val)
     paths = [p for p, _, _ in its]
     t0 = time.time()
-    if a.bps is not None and a.model in NEMO:
-        res = {f"{a.out}_bp{bp:g}": h for bp, h in run_nemo(a.model, a.la, paths, a.batch_sec, a.bps, a.head).items()}
+    if a.bps is not None and (a.model in NEMO or a.model.endswith('.nemo')):
+        res = {f"{a.out}_bp{bp:g}": h for bp, h in run_nemo(a.model, a.la, paths, a.batch_sec, a.bps, a.head, a.ctc_head).items()}
     elif a.bps is not None and a.model == "granite":
         res = {f"{a.out}_bp{bp:g}": h for bp, h in run_granite_bp(paths, a.bps).items()}
-    elif a.model in NEMO:
-        res = {a.out: run_nemo(a.model, a.la, paths, a.batch_sec, [0.0], a.head)[0.0]}
+    elif (a.model in NEMO or a.model.endswith('.nemo')):
+        res = {a.out: run_nemo(a.model, a.la, paths, a.batch_sec, [0.0], a.head, a.ctc_head)[0.0]}
     else:
         res = {a.out: run_hf(a.model, paths, a.batch_sec)}
     dt = time.time() - t0
