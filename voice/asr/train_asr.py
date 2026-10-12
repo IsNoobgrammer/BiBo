@@ -872,6 +872,8 @@ def main():
                     "lin_glu_glu ... (selfcond_head.py, fused training loss)")
     ap.add_argument("--fused_ctc", action="store_true", help="tkf deterministic CTC loss (voice/asr/fused_ctc.py)")
     ap.add_argument("--ctc_weight", type=float, default=None, help="hybrid loss = (1-w) RNN-T + w CTC (model default 0.3)")
+    ap.add_argument("--keep_vocab", action="store_true", help="hub --init (Nemotron, Parakeet): keep its own "
+                    "tokenizer + trained decoder instead of switching to --tok")
     ap.add_argument("--new_vocab", action="store_true", help="with a .nemo --init: switch it to --tok (new CTC/RNN-T "
                     "output layers, encoder kept)")
     ap.add_argument("--seed", type=int, default=None)
@@ -904,7 +906,10 @@ def main():
             m.change_vocabulary(new_tokenizer_dir=a.tok, new_tokenizer_type="bpe")
     else:
         m = nemo_asr.models.ASRModel.from_pretrained(a.init)
-        m.change_vocabulary(new_tokenizer_dir=a.tok, new_tokenizer_type="bpe")
+        if a.keep_vocab:                 # e.g. Nemotron / Parakeet: keep the pretrained tokenizer and decoder
+            print(f"[run] {a.init}: keeping its own vocabulary ({m.tokenizer.vocab_size} pieces) and decoder", flush=True)
+        else:
+            m.change_vocabulary(new_tokenizer_dir=a.tok, new_tokenizer_type="bpe")
 
     tr = OmegaConf.create(OmegaConf.to_container(m.cfg.train_ds))
     with open_dict(tr):
@@ -960,7 +965,9 @@ def main():
     if a.fastemit is not None:                                       # fused_joint reads it from the loss config
         with open_dict(m.cfg):
             m.cfg.loss.warprnnt_numba_kwargs.fastemit_lambda = a.fastemit
-    if a.ctc_weight is not None:
+    if a.ctc_weight is not None and "aux_ctc" not in m.cfg:
+        print(f"[run] --ctc_weight {a.ctc_weight} ignored: {type(m).__name__} has no CTC head", flush=True)
+    elif a.ctc_weight is not None:
         m.ctc_loss_weight = a.ctc_weight
         with open_dict(m.cfg):
             m.cfg.aux_ctc.ctc_loss_weight = a.ctc_weight
@@ -1042,7 +1049,8 @@ def main():
         wandb_fork(logger, a.project, wid, torch.load(resume, map_location="cpu", mmap=True, weights_only=False)["global_step"])
     if not a.no_hf:
         hf_sync.push(a.run, tok_dir=a.tok, wandb_id=logger.experiment.id, block=True)
-    MON = "val_wer_ctcbp_all" if a.val_blank_penalty > 0 else "val_wer_all"
+    # RNN-T-only models (Nemotron / Parakeet without our CTC head) select on the RNN-T WER
+    MON = "val_wer_ctcbp_all" if a.val_blank_penalty > 0 and hasattr(m, "ctc_wer") else "val_wer_all"
     trainer = pl.Trainer(
         devices=1, accelerator="gpu", precision="32-true" if a.bf16_master else "bf16-mixed", max_steps=max_steps, max_epochs=-1,
         val_check_interval=eval_steps, check_val_every_n_epoch=None if eval_steps else 1,
