@@ -906,6 +906,9 @@ def main():
     ap.add_argument("--ctc_head", default=None, help="self-conditioned CTC head, readouts per pass: lin_glu, glu_glu, "
                     "lin_glu_glu ... (selfcond_head.py, fused training loss)")
     ap.add_argument("--fused_ctc", action="store_true", help="tkf deterministic CTC loss (voice/asr/fused_ctc.py)")
+    ap.add_argument("--freeze_encoder", action="store_true",
+                    help="encoder frozen AND pinned to eval mode (BatchNorm running stats, no dropout): train only the "
+                         "heads, e.g. a full-context CTC teacher head on stock Parakeet")
     ap.add_argument("--ctc_distill", type=float, default=0.0,
                     help="with --ctc_head on a transducer hybrid: weight of the on-policy distillation CE from the "
                          "transducer head's greedy alignment into the CTC head (selfcond_head.py); 0 = off")
@@ -1106,6 +1109,14 @@ def main():
         parity = ParityDump(a.parity_dump)
         parity.wrap(m)
         print(f"[parity] SpecAugment off; dump -> {a.parity_dump}", flush=True)
+    if a.freeze_encoder:
+        import types
+        for p in m.encoder.parameters():
+            p.requires_grad_(False)
+        m.encoder.train = types.MethodType(lambda self, mode=True: torch.nn.Module.train(self, False), m.encoder)
+        m.encoder.eval()
+        n_tr = sum(p.numel() for p in m.parameters() if p.requires_grad)
+        print(f"[run] encoder frozen (eval mode pinned); trainable params {n_tr / 1e6:.2f}M", flush=True)
     ckpt_dir = os.path.join(a.out, a.run)
     os.makedirs(ckpt_dir, exist_ok=True)
     # resume: local last.ckpt, else the one in the HF repo (fresh box); the W&B run continues under the same id
