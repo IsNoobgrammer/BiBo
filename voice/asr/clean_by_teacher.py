@@ -18,6 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from score import normalize_v2 as normalize  # noqa: E402  (v2: fillers dropped both sides)
 
 
+def words(t):
+    n = normalize(t)                                        # score.normalize_v2 returns the word list
+    return n if isinstance(n, list) else n.split()
+
+
 def wer_counts(ref, hyp):
     """word-level Levenshtein: (errors, ref words)"""
     r, h = ref, hyp
@@ -89,7 +94,7 @@ def main():
             s[7] += r["duration"]
             keep.append(r)
             continue
-        ref, h = normalize(r["text"]).split(), normalize(hyp[i]).split()
+        ref, h = words(r["text"]), words(hyp[i])
         missing = len(h) >= a.ratio * max(len(ref), 1) and len(h) - len(ref) >= a.extra
         e, n = wer_counts(ref, h) if not missing else (0, len(ref))
         garbage = not missing and n >= a.min_words and e / n > a.max_wer

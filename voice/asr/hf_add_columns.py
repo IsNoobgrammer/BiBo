@@ -27,6 +27,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from clean_by_teacher import wer_counts  # noqa: E402
 from score import normalize_v2  # noqa: E402
 
+
+def words(t):
+    n = normalize_v2(t)                                     # score.normalize_v2 returns the word list
+    return n if isinstance(n, list) else n.split()
+
 COLS = ["parakeet_transcription", "parakeet_wer", "missing_speech", "garbage"]
 
 
@@ -58,7 +63,7 @@ def main():
             if i not in hyp:
                 continue
             key = f'{r["source"]}/{os.path.basename(r["audio_filepath"])}'
-            rw, hw = normalize_v2(r["text"]).split(), normalize_v2(hyp[i]).split()
+            rw, hw = words(r["text"]), words(hyp[i])
             e, n = wer_counts(rw, hw)
             mi = len(hw) >= a.ratio * max(len(rw), 1) and len(hw) - len(rw) >= a.extra
             ga = not mi and n >= a.min_words and e / max(n, 1) > a.max_wer
