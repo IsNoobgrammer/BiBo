@@ -807,7 +807,7 @@ def main():
                     help="evaluate every this many audio hours (must be < one data epoch); 0 = every data epoch")
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--warmup", type=int, default=None, help="warm-up steps; default --warmup_frac of max_steps")
-    ap.add_argument("--min_lr", type=float, default=1e-5, help="final lr of the cosine / WSD decay (absolute; default 1e-5 as before; 0 allowed)")
+    ap.add_argument("--min_lr", type=float, default=0.0, help="final lr of the cosine / WSD decay, absolute (user, Oct 12 2026: decay to 0; runs before 83c1c58 ended at 1e-5 -- pass --min_lr 1e-5 to resume / reproduce one)")
     ap.add_argument("--warmup_frac", type=float, default=0.05, help="warm-up budget as a fraction of max_steps (5%%: user default from Oct 11 2026 -- a fixed 200 steps was 0.36%% of a 10-epoch run)")
     ap.add_argument("--sched", choices=["cosine", "wsd"], default="cosine",
                     help="wsd = linear warm-up, flat at --lr, linear decay over the last --decay_frac to --min_lr")
