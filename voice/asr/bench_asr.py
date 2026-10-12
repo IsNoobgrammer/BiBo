@@ -25,7 +25,8 @@ A = "/home/marimo/work/asr"
 MEET = (("clip16k.wav", "reference.txt"), ("g5_16k.wav", "g5_ref_gemini.txt"))
 HF = {"granite": "ibm-granite/granite-speech-5.0-470m-turboctc", "qwen17": "Qwen/Qwen3-ASR-1.7B-hf",
       "qwen06": "Qwen/Qwen3-ASR-0.6B-hf"}
-NEMO = {"parakeet": "nvidia/parakeet-tdt-0.6b-v2", "nemotron": "nvidia/nemotron-speech-streaming-en-0.6b"}
+NEMO = {"parakeet": "nvidia/parakeet-tdt-0.6b-v2", "nemotron": "nvidia/nemotron-speech-streaming-en-0.6b",
+        "stock": "nvidia/stt_en_fastconformer_hybrid_large_streaming_multi"}   # our base model, before our training
 
 
 def items(meeting_set, val_glob):
@@ -57,7 +58,7 @@ def batches(paths, sec):
         yield cur
 
 
-def run_nemo(name, la, paths, sec, bps):
+def run_nemo(name, la, paths, sec, bps, head="rnnt"):
     """{bp: hyps}: one model load, one decode per blank penalty (blank_penalty.py patches the RNN-T / TDT joint)."""
     import nemo.collections.asr as nemo_asr
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -67,9 +68,11 @@ def run_nemo(name, la, paths, sec, bps):
         ctx = [-1, -1] if la < 0 else [70, la]
         m.encoder.set_default_att_context_size(ctx)
         print(f"[bench] {name} att_context {ctx}", flush=True)
+    if head == "ctc":                    # hybrid RNN-T/CTC model: decode with its CTC head
+        m.change_decoding_strategy(decoder_type="ctc")
     res = {}
     for bp in bps:
-        blank_penalty.apply(bp, head="rnnt")
+        blank_penalty.apply(bp, head=head)
         hyp = [None] * len(paths)
         for b in batches(paths, sec):
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -79,7 +82,7 @@ def run_nemo(name, la, paths, sec, bps):
                 hyp[i] = o.text if hasattr(o, "text") else str(o)
         res[bp] = hyp
         print(f"[bench] {name} bp {bp} done", flush=True)
-    blank_penalty.apply(0.0, head="rnnt")
+    blank_penalty.apply(0.0, head=head)
     return res
 
 
@@ -139,6 +142,7 @@ def main():
     ap.add_argument("--val", default=f"{A}/en3/val_*.jsonl")
     ap.add_argument("--batch_sec", type=float, default=400.0)
     ap.add_argument("--meeting_only", action="store_true")
+    ap.add_argument("--head", choices=["rnnt", "ctc"], default="rnnt", help="NeMo hybrid models: which decoder")
     ap.add_argument("--bps", type=float, nargs="*", default=None,
                     help="blank penalties: NeMo RNN-T/TDT (blank_penalty.py) and Granite CTC; one OUT_bp<x> dir each")
     a = ap.parse_args()
@@ -147,11 +151,11 @@ def main():
     paths = [p for p, _, _ in its]
     t0 = time.time()
     if a.bps is not None and a.model in NEMO:
-        res = {f"{a.out}_bp{bp:g}": h for bp, h in run_nemo(a.model, a.la, paths, a.batch_sec, a.bps).items()}
+        res = {f"{a.out}_bp{bp:g}": h for bp, h in run_nemo(a.model, a.la, paths, a.batch_sec, a.bps, a.head).items()}
     elif a.bps is not None and a.model == "granite":
         res = {f"{a.out}_bp{bp:g}": h for bp, h in run_granite_bp(paths, a.bps).items()}
     elif a.model in NEMO:
-        res = {a.out: run_nemo(a.model, a.la, paths, a.batch_sec, [0.0])[0.0]}
+        res = {a.out: run_nemo(a.model, a.la, paths, a.batch_sec, [0.0], a.head)[0.0]}
     else:
         res = {a.out: run_hf(a.model, paths, a.batch_sec)}
     dt = time.time() - t0
