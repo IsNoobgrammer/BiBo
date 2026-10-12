@@ -56,6 +56,9 @@ def main():
     ap.add_argument("--mix", required=True)
     ap.add_argument("--merge", action="store_true", help="restore into a mix dir other sources are being built into")
     ap.add_argument("--workers", type=int, default=min(16, os.cpu_count() or 4))
+    ap.add_argument("--skip_existing", action="store_true",
+                    help="never rewrite a file that already exists (open-for-write truncates it: a training job reading "
+                         "that file at the moment would get a partial clip); e.g. the verbatim set over a live en3")
     a = ap.parse_args()
     done = os.path.join(a.mix, f".restored_{a.repo.replace('/', '__')}")
     if os.path.exists(done) or (glob.glob(os.path.join(a.mix, "*.jsonl")) and not a.merge):
@@ -79,6 +82,12 @@ def main():
         for l in open(man, encoding="utf-8"):
             r = json.loads(l)
             WANT[f'{r["source"]}/{os.path.basename(r["audio_filepath"])}'] = r["audio_filepath"]
+    kept = 0
+    if a.skip_existing:
+        for k in [k for k, p in WANT.items() if os.path.exists(p) and os.path.getsize(p) > 0]:
+            del WANT[k]
+            kept += 1
+        print(f"fetch_mix: --skip_existing: {kept} files already present are left untouched", flush=True)
     shards = sorted(glob.glob(os.path.join(d, "data", "**", "*.parquet"), recursive=True))
     with Pool(a.workers, initializer=_init, initargs=(WANT,)) as p:
         res = p.map(_restore, shards, chunksize=1)
