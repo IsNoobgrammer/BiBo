@@ -6,7 +6,7 @@
 #   wd0     Muown weight decay 0 (AdamW keeps 1e-3)
 #   drop0   every Dropout 0.0
 #   drop01  every Dropout 0.1 (only the joint changes: 0.2 -> 0.1)
-#   drop005 every Dropout 0.05 (dose-response with drop0 / drop01)
+#   drop02 / drop05  every Dropout 0.2 / 0.5 (user: more dropout for multi-epoch runs; drop0 overfit by step 11250)
 #   (from Oct 12 ~01:30 the joint's default is 0.1, not 0.2: arms run after that use it unless --dropout_all)
 #   tdt     TDT instead of RNN-T as the CTC head's training partner (tkf tdt_joint; durations 0-4, sigma 0.05,
 #           omega 0.1 = NeMo's recipe)
@@ -20,7 +20,7 @@ mkdir -p $A/meetstudy                                   # eval output (a fresh b
 echo "BiBo $(git log --oneline -1 | cut -c1-60) | tkf $(git -C $T log --oneline -1 | cut -c1-60)"
 for arm in ${ARMS:-wd0 drop0 drop01}; do
   case $arm in
-    wd0) X="--muon_wd 0";; drop0) X="--dropout_all 0.0";; drop01) X="--dropout_all 0.1";; drop005) X="--dropout_all 0.05";;
+    wd0) X="--muon_wd 0";; drop0) X="--dropout_all 0.0";; drop01) X="--dropout_all 0.1";; drop005) X="--dropout_all 0.05";; drop02) X="--dropout_all 0.2";; drop05) X="--dropout_all 0.5";;
     tdt) X="--aux tdt";; base) X="";; *) echo "unknown arm $arm"; exit 1;;
   esac
   R=$arm-fe0; FJ="--fused_joint"                                  # TDT too: tkf tdt_joint (parity_tdt_joint)
