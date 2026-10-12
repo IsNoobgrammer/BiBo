@@ -821,7 +821,9 @@ def main():
     ap.add_argument("--lookaheads", type=int, nargs="*", default=None,
                     help="replace the trained look-ahead set: RIGHT contexts in 80 ms frames, e.g. 13 6 3 1 0 -1 "
                          "(-1 = full context; left context 70 kept)")
-    ap.add_argument("--joint_dropout", type=float, default=None, help="RNN-T joint dropout (pretrained config: 0.2)")
+    ap.add_argument("--joint_dropout", type=float, default=0.1,
+                    help="RNN-T / TDT joint dropout: 0.1 since Oct 12 2026 (user; pretrained config 0.2 -- drop01-fe0, "
+                         "all dropout 0.1, tied the 0.2 baseline); --dropout_all, if given, sets it too")
     ap.add_argument("--muon_wd", type=float, default=None,
                     help="weight decay of the Muown (matrix) group; default = the AdamW group's 1e-3")
     ap.add_argument("--val_blank_penalty", type=float, default=1.0,
@@ -967,7 +969,7 @@ def main():
             if isinstance(mod, torch.nn.Dropout):
                 mod.p, n = a.dropout_all, n + 1
         print(f"[run] dropout_all: {n} Dropout modules -> p {a.dropout_all}", flush=True)
-    if a.joint_dropout is not None:          # the joint's Dropout (config 0.2); before fused_joint, which reads it
+    if a.joint_dropout is not None and a.dropout_all is None:   # the joint's Dropout; before fused_joint (reads it)
         for mod in m.joint.joint_net:
             if isinstance(mod, torch.nn.Dropout):
                 print(f"[run] RNN-T joint dropout {mod.p} -> {a.joint_dropout}", flush=True)
