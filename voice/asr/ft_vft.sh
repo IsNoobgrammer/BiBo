@@ -8,7 +8,8 @@
 set -uo pipefail
 A=/home/marimo/work/asr; E3=$A/en3; P=/home/marimo/asrenv/bin/python; T=/home/marimo/work/tkf_ctc
 R=${RUN:-ft-vft-w10}; INIT=${INIT:-$A/exp_long5/ep5-w10/ep5-w10.nemo}; LR=${LR:-1e-4}; EP=${EP:-2}; WU=${WU:-0.05}; X=${EXTRA:-}; O=$A/exp_ft
-TR=$A/vft/train.jsonl
+TR=${TR:-$A/vft/train.jsonl}                                    # e.g. a replay mix (vft + en3 sample)
+LAP=${LAP:-"0:0.05 1:0.15 3:0.35 6:0.10 13:0.15 full:0.20"}     # look-ahead mix (streaming-only: full:0)
 [ -f $TR ] || { echo "no $TR (run build_vft.py)"; exit 1; }
 [ -f $INIT ] || { echo "no $INIT"; exit 1; }
 H=$($P -c "import json; print(round(sum(json.loads(l)['duration'] for l in open('$TR')) / 3600, 1))")
@@ -22,7 +23,7 @@ if [ ! -f $O/$R/$R.nemo ]; then
     --tok $E3/tok/tokenizer_spe_bpe_v2047 --val $VAL --init_weights $INIT --lr $LR --warmup_frac $WU \
     --total_hours $TOT --eval_hours 0 --save_steps $SAVE $X \
     --ctc_head glu_glu --ctc_weight 0.4 --fastemit 0 --batch_sec 1200 --lookaheads 13 6 3 1 0 -1 \
-    --lookahead_probs 0:0.05 1:0.15 3:0.35 6:0.10 13:0.15 full:0.20 \
+    --lookahead_probs $LAP \
     --fused_joint --fused_layer --fused_attn --fused_conv --fused_ctc --out $O > $A/$R.out 2>&1
   echo "TRAIN $R rc $?"
 fi
