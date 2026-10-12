@@ -66,8 +66,17 @@ def run_nemo(name, la, paths, sec, bps, head="rnnt"):
     m = nemo_asr.models.ASRModel.from_pretrained(NEMO[name]).cuda().eval()
     if la is not None:
         ctx = [-1, -1] if la < 0 else [70, la]
-        m.encoder.set_default_att_context_size(ctx)
-        print(f"[bench] {name} att_context {ctx}", flush=True)
+        try:
+            m.encoder.set_default_att_context_size(ctx)
+        except Exception as e:           # a full-attention model (Parakeet) has no streaming presets: force the mask
+            print(f"[bench] preset refused ({e}); forcing chunked_limited {ctx}", flush=True)
+            m.encoder.att_context_style = "chunked_limited"
+            m.encoder.att_context_size_all = [ctx]
+            m.encoder.att_context_size = ctx
+            for layer in m.encoder.layers:
+                if hasattr(layer.self_attn, "att_context_size"):
+                    layer.self_attn.att_context_size = ctx
+        print(f"[bench] {name} att_context {m.encoder.att_context_size} style {m.encoder.att_context_style}", flush=True)
     if head == "ctc":                    # hybrid RNN-T/CTC model: decode with its CTC head
         m.change_decoding_strategy(decoder_type="ctc")
     res = {}
