@@ -79,8 +79,8 @@ def main():
         rel = os.path.relpath(s, src)
         t = pq.read_table(s)
         t = t.drop_columns([c for c in COLS if c in t.column_names])
-        paths = [x["path"] for x in t.column("audio").combine_chunks().field("path").to_pylist()] \
-            if hasattr(t.column("audio").combine_chunks(), "field") else [x["path"] for x in t.column("audio").to_pylist()]
+        aud = t.column("audio").combine_chunks()
+        paths = aud.field("path").to_pylist() if hasattr(aud, "field") else [x["path"] for x in aud.to_pylist()]
         srcs = t.column("source").to_pylist() if "source" in t.column_names else [None] * len(paths)
         vals = []
         for p, so in zip(paths, srcs):
