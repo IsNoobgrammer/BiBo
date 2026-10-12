@@ -12,6 +12,9 @@ R=${RUN:?}; I=${INIT:?}; H=${HEADS:-rnnt}; X=${EXTRA:-}; LR=${LR:-1e-4}
 # our kernels (probe: Nemotron 0.41 s/step fused vs 0.67 NeMo); --fused_ctc only with our CTC head
 F=${FUSED:---fused_joint --fused_layer --fused_attn --fused_conv}; [[ "$X" == *"--ctc_head"* ]] && F="$F --fused_ctc"
 VAL=$(ls $E3/val_*.jsonl | sort | tr '\n' ' ')
+mkdir -p $B $A/ctcdump                    # fresh boxes have neither (the first Parakeet arm's evals were lost to it)
+D=/home/marimo/work/rtc/tools/ctc-decode/target/release/ctc-decode
+[[ "$H" == *ctc* && ! -x $D ]] && echo "HUB_WARN $R: no ctc-decode binary at $D (build it: awfull.sh)"
 cd /home/marimo/work/BiBo
 echo "$(date +%H:%M) HUB_START $R | BiBo $(git log --oneline -1 | cut -c1-40) | init $I lr $LR extra [$X] fused [$F] heads [$H]"
 if [ ! -f $O/$R/$R.nemo ]; then
