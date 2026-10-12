@@ -34,7 +34,10 @@ def wer_counts(ref, hyp):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", required=True)
-    ap.add_argument("--hyp", required=True, help="teacher_transcribe.py --out dir (hyp_*.tsv)")
+    ap.add_argument("--hyp", default=None, help="teacher_transcribe.py --out dir (hyp_*.tsv), rows by manifest index")
+    ap.add_argument("--flags", nargs="*", default=None,
+                    help="hf_add_columns.py flags.tsv files: rows by '<source>/<file>' key (any manifest built from "
+                         "those repos, e.g. en3)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--ratio", type=float, default=1.5)
     ap.add_argument("--extra", type=int, default=5)
@@ -42,6 +45,34 @@ def main():
     ap.add_argument("--min_words", type=int, default=4)
     a = ap.parse_args()
     rows = [json.loads(l) for l in open(a.manifest, encoding="utf-8")]
+    if a.flags:                                             # key-based: the per-repo teacher flags (hf_add_columns.py)
+        fl = {}
+        for p in a.flags:
+            for l in open(p, encoding="utf-8"):
+                k, mi, ga = l.rstrip("\n").split("\t")[:3]
+                fl[k] = (mi == "1", ga == "1")
+        keep, by = [], collections.defaultdict(lambda: [0, 0.0, 0.0, 0.0, 0])
+        for r in rows:
+            s = by[r.get("source", "?")]
+            s[0] += 1
+            s[1] += r["duration"]
+            f = fl.get(f'{r.get("source")}/{os.path.basename(r["audio_filepath"])}')
+            if f is None:
+                s[4] += 1
+                keep.append(r)
+            elif f[0] or f[1]:
+                s[2] += f[0] * r["duration"]
+                s[3] += f[1] * r["duration"]
+            else:
+                keep.append(r)
+        with open(a.out, "w", encoding="utf-8") as fo:
+            for r in keep:
+                fo.write(json.dumps(r, ensure_ascii=False) + "\n")
+        print(f"{'source':<22}{'clips':>8}{'hours':>8}{'missing h':>11}{'garbage h':>11}{'no flag':>9}")
+        for src, s in sorted(by.items(), key=lambda kv: -kv[1][1]):
+            print(f"{src:<22}{s[0]:>8}{s[1] / 3600:>8.1f}{s[2] / 3600:>11.2f}{s[3] / 3600:>11.2f}{s[4]:>9}")
+        print(f"kept {len(keep)} of {len(rows)} clips -> {a.out}")
+        return
     hyp = {}
     for p in glob.glob(os.path.join(a.hyp, "hyp_*.tsv")):
         for l in open(p, encoding="utf-8"):
