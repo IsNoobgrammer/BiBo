@@ -9,11 +9,13 @@
 set -uo pipefail
 A=/home/marimo/work/asr; E3=$A/en3; P=/home/marimo/asrenv/bin/python; T=/home/marimo/work/tkf_ctc; O=$A/exp_hub; B=$A/bench
 R=${RUN:?}; I=${INIT:?}; H=${HEADS:-rnnt}; X=${EXTRA:-}; LR=${LR:-1e-4}
+# our kernels (probe: Nemotron 0.41 s/step fused vs 0.67 NeMo); --fused_ctc only with our CTC head
+F=${FUSED:---fused_joint --fused_layer --fused_attn --fused_conv}; [[ "$X" == *"--ctc_head"* ]] && F="$F --fused_ctc"
 VAL=$(ls $E3/val_*.jsonl | sort | tr '\n' ' ')
 cd /home/marimo/work/BiBo
-echo "$(date +%H:%M) HUB_START $R | BiBo $(git log --oneline -1 | cut -c1-40) | init $I lr $LR extra [$X] heads [$H]"
+echo "$(date +%H:%M) HUB_START $R | BiBo $(git log --oneline -1 | cut -c1-40) | init $I lr $LR extra [$X] fused [$F] heads [$H]"
 if [ ! -f $O/$R/$R.nemo ]; then
-  TKF=$T $P voice/asr/train_asr.py --project asr-hub --run $R --seed 23 --init $I --keep_vocab $X \
+  TKF=$T $P voice/asr/train_asr.py --project asr-hub --run $R --seed 23 --init $I --keep_vocab $X $F \
     --train $E3/train.jsonl --tok $E3/tok/tokenizer_spe_bpe_v2047 --val $VAL --optim adamw --lr $LR --warmup_frac 0.05 \
     --min_lr 0 --total_hours 1875 --eval_hours 1875 --fastemit 0 --batch_sec 1200 --lookaheads 13 6 3 1 0 -1 \
     --lookahead_probs 0:0.05 1:0.15 3:0.35 6:0.10 13:0.15 full:0.20 --out $O > $A/$R.out 2>&1
