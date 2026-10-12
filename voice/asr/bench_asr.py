@@ -75,7 +75,7 @@ def run_nemo(name, la, paths, sec, bps, head="rnnt", sc_head="none"):
             dec.greedy.use_cuda_graph_decoder = False
         m.change_decoding_strategy(dec, decoder_type="rnnt")
     if la is not None:
-        ctx = [-1, -1] if la < 0 else [70, la]
+        ctx = [-1, -1] if la < 0 else [70 - 70 % (la + 1), la]    # the training mask (ctc_heads.set_lookahead): 240 ms = [68, 3]
         try:
             m.encoder.set_default_att_context_size(ctx)
         except Exception as e:           # a full-attention model (Parakeet) has no streaming presets: force the mask
