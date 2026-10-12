@@ -94,6 +94,8 @@ def main():
             print(f"[hf_cols] shard {k + 1}/{len(shards)} {rel}", flush=True)
     print(f"[hf_cols] {len(shards)} shards written to {up}; {nohit} shard rows without a transcript (null columns)", flush=True)
     if a.upload:
+        os.makedirs(os.path.join(up, "annotations"), exist_ok=True)   # the key flags as a small file too
+        shutil.copy(os.path.join(wd, "flags.tsv"), os.path.join(up, "annotations", "parakeet_flags.tsv"))
         HfApi().upload_large_folder(repo_id=a.repo, folder_path=up, repo_type="dataset", num_workers=8)
         print(f"[hf_cols] uploaded {a.repo}", flush=True)
         shutil.rmtree(up, ignore_errors=True)
