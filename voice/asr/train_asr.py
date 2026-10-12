@@ -1006,6 +1006,16 @@ def main():
                 mod.p = a.joint_dropout
     if a.fused_joint:
         import fused_joint
+        if not m.joint._fuse_loss_wer or m.loss.reduction != "mean_batch":   # hub models (Nemotron / Parakeet) ship
+            print(f"[run] fused_joint: joint fuse_loss_wer {m.joint._fuse_loss_wer} -> True, loss reduction "   # with
+                  f"{m.loss.reduction} -> mean_batch (as the 114M streaming model)", flush=True)   # other settings
+            m.joint._fuse_loss_wer = True
+            m.joint._fused_batch_size = m.joint._fused_batch_size or 2
+            m.joint.set_loss(m.loss)
+            m.joint.set_wer(m.wer)
+            m.loss.reduction = "mean_batch"
+            with open_dict(m.cfg):
+                m.cfg.joint.fuse_loss_wer, m.cfg.joint.fused_batch_size = True, m.joint._fused_batch_size
         fused_joint.enable(m)
     if a.bf16_master:
         import bf16_master
