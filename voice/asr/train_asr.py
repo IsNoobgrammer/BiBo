@@ -923,7 +923,7 @@ def main():
     assert not a.fp32_residual or (a.bf16_master and a.fused_layer), "--fp32_residual needs --bf16_master --fused_layer"
 
     import nemo.collections.asr as nemo_asr
-    torch.set_float32_matmul_precision("highest" if a.parity_fp32 else "high")
+    torch.set_float32_matmul_precision(os.environ.get("PARITY_MATMUL") or ("highest" if a.parity_fp32 else "high"))   # PARITY_MATMUL=high: TF32 noise floor
     if a.deterministic:    # det_probe.py: without these the gradient bits still differ run to run (cuDNN / cuBLAS)
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.use_deterministic_algorithms(True, warn_only=True)
