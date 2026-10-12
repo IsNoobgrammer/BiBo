@@ -11,6 +11,7 @@ N=${EPOCHS:-4}; R=mixla${N}ep-w04; O=$A/exp_long
 VAL=$(ls $E3/val_*.jsonl | sort | tr '\n' ' ')
 set -f
 cd /home/marimo/work/BiBo
+mkdir -p $A/meetstudy                                   # eval output (a fresh box has none)
 echo "BiBo $(git log --oneline -1 | cut -c1-60) | tkf $(git -C $T log --oneline -1 | cut -c1-60) | $R"
 SAVE=$(seq -s ' ' 5625 5625 $((5625 * (N - 1))))
 if [ ! -f $O/$R/$R.nemo ]; then
@@ -23,7 +24,8 @@ if [ ! -f $O/$R/$R.nemo ]; then
   echo "TRAIN $R rc $?"
 fi
 [ -f $O/$R/$R.nemo ] || { echo "no final model"; exit 1; }
-CK=""; for s in $SAVE; do f=$(ls $O/$R/*step${s}*.ckpt $O/$R/step=${s}-*.ckpt 2>/dev/null | head -1); [ -n "$f" ] && CK="$CK $s:$f"; done
+set +f                                                   # the checkpoint search below needs globbing
+CK=""; for s in $SAVE; do f=$(ls $O/$R/step${s}.ckpt $O/$R/step=${s}-*.ckpt 2>/dev/null | head -1); [ -n "$f" ] && CK="$CK $s:$f"; done
 echo "epoch checkpoints:$CK"
 for c in $CK final:; do s=${c%%:*}; f=${c#*:}
   TKF=$T $P voice/asr/ab_meeting.py --head glu_glu --las 0 1 3 6 13 -1 --bp 0 0.5 0.75 1.0 1.25 1.5 2.0 \

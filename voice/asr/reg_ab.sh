@@ -8,6 +8,7 @@ A=/home/marimo/work/asr; E3=$A/en3; P=/home/marimo/asrenv/bin/python; T=/home/ma
 [ -f $A/.markers/ready ] || { echo "en3 not ready"; exit 1; }
 R=${RUN:-reg-w04}; VAL=$(ls $E3/val_*.jsonl | sort | tr '\n' ' ')
 cd /home/marimo/work/BiBo
+mkdir -p $A/meetstudy                                   # eval output (a fresh box has none)
 echo "BiBo $(git log --oneline -1 | cut -c1-60) | $R"
 if [ ! -f $A/exp_reg/$R/$R.nemo ]; then
   TKF=$T $P voice/asr/train_asr.py --project asr-ctc-weight --run $R --seed 23 --new_vocab --train $E3/train.jsonl \

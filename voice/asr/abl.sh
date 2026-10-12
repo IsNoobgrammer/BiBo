@@ -14,6 +14,7 @@ A=/home/marimo/work/asr; E3=$A/en3; P=/home/marimo/asrenv/bin/python; T=/home/ma
 [ -f $A/.markers/ready ] || { echo "en3 not ready"; exit 1; }
 VAL=$(ls $E3/val_*.jsonl | sort | tr '\n' ' ')
 cd /home/marimo/work/BiBo
+mkdir -p $A/meetstudy                                   # eval output (a fresh box has none)
 echo "BiBo $(git log --oneline -1 | cut -c1-60) | tkf $(git -C $T log --oneline -1 | cut -c1-60)"
 for arm in ${ARMS:-wd0 drop0 drop01}; do
   case $arm in
