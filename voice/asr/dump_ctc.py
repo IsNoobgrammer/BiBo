@@ -29,6 +29,7 @@ def main():
     ap.add_argument("--nemo", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--head", default="glu_glu")
+    ap.add_argument("--ckpt", default=None, help="Lightning .ckpt whose weights replace the .nemo's (same architecture), e.g. an epoch checkpoint")
     ap.add_argument("--val", nargs="*", default=[])
     ap.add_argument("--la", type=int, default=3, help="validation look-ahead in 80 ms steps (3 = 240 ms)")
     ap.add_argument("--meeting", action="store_true", help="also the 2 meeting recordings at every --las")
@@ -43,7 +44,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, "pieces.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(sp.id_to_piece(i) for i in range(sp.get_piece_size())) + "\n")
-    m = load(a.nemo, a.head)
+    m = load(a.nemo, a.head, a.ckpt)
     lst = open(os.path.join(a.out, "list.txt"), "w", encoding="utf-8")
     refs = open(os.path.join(a.out, "refs.jsonl"), "w", encoding="utf-8")
 
