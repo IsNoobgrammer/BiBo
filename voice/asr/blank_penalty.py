@@ -55,9 +55,10 @@ def _patch(cls, name, delta, mask_ids=None, ilm=0.0):
         if mask_ids is not None:                  # script lock: these tokens can never be emitted
             # an additive bias built on the device once (devanagari_ids): RNN-T greedy decoding runs under CUDA-graph
             # capture, which refuses host->device copies -- and out[..., ids] = -1e4 copies the scalar from the host
-            if mask_ids.shape[-1] < out.shape[-1]:   # TDT joint: the duration logits after blank stay unmasked
-                mask_ids = torch.nn.functional.pad(mask_ids, (0, out.shape[-1] - mask_ids.shape[-1]))
-            out = out + mask_ids
+            mk = mask_ids                       # TDT joint: the duration logits after blank stay unmasked
+            if mk.shape[-1] < out.shape[-1]:
+                mk = torch.nn.functional.pad(mk, (0, out.shape[-1] - mk.shape[-1]))
+            out = out + mk
         return out
 
     setattr(cls, name, wrapped)
