@@ -30,6 +30,12 @@ def enable(model):
     assert getattr(joint, "masking_prob", 0) <= 0 and not joint.is_adapter_available()
     assert getattr(joint, "temperature", 1.0) == 1.0
     lam = float((model.cfg.loss.get("warprnnt_numba_kwargs") or {}).get("fastemit_lambda", 0.0))
+    tdt = model.cfg.loss.get("loss_name") == "tdt"           # train_asr --aux tdt: kernels/sm120/tdt_joint.py
+    if tdt:
+        from kernels.sm120.tdt_joint import tdt_joint_loss
+        kw = model.cfg.loss.tdt_kwargs
+        tdt_cfg = dict(durations=list(kw.durations), sigma=float(kw.get("sigma", 0.0)), omega=float(kw.get("omega", 0.0)))
+        assert float(kw.get("fastemit_lambda", 0.0)) == 0.0, "tdt_joint: FastEmit unsupported"
     nemo_forward = joint.forward
     # The kernel needs N = sum(T_enc * (U + 1)) to size its buffers; asking the GPU for it is a host sync that drains
     # the queue every step. Every term is known on the CPU before the batch is copied: audio lengths (or
@@ -81,9 +87,13 @@ def enable(model):
         f = self.project_encoder(encoder_outputs.transpose(1, 2))
         g = self.project_prednet(decoder_outputs.transpose(1, 2))
         p = drop.p if (drop is not None and self.training) else 0.0
-        loss, _ = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
-                                  transcript_lengths, fastemit_lambda=lam, dropout=p,
-                                  n_rows=n_rows_host(encoder_lengths, transcript_lengths))
+        n_rows = n_rows_host(encoder_lengths, transcript_lengths)
+        if tdt:
+            loss, _ = tdt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
+                                     transcript_lengths, dropout=p, n_rows=n_rows, **tdt_cfg)
+        else:
+            loss, _ = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
+                                      transcript_lengths, fastemit_lambda=lam, dropout=p, n_rows=n_rows)
         wer = wer_num = wer_denom = None
         hyp = []
         if compute_wer:                                              # NeMo's per-sub-batch WER, on the whole batch
@@ -101,8 +111,8 @@ def enable(model):
         return loss, wer, wer_num, wer_denom
 
     joint.forward = types.MethodType(forward, joint)
-    print(f"[fused_joint] NeMo joint loss -> tkf rnnt_joint (FastEmit {lam}, dropout {drop.p if drop else 0})",
-          flush=True)
+    print(f"[fused_joint] NeMo joint loss -> tkf " + (f"tdt_joint {tdt_cfg}" if tdt else f"rnnt_joint (FastEmit {lam})")
+          + f", dropout {drop.p if drop else 0}", flush=True)
     return nemo_forward
 
 

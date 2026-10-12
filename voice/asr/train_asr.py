@@ -603,7 +603,8 @@ def to_tdt(m, durations, sigma, omega):
     """RNN-T -> TDT partner head (Token-and-Duration Transducer): the joint gets len(durations) extra outputs (the
     duration logits, after blank), the loss becomes NeMo's TDT loss, greedy decoding TDT. change_vocabulary (--new_vocab)
     already rebuilt the joint and prediction net from scratch, so RNN-T and TDT arms start equally (only the joint's
-    output layer is wider). NeMo's TDT loss, not tkf's fused RNN-T joint (no duration outputs): --fused_joint is off."""
+    output layer is wider). With --fused_joint the loss runs in tkf kernels/sm120/tdt_joint.py (parity_tdt_joint.py:
+    fp64 + NeMo TDT gates), else NeMo's numba TDT loss."""
     from omegaconf import open_dict
     from nemo.collections.asr.losses.rnnt import RNNTLoss
     jc = m.joint.to_config_dict()
@@ -958,6 +959,8 @@ def main():
         m.ctc_loss_weight = a.ctc_weight
         with open_dict(m.cfg):
             m.cfg.aux_ctc.ctc_loss_weight = a.ctc_weight
+    if a.aux == "tdt":                       # before the dropout settings and fused_joint: both act on the NEW joint
+        to_tdt(m, a.tdt_durations, a.tdt_sigma, a.tdt_omega)
     if a.dropout_all is not None:
         n = 0
         for mod in m.modules():
@@ -993,9 +996,6 @@ def main():
     if a.ctc_head:                       # after fused_ctc: the eval-time CTC loss still goes through it
         import selfcond_head
         selfcond_head.enable(m, a.ctc_head)
-    if a.aux == "tdt":
-        assert not a.fused_joint, "--aux tdt: tkf's fused joint is RNN-T only (no duration outputs); drop --fused_joint"
-        to_tdt(m, a.tdt_durations, a.tdt_sigma, a.tdt_omega)
     if hasattr(m, "ctc_wer") and a.val_blank_penalty > 0:   # hybrid model: + both heads at the app's blank penalty
         bp_metrics(m, a.val_blank_penalty)
     # Exact resume: a 1-layer nn.LSTM ignores its `dropout` (applied only between layers), but with dropout > 0 the

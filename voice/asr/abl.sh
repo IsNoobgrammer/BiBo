@@ -6,7 +6,8 @@
 #   wd0     Muown weight decay 0 (AdamW keeps 1e-3)
 #   drop0   every Dropout 0.0
 #   drop01  every Dropout 0.1 (only the joint changes: 0.2 -> 0.1)
-#   tdt     TDT instead of RNN-T as the CTC head's training partner (NeMo TDT loss; durations 0-4)
+#   tdt     TDT instead of RNN-T as the CTC head's training partner (tkf tdt_joint; durations 0-4, sigma 0.05,
+#           omega 0.1 = NeMo's recipe)
 # Re-running skips finished arms and resumes an unfinished one (HF checkpoints).
 set -uo pipefail
 A=/home/marimo/work/asr; E3=$A/en3; P=/home/marimo/asrenv/bin/python; T=/home/marimo/work/tkf_ctc
@@ -19,7 +20,7 @@ for arm in ${ARMS:-wd0 drop0 drop01}; do
     wd0) X="--muon_wd 0";; drop0) X="--dropout_all 0.0";; drop01) X="--dropout_all 0.1";;
     tdt) X="--aux tdt";; base) X="";; *) echo "unknown arm $arm"; exit 1;;
   esac
-  R=$arm-fe0; FJ="--fused_joint"; [ $arm = tdt ] && FJ=""          # tkf's fused joint is RNN-T only
+  R=$arm-fe0; FJ="--fused_joint"                                  # TDT too: tkf tdt_joint (parity_tdt_joint)
   if [ ! -f $A/exp_abl/$R/$R.nemo ]; then
     TKF=$T $P voice/asr/train_asr.py --project asr-abl --run $R --seed 23 --new_vocab --train $E3/train.jsonl \
       --tok $E3/tok/tokenizer_spe_bpe_v2047 --val $VAL --lr 5e-4 --total_hours 3750 --eval_hours 750 \
