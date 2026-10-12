@@ -807,6 +807,7 @@ def main():
                     help="evaluate every this many audio hours (must be < one data epoch); 0 = every data epoch")
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--warmup", type=int, default=None, help="warm-up steps; default --warmup_frac of max_steps")
+    ap.add_argument("--min_lr", type=float, default=1e-5, help="cosine floor (ep5-lr5e5-d0: 1e-6)")
     ap.add_argument("--warmup_frac", type=float, default=0.05, help="warm-up budget as a fraction of max_steps (5%%: user default from Oct 11 2026 -- a fixed 200 steps was 0.36%% of a 10-epoch run)")
     ap.add_argument("--sched", choices=["cosine", "wsd"], default="cosine",
                     help="wsd = linear warm-up, flat at --lr, linear decay over the last --decay_frac to 1e-5")
@@ -1067,7 +1068,7 @@ def main():
     m.log = log
     m.setup_optimization(OmegaConf.create({
         "name": "adamw", "lr": a.lr, "betas": [0.9, 0.98], "weight_decay": 1e-3,
-        "sched": {"name": "CosineAnnealing", "warmup_steps": a.warmup, "min_lr": 1e-5, "max_steps": max_steps}}))
+        "sched": {"name": "CosineAnnealing", "warmup_steps": a.warmup, "min_lr": a.min_lr, "max_steps": max_steps}}))
     def fuse(opt):                       # NeMo builds AdamW with foreach/fused None: the per-parameter path cost
         if not a.bf16_master:            # 107.7 ms of CPU per step launching ~700 tensors' kernels (--profile_steps)
             for g in opt.param_groups:
