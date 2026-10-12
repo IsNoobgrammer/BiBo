@@ -36,6 +36,17 @@ class SelfCondCTCDecoder(nn.Module):
             return z.float().log_softmax(-1)                              # batch-WER only (no grad)
         return (self.head(h).float() / self.temperature).log_softmax(-1)
 
+    # NeMo's change_decoding_strategy on hybrid models calls these on ctc_decoder (a NeuralModule API)
+    def freeze(self):
+        for p in self.parameters():
+            p.requires_grad_(False)
+        self.eval()
+
+    def unfreeze(self):
+        for p in self.parameters():
+            p.requires_grad_(True)
+        self.train()
+
 
 def enable(model, kind, weights=None):
     readouts = kind.split("_")
