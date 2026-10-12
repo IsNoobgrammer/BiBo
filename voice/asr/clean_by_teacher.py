@@ -12,6 +12,7 @@ import collections
 import glob
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -44,6 +45,9 @@ def main():
                     help="hf_add_columns.py flags.tsv files: rows by '<source>/<file>' key (any manifest built from "
                          "those repos, e.g. en3)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--drop_sources", default=None, help="regex of sources to drop whole, e.g. our synthetic "
+                    "augmentation copies '_(room|phone)$' (vitw_* are real re-recordings: keep)")
+    ap.add_argument("--drop_empty", action="store_true", help="drop rows whose reference is blank after normalize_v2")
     ap.add_argument("--ratio", type=float, default=1.5)
     ap.add_argument("--extra", type=int, default=5)
     ap.add_argument("--max_wer", type=float, default=0.6)
@@ -71,10 +75,21 @@ def main():
                 return (f[0], False)
             return f
 
+        drop_src = re.compile(a.drop_sources) if a.drop_sources else None
+        n_src = n_empty = 0
+        h_src = h_empty = 0.0
         for r in rows:
             s = by[r.get("source", "?")]
             s[0] += 1
             s[1] += r["duration"]
+            if drop_src and drop_src.search(r.get("source") or ""):   # our own synthetic augmentation copies
+                n_src += 1
+                h_src += r["duration"]
+                continue
+            if a.drop_empty and not words(r["text"]):                 # blank / untranscribed reference
+                n_empty += 1
+                h_empty += r["duration"]
+                continue
             f = flag(r.get("source"), os.path.basename(r["audio_filepath"]))
             if f is None:
                 s[4] += 1
@@ -90,7 +105,9 @@ def main():
         print(f"{'source':<22}{'clips':>8}{'hours':>8}{'missing h':>11}{'garbage h':>11}{'no flag':>9}")
         for src, s in sorted(by.items(), key=lambda kv: -kv[1][1]):
             print(f"{src:<22}{s[0]:>8}{s[1] / 3600:>8.1f}{s[2] / 3600:>11.2f}{s[3] / 3600:>11.2f}{s[4]:>9}")
-        print(f"kept {len(keep)} of {len(rows)} clips -> {a.out}")
+        print(f"dropped sources /{a.drop_sources}/: {n_src} clips {h_src / 3600:.1f} h; blank references: {n_empty} clips "
+              f"{h_empty / 3600:.2f} h")
+        print(f"kept {len(keep)} of {len(rows)} clips ({sum(r['duration'] for r in keep) / 3600:.1f} h) -> {a.out}")
         return
     hyp = {}
     for p in glob.glob(os.path.join(a.hyp, "hyp_*.tsv")):
