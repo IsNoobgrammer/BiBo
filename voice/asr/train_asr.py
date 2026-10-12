@@ -807,10 +807,10 @@ def main():
                     help="evaluate every this many audio hours (must be < one data epoch); 0 = every data epoch")
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--warmup", type=int, default=None, help="warm-up steps; default --warmup_frac of max_steps")
-    ap.add_argument("--min_lr", type=float, default=1e-5, help="cosine floor (ep5-lr5e5-d0: 1e-6)")
+    ap.add_argument("--min_lr", type=float, default=1e-5, help="final lr of the cosine / WSD decay (absolute; default 1e-5 as before; 0 allowed)")
     ap.add_argument("--warmup_frac", type=float, default=0.05, help="warm-up budget as a fraction of max_steps (5%%: user default from Oct 11 2026 -- a fixed 200 steps was 0.36%% of a 10-epoch run)")
     ap.add_argument("--sched", choices=["cosine", "wsd"], default="cosine",
-                    help="wsd = linear warm-up, flat at --lr, linear decay over the last --decay_frac to 1e-5")
+                    help="wsd = linear warm-up, flat at --lr, linear decay over the last --decay_frac to --min_lr")
     ap.add_argument("--optim", choices=["adamw", "muown"], default="muown",
                     help="muown (default; beats AdamW -0.55 val WER over 2 epochs, 2 seeds, W&B asr-muown-vs-adamw-2ep) = tkf FusedMuon on the weight matrices + AdamW on the rest (muon_groups.py)")
     ap.add_argument("--muon_lr", type=float, default=None, help="Muon lr (scale adam: same band as AdamW); default --lr")
@@ -1087,7 +1087,7 @@ def main():
         import muon_groups
         opt = muon_groups.build(m, a.lr, muon_lr=a.muon_lr, wd=1e-3, muon_wd=a.muon_wd, variant=a.muon_variant, ns=a.muon_ns,
                                 heads=m.encoder.layers[0].self_attn.h if a.muon_heads else 0)
-        sch = (torch.optim.lr_scheduler.LambdaLR(opt, wsd_lambda(a.warmup, max_steps, a.decay_frac, 1e-5 / a.lr))
+        sch = (torch.optim.lr_scheduler.LambdaLR(opt, wsd_lambda(a.warmup, max_steps, a.decay_frac, a.min_lr / a.lr))
                if a.sched == "wsd" else muon_groups.warmup_cosine(opt, a.warmup, max_steps, a.min_lr))
         m._optimizer, m._scheduler = opt, sch
         m.configure_optimizers = lambda: ([opt], [{"scheduler": sch, "interval": "step", "frequency": 1}])
@@ -1097,7 +1097,7 @@ def main():
         for g in m._optimizer.param_groups:                        # NeMo's scheduler may have set a warm-up lr
             g["lr"] = a.lr
             g.pop("initial_lr", None)
-        sched = torch.optim.lr_scheduler.LambdaLR(m._optimizer, wsd_lambda(a.warmup, max_steps, a.decay_frac, 1e-5 / a.lr))
+        sched = torch.optim.lr_scheduler.LambdaLR(m._optimizer, wsd_lambda(a.warmup, max_steps, a.decay_frac, a.min_lr / a.lr))
         m._scheduler = {"scheduler": sched, "interval": "step", "frequency": 1}
         # NeMo's configure_optimizers() re-runs setup_optimization() at fit time, rebuilding the cosine scheduler
         # over ours (smoke test: lr followed the cosine). Hand Lightning this optimizer + scheduler directly.
