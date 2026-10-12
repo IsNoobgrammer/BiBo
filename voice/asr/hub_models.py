@@ -4,7 +4,7 @@
                                ConvASRDecoder; train_asr's --ctc_head then swaps in our self-conditioned head)
     to_streaming(m, lookaheads, left=70)
                                a full-attention FastConformer (Parakeet) -> cache-aware streaming layout: chunked_limited
-                               attention with our look-ahead presets, causal depthwise convs, causal subsampling. Same
+                               attention with our look-ahead presets, causal depthwise convs (subsampling unchanged). Same
                                tensors (kernel shapes do not change), different padding / masks: needs fine-tuning.
 Both go through save_to -> restore_from(override_config_path=...) so the tokenizer artifacts and every matching weight
 are carried over; new / reshaped parameters are reported.
@@ -55,7 +55,8 @@ def to_streaming(m, lookaheads, left=70):
         e.att_context_size = [[-1, -1] if r < 0 else [left - left % (r + 1), r] for r in lookaheads]
         e.att_context_probs = None
         e.conv_context_size = "causal"
-        e.causal_downsampling = True
+        # causal_downsampling is NOT switched: it changes pre_encode.out's input size (Parakeet 4096 -> 4352), so its
+        # trained weights would not load; the stock subsampling's few frames of look-ahead are kept instead
     return _rebuild(m, edit)
 
 
