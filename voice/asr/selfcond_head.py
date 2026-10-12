@@ -33,6 +33,7 @@ class SelfCondCTCDecoder(nn.Module):
         self.stash = None                    # (targets, target lengths, input lengths, reduce) set by the model
         self.loss = None
         self.distill = 0.0                   # weight of the transducer-alignment cross-entropy (0 = off)
+        self.distill_only = False            # True: the head learns ONLY from the transducer (no text CTC loss)
         self.frame_tgt = None                # (B, T) targets from the transducer's greedy decode, set per step
         self.distill_loss = None
 
@@ -48,7 +49,8 @@ class SelfCondCTCDecoder(nn.Module):
                 nll = -logp[:, :T].gather(-1, self.frame_tgt[:, :T, None]).squeeze(-1)
                 mask = torch.arange(T, device=nll.device)[None, :] < hl[:, None]
                 self.distill_loss = (nll * mask).sum(1).mean()           # per-utterance sum, as CTC mean_batch
-                self.loss = self.loss + self.distill * self.distill_loss
+                self.loss = (self.distill * self.distill_loss if self.distill_only
+                             else self.loss + self.distill * self.distill_loss)
             return z.float().log_softmax(-1)                              # batch-WER only (no grad)
         return (self.head(h).float() / self.temperature).log_softmax(-1)
 
@@ -95,7 +97,7 @@ def _frame_targets(model, enc, enc_len, blank):
     return ft.to(enc.device, non_blocking=True)
 
 
-def enable(model, kind, weights=None, distill=0.0):
+def enable(model, kind, weights=None, distill=0.0, distill_only=False):
     readouts = kind.split("_")
     weights = weights or {2: (0.3, 0.7), 3: (0.2, 0.3, 0.5)}[len(readouts)]
     stock = model.ctc_decoder
@@ -103,13 +105,18 @@ def enable(model, kind, weights=None, distill=0.0):
     dec = SelfCondCTCDecoder(stock, d, readouts, weights).to(next(stock.parameters()).device)
     model.ctc_decoder = dec
     dec.distill = float(distill)
+    dec.distill_only = bool(distill_only)
+    assert not dec.distill_only or dec.distill > 0, "distill_only needs distill > 0"
     if dec.distill > 0:                      # greedy decode inside training: no CUDA-graph decoder
         from omegaconf import open_dict
         dcfg = model.cfg.decoding
         with open_dict(dcfg):
             dcfg.strategy = "greedy_batch"
             dcfg.greedy.use_cuda_graph_decoder = False
+        cur = getattr(model, "cur_decoder", None)
         model.change_decoding_strategy(dcfg, decoder_type="rnnt", verbose=False)
+        if cur is not None:                  # validation keeps decoding with the head it used before
+            model.cur_decoder = cur
     loss = model.ctc_loss
     orig_fwd = model.training_step
 
@@ -149,5 +156,6 @@ def enable(model, kind, weights=None, distill=0.0):
     n = sum(p.numel() for p in dec.parameters())
     print(f"[selfcond_head] CTC decoder -> SelfCondN {readouts} weights {weights}, {n / 1e6:.2f}M params, "
           f"{dec.num_classes_with_blank} classes; training loss via tkf selfcond_ctc_pass"
-          + (f"; + {dec.distill} x transducer-alignment CE (on-policy distillation)" if dec.distill > 0 else ""), flush=True)
+          + (f"; {'ONLY ' if dec.distill_only else '+ '}{dec.distill} x transducer-alignment CE (on-policy distillation)"
+             if dec.distill > 0 else ""), flush=True)
     return dec
