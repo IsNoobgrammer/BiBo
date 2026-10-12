@@ -542,6 +542,29 @@ class StopAt(Callback):
             trainer.should_stop = True
 
 
+class ParityDump(Callback):
+    """--parity_dump PATH: after the FIRST backward (before clipping / the optimizer), save the loss and every grad, then
+    exit. Run once without kernels, once with them, once --parity_fp32: voice/asr/parity_e2e.py compares the three."""
+
+    def __init__(self, path):
+        self.path, self.loss = path, None
+
+    def wrap(self, m):
+        orig = m.training_step
+
+        def step(*args, **kw):
+            out = orig(*args, **kw)
+            self.loss = float((out["loss"] if isinstance(out, dict) else out).detach())
+            return out
+        m.training_step = step
+
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer):
+        g = {n: p.grad.detach().float().cpu() for n, p in pl_module.named_parameters() if p.grad is not None}
+        torch.save({"loss": self.loss, "grads": g}, self.path)
+        print(f"[parity] {self.path}: loss {self.loss:.6f}, {len(g)} grads", flush=True)
+        os._exit(0)
+
+
 class LrScale(Callback):
     """--lr_scale: multiply the scheduler's base lrs once training starts (after a resume restored them)."""
 
@@ -862,6 +885,10 @@ def main():
                          "e.g. 0 0.5 0.5 0.5 0.2")
     ap.add_argument("--grad_diag", type=int, default=0, help="log per-module grad norms + look-ahead every N steps")
     ap.add_argument("--stop_step", type=int, default=None, help="stop at this global step (schedule unchanged)")
+    ap.add_argument("--parity_dump", default=None, help="save loss + grads of the first step and exit (parity_e2e.py); "
+                    "use with --dropout_all 0 and a one-hot --lookahead_probs")
+    ap.add_argument("--parity_fp32", action="store_true", help="with --parity_dump: fp32 reference (precision 32-true, "
+                    "fp32 matmuls at 'highest', no autocast)")
     ap.add_argument("--profile_steps", default=None, help="A:B -- profile real steps A..B (+1 sync-debug step)")
     ap.add_argument("--lr_scale", type=float, default=None, help="multiply the scheduler lrs at train start (resumes)")
     ap.add_argument("--trace", default=None, help="per-step JSONL (loss, grad norm, lr, look-ahead) for reproducibility checks")
@@ -896,7 +923,7 @@ def main():
     assert not a.fp32_residual or (a.bf16_master and a.fused_layer), "--fp32_residual needs --bf16_master --fused_layer"
 
     import nemo.collections.asr as nemo_asr
-    torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision("highest" if a.parity_fp32 else "high")
     if a.deterministic:    # det_probe.py: without these the gradient bits still differ run to run (cuDNN / cuBLAS)
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.use_deterministic_algorithms(True, warn_only=True)
@@ -1007,8 +1034,7 @@ def main():
             if isinstance(mod, torch.nn.Dropout):
                 print(f"[run] RNN-T joint dropout {mod.p} -> {a.joint_dropout}", flush=True)
                 mod.p = a.joint_dropout
-    if a.fused_joint:
-        import fused_joint
+    if (a.fused_joint or a.parity_dump) and hasattr(m, "joint"):   # parity: the eager run gets the same loss setup
         if not m.joint._fuse_loss_wer or m.loss.reduction != "mean_batch":   # hub models (Nemotron / Parakeet) ship
             print(f"[run] fused_joint: joint fuse_loss_wer {m.joint._fuse_loss_wer} -> True, loss reduction "   # with
                   f"{m.loss.reduction} -> mean_batch (as the 114M streaming model)", flush=True)   # other settings
@@ -1019,6 +1045,8 @@ def main():
             m.loss.reduction = "mean_batch"
             with open_dict(m.cfg):
                 m.cfg.joint.fuse_loss_wer, m.cfg.joint.fused_batch_size = True, m.joint._fused_batch_size
+    if a.fused_joint:
+        import fused_joint
         fused_joint.enable(m)
     if a.bf16_master:
         import bf16_master
@@ -1066,6 +1094,12 @@ def main():
                   flush=True)
             mod.dropout = 0.0
 
+    parity = None
+    if a.parity_dump:
+        m.spec_augmentation = None
+        parity = ParityDump(a.parity_dump)
+        parity.wrap(m)
+        print(f"[parity] SpecAugment off; dump -> {a.parity_dump}", flush=True)
     ckpt_dir = os.path.join(a.out, a.run)
     os.makedirs(ckpt_dir, exist_ok=True)
     # resume: local last.ckpt, else the one in the HF repo (fresh box); the W&B run continues under the same id
@@ -1085,7 +1119,7 @@ def main():
     # RNN-T-only models (Nemotron / Parakeet without our CTC head) select on the RNN-T WER
     MON = "val_wer_ctcbp_all" if a.val_blank_penalty > 0 and hasattr(m, "ctc_wer") else "val_wer_all"
     trainer = pl.Trainer(
-        devices=1, accelerator="gpu", precision="32-true" if a.bf16_master else "bf16-mixed", max_steps=max_steps, max_epochs=-1,
+        devices=1, accelerator="gpu", precision="32-true" if a.bf16_master or a.parity_fp32 else "bf16-mixed", max_steps=max_steps, max_epochs=-1,
         val_check_interval=eval_steps, check_val_every_n_epoch=None if eval_steps else 1,
         num_sanity_val_steps=0, gradient_clip_val=None if a.bf16_master else 1.0, log_every_n_steps=50,
         use_distributed_sampler=False, logger=logger, enable_checkpointing=True, benchmark=False,
@@ -1096,6 +1130,7 @@ def main():
                    *([StepTrace(a.trace)] if a.trace else []),
                    *([GradDiag(a.grad_diag)] if a.grad_diag else []),
                    *([StopAt(a.stop_step)] if a.stop_step else []),
+                   *([parity] if parity else []),
                    *([ProfileSteps(a.profile_steps)] if a.profile_steps else []),
                    *([LrScale(a.lr_scale)] if a.lr_scale else []),
                    *([] if a.no_hf else [HFSync(a.run, ckpt_dir)])])
