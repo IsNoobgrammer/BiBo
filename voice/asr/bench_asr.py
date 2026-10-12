@@ -57,21 +57,50 @@ def batches(paths, sec):
         yield cur
 
 
-def run_nemo(name, la, paths, sec):
+def run_nemo(name, la, paths, sec, bps):
+    """{bp: hyps}: one model load, one decode per blank penalty (blank_penalty.py patches the RNN-T / TDT joint)."""
     import nemo.collections.asr as nemo_asr
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import blank_penalty
     m = nemo_asr.models.ASRModel.from_pretrained(NEMO[name]).cuda().eval()
     if la is not None:
         ctx = [-1, -1] if la < 0 else [70, la]
         m.encoder.set_default_att_context_size(ctx)
         print(f"[bench] {name} att_context {ctx}", flush=True)
-    hyp = [None] * len(paths)
-    for b in batches(paths, sec):
-        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-            out = m.transcribe([paths[i] for i in b], batch_size=len(b), verbose=False)
-        out = out[0] if isinstance(out, tuple) else out
-        for i, o in zip(b, out):
-            hyp[i] = o.text if hasattr(o, "text") else str(o)
-    return hyp
+    res = {}
+    for bp in bps:
+        blank_penalty.apply(bp, head="rnnt")
+        hyp = [None] * len(paths)
+        for b in batches(paths, sec):
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                out = m.transcribe([paths[i] for i in b], batch_size=len(b), verbose=False)
+            out = out[0] if isinstance(out, tuple) else out
+            for i, o in zip(b, out):
+                hyp[i] = o.text if hasattr(o, "text") else str(o)
+        res[bp] = hyp
+        print(f"[bench] {name} bp {bp} done", flush=True)
+    blank_penalty.apply(0.0, head="rnnt")
+    return res
+
+
+def run_granite_bp(paths, bps):
+    """{bp: hyps}: Granite TurboCTC frame log-probs once per utterance (batch 1: no padded frames), then for each
+    penalty: subtract it from blank (id 0), greedy argmax, collapse repeats, drop blanks, detokenise."""
+    from transformers import AutoModelForCTC, AutoProcessor
+    proc = AutoProcessor.from_pretrained(HF["granite"])
+    m = AutoModelForCTC.from_pretrained(HF["granite"], device_map="cuda", torch_dtype=torch.bfloat16).eval()
+    res = {bp: [None] * len(paths) for bp in bps}
+    for i, p in enumerate(paths):
+        inp = proc([load(p)], sampling_rate=16000, device=m.device)
+        inp.to(m.device, dtype=m.dtype)
+        with torch.inference_mode():
+            lp = m(**inp).logits.float().log_softmax(-1)[0]
+        for bp in bps:
+            x = lp.clone(); x[:, 0] -= bp
+            ids = x.argmax(-1).tolist()
+            keep = [t for j, t in enumerate(ids) if t != 0 and (j == 0 or t != ids[j - 1])]
+            res[bp][i] = proc.tokenizer.decode(keep, skip_special_tokens=True)
+    return res
 
 
 def run_hf(name, paths, sec):
@@ -110,23 +139,34 @@ def main():
     ap.add_argument("--val", default=f"{A}/en3/val_*.jsonl")
     ap.add_argument("--batch_sec", type=float, default=400.0)
     ap.add_argument("--meeting_only", action="store_true")
+    ap.add_argument("--bps", type=float, nargs="*", default=None,
+                    help="blank penalties: NeMo RNN-T/TDT (blank_penalty.py) and Granite CTC; one OUT_bp<x> dir each")
     a = ap.parse_args()
-    os.makedirs(a.out, exist_ok=True)
     mset = "meeting_full" if a.la is None or a.la < 0 else f"meeting_la{a.la * 80}"
     its = items(mset, "/nonexistent" if a.meeting_only else a.val)
     paths = [p for p, _, _ in its]
     t0 = time.time()
-    hyp = run_nemo(a.model, a.la, paths, a.batch_sec) if a.model in NEMO else run_hf(a.model, paths, a.batch_sec)
+    if a.bps is not None and a.model in NEMO:
+        res = {f"{a.out}_bp{bp:g}": h for bp, h in run_nemo(a.model, a.la, paths, a.batch_sec, a.bps).items()}
+    elif a.bps is not None and a.model == "granite":
+        res = {f"{a.out}_bp{bp:g}": h for bp, h in run_granite_bp(paths, a.bps).items()}
+    elif a.model in NEMO:
+        res = {a.out: run_nemo(a.model, a.la, paths, a.batch_sec, [0.0])[0.0]}
+    else:
+        res = {a.out: run_hf(a.model, paths, a.batch_sec)}
     dt = time.time() - t0
     audio_h = sum(sf.info(p).duration for p in paths) / 3600
-    with open(f"{a.out}/refs.jsonl", "w", encoding="utf-8") as f:
-        for p, s, r in its:
-            f.write(json.dumps({"file": p, "set": s, "ref": r}, ensure_ascii=False) + "\n")
-    with open(f"{a.out}/hyp.tsv", "w", encoding="utf-8") as f:
-        for p, h in zip(paths, hyp):
-            f.write(f"{p}\t{(h or '').replace(chr(9), ' ').replace(chr(10), ' ')}\n")
-    print(f"BENCH {a.model} la {a.la} | {len(paths)} files, {audio_h:.2f} h audio in {dt / 60:.1f} min "
-          f"(RTFx {audio_h * 3600 / max(dt, 1e-9):.0f}) | empty {sum(not h for h in hyp)}", flush=True)
+    for out, hyp in res.items():
+        os.makedirs(out, exist_ok=True)
+        with open(f"{out}/refs.jsonl", "w", encoding="utf-8") as f:
+            for p, s, r in its:
+                f.write(json.dumps({"file": p, "set": s, "ref": r}, ensure_ascii=False) + "\n")
+        with open(f"{out}/hyp.tsv", "w", encoding="utf-8") as f:
+            for p, h in zip(paths, hyp):
+                f.write(f"{p}\t{(h or '').replace(chr(9), ' ').replace(chr(10), ' ')}\n")
+        print(f"BENCH {os.path.basename(out)} | {len(paths)} files, {audio_h:.2f} h audio | empty {sum(not h for h in hyp)}", flush=True)
+    print(f"BENCH_TIME {a.model} la {a.la} bps {a.bps}: {dt / 60:.1f} min for {len(res)} decode(s) "
+          f"(RTFx {len(res) * audio_h * 3600 / max(dt, 1e-9):.0f})", flush=True)
 
 
 if __name__ == "__main__":
