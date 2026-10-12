@@ -57,11 +57,25 @@ def main():
                 k, mi, ga = l.rstrip("\n").split("\t")[:3]
                 fl[k] = (mi == "1", ga == "1")
         keep, by = [], collections.defaultdict(lambda: [0, 0.0, 0.0, 0.0, 0])
+
+        def flag(src, fn):
+            """re-recorded / far-field variants: the teacher's own WER there measures the TEACHER failing on
+            reverberant audio (medical_room 36.9 % / svarah_room 36.1 % 'garbage' vs ~0-2 % on their close-mic
+            originals with the same transcripts). Take the close-mic original's flags when it exists; else trust only
+            missing_speech (noise makes the teacher hear fewer words, never more)."""
+            base = {"ami_sdm": "ami_ihm"}.get(src) or (src.rsplit("_", 1)[0] if src.endswith(("_room", "_phone")) else None)
+            if base and f"{base}/{fn}" in fl:
+                return fl[f"{base}/{fn}"]
+            f = fl.get(f"{src}/{fn}")
+            if f is not None and (base or src.startswith("vitw_")):
+                return (f[0], False)
+            return f
+
         for r in rows:
             s = by[r.get("source", "?")]
             s[0] += 1
             s[1] += r["duration"]
-            f = fl.get(f'{r.get("source")}/{os.path.basename(r["audio_filepath"])}')
+            f = flag(r.get("source"), os.path.basename(r["audio_filepath"]))
             if f is None:
                 s[4] += 1
                 keep.append(r)
