@@ -906,6 +906,9 @@ def main():
     ap.add_argument("--ctc_head", default=None, help="self-conditioned CTC head, readouts per pass: lin_glu, glu_glu, "
                     "lin_glu_glu ... (selfcond_head.py, fused training loss)")
     ap.add_argument("--fused_ctc", action="store_true", help="tkf deterministic CTC loss (voice/asr/fused_ctc.py)")
+    ap.add_argument("--head_lr", type=float, default=None,
+                    help="peak lr for the CTC head (AdamW param group, same schedule). Default with --hub_head + "
+                         "--ctc_head (a FRESH head on a pretrained encoder): 10 x --lr; else --lr")
     ap.add_argument("--ctc_weight", type=float, default=None, help="hybrid loss = (1-w) RNN-T + w CTC (model default 0.3)")
     ap.add_argument("--keep_vocab", action="store_true", help="hub --init (Nemotron, Parakeet): keep its own "
                     "tokenizer + trained decoder instead of switching to --tok")
@@ -1142,6 +1145,12 @@ def main():
             value = torch.tensor(float(value))
         return lightning_log(name, value, *args, **kw)
     m.log = log
+    head_lr = a.head_lr if a.head_lr is not None else (10 * a.lr if a.hub_head == "hybrid" and a.ctc_head else None)
+    if head_lr is not None and a.optim == "adamw" and hasattr(m, "ctc_decoder"):   # NeMo optim_param_groups
+        with open_dict(m.cfg):
+            m.cfg.optim_param_groups = {"ctc_decoder": {"lr": head_lr}}
+        print(f"[run] CTC head lr {head_lr:g} (encoder / rest {a.lr:g}): a fresh head at the encoder's fine-tune lr "
+              f"stayed undertrained (hub-pk-hybrid: 41.6 meeting WER at full context after 1 epoch)", flush=True)
     m.setup_optimization(OmegaConf.create({
         "name": "adamw", "lr": a.lr, "betas": [0.9, 0.98], "weight_decay": 1e-3,
         "sched": {"name": "CosineAnnealing", "warmup_steps": a.warmup, "min_lr": a.min_lr, "max_steps": max_steps}}))
