@@ -18,6 +18,7 @@ published): synthetic RIRs, babble from LibriSpeech / TED-LIUM rows or coloured 
 import argparse
 import json
 import os
+import sys
 import zlib
 from multiprocessing import Pool
 
@@ -27,7 +28,8 @@ import torch
 import torchaudio.functional as AF
 from scipy.signal import fftconvolve
 
-from augment import SR, _at_snr, _colored
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from augment import SR, _at_snr, _colored  # noqa: E402
 
 torch.set_num_threads(1)
 PLAN = {"earnings22": "ffn|ero", "multispk_ami": "ffn|ero", "notsofar": "ro", "phone": "ffn"}
