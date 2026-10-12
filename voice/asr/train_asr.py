@@ -874,6 +874,10 @@ def main():
     ap.add_argument("--ctc_weight", type=float, default=None, help="hybrid loss = (1-w) RNN-T + w CTC (model default 0.3)")
     ap.add_argument("--keep_vocab", action="store_true", help="hub --init (Nemotron, Parakeet): keep its own "
                     "tokenizer + trained decoder instead of switching to --tok")
+    ap.add_argument("--hub_head", choices=["native", "hybrid"], default="native",
+                    help="hybrid: add a CTC head to an RNN-T/TDT hub model (hub_models.to_hybrid)")
+    ap.add_argument("--hub_streaming", action="store_true",
+                    help="full-attention hub model (Parakeet) -> chunked attention + causal convs (hub_models.to_streaming)")
     ap.add_argument("--new_vocab", action="store_true", help="with a .nemo --init: switch it to --tok (new CTC/RNN-T "
                     "output layers, encoder kept)")
     ap.add_argument("--seed", type=int, default=None)
@@ -910,6 +914,12 @@ def main():
             print(f"[run] {a.init}: keeping its own vocabulary ({m.tokenizer.vocab_size} pieces) and decoder", flush=True)
         else:
             m.change_vocabulary(new_tokenizer_dir=a.tok, new_tokenizer_type="bpe")
+    if a.hub_streaming or a.hub_head == "hybrid":
+        import hub_models                # before the data loaders: a rebuilt model has none
+        if a.hub_streaming:              # full-attention model (Parakeet) -> chunked attention + causal convs
+            m = hub_models.to_streaming(m, a.lookaheads or [13, 6, 3, 1, 0, -1])
+        if a.hub_head == "hybrid":       # RNN-T / TDT model + a CTC head (--ctc_head swaps in ours, --ctc_only trains it alone)
+            m = hub_models.to_hybrid(m, a.ctc_weight if a.ctc_weight is not None else 0.3)
 
     tr = OmegaConf.create(OmegaConf.to_container(m.cfg.train_ds))
     with open_dict(tr):
@@ -920,6 +930,8 @@ def main():
                   # same seed -> same batches (det_probe.py): NeMo's defaults draw per-worker seeds from the OS RNG
                   # (shard_seed "trng") and fill buckets from a background thread (timing-dependent batch contents)
                   shard_seed="randomized", concurrent_bucketing=False)
+        for k in [k for k, v in tr.items() if v is None and k != "batch_size"]:   # hub configs: None where newer NeMo
+            tr.pop(k)                                                           # wants an int (bucket_buffer_size)
     m.setup_training_data(tr)
     wrap_train_sampler(m, a)
     if a.aug_schedule:
