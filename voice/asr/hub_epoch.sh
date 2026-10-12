@@ -19,8 +19,8 @@ cd /home/marimo/work/BiBo
 echo "$(date +%H:%M) HUB_START $R | BiBo $(git log --oneline -1 | cut -c1-40) | init $I lr $LR extra [$X] fused [$F] heads [$H]"
 if [ ! -f $O/$R/$R.nemo ]; then
   TKF=$T $P voice/asr/train_asr.py --project asr-hub --run $R --seed 23 --init $I --keep_vocab $X $F \
-    --train $E3/train.jsonl --tok $E3/tok/tokenizer_spe_bpe_v2047 --val $VAL --optim adamw --lr $LR --warmup_frac 0.05 \
-    --min_lr 0 --total_hours 1875 --eval_hours 1875 --fastemit 0 --batch_sec 1200 --lookaheads 13 6 3 1 0 -1 \
+    --train ${TRAIN:-$E3/train.jsonl} --tok $E3/tok/tokenizer_spe_bpe_v2047 --val $VAL --optim adamw --lr $LR --warmup_frac 0.05 \
+    --min_lr 0 --total_hours ${HOURS:-1875} --eval_hours ${HOURS:-1875} --fastemit 0 --batch_sec 1200 --lookaheads 13 6 3 1 0 -1 \
     --lookahead_probs 0:0.05 1:0.15 3:0.35 6:0.10 13:0.15 full:0.20 --out $O > $A/$R.out 2>&1
   echo "$(date +%H:%M) HUB_TRAIN $R rc $? $(grep -E 'it/s|s/it' $A/$R.out | tail -1 | tr '\r' '\n' | tail -1 | grep -oE '[0-9.]+ ?(it/s|s/it)')"
 fi
