@@ -105,7 +105,9 @@ def _job(a):
     x, sr = sf.read(row["audio_filepath"], dtype="float32")
     x = x.mean(1) if x.ndim > 1 else x
     assert sr == SR, (row["audio_filepath"], sr)
-    y = FX[kind](x, rng) * 10 ** (rng.uniform(-6, 0) / 20)
+    y = FX[kind](x, rng)
+    y = y * np.sqrt(((x ** 2).mean() + 1e-10) / ((y ** 2).mean() + 1e-10))   # the RIR normalisation drops the level
+    y = y * 10 ** (rng.uniform(-6, 0) / 20)                                 # 20-70x: back to the original loudness
     peak = np.abs(y).max()
     y = (y / peak * 0.95 if peak > 1 else y).astype(np.float32)
     d = os.path.join(out, "audio", f"{row['source']}_{kind}")
