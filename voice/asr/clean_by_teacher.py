@@ -68,10 +68,11 @@ def main():
             originals with the same transcripts). Take the close-mic original's flags when it exists; else trust only
             missing_speech (noise makes the teacher hear fewer words, never more)."""
             base = {"ami_sdm": "ami_ihm"}.get(src) or (src.rsplit("_", 1)[0] if src.endswith(("_room", "_phone")) else None)
+            far = src.startswith("vitw_") or src in ("notsofar", "ami_sdm")   # real far-field: teacher fails there too
             if base and f"{base}/{fn}" in fl:
                 return fl[f"{base}/{fn}"]
             f = fl.get(f"{src}/{fn}")
-            if f is not None and (base or src.startswith("vitw_")):
+            if f is not None and (base or far):
                 return (f[0], False)
             return f
 
