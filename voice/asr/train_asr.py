@@ -983,8 +983,11 @@ def main():
         print(f"[run] lookahead mix {dict(('full' if c[1] < 0 else c[1] * 80, p) for c, p in zip(ctxs, m.encoder.att_context_probs))} (ms: prob)",
               flush=True)
     if a.fastemit is not None:                                       # fused_joint reads it from the loss config
-        with open_dict(m.cfg):
-            m.cfg.loss.warprnnt_numba_kwargs.fastemit_lambda = a.fastemit
+        with open_dict(m.cfg):                                       # hub TDT models (Parakeet) carry tdt_kwargs
+            key = "tdt_kwargs" if m.cfg.loss.get("loss_name") == "tdt" else "warprnnt_numba_kwargs"
+            if m.cfg.loss.get(key) is None:
+                m.cfg.loss[key] = {}
+            m.cfg.loss[key].fastemit_lambda = a.fastemit
     if a.ctc_weight is not None and "aux_ctc" not in m.cfg:
         print(f"[run] --ctc_weight {a.ctc_weight} ignored: {type(m).__name__} has no CTC head", flush=True)
     elif a.ctc_weight is not None:
