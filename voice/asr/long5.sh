@@ -9,17 +9,17 @@
 set -uo pipefail
 A=/home/marimo/work/asr; E3=$A/en3; P=/home/marimo/asrenv/bin/python; T=/home/marimo/work/tkf_ctc
 [ -f $A/.markers/ready ] || { echo "en3 not ready"; exit 1; }
-R=${RUN:?}; WU=${WU:?}; LR=${LR:?}; O=$A/exp_long5
+R=${RUN:?}; WU=${WU:?}; LR=${LR:?}; X=${EXTRA:-}; O=$A/exp_long5        # EXTRA: more train_asr flags, e.g. "--dropout_all 0.0"
 VAL=$(ls $E3/val_*.jsonl | sort | tr '\n' ' ')
 cd /home/marimo/work/BiBo
 mkdir -p $A/meetstudy
-echo "BiBo $(git log --oneline -1 | cut -c1-60) | tkf $(git -C $T log --oneline -1 | cut -c1-60) | $R warm-up $WU lr $LR"
+echo "BiBo $(git log --oneline -1 | cut -c1-60) | tkf $(git -C $T log --oneline -1 | cut -c1-60) | $R warm-up $WU lr $LR extra [$X]"
 if [ ! -f $O/$R/$R.nemo ]; then
   TKF=$T $P voice/asr/train_asr.py --project asr-long5 --run $R --seed 23 --new_vocab --train $E3/train.jsonl \
     --tok $E3/tok/tokenizer_spe_bpe_v2047 --val $VAL --lr $LR --warmup_frac $WU --total_hours 9375 --eval_hours 1875 \
     --ctc_head glu_glu --ctc_weight 0.4 --fastemit 0 --batch_sec 1200 --lookaheads 13 6 3 1 0 -1 \
     --lookahead_probs 0:0.05 1:0.15 3:0.35 6:0.10 13:0.15 full:0.20 --save_steps 5625 11250 16875 22500 \
-    --fused_joint --fused_layer --fused_attn --fused_conv --fused_ctc --out $O > $A/$R.out 2>&1
+    --fused_joint --fused_layer --fused_attn --fused_conv --fused_ctc $X --out $O > $A/$R.out 2>&1
   echo "TRAIN $R rc $?"
 fi
 [ -f $O/$R/$R.nemo ] || { echo "no final model"; exit 1; }
