@@ -131,7 +131,15 @@ def wrap_train_sampler(m, a=None):
     assert not hasattr(old.dataset, "sampler"), "iterable (tarred / Shar) Lhotse data: sampler lives in the workers"
     if a is not None and a.loader == "fast":           # fast_loader: numpy index, exact batches, int16 pinned
         import fast_loader
-        ix = fast_loader.ManifestIndex.load(a.train, os.path.join(a.tok, "tokenizer.model"))
+        tok_model = os.path.join(a.tok, "tokenizer.model")
+        if a.keep_vocab:                 # hub model with its own vocabulary: tokenise the labels with ITS tokenizer
+            tok_model = os.path.join(a.out, "hub_tok", a.init.replace("/", "_") + ".model")   # (labels past its
+            if not os.path.exists(tok_model):                                             # embedding crashed RNN-T)
+                os.makedirs(os.path.dirname(tok_model), exist_ok=True)
+                with open(tok_model, "wb") as f:
+                    f.write(m.tokenizer.tokenizer.serialized_model_proto())
+            print(f"[run] fast loader tokenises with the model's own tokenizer {tok_model}", flush=True)
+        ix = fast_loader.ManifestIndex.load(a.train, tok_model)
         ix = ix.filter(lambda v: (v.col("dur") >= 0.1) & (v.col("dur") <= 30.0))   # NeMo's train_ds limits
         if a.source_weight:                            # per-source mix weights (row repetition, no new audio)
             w = {k: float(v) for k, v in (x.rsplit(":", 1) for x in a.source_weight)}
