@@ -72,6 +72,9 @@ def _check():
     src = os.environ.get("CHECK_MODEL", "/home/marimo/work/asr/exp/run1/run1.nemo")     # .nemo path or a hub id
     m = (nemo_asr.models.ASRModel.restore_from(src) if src.endswith(".nemo")
          else nemo_asr.models.ASRModel.from_pretrained(src)).cuda().eval()
+    if os.environ.get("CHECK_STREAMING"):                 # a full-context hub model as train_asr --hub_streaming makes it
+        import hub_models
+        m = hub_models.to_streaming(m, [13, 6, 3, 1, 0, -1]).cuda().eval()
     c0 = m.encoder.layers[0].conv
     print("conv:", c0.norm_type, "K", c0.depthwise_conv.kernel_size, "pad", c0.depthwise_conv._left_padding,
           c0.depthwise_conv._right_padding, flush=True)
