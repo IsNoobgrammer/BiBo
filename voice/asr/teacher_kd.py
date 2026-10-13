@@ -83,10 +83,15 @@ def mask_outputs(model, ids):
     V1 = model.joint.joint_net[-1].out_features
     lins = [model.joint.joint_net[-1]] + [m for m in model.ctc_decoder.modules()
                                           if isinstance(m, torch.nn.Linear) and m.out_features == V1]
-    idx = torch.tensor(ids, dtype=torch.long, device=lins[0].weight.device)
+    idx = {}                                          # per device: built while the model is still on the CPU
+
+    def on(dev):
+        if dev not in idx:
+            idx[dev] = torch.tensor(ids, dtype=torch.long, device=dev)
+        return idx[dev]
 
     def zero_rows(g):
-        return g.index_fill(0, idx, 0.0)
+        return g.index_fill(0, on(g.device), 0.0)
 
     for lin in lins:
         lin.weight.register_hook(zero_rows)
@@ -95,7 +100,7 @@ def mask_outputs(model, ids):
     @torch.no_grad()
     def reset():                                     # every step (weight decay must not pull them back up)
         for lin in lins:
-            lin.bias.index_fill_(0, idx, -1e4)
+            lin.bias.index_fill_(0, on(lin.bias.device), -1e4)
 
     reset()
     return reset, len(lins)
