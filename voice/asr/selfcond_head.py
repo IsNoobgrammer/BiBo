@@ -34,6 +34,7 @@ class SelfCondCTCDecoder(nn.Module):
         self.loss = None
         self.distill = 0.0                   # weight of the transducer-alignment cross-entropy (0 = off)
         self.distill_only = False            # True: the head learns ONLY from the transducer (no text CTC loss)
+        self.hard = 1.0                      # weight of the text CTC loss when distilling (teacher_kd: 0.3)
         self.frame_tgt = None                # (B, T) targets from the transducer's greedy decode, set per step
         self.distill_loss = None
         self.distill_mode = "greedy"         # "lattice": targets = the fused joint's per-frame lattice posteriors
@@ -65,7 +66,7 @@ class SelfCondCTCDecoder(nn.Module):
                 self.distill_loss = (nll * mask).sum(1).mean()           # per-utterance sum, as CTC mean_batch
             if self.distill > 0 and self.distill_loss is not None:
                 self.loss = (self.distill * self.distill_loss if self.distill_only
-                             else self.loss + self.distill * self.distill_loss)
+                             else self.hard * self.loss + self.distill * self.distill_loss)
             return z.detach().float().log_softmax(-1)                     # batch-WER only (no grad)
         return (self.head(h).float() / self.temperature).log_softmax(-1)
 
@@ -122,7 +123,7 @@ def _frame_targets(model, enc, enc_len, blank):
     return ft.to(enc.device, non_blocking=True)
 
 
-def enable(model, kind, weights=None, distill=0.0, distill_only=False, distill_mode="greedy"):
+def enable(model, kind, weights=None, distill=0.0, distill_only=False, distill_mode="greedy", hard=1.0):
     readouts = kind.split("_")
     weights = weights or {2: (0.3, 0.7), 3: (0.2, 0.3, 0.5)}[len(readouts)]
     stock = model.ctc_decoder
@@ -131,6 +132,7 @@ def enable(model, kind, weights=None, distill=0.0, distill_only=False, distill_m
     model.ctc_decoder = dec
     dec.distill = float(distill)
     dec.distill_only = bool(distill_only)
+    dec.hard = float(hard)
     dec.distill_mode = distill_mode
     if dec.distill > 0 and distill_mode == "lattice":       # the fused joint (train_asr --fused_joint) writes them
         model.joint._frame_k = 4

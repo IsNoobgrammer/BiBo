@@ -915,6 +915,14 @@ def main():
     ap.add_argument("--ctc_distill_mode", choices=["lattice", "greedy"], default="lattice",
                     help="lattice: the fused joint's per-frame lattice posteriors -> one fused KL (needs --fused_joint, "
                          "no decoding); greedy: decode the transducer every step (~1.75x step time)")
+    ap.add_argument("--teacher", default=None, help="teacher_kd.py: a frozen transducer teacher (HF id or .nemo) on "
+                    "the SAME tokenizer as the student (--tok = the teacher's pieces); every batch both student heads "
+                    "learn --hard_weight x text loss + --kd_weight x KD")
+    ap.add_argument("--teacher_ckpt", default=None, help="teacher weights over --teacher: a Lightning .ckpt path or hf:<repo>:<path>")
+    ap.add_argument("--teacher_lookaheads", type=int, nargs="*", default=[13, 6, 3, 1, 0, -1],
+                    help="the look-ahead set the teacher was fine-tuned with (its context follows the student's)")
+    ap.add_argument("--kd_weight", type=float, default=0.7)
+    ap.add_argument("--hard_weight", type=float, default=0.3)
     ap.add_argument("--ctc_distill_only", action="store_true",
                     help="with --ctc_distill: the CTC head's loss is ONLY the transducer distillation (no text CTC)")
     ap.add_argument("--head_lr", type=float, default=None,
@@ -1082,8 +1090,12 @@ def main():
         ctc_only.enable(m)
     if a.ctc_head:                       # after fused_ctc: the eval-time CTC loss still goes through it
         import selfcond_head
-        selfcond_head.enable(m, a.ctc_head, distill=a.ctc_distill, distill_only=a.ctc_distill_only,
-                             distill_mode=a.ctc_distill_mode if a.fused_joint else "greedy")
+        if a.teacher:                    # the CTC head learns from the TEACHER's per-frame lattice targets
+            assert a.fused_joint and a.fused_attn, "--teacher needs --fused_joint and --fused_attn"
+            selfcond_head.enable(m, a.ctc_head, distill=a.kd_weight, distill_mode="lattice", hard=a.hard_weight)
+        else:
+            selfcond_head.enable(m, a.ctc_head, distill=a.ctc_distill, distill_only=a.ctc_distill_only,
+                                 distill_mode=a.ctc_distill_mode if a.fused_joint else "greedy")
     if hasattr(m, "ctc_wer") and a.val_blank_penalty > 0:   # hybrid model: + both heads at the app's blank penalty
         bp_metrics(m, a.val_blank_penalty)
     if a.init_weights:                   # fine-tune from a trained run: the model is built as that run was (stock
@@ -1099,6 +1111,11 @@ def main():
         assert not [k for k in miss if k in params], f"--init_weights: parameters not in the checkpoint: {miss[:8]}"
         print(f"[run] init_weights {a.init_weights}: {len(sd)} tensors loaded, all {len(params)} parameters "
               f"(missing buffers {len(miss)}, unused {len(unexp)})", flush=True)
+    if a.teacher:                        # after every student kernel / head / weight load: the teacher hooks the joint
+        assert a.fused_joint and a.fused_attn, "--teacher needs --fused_joint and --fused_attn"
+        import teacher_kd
+        teacher_kd.enable(m, a.teacher, a.teacher_ckpt, a.teacher_lookaheads, a.kd_weight, a.hard_weight,
+                          frame_k=4 if a.ctc_head else 0)
     # Exact resume: a 1-layer nn.LSTM ignores its `dropout` (applied only between layers), but with dropout > 0 the
     # first call per process makes cuDNN's dropout state, drawing a seed from the CUDA generator -- at step 1 in an
     # uninterrupted run, at the first step after a resume in a resumed one, so every later dropout mask differed
