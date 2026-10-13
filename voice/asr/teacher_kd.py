@@ -22,7 +22,7 @@ TKF = os.environ.get("TKF", "/home/marimo/work/triton-kernel-fused")
 
 
 def _ctx(left, r):
-    return [-1, -1] if r < 0 else [left - left % (r + 1), r]
+    return [-1, -1] if r < 0 else [left, r]                 # train_asr --lookaheads' rule (240 ms = [70, 3])
 
 
 def load_teacher(init, ckpt=None, lookaheads=None, fused=True):
