@@ -918,7 +918,7 @@ def main():
                     "RNN-T head learns from the transcript only)")
     ap.add_argument("--hard_rnnt", type=float, default=None, help="RNN-T head text-loss weight (default --hard_weight; "
                     "0 = KD only, the alpha/beta lattice is skipped)")
-    ap.add_argument("--kd_rnnt_mode", choices=["node", "fullsum"], default="node", help="RNN-T head KD: node = collapsed KL at every lattice node (matches the teacher's timing); fullsum = |student - teacher| -log P(Y|X) summed over all alignments (sequence level, timing-free; arXiv 2303.05958)")
+    ap.add_argument("--kd_rnnt_mode", choices=["node", "fullsum", "pos"], default="node", help="RNN-T head KD: node = collapsed KL at every lattice node (matches the teacher's timing); fullsum = |student - teacher| -log P(Y|X) summed over all alignments (sequence level, timing-free; arXiv 2303.05958); pos = the teacher's full-vocabulary distribution of every token position (frames marginalised), matched at the student's own timing")
     ap.add_argument("--kd_ctc", type=float, default=None, help="CTC head KD weight (default --kd_weight)")
     ap.add_argument("--hard_ctc", type=float, default=None, help="CTC head text-loss weight (default --hard_weight; "
                     "0 = KD only, the CTC lattice is skipped)")

@@ -171,10 +171,15 @@ def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0
                   f"max {dm.max().item():.2e}; on non-blank mass: {(dm.sum() / (1 - pr[..., -1]).sum()).item():.2e}",
                   flush=True)
             state["mass"] += 1
-        tpb, tpy, tnll, ft = rnnt_joint_node_logp(f, g, lin.weight, lin.bias, transcripts, encoder_lengths,
+        out = rnnt_joint_node_logp(f, g, lin.weight, lin.bias, transcripts, encoder_lengths,
                                                   transcript_lengths, n_rows=n_rows, frame_targets=frame_k,
-                                                  blank_penalty=teacher_bp)
-        return tpb, tpy, ft, tnll
+                                                  blank_penalty=teacher_bp, pos_targets=rnnt_mode == "pos")
+        tpb, tpy, tnll, ft = out[:4]
+        pbar = out[4] if rnnt_mode == "pos" else None
+        if pbar is not None and dead_t is not None:   # the student cannot emit masked pieces: renormalise without them
+            pbar = pbar.index_fill(-1, dead_t, 0.0)
+            pbar = pbar / pbar.sum(-1, keepdim=True).clamp_min(1e-30)
+        return tpb, tpy, ft, tnll, pbar
 
     model.training_step = training_step
     model.joint._teacher = teach

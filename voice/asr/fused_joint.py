@@ -96,8 +96,13 @@ def enable(model):
             teach = getattr(self, "_teacher", None) if self.training else None   # teacher_kd.py
             kd = teach(encoder_lengths, transcripts, transcript_lengths, n_rows) if teach is not None else None
             if kd is not None and self._kd_w > 0:   # student RNN-T: hard x nll + kd x lattice KL (hard 0: no lattice)
-                tpb, tpy, ft, tnll = kd               # CTC head gets the TEACHER's per-frame targets
-                if getattr(self, "_kd_mode", "node") == "fullsum":    # sequence level: no timing matched
+                tpb, tpy, ft, tnll, pbar = kd         # CTC head gets the TEACHER's per-frame targets
+                mode = getattr(self, "_kd_mode", "node")
+                if mode == "pos":                     # teacher's full distribution per token position, timing-free
+                    out = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
+                                          transcript_lengths, fastemit_lambda=lam, dropout=p, n_rows=n_rows,
+                                          pos=pbar, kd_weight=self._kd_w, hard_weight=self._hard_w)
+                elif mode == "fullsum":               # sequence level: no timing matched
                     out = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
                                           transcript_lengths, fastemit_lambda=lam, dropout=p, n_rows=n_rows,
                                           fs=tnll, kd_weight=self._kd_w, hard_weight=self._hard_w)
