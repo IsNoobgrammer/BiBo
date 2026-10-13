@@ -58,7 +58,7 @@ def batches(paths, sec):
         yield cur
 
 
-def run_nemo(name, la, paths, sec, bps, head="rnnt", sc_head="none"):
+def run_nemo(name, la, paths, sec, bps, head="rnnt", sc_head="none", fused=False):
     """{bp: hyps}: one model load, one decode per blank penalty (blank_penalty.py patches the RNN-T / TDT joint)."""
     import nemo.collections.asr as nemo_asr
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -87,6 +87,9 @@ def run_nemo(name, la, paths, sec, bps, head="rnnt", sc_head="none"):
                 if hasattr(layer.self_attn, "att_context_size"):
                     layer.self_attn.att_context_size = ctx
         print(f"[bench] {name} att_context {m.encoder.att_context_size} style {m.encoder.att_context_style}", flush=True)
+    if fused:                            # tkf fused relative-position attention (fused_attn.py; full context for Parakeet)
+        import fused_attn
+        fused_attn.enable(m)
     if head == "ctc":                    # hybrid RNN-T/CTC model: decode with its CTC head
         m.change_decoding_strategy(decoder_type="ctc")
     res = {}
@@ -100,7 +103,8 @@ def run_nemo(name, la, paths, sec, bps, head="rnnt", sc_head="none"):
             for i, o in zip(b, out):
                 hyp[i] = o.text if hasattr(o, "text") else str(o)
         res[bp] = hyp
-        print(f"[bench] {name} bp {bp} done", flush=True)
+        print(f"[bench] {name} bp {bp} done" + (f" (fused attention calls {m.encoder._fused_calls})" if fused else ""),
+              flush=True)
     blank_penalty.apply(0.0, head=head)
     return res
 
@@ -161,6 +165,7 @@ def main():
     ap.add_argument("--val", default=f"{A}/en3/val_*.jsonl")
     ap.add_argument("--batch_sec", type=float, default=400.0)
     ap.add_argument("--meeting_only", action="store_true")
+    ap.add_argument("--fused_attn", action="store_true", help="NeMo models: tkf fused attention (fused_attn.py)")
     ap.add_argument("--ctc_head", default="none", help="a trained .nemo with our self-conditioned CTC head: glu_glu")
     ap.add_argument("--head", choices=["rnnt", "ctc"], default="rnnt", help="NeMo hybrid models: which decoder")
     ap.add_argument("--bps", type=float, nargs="*", default=None,
@@ -171,7 +176,7 @@ def main():
     paths = [p for p, _, _ in its]
     t0 = time.time()
     if a.bps is not None and (a.model in NEMO or a.model.endswith('.nemo')):
-        res = {f"{a.out}_bp{bp:g}": h for bp, h in run_nemo(a.model, a.la, paths, a.batch_sec, a.bps, a.head, a.ctc_head).items()}
+        res = {f"{a.out}_bp{bp:g}": h for bp, h in run_nemo(a.model, a.la, paths, a.batch_sec, a.bps, a.head, a.ctc_head, a.fused_attn).items()}
     elif a.bps is not None and a.model == "granite":
         res = {f"{a.out}_bp{bp:g}": h for bp, h in run_granite_bp(paths, a.bps).items()}
     elif (a.model in NEMO or a.model.endswith('.nemo')):
