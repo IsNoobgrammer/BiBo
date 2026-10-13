@@ -923,6 +923,15 @@ def main():
                     help="the look-ahead set the teacher was fine-tuned with (its context follows the student's)")
     ap.add_argument("--kd_weight", type=float, default=0.7)
     ap.add_argument("--hard_weight", type=float, default=0.3)
+    ap.add_argument("--kd_rnnt", type=float, default=None, help="RNN-T head KD weight (default --kd_weight; 0 = the "
+                    "RNN-T head learns from the transcript only)")
+    ap.add_argument("--hard_rnnt", type=float, default=None, help="RNN-T head text-loss weight (default --hard_weight; "
+                    "0 = KD only, the alpha/beta lattice is skipped)")
+    ap.add_argument("--kd_ctc", type=float, default=None, help="CTC head KD weight (default --kd_weight)")
+    ap.add_argument("--hard_ctc", type=float, default=None, help="CTC head text-loss weight (default --hard_weight; "
+                    "0 = KD only, the CTC lattice is skipped)")
+    ap.add_argument("--no_mask_pieces", action="store_true", help="--teacher: do NOT mask the teacher's cased / "
+                    "punctuated pieces our transcripts never produce")
     ap.add_argument("--ctc_distill_only", action="store_true",
                     help="with --ctc_distill: the CTC head's loss is ONLY the transducer distillation (no text CTC)")
     ap.add_argument("--head_lr", type=float, default=None,
@@ -942,6 +951,14 @@ def main():
                     help="bitwise same-seed runs (with --fused_ctc): torch deterministic algorithms, cuDNN deterministic")
     ap.add_argument("--project", default="bibo-asr")
     a = ap.parse_args()
+    for h in ("rnnt", "ctc"):            # --teacher: per-head weights default to --kd_weight / --hard_weight
+        if getattr(a, f"kd_{h}") is None:
+            setattr(a, f"kd_{h}", a.kd_weight)
+        if getattr(a, f"hard_{h}") is None:
+            setattr(a, f"hard_{h}", a.hard_weight)
+    if a.teacher:
+        print(f"[run] teacher KD: RNN-T {a.hard_rnnt} x text + {a.kd_rnnt} x KD | CTC {a.hard_ctc} x text + {a.kd_ctc} x KD"
+              f" (weight 0 = that loss is not computed)", flush=True)
     assert not a.fp32_residual or (a.bf16_master and a.fused_layer), "--fp32_residual needs --bf16_master --fused_layer"
 
     import nemo.collections.asr as nemo_asr
@@ -1092,7 +1109,7 @@ def main():
         import selfcond_head
         if a.teacher:                    # the CTC head learns from the TEACHER's per-frame lattice targets
             assert a.fused_joint and a.fused_attn, "--teacher needs --fused_joint and --fused_attn"
-            selfcond_head.enable(m, a.ctc_head, distill=a.kd_weight, distill_mode="lattice", hard=a.hard_weight)
+            selfcond_head.enable(m, a.ctc_head, distill=a.kd_ctc, distill_mode="lattice", hard=a.hard_ctc)
         else:
             selfcond_head.enable(m, a.ctc_head, distill=a.ctc_distill, distill_only=a.ctc_distill_only,
                                  distill_mode=a.ctc_distill_mode if a.fused_joint else "greedy")
@@ -1114,8 +1131,9 @@ def main():
     if a.teacher:                        # after every student kernel / head / weight load: the teacher hooks the joint
         assert a.fused_joint and a.fused_attn, "--teacher needs --fused_joint and --fused_attn"
         import teacher_kd
-        teacher_kd.enable(m, a.teacher, a.teacher_ckpt, a.teacher_lookaheads, a.kd_weight, a.hard_weight,
-                          frame_k=4 if a.ctc_head else 0)
+        teacher_kd.enable(m, a.teacher, a.teacher_ckpt, a.teacher_lookaheads, a.kd_rnnt, a.hard_rnnt,
+                          frame_k=4 if (a.ctc_head and a.kd_ctc > 0) else 0, mask=not a.no_mask_pieces,
+                          manifest=a.train)
     # Exact resume: a 1-layer nn.LSTM ignores its `dropout` (applied only between layers), but with dropout > 0 the
     # first call per process makes cuDNN's dropout state, drawing a seed from the CUDA generator -- at step 1 in an
     # uninterrupted run, at the first step after a resume in a resumed one, so every later dropout mask differed

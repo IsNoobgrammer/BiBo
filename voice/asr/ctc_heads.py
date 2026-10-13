@@ -248,7 +248,7 @@ class SelfCondN(nn.Module):
         self.auxs = list(zip(zs[:-1], self.w[:-1]))
         return zs[-1]
 
-    def fused_loss(self, h, hl, tgt, tlen, blank, reduce=None, return_logits=False):
+    def fused_loss(self, h, hl, tgt, tlen, blank, reduce=None, return_logits=False, ctc=True):
         """Training loss via tkf's fused pass (kernels/sm120/selfcond_ctc.py): sum_i w_i * reduce(nll_i, tlen), reduce
         default = ctc()'s normalisation (nll / target length, batch mean). Same parameters and maths as forward() +
         ctc(). return_logits: also the last pass's logits (bf16, no grad) for batch WER."""
@@ -262,8 +262,9 @@ class SelfCondN(nn.Module):
             x, lin = (h, r) if isinstance(r, nn.Linear) else (r.hidden(h), r.out)
             wf = (torch.cat([self.cond[i]["cur"].weight, self.cond[i]["prev"].weight], 0)
                   if i < self.npass - 1 else None)
-            nll, q, z = selfcond_ctc_pass(x, lin.weight, lin.bias, wf, tgt, hl, tlen, blank)
-            loss = loss + self.w[i] * reduce(nll, tlen)
+            nll, q, z = selfcond_ctc_pass(x, lin.weight, lin.bias, wf, tgt, hl, tlen, blank, ctc=ctc)
+            if ctc:                      # ctc=False (teacher KD only): no CTC loss / lattice at all
+                loss = loss + self.w[i] * reduce(nll, tlen)
         return (loss, z) if return_logits else loss
 
 

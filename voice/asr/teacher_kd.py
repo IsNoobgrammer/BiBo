@@ -58,7 +58,51 @@ def load_teacher(init, ckpt=None, lookaheads=None, fused=True):
     return t
 
 
-def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0.3, frame_k=4, fused=True):
+def dead_pieces(tok, manifest=None):
+    """ids of the teacher's cased / punctuated pieces ('▁The', '..', '<unk>') that the training transcripts never
+    produce: a masked piece that DID occur as a target would cost ~1e4 nats, so the whole manifest is checked"""
+    import json
+    import re
+    ok = re.compile(r"^▁?[a-z0-9']+$")
+    sp = tok.tokenizer
+    cand = {i for i in range(sp.get_piece_size()) if not ok.match(sp.id_to_piece(i))}
+    if manifest:
+        texts = [json.loads(line)["text"] for line in open(manifest, encoding="utf-8")]
+        used = set()
+        for ids in sp.encode(texts):
+            used.update(ids)
+        print(f"[teacher_kd] {len(texts)} transcripts: {len(cand & used)} cased / punctuated pieces DO occur and stay "
+              f"unmasked: {[sp.id_to_piece(i) for i in sorted(cand & used)][:20]}", flush=True)
+        cand -= used
+    return sorted(cand)
+
+
+def mask_outputs(model, ids):
+    """student: the dead pieces' output biases held at -1e4 (logit ~ -inf in training, validation, export) in every
+    vocabulary readout (RNN-T joint + each CTC pass); their weight / bias gradients are zeroed"""
+    V1 = model.joint.joint_net[-1].out_features
+    lins = [model.joint.joint_net[-1]] + [m for m in model.ctc_decoder.modules()
+                                          if isinstance(m, torch.nn.Linear) and m.out_features == V1]
+    idx = torch.tensor(ids, dtype=torch.long, device=lins[0].weight.device)
+
+    def zero_rows(g):
+        return g.index_fill(0, idx, 0.0)
+
+    for lin in lins:
+        lin.weight.register_hook(zero_rows)
+        lin.bias.register_hook(zero_rows)
+
+    @torch.no_grad()
+    def reset():                                     # every step (weight decay must not pull them back up)
+        for lin in lins:
+            lin.bias.index_fill_(0, idx, -1e4)
+
+    reset()
+    return reset, len(lins)
+
+
+def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0.3, frame_k=4, fused=True,
+           mask=True, manifest=None):
     sys.path.insert(0, TKF)
     from kernels.sm120.rnnt_joint import rnnt_joint_node_logp
     teacher = load_teacher(init, ckpt, lookaheads, fused)
@@ -67,10 +111,20 @@ def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0
     assert a == b and model.tokenizer.vocab_size == teacher.tokenizer.vocab_size, \
         f"student and teacher tokenizers differ ({model.tokenizer.vocab_size} vs {teacher.tokenizer.vocab_size} pieces)"
     tctx = {c[1]: list(c) for c in teacher.encoder.att_context_size_all}
-    state = {"batch": None, "checked": 0}
+    state = {"batch": None, "checked": 0, "mass": 0}
+    dead = dead_pieces(teacher.tokenizer, manifest) if mask else []
+    reset = None
+    if dead:
+        reset, nlin = mask_outputs(model, dead)
+        print(f"[teacher_kd] student: {len(dead)} of {teacher.tokenizer.vocab_size} pieces masked (bias -1e4, no grad) "
+              f"in {nlin} readouts -- never produced by lowercase transcripts: "
+              f"{[teacher.tokenizer.tokenizer.id_to_piece(i) for i in dead[:12]]} ...", flush=True)
+    dead_t = torch.tensor(dead, dtype=torch.long, device="cuda") if dead else None
     orig_step = model.training_step
 
     def training_step(batch, *args, **kw):         # Lightning passes batch_idx only if the signature names it
+        if reset is not None:
+            reset()
         state["batch"] = batch[:4]                   # after on_after_batch_transfer: the augmented audio
         try:
             out = orig_step(batch, *args, **kw)
@@ -101,6 +155,16 @@ def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0
                 f"teacher / student frame counts differ: {elen.tolist()[:4]} vs {encoder_lengths.tolist()[:4]}"
             state["checked"] += 1
         lin = teacher.joint.joint_net[-1]
+        if dead_t is not None and state["mass"] < 3:  # how much the teacher puts on the masked pieces (one utterance)
+            t0, u0 = int(encoder_lengths[0]), int(transcript_lengths[0]) + 1
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                lg = teacher.joint.joint_net(f[0, :t0, None] + g[0, None, :u0])
+            pr = lg.float().softmax(-1)
+            dm = pr.index_select(-1, dead_t).sum(-1)
+            print(f"[teacher_kd] teacher mass on masked pieces (utt 0, {t0}x{u0} nodes): mean {dm.mean().item():.2e} "
+                  f"max {dm.max().item():.2e}; on non-blank mass: {(dm.sum() / (1 - pr[..., -1]).sum()).item():.2e}",
+                  flush=True)
+            state["mass"] += 1
         tpb, tpy, tnll, ft = rnnt_joint_node_logp(f, g, lin.weight, lin.bias, transcripts, encoder_lengths,
                                                   transcript_lengths, n_rows=n_rows, frame_targets=frame_k)
         return tpb, tpy, ft

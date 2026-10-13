@@ -44,8 +44,9 @@ class SelfCondCTCDecoder(nn.Module):
         h = encoder_output.transpose(1, 2)                                # (B, T, d)
         if self.training and self.stash is not None:
             tgt, tlen, hl, reduce = self.stash
+            hard = not (self.distill > 0 and (self.distill_only or self.hard == 0))   # KD only: skip the CTC lattice
             self.loss, z = self.head.fused_loss(h, hl, tgt, tlen, self.num_classes_with_blank - 1, reduce=reduce,
-                                                return_logits=True)
+                                                return_logits=True, ctc=hard)
             lat = self.lattice_src() if (self.distill > 0 and self.distill_mode == "lattice") else None
             if lat is not None:                                          # soft per-frame targets from the lattice:
                 idx, lpt = lat                                           # one fused KL (kl_div_topk), no decoding,

@@ -95,14 +95,20 @@ def enable(model):
             fk = getattr(self, "_frame_k", 0) if self.training else 0   # lattice CTC distillation (selfcond_head)
             teach = getattr(self, "_teacher", None) if self.training else None   # teacher_kd.py
             kd = teach(encoder_lengths, transcripts, transcript_lengths, n_rows) if teach is not None else None
-            if kd is not None:            # student RNN-T: hard x nll + kd x lattice KL; CTC head gets the TEACHER's
-                tpb, tpy, ft = kd         # per-frame targets
+            if kd is not None and self._kd_w > 0:   # student RNN-T: hard x nll + kd x lattice KL (hard 0: no lattice)
+                tpb, tpy, ft = kd                     # CTC head gets the TEACHER's per-frame targets
                 out = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
                                       transcript_lengths, fastemit_lambda=lam, dropout=p, n_rows=n_rows,
                                       kd=(tpb, tpy), kd_weight=self._kd_w, hard_weight=self._hard_w)
                 loss = out[0]
                 self._kd_value = out[3].mean().detach()
                 self._frame_targets = ft if fk else None
+            elif kd is not None:                      # RNN-T on the transcript only; the teacher teaches the CTC head
+                out = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
+                                      transcript_lengths, fastemit_lambda=lam, dropout=p, n_rows=n_rows,
+                                      hard_weight=self._hard_w)
+                loss = out[0]
+                self._frame_targets = kd[2] if fk else None
             else:
                 out = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
                                       transcript_lengths, fastemit_lambda=lam, dropout=p, n_rows=n_rows,
