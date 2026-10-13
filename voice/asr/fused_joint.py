@@ -97,6 +97,7 @@ def enable(model):
             kd = teach(encoder_lengths, transcripts, transcript_lengths, n_rows) if teach is not None else None
             if kd is not None and self._kd_w > 0:   # student RNN-T: hard x nll + kd x lattice KL (hard 0: no lattice)
                 tpb, tpy, ft, tnll, pbar = kd         # CTC head gets the TEACHER's per-frame targets
+                self._pbar = pbar                     # per-token targets for the CTC head too (--kd_ctc_mode pos)
                 mode = getattr(self, "_kd_mode", "node")
                 if mode == "pos":                     # teacher's full distribution per token position, timing-free
                     out = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
@@ -114,6 +115,7 @@ def enable(model):
                 self._kd_value = out[2].mean().detach()
                 self._frame_targets = ft if fk else None
             elif kd is not None:                      # RNN-T on the transcript only; the teacher teaches the CTC head
+                self._pbar = kd[4]
                 out = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
                                       transcript_lengths, fastemit_lambda=lam, dropout=p, n_rows=n_rows,
                                       hard_weight=self._hard_w)

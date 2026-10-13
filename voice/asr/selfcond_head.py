@@ -35,12 +35,38 @@ class SelfCondCTCDecoder(nn.Module):
         self.hard = 1.0                      # weight of the text CTC loss when distilling (teacher_kd: 0.3; 0 = none)
         self.distill_loss = None
         self.lattice_src = None              # () -> (idx, logp) each (B, T, K), set by enable()
+        self.mode = "align"                  # align: CE to the teacher's alignment | pos: per-token, timing-free
+        self.pbar_src = None                 # () -> P (B, U, V) the teacher's per-token targets (mode pos)
 
     def forward(self, encoder_output):
         h = encoder_output.transpose(1, 2)                                # (B, T, d)
         if self.training and self.stash is not None:
             tgt, tlen, hl, reduce = self.stash
             hard = not (self.distill > 0 and self.hard == 0)              # KD only: skip the CTC lattice
+            if self.distill > 0 and self.mode == "pos":
+                # per-token KD on the CTC head, timing-free: the teacher's distribution of token u (P_u, frames
+                # marginalised) matched at the frames where THIS head's own CTC alignment puts u: w(t, u) = its
+                # label occupancy normalised over t, per-frame target D_t = sum_u w(t, u) P_u, loss = sum_u H-term
+                # - sum_t sum_v D_t(v) log q_t(v | not blank); w detached; grad via the fused pass's logits
+                assert hard, "per-token CTC KD needs the CTC lattice (--hard_ctc > 0)"
+                self.loss, z, occ = self.head.fused_loss(h, hl, tgt, tlen, self.num_classes_with_blank - 1,
+                                                         reduce=reduce, return_logits=True, ctc=True, want_occ=True)
+                P = self.pbar_src() if self.pbar_src is not None else None
+                if P is not None:
+                    V = z.shape[-1]
+                    w = occ / occ.sum(1, keepdim=True).clamp_min(1e-30)              # (B, T, U), sum_t = 1
+                    D = torch.einsum("btu,buv->btv", w, P[:, :occ.shape[2], :V].float())
+                    zf = z.float()
+                    zf = torch.cat([zf[..., :V - 1], torch.full_like(zf[..., V - 1:], -1e4)], -1)   # blank out,
+                    lq = zf.log_softmax(-1)                                                    # finite (no 0 * -inf)
+                    Pu = P[:, :occ.shape[2], :V].float()
+                    negent = torch.where(Pu > 0, Pu * Pu.clamp_min(1e-30).log(), torch.zeros_like(Pu)).sum(-1)
+                    has = (occ.sum(1) > 0).float()                                     # tokens present
+                    tmask = (torch.arange(z.shape[1], device=z.device)[None, :] < hl[:, None]).float()
+                    kd = (negent * has).sum(1) - ((D * lq).sum(-1) * tmask).sum(1)     # per utterance
+                    self.distill_loss = kd.mean()
+                    self.loss = self.hard * self.loss + self.distill * self.distill_loss
+                return z.detach().float().log_softmax(-1)
             self.loss, z = self.head.fused_loss(h, hl, tgt, tlen, self.num_classes_with_blank - 1, reduce=reduce,
                                                 return_logits=True, ctc=hard)
             lat = self.lattice_src() if self.distill > 0 else None
@@ -79,7 +105,7 @@ def _kl_topk():
     return kl_div_topk
 
 
-def enable(model, kind, weights=None, distill=0.0, hard=1.0):
+def enable(model, kind, weights=None, distill=0.0, hard=1.0, mode="align"):
     readouts = kind.split("_")
     weights = weights or {2: (0.3, 0.7), 3: (0.2, 0.3, 0.5)}[len(readouts)]
     stock = model.ctc_decoder
@@ -88,7 +114,10 @@ def enable(model, kind, weights=None, distill=0.0, hard=1.0):
     model.ctc_decoder = dec
     dec.distill = float(distill)
     dec.hard = float(hard)
-    if dec.distill > 0:                      # teacher_kd: the fused joint writes the teacher's per-frame targets here
+    dec.mode = mode
+    if dec.distill > 0 and mode == "pos":    # teacher_kd: the fused joint keeps the teacher's per-token targets
+        dec.pbar_src = lambda: getattr(model.joint, "_pbar", None)
+    elif dec.distill > 0:                    # teacher_kd: the fused joint writes the teacher's per-frame targets here
         model.joint._frame_k = 1          # one-hot alignment targets (teacher_kd)
         dec.lattice_src = lambda: getattr(model.joint, "_frame_targets", None)
     loss = model.ctc_loss

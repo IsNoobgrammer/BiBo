@@ -922,6 +922,9 @@ def main():
                     "0 = KD only, the alpha/beta lattice is skipped)")
     ap.add_argument("--kd_rnnt_mode", choices=["node", "fullsum", "pos"], default="node", help="RNN-T head KD: node = collapsed KL at every lattice node (matches the teacher's timing); fullsum = |student - teacher| -log P(Y|X) summed over all alignments (sequence level, timing-free; arXiv 2303.05958); pos = the teacher's full-vocabulary distribution of every token position (frames marginalised), matched at the student's own timing")
     ap.add_argument("--kd_ctc", type=float, default=None, help="CTC head KD weight (default --kd_weight)")
+    ap.add_argument("--kd_ctc_mode", choices=["align", "pos"], default="align", help="CTC head KD: align = CE to the "
+                    "teacher's one-token-per-frame alignment; pos = the teacher's per-token distributions at THIS "
+                    "head's own CTC alignment (timing-free; needs --kd_rnnt_mode pos for the targets)")
     ap.add_argument("--hard_ctc", type=float, default=None, help="CTC head text-loss weight (default --hard_weight; "
                     "0 = KD only, the CTC lattice is skipped)")
     ap.add_argument("--teacher_bp", type=float, default=0.0, help="--teacher: blank penalty on the teacher's "
@@ -1098,7 +1101,7 @@ def main():
         import selfcond_head
         if a.teacher:                    # the CTC head learns from the TEACHER's per-frame lattice targets
             assert a.fused_joint and a.fused_attn, "--teacher needs --fused_joint and --fused_attn"
-            selfcond_head.enable(m, a.ctc_head, distill=a.kd_ctc, hard=a.hard_ctc)
+            selfcond_head.enable(m, a.ctc_head, distill=a.kd_ctc, hard=a.hard_ctc, mode=a.kd_ctc_mode)
         else:
             selfcond_head.enable(m, a.ctc_head)
     if hasattr(m, "ctc_wer") and a.val_blank_penalty > 0:   # hybrid model: + both heads at the app's blank penalty
@@ -1125,7 +1128,8 @@ def main():
         assert a.fused_joint and a.fused_attn, "--teacher needs --fused_joint and --fused_attn"
         import teacher_kd
         teacher_kd.enable(m, a.teacher, a.teacher_ckpt, a.teacher_lookaheads, a.kd_rnnt, a.hard_rnnt,
-                          frame_k=1 if (a.ctc_head and a.kd_ctc > 0) else 0, mask=not a.no_mask_pieces,
+                          frame_k=1 if (a.ctc_head and a.kd_ctc > 0 and a.kd_ctc_mode == "align") else 0,
+                          mask=not a.no_mask_pieces,
                           manifest=a.train, teacher_bp=a.teacher_bp, teacher_la=a.teacher_la,
                           rnnt_mode=a.kd_rnnt_mode, cache=a.kd_cache)
     # Exact resume: a 1-layer nn.LSTM ignores its `dropout` (applied only between layers), but with dropout > 0 the
