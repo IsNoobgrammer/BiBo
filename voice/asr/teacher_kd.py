@@ -243,6 +243,10 @@ def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0
         "kd cache: per-token mode with a fixed --teacher_la (a cached target must not depend on the sampled context)"
     from kernels.sm120.rnnt_joint import rnnt_joint_node_logp
     teacher = load_teacher(init, ckpt, lookaheads, fused)
+    tdt = [int(d) for d in (teacher.cfg.model_defaults.get("tdt_durations", None) or [])]   # Parakeet TDT teacher
+    if tdt:
+        assert rnnt_mode == "pos" and not frame_k, "a TDT teacher only supports per-token targets (--kd_rnnt_mode pos)"
+        from kernels.sm120.tdt_joint import tdt_joint_pos_targets
     sample = "the quick brown fox jumps over the lazy dog's medical appointment on tuesday"
     a, b = model.tokenizer.text_to_ids(sample), teacher.tokenizer.text_to_ids(sample)
     assert a == b and model.tokenizer.vocab_size == teacher.tokenizer.vocab_size, \
@@ -305,12 +309,16 @@ def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0
             dec, _, _ = teacher.decoder(targets=transcripts, target_length=transcript_lengths)
             f = teacher.joint.project_encoder(enc.transpose(1, 2))
             g = teacher.joint.project_prednet(dec.transpose(1, 2))
-        if state["checked"] < 3:                     # 3 one-off syncs: the two lattices must line up node for node
+        if tdt:                                      # per-token targets are frame-free: the teacher's own lattice
+            lin = teacher.joint.joint_net[-1]
+            pbar, _ = tdt_joint_pos_targets(f, g, lin.weight, lin.bias, transcripts, elen, transcript_lengths, tdt)
+            tpb = tpy = tnll = ft = None
+        if not tdt and state["checked"] < 3:         # 3 one-off syncs: the two lattices must line up node for node
             assert torch.equal(elen.long(), encoder_lengths.long()), \
                 f"teacher / student frame counts differ: {elen.tolist()[:4]} vs {encoder_lengths.tolist()[:4]}"
             state["checked"] += 1
         lin = teacher.joint.joint_net[-1]
-        if dead_t is not None and state["mass"] < 3:  # how much the teacher puts on the masked pieces (one utterance)
+        if not tdt and dead_t is not None and state["mass"] < 3:  # how much the teacher puts on the masked pieces (one utterance)
             t0, u0 = int(encoder_lengths[0]), int(transcript_lengths[0]) + 1
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 lg = teacher.joint.joint_net(f[0, :t0, None] + g[0, None, :u0])
@@ -320,11 +328,12 @@ def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0
                   f"max {dm.max().item():.2e}; on non-blank mass: {(dm.sum() / (1 - pr[..., -1]).sum()).item():.2e}",
                   flush=True)
             state["mass"] += 1
-        out = rnnt_joint_node_logp(f, g, lin.weight, lin.bias, transcripts, encoder_lengths,
-                                                  transcript_lengths, n_rows=n_rows, frame_targets=frame_k,
-                                                  blank_penalty=teacher_bp, pos_targets=rnnt_mode == "pos")
-        tpb, tpy, tnll, ft = out[:4]
-        pbar = out[4] if rnnt_mode == "pos" else None
+        if not tdt:
+            out = rnnt_joint_node_logp(f, g, lin.weight, lin.bias, transcripts, encoder_lengths,
+                                       transcript_lengths, n_rows=n_rows, frame_targets=frame_k,
+                                       blank_penalty=teacher_bp, pos_targets=rnnt_mode == "pos")
+            tpb, tpy, tnll, ft = out[:4]
+            pbar = out[4] if rnnt_mode == "pos" else None
         if pbar is not None and dead_t is not None:   # the student cannot emit masked pieces: renormalise without them
             pbar = pbar.index_fill(-1, dead_t, 0.0)
             pbar = pbar / pbar.sum(-1, keepdim=True).clamp_min(1e-30)
