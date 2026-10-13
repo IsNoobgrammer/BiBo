@@ -119,6 +119,7 @@ def _check_pk():
     import random
     import nemo.collections.asr as nemo_asr
     import soundfile as sf
+    sys.path.insert(0, TKF)
     from kernels.sm120.tdt_joint import tdt_joint_pos_targets
     m = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v2").cuda().eval()
     sys.path.insert(0, TKF)
