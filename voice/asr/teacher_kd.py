@@ -106,6 +106,113 @@ def mask_outputs(model, ids):
     return reset, len(lins)
 
 
+def load_store(path, n_rows):
+    """teacher_dump.py shards -> (start (n_rows,) int64 or -1, U (n_rows,) int32, idx (T, K) int16, p (T, K) float16,
+    tok (T,) int16) indexed by manifest row"""
+    import glob
+    import numpy as np
+    if path.startswith("hf:"):
+        from huggingface_hub import snapshot_download
+        _, repo, sub = path.split(":", 2)
+        path = os.path.join(snapshot_download(repo, allow_patterns=[f"{sub}/*.npz"]), sub)
+    files = sorted(glob.glob(os.path.join(path, "shard_*.npz")))
+    assert files, f"no teacher_dump shards in {path}"
+    start = np.full(n_rows, -1, np.int64)
+    U = np.zeros(n_rows, np.int32)
+    idx, p, tok, base = [], [], [], 0
+    for fn in files:
+        z = np.load(fn)
+        r = z["row"]
+        assert r.max() < n_rows, f"{fn}: row {r.max()} >= manifest rows {n_rows} (another manifest?)"
+        start[r] = z["off"] + base
+        U[r] = z["U"]
+        idx.append(z["idx"]); p.append(z["p"]); tok.append(z["tok"])
+        base += len(z["tok"])
+    return start, U, np.concatenate(idx), np.concatenate(p), np.concatenate(tok), len(files)
+
+
+def enable_store(model, path, kd_weight=0.7, hard_weight=1.0, mask=True, manifest=None):
+    """per-token KD on the RNN-T head from DUMPED teacher targets (teacher_dump.py): no teacher forward in the step.
+    The fast loader's batches carry their manifest row ids (5th element); an outermost on_before_batch_transfer
+    takes them off (NeMo's step sees the usual 4) and the joint builds the dense (B, U, V) targets from the store."""
+    import numpy as np
+    n_rows = sum(1 for _ in open(manifest, encoding="utf-8"))
+    start, U, idx, p, tok, nf = load_store(path, n_rows)
+    missing = int((start < 0).sum())
+    assert missing == 0, f"teacher store {path}: {missing} of {n_rows} manifest rows have no targets"
+    V1 = model.joint.joint_net[-1].out_features
+    dead = dead_pieces(model.tokenizer, manifest) if mask else []
+    reset = None
+    if dead:
+        reset, nlin = mask_outputs(model, dead)
+        print(f"[teacher_kd] student: {len(dead)} pieces masked (bias -1e4, no grad) in {nlin} readouts", flush=True)
+    dead_t = torch.tensor(dead, dtype=torch.long, device="cuda") if dead else None
+    state = {"ids": None, "checked": 0}
+    before = model.on_before_batch_transfer
+
+    def on_before_batch_transfer(batch, dataloader_idx):
+        if isinstance(batch, (tuple, list)) and len(batch) == 5:
+            state["ids"] = batch[4].numpy()
+            batch = tuple(batch[:4])
+        return before(batch, dataloader_idx)
+
+    model.on_before_batch_transfer = on_before_batch_transfer
+    orig_step = model.training_step
+
+    def training_step(batch, *args, **kw):
+        if reset is not None:
+            reset()
+        try:
+            out = orig_step(batch, *args, **kw)
+            kd = getattr(model.joint, "_kd_value", None)
+            if kd is not None:
+                model.log("core/loss_kd_rnnt", kd, on_step=True, on_epoch=False)
+            return out
+        finally:
+            model.joint._kd_value = None
+
+    def teach(encoder_lengths, transcripts, transcript_lengths, n_rows_):
+        ids = state["ids"]
+        if ids is None:
+            return None
+        B, Um = transcripts.shape
+        u = U[ids]
+        if state["checked"] < 5:                     # join check: the stored tokens ARE this batch's labels
+            tl = transcript_lengths.cpu().numpy()
+            assert (u == tl).all(), f"store token counts != labels for rows {ids[u != tl][:4]}"
+            tr = transcripts.cpu().numpy()
+            for k in range(B):
+                st = start[ids[k]]
+                assert (tok[st:st + u[k]].astype(np.int64) == tr[k, :u[k]]).all(), f"store tokens != labels, row {ids[k]}"
+            state["checked"] += 1
+            if state["checked"] == 5:
+                print("[teacher_kd] store join check: 5 batches, every row's stored tokens == its labels", flush=True)
+        pos = np.concatenate([np.arange(n) for n in u]) if u.sum() else np.zeros(0, np.int64)
+        brow = np.repeat(np.arange(B), u)
+        src = np.repeat(start[ids], u) + pos
+        K = idx.shape[1]
+        ii = torch.from_numpy(idx[src].astype(np.int64)).cuda(non_blocking=True)
+        pp = torch.from_numpy(p[src].astype(np.float32)).cuda(non_blocking=True)
+        dense = torch.zeros(B * Um, V1, device="cuda")
+        flat = torch.from_numpy(brow * Um + pos).cuda(non_blocking=True)
+        rows_ = torch.zeros(len(src), V1, device="cuda").scatter_(1, ii, pp)
+        dense.index_copy_(0, flat, rows_)
+        pbar = dense.view(B, Um, V1)
+        if dead_t is not None:
+            pbar.index_fill_(-1, dead_t, 0.0)
+        pbar[..., V1 - 1] = 0.0
+        pbar = pbar / pbar.sum(-1, keepdim=True).clamp_min(1e-30)
+        return None, None, None, None, pbar
+
+    model.training_step = training_step
+    model.joint._teacher = teach
+    model.joint._kd_w = float(kd_weight)
+    model.joint._hard_w = float(hard_weight)
+    model.joint._kd_mode = "pos"
+    print(f"[teacher_kd] per-token KD from the dumped store {path}: {nf} shards, {len(tok)} tokens, {n_rows} rows, "
+          f"top-{idx.shape[1]}; RNN-T loss = {hard_weight} x text + {kd_weight} x KD; no teacher model", flush=True)
+
+
 def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0.3, frame_k=1, fused=True,
            rnnt_mode="node",
            mask=True, manifest=None, teacher_bp=0.0, teacher_la=None):

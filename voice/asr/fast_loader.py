@@ -176,8 +176,8 @@ class BatchPlan:
 class FastAudioDataset(torch.utils.data.Dataset):
     """Map-style: the DataLoader hands __getitem__ a whole batch of row ids (batch_size=None + BatchPlan)."""
 
-    def __init__(self, index, sr=16000):
-        self.index, self.sr = index, sr
+    def __init__(self, index, sr=16000, with_ids=False):
+        self.index, self.sr, self.with_ids = index, sr, with_ids      # with_ids: + the batch's manifest row ids
 
     def __getitem__(self, ids):
         ix = self.index
@@ -194,7 +194,8 @@ class FastAudioDataset(torch.utils.data.Dataset):
         toks = np.zeros((len(ids), max(int(tl.max()), 1)), np.int64)
         for k, i in enumerate(ids):
             toks[k, : tl[k]] = ix.a["tok"][to[i]:to[i + 1]]
-        return torch.from_numpy(audio), torch.from_numpy(alen), torch.from_numpy(toks), torch.from_numpy(tl)
+        out = (torch.from_numpy(audio), torch.from_numpy(alen), torch.from_numpy(toks), torch.from_numpy(tl))
+        return out + (torch.from_numpy(np.asarray(ids, np.int64)),) if self.with_ids else out
 
     def __len__(self):
         return len(self.index)

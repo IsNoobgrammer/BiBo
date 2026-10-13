@@ -155,6 +155,8 @@ def wrap_train_sampler(m, a=None):
               f"(worst {100 * st['min_fill']:.1f}%) of {a.batch_sec:.0f} s, {st['tails']} bucket tails, padding "
               f"{100 * st['padding']:.1f}%, {st['utts']:.0f} clips/batch, {dl.num_workers} workers", flush=True)
         assert st["fill"] >= 0.95, f"preflight: batches only {100 * st['fill']:.1f}% full -- fix before training"
+        if getattr(a, "kd_targets", None):            # teacher_kd store: the batch carries its manifest row ids
+            dl.dataset.with_ids = True
         m._train_dl = torch.utils.data.DataLoader(dl.dataset, sampler=SkipFirst(plan), batch_size=None,
                                                   num_workers=dl.num_workers, pin_memory=True,
                                                   persistent_workers=dl.num_workers > 0, prefetch_factor=4)
@@ -927,6 +929,9 @@ def main():
                     "teacher's blank / deletion bias")
     ap.add_argument("--teacher_la", type=int, default=None, help="--teacher: FIXED teacher look-ahead in 80 ms frames "
                     "(-1 = full context); default: the student's sampled look-ahead of each batch")
+    ap.add_argument("--kd_targets", default=None, help="per-token KD from DUMPED teacher targets (teacher_dump.py "
+                    "shards: a local dir or hf:<repo>:<dir>) instead of a teacher forward every step; RNN-T head, "
+                    "--kd_rnnt / --hard_rnnt weights; needs --loader fast")
     ap.add_argument("--no_mask_pieces", action="store_true", help="--teacher: do NOT mask the teacher's cased / "
                     "punctuated pieces our transcripts never produce")
     ap.add_argument("--ctc_weight", type=float, default=None, help="hybrid loss = (1-w) RNN-T + w CTC (model default 0.3)")
@@ -1109,6 +1114,11 @@ def main():
         assert not [k for k in miss if k in params], f"--init_weights: parameters not in the checkpoint: {miss[:8]}"
         print(f"[run] init_weights {a.init_weights}: {len(sd)} tensors loaded, all {len(params)} parameters "
               f"(missing buffers {len(miss)}, unused {len(unexp)})", flush=True)
+    if a.kd_targets:                     # per-token KD from dumped targets: no teacher model at all
+        assert not a.teacher and a.fused_joint and a.loader == "fast", "--kd_targets: no --teacher, --fused_joint, fast loader"
+        assert a.kd_ctc == 0, "--kd_targets: the CTC head trains on text (--kd_ctc 0)"
+        import teacher_kd
+        teacher_kd.enable_store(m, a.kd_targets, a.kd_rnnt, a.hard_rnnt, mask=not a.no_mask_pieces, manifest=a.train)
     if a.teacher:                        # after every student kernel / head / weight load: the teacher hooks the joint
         assert a.fused_joint and a.fused_attn, "--teacher needs --fused_joint and --fused_attn"
         import teacher_kd
