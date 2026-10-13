@@ -47,8 +47,9 @@ class SelfCondCTCDecoder(nn.Module):
                                                 return_logits=True)
             lat = self.lattice_src() if (self.distill > 0 and self.distill_mode == "lattice") else None
             if lat is not None:                                          # soft per-frame targets from the lattice:
-                idx, lpt = lat                                           # one fused KL (kl_div_topk), no decoding
-                z2 = self.head(h)
+                idx, lpt = lat                                           # one fused KL (kl_div_topk), no decoding,
+                z2 = z                                                   # on the fused pass's own logits (its grad
+                                                                         # joins the pass's fused backward)
                 B, T, V = z2.shape
                 Tt = min(T, idx.shape[1])
                 K = idx.shape[2]
@@ -65,7 +66,7 @@ class SelfCondCTCDecoder(nn.Module):
             if self.distill > 0 and self.distill_loss is not None:
                 self.loss = (self.distill * self.distill_loss if self.distill_only
                              else self.loss + self.distill * self.distill_loss)
-            return z.float().log_softmax(-1)                              # batch-WER only (no grad)
+            return z.detach().float().log_softmax(-1)                     # batch-WER only (no grad)
         return (self.head(h).float() / self.temperature).log_softmax(-1)
 
     # NeMo's change_decoding_strategy on hybrid models calls these on ctc_decoder (a NeuralModule API)
