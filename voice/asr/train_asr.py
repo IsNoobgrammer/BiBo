@@ -918,6 +918,7 @@ def main():
                     "RNN-T head learns from the transcript only)")
     ap.add_argument("--hard_rnnt", type=float, default=None, help="RNN-T head text-loss weight (default --hard_weight; "
                     "0 = KD only, the alpha/beta lattice is skipped)")
+    ap.add_argument("--kd_rnnt_mode", choices=["node", "fullsum"], default="node", help="RNN-T head KD: node = collapsed KL at every lattice node (matches the teacher's timing); fullsum = |student - teacher| -log P(Y|X) summed over all alignments (sequence level, timing-free; arXiv 2303.05958)")
     ap.add_argument("--kd_ctc", type=float, default=None, help="CTC head KD weight (default --kd_weight)")
     ap.add_argument("--hard_ctc", type=float, default=None, help="CTC head text-loss weight (default --hard_weight; "
                     "0 = KD only, the CTC lattice is skipped)")
@@ -1113,7 +1114,8 @@ def main():
         import teacher_kd
         teacher_kd.enable(m, a.teacher, a.teacher_ckpt, a.teacher_lookaheads, a.kd_rnnt, a.hard_rnnt,
                           frame_k=1 if (a.ctc_head and a.kd_ctc > 0) else 0, mask=not a.no_mask_pieces,
-                          manifest=a.train, teacher_bp=a.teacher_bp, teacher_la=a.teacher_la)
+                          manifest=a.train, teacher_bp=a.teacher_bp, teacher_la=a.teacher_la,
+                          rnnt_mode=a.kd_rnnt_mode)
     # Exact resume: a 1-layer nn.LSTM ignores its `dropout` (applied only between layers), but with dropout > 0 the
     # first call per process makes cuDNN's dropout state, drawing a seed from the CUDA generator -- at step 1 in an
     # uninterrupted run, at the first step after a resume in a resumed one, so every later dropout mask differed

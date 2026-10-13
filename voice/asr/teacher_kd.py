@@ -107,6 +107,7 @@ def mask_outputs(model, ids):
 
 
 def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0.3, frame_k=1, fused=True,
+           rnnt_mode="node",
            mask=True, manifest=None, teacher_bp=0.0, teacher_la=None):
     sys.path.insert(0, TKF)
     from kernels.sm120.rnnt_joint import rnnt_joint_node_logp
@@ -173,11 +174,12 @@ def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0
         tpb, tpy, tnll, ft = rnnt_joint_node_logp(f, g, lin.weight, lin.bias, transcripts, encoder_lengths,
                                                   transcript_lengths, n_rows=n_rows, frame_targets=frame_k,
                                                   blank_penalty=teacher_bp)
-        return tpb, tpy, ft
+        return tpb, tpy, ft, tnll
 
     model.training_step = training_step
     model.joint._teacher = teach
     model.joint._kd_w = float(kd_weight)
+    model.joint._kd_mode = rnnt_mode           # node: lattice KL | fullsum: |nll - teacher nll|
     model.joint._hard_w = float(hard_weight)
     model._kd_teacher = [teacher]                    # a list: not registered as a submodule (not saved, not trained)
     n = sum(p.numel() for p in teacher.parameters())

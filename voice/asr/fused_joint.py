@@ -96,10 +96,15 @@ def enable(model):
             teach = getattr(self, "_teacher", None) if self.training else None   # teacher_kd.py
             kd = teach(encoder_lengths, transcripts, transcript_lengths, n_rows) if teach is not None else None
             if kd is not None and self._kd_w > 0:   # student RNN-T: hard x nll + kd x lattice KL (hard 0: no lattice)
-                tpb, tpy, ft = kd                     # CTC head gets the TEACHER's per-frame targets
-                out = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
-                                      transcript_lengths, fastemit_lambda=lam, dropout=p, n_rows=n_rows,
-                                      kd=(tpb, tpy), kd_weight=self._kd_w, hard_weight=self._hard_w)
+                tpb, tpy, ft, tnll = kd               # CTC head gets the TEACHER's per-frame targets
+                if getattr(self, "_kd_mode", "node") == "fullsum":    # sequence level: no timing matched
+                    out = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
+                                          transcript_lengths, fastemit_lambda=lam, dropout=p, n_rows=n_rows,
+                                          fs=tnll, kd_weight=self._kd_w, hard_weight=self._hard_w)
+                else:
+                    out = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
+                                          transcript_lengths, fastemit_lambda=lam, dropout=p, n_rows=n_rows,
+                                          kd=(tpb, tpy), kd_weight=self._kd_w, hard_weight=self._hard_w)
                 loss = out[0]
                 self._kd_value = out[2].mean().detach()
                 self._frame_targets = ft if fk else None
