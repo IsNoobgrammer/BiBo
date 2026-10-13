@@ -213,10 +213,34 @@ def enable_store(model, path, kd_weight=0.7, hard_weight=1.0, mask=True, manifes
           f"top-{idx.shape[1]}; RNN-T loss = {hard_weight} x text + {kd_weight} x KD; no teacher model", flush=True)
 
 
+def _dense_from_topk(rows, B, Um, V1, dead_t):
+    """rows: per batch row (idx (U, K) int, p (U, K) float) -> (B, Um, V1) per-token targets on the GPU, renormalised
+    over the stored top-K, blank and masked pieces 0"""
+    import numpy as np
+    U = [len(r[0]) for r in rows]
+    if not sum(U):
+        return torch.zeros(B, Um, V1, device="cuda")
+    ii = torch.from_numpy(np.concatenate([r[0] for r in rows]).astype(np.int64)).cuda(non_blocking=True)
+    pp = torch.from_numpy(np.concatenate([r[1] for r in rows]).astype(np.float32)).cuda(non_blocking=True)
+    flat = torch.from_numpy(np.concatenate([b * Um + np.arange(u) for b, u in enumerate(U)]).astype(np.int64)).cuda()
+    dense = torch.zeros(B * Um, V1, device="cuda")
+    dense.index_copy_(0, flat, torch.zeros(len(ii), V1, device="cuda").scatter_(1, ii, pp))
+    pbar = dense.view(B, Um, V1)
+    if dead_t is not None:
+        pbar.index_fill_(-1, dead_t, 0.0)
+    pbar[..., V1 - 1] = 0.0
+    return pbar / pbar.sum(-1, keepdim=True).clamp_min(1e-30)
+
+
 def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0.3, frame_k=1, fused=True,
            rnnt_mode="node",
-           mask=True, manifest=None, teacher_bp=0.0, teacher_la=None):
+           mask=True, manifest=None, teacher_bp=0.0, teacher_la=None, cache=False, cache_k=16):
+    """cache=True (per-token mode, FIXED teacher look-ahead): each row's top-cache_k targets are kept in RAM the
+    first time the teacher sees it (epoch 1); a batch whose rows are all cached skips the teacher (epoch 2+). Needs
+    the fast loader's row ids (train_asr --kd_cache)."""
     sys.path.insert(0, TKF)
+    assert not cache or (rnnt_mode == "pos" and teacher_la is not None and not frame_k), \
+        "kd cache: per-token mode with a fixed --teacher_la (a cached target must not depend on the sampled context)"
     from kernels.sm120.rnnt_joint import rnnt_joint_node_logp
     teacher = load_teacher(init, ckpt, lookaheads, fused)
     sample = "the quick brown fox jumps over the lazy dog's medical appointment on tuesday"
@@ -233,6 +257,18 @@ def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0
               f"in {nlin} readouts -- never produced by lowercase transcripts: "
               f"{[teacher.tokenizer.tokenizer.id_to_piece(i) for i in dead[:12]]} ...", flush=True)
     dead_t = torch.tensor(dead, dtype=torch.long, device="cuda") if dead else None
+    store = {}                                       # kd cache: manifest row -> (idx (U, K) int16, p (U, K) float16)
+    stats = {"hit": 0, "miss": 0}
+    if cache:
+        before = model.on_before_batch_transfer
+
+        def on_before_batch_transfer(batch, dataloader_idx):
+            if isinstance(batch, (tuple, list)) and len(batch) == 5:
+                state["ids"] = batch[4].numpy()
+                batch = tuple(batch[:4])
+            return before(batch, dataloader_idx)
+
+        model.on_before_batch_transfer = on_before_batch_transfer
     orig_step = model.training_step
 
     def training_step(batch, *args, **kw):         # Lightning passes batch_idx only if the signature names it
@@ -253,6 +289,12 @@ def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0
     def teach(encoder_lengths, transcripts, transcript_lengths, n_rows):
         if state["batch"] is None:
             return None
+        ids = state.get("ids") if cache else None
+        V1 = model.joint.joint_net[-1].out_features
+        if ids is not None and all(int(i) in store for i in ids):   # epoch 2+: no teacher forward
+            stats["hit"] += 1
+            pbar = _dense_from_topk([store[int(i)] for i in ids], transcripts.shape[0], transcripts.shape[1], V1, dead_t)
+            return None, None, None, None, pbar
         sig, slen = state["batch"][0], state["batch"][1]
         ctx = getattr(model.encoder, "_fused_ctx", None)
         assert ctx is not None, "teacher_kd needs --fused_attn on the student (its sampled look-ahead)"
@@ -286,6 +328,15 @@ def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0
         if pbar is not None and dead_t is not None:   # the student cannot emit masked pieces: renormalise without them
             pbar = pbar.index_fill(-1, dead_t, 0.0)
             pbar = pbar / pbar.sum(-1, keepdim=True).clamp_min(1e-30)
+        if ids is not None and pbar is not None:      # epoch 1: keep each row's top-K for later epochs
+            stats["miss"] += 1
+            pk, ik = pbar.topk(cache_k, dim=-1)
+            pk, ik = pk.cpu().numpy().astype("float16"), ik.cpu().numpy().astype("int16")
+            ul = transcript_lengths.cpu().numpy()
+            for b, i in enumerate(ids):
+                store[int(i)] = (ik[b, :ul[b]], pk[b, :ul[b]])
+            if stats["miss"] % 1000 == 0:
+                print(f"[teacher_kd] cache: {len(store)} rows stored, {stats['hit']} cached batches so far", flush=True)
         return tpb, tpy, ft, tnll, pbar
 
     model.training_step = training_step
@@ -294,6 +345,7 @@ def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0
     model.joint._kd_mode = rnnt_mode           # node: lattice KL | fullsum: |nll - teacher nll|
     model.joint._hard_w = float(hard_weight)
     model._kd_teacher = [teacher]                    # a list: not registered as a submodule (not saved, not trained)
+    model._kd_cache_stats = stats
     n = sum(p.numel() for p in teacher.parameters())
     print(f"[teacher_kd] teacher {n / 1e6:.0f}M params frozen; student loss per head = {hard_weight} x hard + "
           f"{kd_weight} x KD (RNN-T: collapsed lattice KL; CTC: CE to the teacher's one-token-per-frame alignment); teacher look-ahead "

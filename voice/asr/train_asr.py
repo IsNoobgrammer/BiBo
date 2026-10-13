@@ -155,7 +155,7 @@ def wrap_train_sampler(m, a=None):
               f"(worst {100 * st['min_fill']:.1f}%) of {a.batch_sec:.0f} s, {st['tails']} bucket tails, padding "
               f"{100 * st['padding']:.1f}%, {st['utts']:.0f} clips/batch, {dl.num_workers} workers", flush=True)
         assert st["fill"] >= 0.95, f"preflight: batches only {100 * st['fill']:.1f}% full -- fix before training"
-        if getattr(a, "kd_targets", None):            # teacher_kd store: the batch carries its manifest row ids
+        if getattr(a, "kd_targets", None) or getattr(a, "kd_cache", False):   # the batch carries its row ids
             dl.dataset.with_ids = True
         m._train_dl = torch.utils.data.DataLoader(dl.dataset, sampler=SkipFirst(plan), batch_size=None,
                                                   num_workers=dl.num_workers, pin_memory=True,
@@ -932,6 +932,8 @@ def main():
     ap.add_argument("--kd_targets", default=None, help="per-token KD from DUMPED teacher targets (teacher_dump.py "
                     "shards: a local dir or hf:<repo>:<dir>) instead of a teacher forward every step; RNN-T head, "
                     "--kd_rnnt / --hard_rnnt weights; needs --loader fast")
+    ap.add_argument("--kd_cache", action="store_true", help="--teacher, per-token mode, fixed --teacher_la: keep "
+                    "each row's teacher targets in RAM after its first visit; later epochs skip the teacher forward")
     ap.add_argument("--no_mask_pieces", action="store_true", help="--teacher: do NOT mask the teacher's cased / "
                     "punctuated pieces our transcripts never produce")
     ap.add_argument("--ctc_weight", type=float, default=None, help="hybrid loss = (1-w) RNN-T + w CTC (model default 0.3)")
@@ -1125,7 +1127,7 @@ def main():
         teacher_kd.enable(m, a.teacher, a.teacher_ckpt, a.teacher_lookaheads, a.kd_rnnt, a.hard_rnnt,
                           frame_k=1 if (a.ctc_head and a.kd_ctc > 0) else 0, mask=not a.no_mask_pieces,
                           manifest=a.train, teacher_bp=a.teacher_bp, teacher_la=a.teacher_la,
-                          rnnt_mode=a.kd_rnnt_mode)
+                          rnnt_mode=a.kd_rnnt_mode, cache=a.kd_cache)
     # Exact resume: a 1-layer nn.LSTM ignores its `dropout` (applied only between layers), but with dropout > 0 the
     # first call per process makes cuDNN's dropout state, drawing a seed from the CUDA generator -- at step 1 in an
     # uninterrupted run, at the first step after a resume in a resumed one, so every later dropout mask differed
