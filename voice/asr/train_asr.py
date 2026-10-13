@@ -930,6 +930,11 @@ def main():
     ap.add_argument("--kd_ctc", type=float, default=None, help="CTC head KD weight (default --kd_weight)")
     ap.add_argument("--hard_ctc", type=float, default=None, help="CTC head text-loss weight (default --hard_weight; "
                     "0 = KD only, the CTC lattice is skipped)")
+    ap.add_argument("--teacher_bp", type=float, default=0.0, help="--teacher: blank penalty on the teacher's "
+                    "distribution before the KD (its best decode setting, e.g. 1.0): the student does not inherit the "
+                    "teacher's blank / deletion bias")
+    ap.add_argument("--teacher_la", type=int, default=None, help="--teacher: FIXED teacher look-ahead in 80 ms frames "
+                    "(-1 = full context); default: the student's sampled look-ahead of each batch")
     ap.add_argument("--no_mask_pieces", action="store_true", help="--teacher: do NOT mask the teacher's cased / "
                     "punctuated pieces our transcripts never produce")
     ap.add_argument("--ctc_distill_only", action="store_true",
@@ -1133,7 +1138,7 @@ def main():
         import teacher_kd
         teacher_kd.enable(m, a.teacher, a.teacher_ckpt, a.teacher_lookaheads, a.kd_rnnt, a.hard_rnnt,
                           frame_k=4 if (a.ctc_head and a.kd_ctc > 0) else 0, mask=not a.no_mask_pieces,
-                          manifest=a.train)
+                          manifest=a.train, teacher_bp=a.teacher_bp, teacher_la=a.teacher_la)
     # Exact resume: a 1-layer nn.LSTM ignores its `dropout` (applied only between layers), but with dropout > 0 the
     # first call per process makes cuDNN's dropout state, drawing a seed from the CUDA generator -- at step 1 in an
     # uninterrupted run, at the first step after a resume in a resumed one, so every later dropout mask differed

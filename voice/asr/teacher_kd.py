@@ -107,7 +107,7 @@ def mask_outputs(model, ids):
 
 
 def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0.3, frame_k=4, fused=True,
-           mask=True, manifest=None):
+           mask=True, manifest=None, teacher_bp=0.0, teacher_la=None):
     sys.path.insert(0, TKF)
     from kernels.sm120.rnnt_joint import rnnt_joint_node_logp
     teacher = load_teacher(init, ckpt, lookaheads, fused)
@@ -148,7 +148,7 @@ def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0
         sig, slen = state["batch"][0], state["batch"][1]
         ctx = getattr(model.encoder, "_fused_ctx", None)
         assert ctx is not None, "teacher_kd needs --fused_attn on the student (its sampled look-ahead)"
-        r = ctx[0][1]
+        r = ctx[0][1] if teacher_la is None else teacher_la   # fixed teacher look-ahead (-1 = full) or the student's
         teacher.encoder.set_default_att_context_size(tctx.get(r, _ctx(70, r)))
         with torch.autocast("cuda", dtype=torch.bfloat16):
             enc, elen = teacher.forward(input_signal=sig, input_signal_length=slen)
@@ -171,7 +171,8 @@ def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0
                   flush=True)
             state["mass"] += 1
         tpb, tpy, tnll, ft = rnnt_joint_node_logp(f, g, lin.weight, lin.bias, transcripts, encoder_lengths,
-                                                  transcript_lengths, n_rows=n_rows, frame_targets=frame_k)
+                                                  transcript_lengths, n_rows=n_rows, frame_targets=frame_k,
+                                                  blank_penalty=teacher_bp)
         return tpb, tpy, ft
 
     model.training_step = training_step
@@ -182,5 +183,6 @@ def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0
     n = sum(p.numel() for p in teacher.parameters())
     print(f"[teacher_kd] teacher {n / 1e6:.0f}M params frozen; student loss per head = {hard_weight} x hard + "
           f"{kd_weight} x KD (RNN-T: collapsed lattice KL; CTC: teacher per-frame top-{frame_k}); teacher look-ahead "
-          f"follows the student's sampled context {sorted(tctx)}", flush=True)
+          + (f"follows the student's sampled context {sorted(tctx)}" if teacher_la is None else f"fixed at {teacher_la}")
+          + (f"; teacher blank penalty {teacher_bp} (as it decodes best)" if teacher_bp else ""), flush=True)
     return teacher
