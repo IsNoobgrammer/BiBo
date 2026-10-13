@@ -41,12 +41,16 @@ def main():
         t = teacher_kd.load_teacher(init, ckpt, None if "parakeet" in init else [13, 6, 3, 1, 0, -1], fused=True)
         tdt = [int(d) for d in (t.cfg.model_defaults.get("tdt_durations", None) or [])]
         ctxs = {c[1]: list(c) for c in t.encoder.att_context_size_all}
+        sp = t.tokenizer.tokenizer
+        pieces = [sp.id_to_piece(i) for i in range(sp.get_piece_size())]
+        pid = {q: i for i, q in enumerate(pieces)}
+        lowid = torch.tensor([pid.get(q.lower(), i) for i, q in enumerate(pieces)] + [len(pieces)], device="cuda")
         for la in a.la:
             if tdt and la != -1:
                 continue                                   # Parakeet: full attention only
             if not tdt:
                 t.encoder.set_default_att_context_size(ctxs.get(la, [-1, -1] if la < 0 else [70, la]))
-            pr, t1, ent, ntok = 0.0, 0, 0.0, 0
+            pr, prc, t1, ent, ntok = 0.0, 0.0, 0, 0.0, 0
             for i in range(0, len(rows), a.bs):
                 bt = rows[i:i + a.bs]
                 wav = [sf.read(r["audio_filepath"], dtype="float32")[0] for r in bt]
@@ -78,11 +82,13 @@ def main():
                     p = P[j, :u].double()
                     ref = y[j, :u]
                     pr += p.gather(1, ref[:, None]).sum().item()
+                    pl = torch.zeros_like(p).index_add_(1, lowid[:p.shape[1]], p)   # case-folded: The + the
+                    prc += pl.gather(1, lowid[ref][:, None]).sum().item()
                     t1 += (p.argmax(1) == ref).sum().item()
                     ent += -(p * p.clamp_min(1e-30).log()).sum().item()
                     ntok += u
             print(f"PROBE {spec.split('/')[-1][:60]:60s} la {la:3d} | tokens {ntok} | p(ref) {pr / ntok:.4f} | "
-                  f"top1==ref {100 * t1 / ntok:.2f}% | other mass {1 - pr / ntok:.4f} | entropy {ent / ntok:.4f} nats",
+                  f"p(ref, any case) {prc / ntok:.4f} | top1==ref {100 * t1 / ntok:.2f}% | other mass {1 - pr / ntok:.4f} | entropy {ent / ntok:.4f} nats",
                   flush=True)
         del t
         torch.cuda.empty_cache()
