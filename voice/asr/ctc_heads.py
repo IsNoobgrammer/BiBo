@@ -330,7 +330,7 @@ def main():
     ap.add_argument("--minutes", type=float, default=13, help="training wall-clock budget (sets --steps after 100)")
     ap.add_argument("--fused", action="store_true", help="train SelfCondN heads with tkf's fused CTC pass")
     ap.add_argument("--per_pass", action="store_true", help="also score pass 1 / 2 of the 3-pass heads")
-    ap.add_argument("--save", default=None, help="save the trained heads here (.pt), e.g. for head_diag.py")
+    ap.add_argument("--save", default=None, help="save the trained heads here (.pt)")
     ap.add_argument("--tok", default=None, help="tokenizer dir for the heads (default: the model's own)")
     ap.add_argument("--eval_batch", type=int, default=128)
     ap.add_argument("--las", type=int, nargs="+", default=[0, 1, 3, 6, 13], help="look-aheads to score (80 ms frames)")

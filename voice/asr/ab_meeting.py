@@ -2,7 +2,7 @@
 
 The saved .nemo describes the stock CTC decoder, so NeMo's streaming script cannot load it: restore non-strict, put the
 head back (selfcond_head.enable), then load the full state dict strictly. Encoding is ctc_heads.encode (the training
-look-ahead mask, as head_rescore.py); CTC greedy with blank penalty + English lock, RNN-T greedy (hybrid runs) with the
+look-ahead mask); CTC greedy with blank penalty + English lock, RNN-T greedy (hybrid runs) with the
 same penalty / lock via blank_penalty.apply.
 
     python voice/asr/ab_meeting.py --nemo exp_ab/ab-ctc_only/ab-ctc_only.nemo --head glu_glu --bp 0 0.5 1.0

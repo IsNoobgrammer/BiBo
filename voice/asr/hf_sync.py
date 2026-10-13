@@ -70,7 +70,7 @@ def pull(run, asr_dir):
 if __name__ == "__main__":
     if sys.argv[1] == "pull":
         tok, _, _ = pull(sys.argv[2], sys.argv[3])
-        if tok:                                                 # put the run's tokenizer where run1.sh expects it
+        if tok:                                                 # put the run's tokenizer where the train scripts expect it
             dst = os.path.join(sys.argv[3], sys.argv[2], "tok", "tokenizer_spe_bpe_v4096")
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             if not os.path.exists(dst):
