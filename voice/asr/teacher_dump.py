@@ -45,6 +45,7 @@ def main():
     ap.add_argument("--hf_repo", default=None)
     ap.add_argument("--hf_dir", default=None)
     ap.add_argument("--limit", type=int, default=None, help="only the first N rows (a probe)")
+    ap.add_argument("--upload_every", type=int, default=20, help="shards per HF commit")
     a = ap.parse_args()
     sys.path.insert(0, TKF)
     import sentencepiece as spm
@@ -69,6 +70,7 @@ def main():
         api = HfApi()
         done_hf = {os.path.basename(f) for f in api.list_repo_files(a.hf_repo) if f.startswith(a.hf_dir + "/")}
     pool = ThreadPoolExecutor(16)
+    pending = []
     t0, n_done, h_done = time.time(), 0, 0.0
     for s0 in range(0, len(rows), a.shard):
         name = f"shard_{s0:08d}.npz"
@@ -121,15 +123,9 @@ def main():
         p = np.concatenate([res[i][1] for i in order]) if U.sum() else np.zeros((0, a.k), np.float16)
         tok = np.concatenate([np.array(toks[i], dtype=np.int16) for i in order]) if U.sum() else np.zeros(0, np.int16)
         np.savez(path, row=np.array(order, dtype=np.int64), U=U, off=off, idx=idx, p=p, tok=tok)
-        if api is not None:
-            for k in range(5):
-                try:
-                    api.upload_file(path_or_fileobj=path, path_in_repo=f"{a.hf_dir}/{name}", repo_id=a.hf_repo,
-                                    commit_message=f"kd targets {a.hf_dir} {name}")
-                    break
-                except Exception as e:
-                    print(f"[dump] upload retry {k}: {e}", flush=True)
-                    time.sleep(30)
+        pending.append(name)
+        if api is not None and len(pending) >= a.upload_every:   # one HF commit per batch of shards (per-shard
+            pending = upload(api, a, pending)                   # commits hit HF's 429 commit rate limit)
         n_done += len(order)
         h_done += sum(rows[i]["duration"] for i in order) / 3600
         mass = float(p.astype(np.float32).sum(1).mean()) if len(p) else 0.0
@@ -137,7 +133,29 @@ def main():
         print(f"DUMP_SHARD {name} rows {len(order)} tokens {int(U.sum())} | top-{a.k} mass {mass:.4f} | "
               f"{n_done} rows {h_done:.1f} h in {el / 60:.1f} min ({h_done * 3600 / max(el, 1):.0f}x real time)",
               flush=True)
+    if api is not None:                                     # everything local not yet on HF, one commit
+        local = sorted(f for f in os.listdir(a.out) if f.startswith("shard_") and f.endswith(".npz"))
+        have = {os.path.basename(f) for f in api.list_repo_files(a.hf_repo) if f.startswith(a.hf_dir + "/")}
+        left = upload(api, a, [f for f in local if f not in have])
+        print(f"DUMP_UPLOAD local {len(local)} shards, HF missing after upload: {len(left)}", flush=True)
     print("DUMP_DONE", flush=True)
+
+
+def upload(api, a, names):
+    """one commit for these shards; returns the names still not uploaded"""
+    from huggingface_hub import CommitOperationAdd
+    if not names:
+        return []
+    for k in range(8):
+        try:
+            api.create_commit(a.hf_repo, operations=[CommitOperationAdd(f"{a.hf_dir}/{n}", os.path.join(a.out, n))
+                                                    for n in names],
+                              commit_message=f"kd targets {a.hf_dir}: {len(names)} shards {names[0]}..{names[-1]}")
+            return []
+        except Exception as e:
+            print(f"[dump] upload retry {k}: {e}", flush=True)
+            time.sleep(60 * (k + 1))
+    return names
 
 
 if __name__ == "__main__":
