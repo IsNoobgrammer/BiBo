@@ -36,6 +36,8 @@ class SelfCondCTCDecoder(nn.Module):
         self.distill_only = False            # True: the head learns ONLY from the transducer (no text CTC loss)
         self.frame_tgt = None                # (B, T) targets from the transducer's greedy decode, set per step
         self.distill_loss = None
+        self.distill_mode = "greedy"         # "lattice": targets = the fused joint's per-frame lattice posteriors
+        self.lattice_src = None              # () -> (idx, logp) each (B, T, K), set by enable()
 
     def forward(self, encoder_output):
         h = encoder_output.transpose(1, 2)                                # (B, T, d)
@@ -43,12 +45,24 @@ class SelfCondCTCDecoder(nn.Module):
             tgt, tlen, hl, reduce = self.stash
             self.loss, z = self.head.fused_loss(h, hl, tgt, tlen, self.num_classes_with_blank - 1, reduce=reduce,
                                                 return_logits=True)
-            if self.distill > 0 and self.frame_tgt is not None:          # eager head pass WITH grad for the CE
+            lat = self.lattice_src() if (self.distill > 0 and self.distill_mode == "lattice") else None
+            if lat is not None:                                          # soft per-frame targets from the lattice:
+                idx, lpt = lat                                           # one fused KL (kl_div_topk), no decoding
+                z2 = self.head(h)
+                B, T, V = z2.shape
+                Tt = min(T, idx.shape[1])
+                K = idx.shape[2]
+                kl = _kl_topk()(z2[:, :Tt].reshape(-1, V), idx[:, :Tt].reshape(-1, K),
+                                lpt[:, :Tt].reshape(-1, K)).view(B, Tt)
+                mask = torch.arange(Tt, device=kl.device)[None, :] < hl[:, None]
+                self.distill_loss = (kl * mask).sum(1).mean()            # per-utterance sum, as CTC mean_batch
+            elif self.distill > 0 and self.frame_tgt is not None:        # eager head pass WITH grad for the CE
                 logp = self.head(h).float().log_softmax(-1)
                 T = min(logp.shape[1], self.frame_tgt.shape[1])
                 nll = -logp[:, :T].gather(-1, self.frame_tgt[:, :T, None]).squeeze(-1)
                 mask = torch.arange(T, device=nll.device)[None, :] < hl[:, None]
                 self.distill_loss = (nll * mask).sum(1).mean()           # per-utterance sum, as CTC mean_batch
+            if self.distill > 0 and self.distill_loss is not None:
                 self.loss = (self.distill * self.distill_loss if self.distill_only
                              else self.loss + self.distill * self.distill_loss)
             return z.float().log_softmax(-1)                              # batch-WER only (no grad)
@@ -64,6 +78,16 @@ class SelfCondCTCDecoder(nn.Module):
         for p in self.parameters():
             p.requires_grad_(True)
         self.train()
+
+
+def _kl_topk():
+    import os
+    import sys
+    tkf = os.environ.get("TKF", "/home/marimo/work/triton-kernel-fused")
+    if tkf not in sys.path:
+        sys.path.insert(0, tkf)
+    from kernels.sm120.kl_div import kl_div_topk
+    return kl_div_topk
 
 
 def _frame_targets(model, enc, enc_len, blank):
@@ -97,7 +121,7 @@ def _frame_targets(model, enc, enc_len, blank):
     return ft.to(enc.device, non_blocking=True)
 
 
-def enable(model, kind, weights=None, distill=0.0, distill_only=False):
+def enable(model, kind, weights=None, distill=0.0, distill_only=False, distill_mode="greedy"):
     readouts = kind.split("_")
     weights = weights or {2: (0.3, 0.7), 3: (0.2, 0.3, 0.5)}[len(readouts)]
     stock = model.ctc_decoder
@@ -106,8 +130,12 @@ def enable(model, kind, weights=None, distill=0.0, distill_only=False):
     model.ctc_decoder = dec
     dec.distill = float(distill)
     dec.distill_only = bool(distill_only)
+    dec.distill_mode = distill_mode
+    if dec.distill > 0 and distill_mode == "lattice":       # the fused joint (train_asr --fused_joint) writes them
+        model.joint._frame_k = 4
+        dec.lattice_src = lambda: getattr(model.joint, "_frame_targets", None)
     assert not dec.distill_only or dec.distill > 0, "distill_only needs distill > 0"
-    if dec.distill > 0:                      # greedy decode inside training: no CUDA-graph decoder
+    if dec.distill > 0 and distill_mode == "greedy":         # greedy decode inside training: no CUDA-graph decoder
         from omegaconf import open_dict
         dcfg = model.cfg.decoding
         with open_dict(dcfg):
@@ -139,7 +167,7 @@ def enable(model, kind, weights=None, distill=0.0, distill_only=False):
         out = enc_fwd(*args, **kwargs)
         if dec.stash is not None:
             dec.stash[2] = out[1]
-            if dec.distill > 0:
+            if dec.distill > 0 and dec.distill_mode == "greedy":
                 dec.frame_tgt = _frame_targets(model, out[0], out[1], dec.num_classes_with_blank - 1)
         return out
 
@@ -156,6 +184,6 @@ def enable(model, kind, weights=None, distill=0.0, distill_only=False):
     n = sum(p.numel() for p in dec.parameters())
     print(f"[selfcond_head] CTC decoder -> SelfCondN {readouts} weights {weights}, {n / 1e6:.2f}M params, "
           f"{dec.num_classes_with_blank} classes; training loss via tkf selfcond_ctc_pass"
-          + (f"; {'ONLY ' if dec.distill_only else '+ '}{dec.distill} x transducer-alignment CE (on-policy distillation)"
+          + (f"; {'ONLY ' if dec.distill_only else '+ '}{dec.distill} x transducer distillation ({dec.distill_mode})"
              if dec.distill > 0 else ""), flush=True)
     return dec

@@ -912,6 +912,9 @@ def main():
     ap.add_argument("--ctc_distill", type=float, default=0.0,
                     help="with --ctc_head on a transducer hybrid: weight of the on-policy distillation CE from the "
                          "transducer head's greedy alignment into the CTC head (selfcond_head.py); 0 = off")
+    ap.add_argument("--ctc_distill_mode", choices=["lattice", "greedy"], default="lattice",
+                    help="lattice: the fused joint's per-frame lattice posteriors -> one fused KL (needs --fused_joint, "
+                         "no decoding); greedy: decode the transducer every step (~1.75x step time)")
     ap.add_argument("--ctc_distill_only", action="store_true",
                     help="with --ctc_distill: the CTC head's loss is ONLY the transducer distillation (no text CTC)")
     ap.add_argument("--head_lr", type=float, default=None,
@@ -1079,7 +1082,8 @@ def main():
         ctc_only.enable(m)
     if a.ctc_head:                       # after fused_ctc: the eval-time CTC loss still goes through it
         import selfcond_head
-        selfcond_head.enable(m, a.ctc_head, distill=a.ctc_distill, distill_only=a.ctc_distill_only)
+        selfcond_head.enable(m, a.ctc_head, distill=a.ctc_distill, distill_only=a.ctc_distill_only,
+                             distill_mode=a.ctc_distill_mode if a.fused_joint else "greedy")
     if hasattr(m, "ctc_wer") and a.val_blank_penalty > 0:   # hybrid model: + both heads at the app's blank penalty
         bp_metrics(m, a.val_blank_penalty)
     if a.init_weights:                   # fine-tune from a trained run: the model is built as that run was (stock

@@ -92,8 +92,11 @@ def enable(model):
             loss, _ = tdt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
                                      transcript_lengths, dropout=p, n_rows=n_rows, **tdt_cfg)
         else:
-            loss, _ = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
-                                      transcript_lengths, fastemit_lambda=lam, dropout=p, n_rows=n_rows)
+            fk = getattr(self, "_frame_k", 0) if self.training else 0   # lattice CTC distillation (selfcond_head)
+            out = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
+                                  transcript_lengths, fastemit_lambda=lam, dropout=p, n_rows=n_rows, frame_targets=fk)
+            loss = out[0]
+            self._frame_targets = out[2] if fk else None
         wer = wer_num = wer_denom = None
         hyp = []
         if compute_wer:                                              # NeMo's per-sub-batch WER, on the whole batch
