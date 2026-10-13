@@ -5,7 +5,7 @@ from a frozen transducer teacher (e.g. the fine-tuned Nemotron RNN-T-only model)
   RNN-T head  loss = hard_weight * RNN-T nll + kd_weight * collapsed lattice KL (every (t, u) node, {label, blank,
               rest}), fused into the student's joint backward (tkf rnnt_joint_loss(kd=...))
   CTC head    loss = hard_weight * CTC + kd_weight * KL(teacher per-frame emission distribution || CTC head),
-              targets = the teacher lattice's per-frame top-4 (tkf rnnt_joint_node_logp(frame_targets=4)),
+              targets = the teacher's ALIGNMENT, one token or blank per frame (tkf rnnt_joint_node_logp(frame_targets=1)),
               KL by kl_div_topk on the fused self-conditioned pass's own logits (selfcond_head, lattice mode)
 The teacher runs no-grad in bf16 on the batch's (augmented) audio, without SpecAugment, at the look-ahead the
 student's encoder sampled for this batch (so a 240 ms student is taught by a 240 ms teacher). Its own lattice uses
@@ -106,7 +106,7 @@ def mask_outputs(model, ids):
     return reset, len(lins)
 
 
-def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0.3, frame_k=4, fused=True,
+def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0.3, frame_k=1, fused=True,
            mask=True, manifest=None, teacher_bp=0.0, teacher_la=None):
     sys.path.insert(0, TKF)
     from kernels.sm120.rnnt_joint import rnnt_joint_node_logp
@@ -182,7 +182,7 @@ def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0
     model._kd_teacher = [teacher]                    # a list: not registered as a submodule (not saved, not trained)
     n = sum(p.numel() for p in teacher.parameters())
     print(f"[teacher_kd] teacher {n / 1e6:.0f}M params frozen; student loss per head = {hard_weight} x hard + "
-          f"{kd_weight} x KD (RNN-T: collapsed lattice KL; CTC: teacher per-frame top-{frame_k}); teacher look-ahead "
+          f"{kd_weight} x KD (RNN-T: collapsed lattice KL; CTC: CE to the teacher's one-token-per-frame alignment); teacher look-ahead "
           + (f"follows the student's sampled context {sorted(tctx)}" if teacher_la is None else f"fixed at {teacher_la}")
           + (f"; teacher blank penalty {teacher_bp} (as it decodes best)" if teacher_bp else ""), flush=True)
     return teacher

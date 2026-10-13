@@ -1112,7 +1112,7 @@ def main():
         assert a.fused_joint and a.fused_attn, "--teacher needs --fused_joint and --fused_attn"
         import teacher_kd
         teacher_kd.enable(m, a.teacher, a.teacher_ckpt, a.teacher_lookaheads, a.kd_rnnt, a.hard_rnnt,
-                          frame_k=4 if (a.ctc_head and a.kd_ctc > 0) else 0, mask=not a.no_mask_pieces,
+                          frame_k=1 if (a.ctc_head and a.kd_ctc > 0) else 0, mask=not a.no_mask_pieces,
                           manifest=a.train, teacher_bp=a.teacher_bp, teacher_la=a.teacher_la)
     # Exact resume: a 1-layer nn.LSTM ignores its `dropout` (applied only between layers), but with dropout > 0 the
     # first call per process makes cuDNN's dropout state, drawing a seed from the CUDA generator -- at step 1 in an

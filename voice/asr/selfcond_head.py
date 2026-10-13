@@ -89,7 +89,7 @@ def enable(model, kind, weights=None, distill=0.0, hard=1.0):
     dec.distill = float(distill)
     dec.hard = float(hard)
     if dec.distill > 0:                      # teacher_kd: the fused joint writes the teacher's per-frame targets here
-        model.joint._frame_k = 4
+        model.joint._frame_k = 1          # one-hot alignment targets (teacher_kd)
         dec.lattice_src = lambda: getattr(model.joint, "_frame_targets", None)
     loss = model.ctc_loss
     orig_fwd = model.training_step

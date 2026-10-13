@@ -101,7 +101,7 @@ def enable(model):
                                       transcript_lengths, fastemit_lambda=lam, dropout=p, n_rows=n_rows,
                                       kd=(tpb, tpy), kd_weight=self._kd_w, hard_weight=self._hard_w)
                 loss = out[0]
-                self._kd_value = out[3].mean().detach()
+                self._kd_value = out[2].mean().detach()
                 self._frame_targets = ft if fk else None
             elif kd is not None:                      # RNN-T on the transcript only; the teacher teaches the CTC head
                 out = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
