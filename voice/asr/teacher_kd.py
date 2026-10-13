@@ -70,10 +70,10 @@ def enable(model, init, ckpt=None, lookaheads=None, kd_weight=0.7, hard_weight=0
     state = {"batch": None, "checked": 0}
     orig_step = model.training_step
 
-    def training_step(batch, batch_nb):
+    def training_step(batch, *args, **kw):         # Lightning passes batch_idx only if the signature names it
         state["batch"] = batch[:4]                   # after on_after_batch_transfer: the augmented audio
         try:
-            out = orig_step(batch, batch_nb)
+            out = orig_step(batch, *args, **kw)
             kd = getattr(model.joint, "_kd_value", None)
             if kd is not None:
                 model.log("core/loss_kd_rnnt", kd, on_step=True, on_epoch=False)
