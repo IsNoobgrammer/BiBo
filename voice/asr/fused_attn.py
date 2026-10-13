@@ -24,9 +24,11 @@ def enable(model):
     sys.path.insert(0, TKF)
     from kernels.sm120.relpos_attn import relpos_attention
     enc = model.encoder
-    if enc.att_context_style != "chunked_limited" or enc.self_attention_model != "rel_pos":
+    if enc.att_context_style not in ("chunked_limited", "regular") or enc.self_attention_model != "rel_pos":
         print(f"[fused_attn] {enc.att_context_style} / {enc.self_attention_model}: not supported, NeMo attention kept")
         return
+    regular = enc.att_context_style == "regular"     # Parakeet: at full context [-1, -1] its mask is the padding only,
+                                                     # the same as chunked_limited's; any other regular band -> NeMo
     nemo_masks = enc._create_masks
 
     def create_masks(att_context_size, padding_length, max_audio_length, offset, device):
@@ -44,6 +46,8 @@ def enable(model):
                 or pos_emb.size(1) != 2 * T - 1 or key is not query or value is not query):
             return self._nemo_forward(query, key, value, mask, pos_emb, cache=cache)
         (left, right), lengths, _ = ctx
+        if regular and (left >= 0 or right >= 0):
+            return self._nemo_forward(query, key, value, mask, pos_emb, cache=cache)
         enc._fused_calls += 1                    # parity / plumbing checks assert the kernel really ran
         # NeMo's dtypes: under bf16 autocast its avoid_float16_autocast_context is a no-op, so the projections and the
         # attention matmuls are bf16 (softmax fp32); the kernel follows q's dtype. q, k, v = ONE GEMM (one input cast,
@@ -64,7 +68,8 @@ def enable(model):
         att._nemo_forward = att.forward
         att.forward = types.MethodType(forward, att)
         n += 1
-    print(f"[fused_attn] {n} rel_pos attention layers -> tkf relpos_attention", flush=True)
+    print(f"[fused_attn] {n} rel_pos attention layers -> tkf relpos_attention"
+          + (" (regular style: full context only)" if regular else ""), flush=True)
 
 
 def _check():
@@ -104,3 +109,87 @@ def _check():
 
 if __name__ == "__main__" and "--check" in sys.argv:
     _check()
+
+
+def _check_pk():
+    """Parakeet TDT 0.6B v2 (regular rel_pos, full context), no grad: (1) per layer NeMo bf16 vs fused bf16 vs the
+    layer in fp64 on the same input; (2) end to end, the teacher's per-token KD targets on real clips with fused vs
+    NeMo attention, and vs an fp32 NeMo forward. Prints PKATTN lines."""
+    import json
+    import random
+    import nemo.collections.asr as nemo_asr
+    import soundfile as sf
+    from kernels.sm120.tdt_joint import tdt_joint_pos_targets
+    m = nemo_asr.models.ASRModel.from_pretrained("nvidia/parakeet-tdt-0.6b-v2").cuda().eval()
+    sys.path.insert(0, TKF)
+    enable(m)
+    enc = m.encoder
+    rows = [json.loads(l) for l in open("/home/marimo/work/asr/en3/train_cleanA.jsonl")]
+    random.Random(5).shuffle(rows)
+    rows = [r for r in rows if 3 <= r["duration"] <= 20][:16]
+    wav = [sf.read(r["audio_filepath"], dtype="float32")[0] for r in rows]
+    L = max(len(w) for w in wav)
+    sig = torch.zeros(len(wav), L, device="cuda")
+    for j, w in enumerate(wav):
+        sig[j, :len(w)] = torch.from_numpy(w)
+    slen = torch.tensor([len(w) for w in wav], device="cuda")
+    ys = [m.tokenizer.text_to_ids(r["text"]) for r in rows]
+    y = torch.zeros(len(ys), max(len(t) for t in ys), dtype=torch.long, device="cuda")
+    for j, t in enumerate(ys):
+        y[j, :len(t)] = torch.tensor(t)
+    ylen = torch.tensor([len(t) for t in ys], device="cuda")
+    rel = lambda a, b: ((a.double() - b.double()).norm() / b.double().norm()).item()
+    ok = True
+    caps = {}
+    hooks = [enc.layers[i].self_attn.register_forward_pre_hook(
+        lambda mod, a, kw, i=i: caps.setdefault(i, (a, kw)), with_kwargs=True) for i in (0, 11, 23)]
+
+    def run(fused, amp=True):
+        enc._fused_off = not fused
+        enc._fused_calls = 0
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+            e, el = m.forward(input_signal=sig, input_signal_length=slen)
+            d, _, _ = m.decoder(targets=y, target_length=ylen)
+            f = m.joint.project_encoder(e.transpose(1, 2))
+            g = m.joint.project_prednet(d.transpose(1, 2))
+        lin = m.joint.joint_net[-1]
+        P, nll = tdt_joint_pos_targets(f, g, lin.weight, lin.bias, y, el, ylen, [0, 1, 2, 3, 4])
+        return e.float(), P, nll, enc._fused_calls
+
+    ef, Pf, nf, calls = run(True)
+    for h in hooks:
+        h.remove()
+    for i, (a, kw) in sorted(caps.items()):
+        att = enc.layers[i].self_attn
+        args = dict(zip(("query", "key", "value", "mask", "pos_emb"), a)) | kw
+        x = args["query"].detach()
+        with torch.no_grad():
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                yn = att._nemo_forward(x, x, x, args["mask"], args["pos_emb"], cache=None)
+                yf = att.forward(x, x, x, args["mask"], args["pos_emb"], cache=None)
+            att64 = __import__("copy").deepcopy(att).double()
+            x64 = x.double()
+            y64 = type(att).forward(att64, x64, x64, x64, args["mask"], args["pos_emb"].double(), cache=None)
+        en, ef_ = rel(yn, y64), rel(yf, y64)
+        r = ef_ <= 1.1 * en
+        ok &= r
+        print(f"PKATTN layer {i}: vs fp64 rel  NeMo bf16 {en:.2e}  fused bf16 {ef_:.2e}  [{'PASS' if r else 'FAIL'}]", flush=True)
+    en_, Pn, nn_, _ = run(False)
+    e32, P32, n32, _ = run(False, amp=False)
+    m_ = torch.zeros_like(Pf[..., 0], dtype=torch.bool)
+    for j in range(len(ys)):
+        m_[j, :len(ys[j])] = True
+    dfn = (Pf - Pn)[m_].abs().max().item()
+    dn32 = (Pn - P32)[m_].abs().max().item()
+    df32 = (Pf - P32)[m_].abs().max().item()
+    r = calls == len(enc.layers) and df32 <= 1.1 * dn32 + 1e-3
+    ok &= r
+    print(f"PKATTN e2e: fused calls {calls}/{len(enc.layers)} | encoder rel vs fp32: NeMo bf16 {rel(en_, e32):.2e} "
+          f"fused bf16 {rel(ef, e32):.2e} | KD targets max abs: fused-NeMo {dfn:.2e}, NeMo bf16-fp32 {dn32:.2e}, "
+          f"fused-fp32 {df32:.2e} | nll mean fused {nf.mean().item():.3f} NeMo {nn_.mean().item():.3f} fp32 "
+          f"{n32.mean().item():.3f} [{'PASS' if r else 'FAIL'}]", flush=True)
+    print("PKATTN ALL PASS" if ok else "PKATTN FAILED", flush=True)
+
+
+if __name__ == "__main__" and "--check_pk" in sys.argv:
+    _check_pk()
