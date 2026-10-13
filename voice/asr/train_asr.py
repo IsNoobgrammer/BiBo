@@ -906,15 +906,6 @@ def main():
     ap.add_argument("--ctc_head", default=None, help="self-conditioned CTC head, readouts per pass: lin_glu, glu_glu, "
                     "lin_glu_glu ... (selfcond_head.py, fused training loss)")
     ap.add_argument("--fused_ctc", action="store_true", help="tkf deterministic CTC loss (voice/asr/fused_ctc.py)")
-    ap.add_argument("--freeze_encoder", action="store_true",
-                    help="encoder frozen AND pinned to eval mode (BatchNorm running stats, no dropout): train only the "
-                         "heads, e.g. a full-context CTC teacher head on stock Parakeet")
-    ap.add_argument("--ctc_distill", type=float, default=0.0,
-                    help="with --ctc_head on a transducer hybrid: weight of the on-policy distillation CE from the "
-                         "transducer head's greedy alignment into the CTC head (selfcond_head.py); 0 = off")
-    ap.add_argument("--ctc_distill_mode", choices=["lattice", "greedy"], default="lattice",
-                    help="lattice: the fused joint's per-frame lattice posteriors -> one fused KL (needs --fused_joint, "
-                         "no decoding); greedy: decode the transducer every step (~1.75x step time)")
     ap.add_argument("--teacher", default=None, help="teacher_kd.py: a frozen transducer teacher (HF id or .nemo) on "
                     "the SAME tokenizer as the student (--tok = the teacher's pieces); every batch both student heads "
                     "learn --hard_weight x text loss + --kd_weight x KD")
@@ -937,18 +928,9 @@ def main():
                     "(-1 = full context); default: the student's sampled look-ahead of each batch")
     ap.add_argument("--no_mask_pieces", action="store_true", help="--teacher: do NOT mask the teacher's cased / "
                     "punctuated pieces our transcripts never produce")
-    ap.add_argument("--ctc_distill_only", action="store_true",
-                    help="with --ctc_distill: the CTC head's loss is ONLY the transducer distillation (no text CTC)")
-    ap.add_argument("--head_lr", type=float, default=None,
-                    help="peak lr for the CTC head (AdamW param group, same schedule). Default with --hub_head + "
-                         "--ctc_head (a FRESH head on a pretrained encoder): 10 x --lr; else --lr")
     ap.add_argument("--ctc_weight", type=float, default=None, help="hybrid loss = (1-w) RNN-T + w CTC (model default 0.3)")
     ap.add_argument("--keep_vocab", action="store_true", help="hub --init (Nemotron, Parakeet): keep its own "
                     "tokenizer + trained decoder instead of switching to --tok")
-    ap.add_argument("--hub_head", choices=["native", "hybrid"], default="native",
-                    help="hybrid: add a CTC head to an RNN-T/TDT hub model (hub_models.to_hybrid)")
-    ap.add_argument("--hub_streaming", action="store_true",
-                    help="full-attention hub model (Parakeet) -> chunked attention + causal convs (hub_models.to_streaming)")
     ap.add_argument("--new_vocab", action="store_true", help="with a .nemo --init: switch it to --tok (new CTC/RNN-T "
                     "output layers, encoder kept)")
     ap.add_argument("--seed", type=int, default=None)
@@ -993,12 +975,6 @@ def main():
             print(f"[run] {a.init}: keeping its own vocabulary ({m.tokenizer.vocab_size} pieces) and decoder", flush=True)
         else:
             m.change_vocabulary(new_tokenizer_dir=a.tok, new_tokenizer_type="bpe")
-    if a.hub_streaming or a.hub_head == "hybrid":
-        import hub_models                # before the data loaders: a rebuilt model has none
-        if a.hub_streaming:              # full-attention model (Parakeet) -> chunked attention + causal convs
-            m = hub_models.to_streaming(m, a.lookaheads or [13, 6, 3, 1, 0, -1])
-        if a.hub_head == "hybrid":       # RNN-T / TDT model + a CTC head (--ctc_head swaps in ours, --ctc_only trains it alone)
-            m = hub_models.to_hybrid(m, a.ctc_weight if a.ctc_weight is not None else 0.3)
 
     tr = OmegaConf.create(OmegaConf.to_container(m.cfg.train_ds))
     with open_dict(tr):
@@ -1114,10 +1090,9 @@ def main():
         import selfcond_head
         if a.teacher:                    # the CTC head learns from the TEACHER's per-frame lattice targets
             assert a.fused_joint and a.fused_attn, "--teacher needs --fused_joint and --fused_attn"
-            selfcond_head.enable(m, a.ctc_head, distill=a.kd_ctc, distill_mode="lattice", hard=a.hard_ctc)
+            selfcond_head.enable(m, a.ctc_head, distill=a.kd_ctc, hard=a.hard_ctc)
         else:
-            selfcond_head.enable(m, a.ctc_head, distill=a.ctc_distill, distill_only=a.ctc_distill_only,
-                                 distill_mode=a.ctc_distill_mode if a.fused_joint else "greedy")
+            selfcond_head.enable(m, a.ctc_head)
     if hasattr(m, "ctc_wer") and a.val_blank_penalty > 0:   # hybrid model: + both heads at the app's blank penalty
         bp_metrics(m, a.val_blank_penalty)
     if a.init_weights:                   # fine-tune from a trained run: the model is built as that run was (stock
@@ -1155,14 +1130,6 @@ def main():
         parity = ParityDump(a.parity_dump)
         parity.wrap(m)
         print(f"[parity] SpecAugment off; dump -> {a.parity_dump}", flush=True)
-    if a.freeze_encoder:
-        import types
-        for p in m.encoder.parameters():
-            p.requires_grad_(False)
-        m.encoder.train = types.MethodType(lambda self, mode=True: torch.nn.Module.train(self, False), m.encoder)
-        m.encoder.eval()
-        n_tr = sum(p.numel() for p in m.parameters() if p.requires_grad)
-        print(f"[run] encoder frozen (eval mode pinned); trainable params {n_tr / 1e6:.2f}M", flush=True)
     ckpt_dir = os.path.join(a.out, a.run)
     os.makedirs(ckpt_dir, exist_ok=True)
     # resume: local last.ckpt, else the one in the HF repo (fresh box); the W&B run continues under the same id
@@ -1205,12 +1172,6 @@ def main():
             value = torch.tensor(float(value))
         return lightning_log(name, value, *args, **kw)
     m.log = log
-    head_lr = a.head_lr if a.head_lr is not None else (10 * a.lr if a.hub_head == "hybrid" and a.ctc_head else None)
-    if head_lr is not None and a.optim == "adamw" and hasattr(m, "ctc_decoder"):   # NeMo optim_param_groups
-        with open_dict(m.cfg):
-            m.cfg.optim_param_groups = {"ctc_decoder": {"lr": head_lr}}
-        print(f"[run] CTC head lr {head_lr:g} (encoder / rest {a.lr:g}): a fresh head at the encoder's fine-tune lr "
-              f"stayed undertrained (hub-pk-hybrid: 41.6 meeting WER at full context after 1 epoch)", flush=True)
     m.setup_optimization(OmegaConf.create({
         "name": "adamw", "lr": a.lr, "betas": [0.9, 0.98], "weight_decay": 1e-3,
         "sched": {"name": "CosineAnnealing", "warmup_steps": a.warmup, "min_lr": a.min_lr, "max_steps": max_steps}}))

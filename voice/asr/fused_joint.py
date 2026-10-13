@@ -92,7 +92,7 @@ def enable(model):
             loss, _ = tdt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
                                      transcript_lengths, dropout=p, n_rows=n_rows, **tdt_cfg)
         else:
-            fk = getattr(self, "_frame_k", 0) if self.training else 0   # lattice CTC distillation (selfcond_head)
+            fk = getattr(self, "_frame_k", 0) if self.training else 0   # CTC head distills (selfcond_head)
             teach = getattr(self, "_teacher", None) if self.training else None   # teacher_kd.py
             kd = teach(encoder_lengths, transcripts, transcript_lengths, n_rows) if teach is not None else None
             if kd is not None and self._kd_w > 0:   # student RNN-T: hard x nll + kd x lattice KL (hard 0: no lattice)
@@ -110,11 +110,8 @@ def enable(model):
                 loss = out[0]
                 self._frame_targets = kd[2] if fk else None
             else:
-                out = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
-                                      transcript_lengths, fastemit_lambda=lam, dropout=p, n_rows=n_rows,
-                                      frame_targets=fk)
-                loss = out[0]
-                self._frame_targets = out[2] if fk else None
+                loss, _ = rnnt_joint_loss(f, g, net[-1].weight, net[-1].bias, transcripts, encoder_lengths,
+                                          transcript_lengths, fastemit_lambda=lam, dropout=p, n_rows=n_rows)
         wer = wer_num = wer_denom = None
         hyp = []
         if compute_wer:                                              # NeMo's per-sub-batch WER, on the whole batch

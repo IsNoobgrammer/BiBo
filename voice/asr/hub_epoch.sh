@@ -2,7 +2,7 @@
 # One fine-tuning epoch of a hub encoder arm (Nemotron / Parakeet, Oct 2026 study), then the same evaluation as
 # bench_asr.py: meeting clips + en3 validation per look-ahead, blank penalties, scored by score_ctc_decode.py.
 #   RUN=hub-nt-hybrid INIT=nvidia/nemotron-speech-streaming-en-0.6b HEADS="rnnt ctc" \
-#     EXTRA="--hub_head hybrid --ctc_head glu_glu --ctc_weight 0.4" bash voice/asr/hub_epoch.sh
+#     EXTRA="--fastemit 0" bash voice/asr/hub_epoch.sh
 # HEADS: which decoders to evaluate (rnnt = the RNN-T/TDT head via bench_asr; ctc = our glu_glu head via dump_ctc +
 # the app's Rust ctc-decode). Prints HUB_DONE <run>. Recipe: run6's data + look-ahead mix, AdamW (cosine: user rule),
 # lr ${LR:-1e-4}, 5% warm-up, final lr 0, 1 epoch = 1875 h = 5625 steps at 1200 s batches; HF checkpoint at the end.
