@@ -83,8 +83,11 @@ class FFNReadout(nn.Module):
       ffn4: h + down(act(up(LN h))), d -> 4d -> d           (2 * 4 d^2 params)
       glu : h + down(act(gate(LN h)) * up(LN h)), hidden 8d/3 rounded to 8  (3 * 8/3 d^2 params)
     then Linear d -> vocab. act = SiLU or radial normsilu (on the gate for glu, as in BiBo's experts).
-    p: dropout on the hidden activation before `down` (train_asr --ctc_dropout; 0 = none, the default)."""
+    p: dropout on the hidden activation before `down` (train_asr --ctc_dropout; 0 = none, the default).
+    post_norm: "layer" | "rms" | None -- a norm on the readout's output right before the vocab projection (as the final
+    RMSNorm before an LLM's LM head; train_asr --ctc_head_norm). Without it the head's scale drifts in long runs."""
     p = 0.0
+    post_norm = None
 
     def __init__(self, d, c, kind, radial=False, residual=True):
         super().__init__()
@@ -94,6 +97,8 @@ class FFNReadout(nn.Module):
         self.up = nn.Linear(d, (2 if kind == "glu" else 1) * hid)
         self.down = nn.Linear(hid, d)
         self.out = nn.Linear(d, c)
+        self.post = (nn.LayerNorm(d) if self.post_norm == "layer" else nn.RMSNorm(d) if self.post_norm == "rms"
+                     else None)
         self.radial_theta = nn.Parameter(torch.zeros(())) if radial else None
 
     def act(self, g):
@@ -109,7 +114,8 @@ class FFNReadout(nn.Module):
             x = self.act(x)
         if self.p > 0 and self.training:
             x = F.dropout(x, self.p, True)
-        return (h if self.residual else 0) + self.down(x)
+        y = (h if self.residual else 0) + self.down(x)
+        return self.post(y) if self.post is not None else y
 
     def forward(self, h):
         return self.out(self.hidden(h))

@@ -887,6 +887,8 @@ def main():
                          "e.g. 0 0.5 0.5 0.5 0.2")
     ap.add_argument("--grad_diag", type=int, default=0, help="log per-module grad norms + look-ahead every N steps")
     ap.add_argument("--ctc_dropout", type=float, default=0.0, help="dropout inside the CTC head's FFN/GLU readouts (0 = none)")
+    ap.add_argument("--ctc_head_norm", choices=["none", "layer", "rms"], default="none",
+                    help="norm on the CTC readout output before the vocab projection (new params: not resumable)")
     ap.add_argument("--ctc_zloss", type=float, default=0.0, help="z-loss on the CTC head logits: coef x sum_t logsumexp^2 (0 = off)")
     ap.add_argument("--log_every", type=int, default=50, help="Lightning log_every_n_steps (debug probes: 5)")
     ap.add_argument("--clip", type=float, default=1.0, help="global grad-norm clip (debug: late-training spikes)")
@@ -954,6 +956,10 @@ def main():
                     help="bitwise same-seed runs (with --fused_ctc): torch deterministic algorithms, cuDNN deterministic")
     ap.add_argument("--project", default="bibo-asr")
     a = ap.parse_args()
+    if a.ctc_head_norm != "none":           # norm right before the CTC vocab projection; set before the head is built
+        import ctc_heads
+        ctc_heads.FFNReadout.post_norm = a.ctc_head_norm
+        print(f"[run] CTC head: {a.ctc_head_norm} norm before the vocab projection", flush=True)
     if a.ctc_dropout:                       # CTC head FFN/GLU dropout (the head had none); every run type
         import ctc_heads
         ctc_heads.FFNReadout.p = a.ctc_dropout
