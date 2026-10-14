@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Vendored from https://github.com/mudler/parakeet.cpp scripts/convert_parakeet_to_gguf.py @ 2f9e8ea (MIT, see LICENSE.parakeet.cpp).
 # Keep it in sync with the parakeet.cpp the RT Captions engine builds: the GGUF schema is read by that C++ loader.
-"""Convert a NeMo Parakeet checkpoint to GGUF (f32 / f16 / q8_0).
+"""Convert a NeMo Parakeet checkpoint to GGUF (f32 / f16 / q8_0 / q4_0).
 
 The GGUF is fully metadata-driven: all config lives in KV, and tensor names are
 kept **verbatim** from the NeMo ``state_dict`` (no renaming) so the C++ port is a
@@ -9,7 +9,7 @@ kept **verbatim** from the NeMo ``state_dict`` (no renaming) so the C++ port is 
 ``preprocessor.featurizer.window``) are lifted directly from the checkpoint so the
 C++ side never re-derives the mel filterbank with librosa.
 
-Quantization (``--dtype f16|q8_0``) is applied **only** to the large linear
+Quantization (``--dtype f16|q8_0|q4_0``) is applied **only** to the large linear
 weights that the C++ engine consumes directly via ``ggml_mul_mat`` (the encoder
 FFN + attention projections, the subsampling output projection, and the joint
 enc/pred projections). ggml dequantizes those on the fly inside the compute
@@ -238,10 +238,10 @@ def should_quantize(name, shape, dtype):
         return None
     if dtype == "f16":
         return gguf.GGMLQuantizationType.F16
-    if dtype == "q8_0":
+    if dtype in ("q8_0", "q4_0"):           # both block 32 along the contraction axis
         if shape[0] % 32 != 0:
             return None  # leading dim not block-aligned -> keep F32
-        return gguf.GGMLQuantizationType.Q8_0
+        return gguf.GGMLQuantizationType.Q8_0 if dtype == "q8_0" else gguf.GGMLQuantizationType.Q4_0
     return None
 
 
@@ -251,7 +251,7 @@ def main():
     ap.add_argument("--output", required=True)
     ap.add_argument(
         "--dtype",
-        choices=["f32", "f16", "q8_0"],
+        choices=["f32", "f16", "q8_0", "q4_0"],
         default="f32",
         help="quantization for allowlisted linear weights (everything else f32)",
     )
