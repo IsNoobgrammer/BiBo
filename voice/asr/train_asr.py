@@ -887,6 +887,7 @@ def main():
                          "e.g. 0 0.5 0.5 0.5 0.2")
     ap.add_argument("--grad_diag", type=int, default=0, help="log per-module grad norms + look-ahead every N steps")
     ap.add_argument("--ctc_dropout", type=float, default=0.0, help="dropout inside the CTC head's FFN/GLU readouts (0 = none)")
+    ap.add_argument("--ctc_zloss", type=float, default=0.0, help="z-loss on the CTC head logits: coef x sum_t logsumexp^2 (0 = off)")
     ap.add_argument("--log_every", type=int, default=50, help="Lightning log_every_n_steps (debug probes: 5)")
     ap.add_argument("--clip", type=float, default=1.0, help="global grad-norm clip (debug: late-training spikes)")
     ap.add_argument("--hold_lr_step", type=int, default=None, help="freeze the schedule's lr at this step (debug probes)")
@@ -1112,6 +1113,9 @@ def main():
             selfcond_head.enable(m, a.ctc_head, distill=a.kd_ctc, hard=a.hard_ctc, mode=a.kd_ctc_mode)
         else:
             selfcond_head.enable(m, a.ctc_head)
+        if a.ctc_zloss:                  # bound the CTC head's logit scale (z-loss on the fused pass's logits)
+            m.ctc_decoder.zloss = a.ctc_zloss
+            print(f"[run] CTC head z-loss {a.ctc_zloss}", flush=True)
     if hasattr(m, "ctc_wer") and a.val_blank_penalty > 0:   # hybrid model: + both heads at the app's blank penalty
         bp_metrics(m, a.val_blank_penalty)
     if a.init_weights:                   # fine-tune from a trained run: the model is built as that run was (stock

@@ -34,6 +34,10 @@ class SelfCondCTCDecoder(nn.Module):
         self.distill = 0.0                   # weight of the teacher KL (0 = off)
         self.hard = 1.0                      # weight of the text CTC loss when distilling (teacher_kd: 0.3; 0 = none)
         self.distill_loss = None
+        self.zloss = 0.0                     # --ctc_zloss: coef x sum over frames of logsumexp(logits)^2 (bounds the
+                                             # head's logit scale; Oct 14 2026: unbounded growth broke long runs)
+        self.zloss_value = None
+        self.lse_value = None
         self.lattice_src = None              # () -> (idx, logp) each (B, T, K), set by enable()
         self.mode = "align"                  # align: CE to the teacher's alignment | pos: per-token, timing-free
         self.pbar_src = None                 # () -> P (B, U, V) the teacher's per-token targets (mode pos)
@@ -69,6 +73,13 @@ class SelfCondCTCDecoder(nn.Module):
                 return z.detach().float().log_softmax(-1)
             self.loss, z = self.head.fused_loss(h, hl, tgt, tlen, self.num_classes_with_blank - 1, reduce=reduce,
                                                 return_logits=True, ctc=hard)
+            tm = (torch.arange(z.shape[1], device=z.device)[None, :] < hl[:, None]).float()
+            lse = z.float().logsumexp(-1)                                # the head's logit scale, every step
+            self.lse_value = ((lse.detach().abs() * tm).sum() / tm.sum().clamp_min(1)).detach()
+            if self.zloss > 0:                                           # z-loss on the final pass's logits
+                zl = ((lse ** 2) * tm).sum(1).mean()                     # per-utterance sum, as CTC mean_batch
+                self.zloss_value = zl.detach()
+                self.loss = self.loss + self.zloss * zl
             lat = self.lattice_src() if self.distill > 0 else None
             if lat is not None:                                          # teacher per-frame targets: one fused KL
                 idx, lpt = lat                                           # (kl_div_topk) on the fused pass's own
@@ -132,6 +143,10 @@ def enable(model, kind, weights=None, distill=0.0, hard=1.0, mode="align"):
             out = orig_fwd(batch, batch_nb)
             if dec.distill_loss is not None:
                 self.log("core/loss_distill", dec.distill_loss.detach(), on_step=True, on_epoch=False)
+            if getattr(dec, "lse_value", None) is not None:              # CTC logit scale (|logsumexp| per frame)
+                self.log("core/ctc_logit_scale", dec.lse_value, on_step=True, on_epoch=False)
+            if getattr(dec, "zloss_value", None) is not None:
+                self.log("core/loss_ctc_z", dec.zloss_value, on_step=True, on_epoch=False)
             return out
         finally:
             dec.stash, dec.loss, dec.distill_loss = None, None, None
