@@ -37,11 +37,13 @@ def main():
     ap.add_argument("--init", default="nvidia/nemotron-speech-streaming-en-0.6b")
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--lookaheads", type=int, nargs="*", default=[13, 6, 3, 1, 0, -1])
-    ap.add_argument("--la", type=int, default=-1, help="teacher look-ahead in 80 ms frames (-1 = full context)")
+    ap.add_argument("--la", type=int, nargs="+", default=[-1], help="teacher look-ahead(s) in 80 ms frames (-1 = full "
+                    "context); several = one pass (audio, features and prediction net once per batch, one encoder "
+                    "pass per look-ahead), each into <out>/la<R>/ (train_asr --kd_targets R=<out>/la<R> ...)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--k", type=int, default=16)
     ap.add_argument("--shard", type=int, default=4096)
-    ap.add_argument("--batch_sec", type=float, default=900.0)
+    ap.add_argument("--batch_sec", type=float, default=1200.0)
     ap.add_argument("--hf_repo", default=None)
     ap.add_argument("--hf_dir", default=None)
     ap.add_argument("--limit", type=int, default=None, help="only the first N rows (a probe)")
@@ -59,28 +61,43 @@ def main():
     t = teacher_kd.load_teacher(a.init, a.ckpt, a.lookaheads, fused=True)
     probe = "the quick brown fox jumps over the lazy dog's medical appointment on tuesday"
     assert sp.encode(probe) == t.tokenizer.text_to_ids(probe), "student and teacher tokenizers differ"
-    t.encoder.set_default_att_context_size([-1, -1] if a.la < 0 else [t.encoder.att_context_size_all[0][0], a.la])
+    left = t.encoder.att_context_size_all[0][0]
+    ctx = {r: ([-1, -1] if r < 0 else [left, r]) for r in a.la}
+    multi = len(a.la) > 1
+    outs = {r: os.path.join(a.out, f"la{r}") if multi else a.out for r in a.la}
+    hfd = {r: (f"{a.hf_dir}/la{r}" if multi else a.hf_dir) for r in a.la} if a.hf_dir else {}
     blank = t.tokenizer.vocab_size
     lin = t.joint.joint_net[-1]
-    os.makedirs(a.out, exist_ok=True)
-    done_hf = set()
+    for o in outs.values():
+        os.makedirs(o, exist_ok=True)
+    done_hf = {r: set() for r in a.la}
     api = None
     if a.hf_repo:
         from huggingface_hub import HfApi
         api = HfApi()
-        done_hf = {os.path.basename(f) for f in api.list_repo_files(a.hf_repo) if f.startswith(a.hf_dir + "/")}
+        files = api.list_repo_files(a.hf_repo)
+        done_hf = {r: {os.path.basename(f) for f in files if f.startswith(hfd[r] + "/")} for r in a.la}
     pool = ThreadPoolExecutor(16)
-    pending = []
+    pending = {r: [] for r in a.la}
     t0, n_done, h_done = time.time(), 0, 0.0
+
+    def load(bt):                                    # CPU side of one batch, runs ahead of the GPU
+        wavs = list(pool.map(lambda i: sf.read(rows[i]["audio_filepath"], dtype="float32")[0], bt))
+        L = torch.tensor([len(w) for w in wavs])
+        sig = torch.zeros(len(wavs), int(L.max()))
+        for j, w in enumerate(wavs):
+            sig[j, :len(w)] = torch.from_numpy(w)
+        return sig.pin_memory(), L
+
+    loader = ThreadPoolExecutor(1)
     for s0 in range(0, len(rows), a.shard):
         name = f"shard_{s0:08d}.npz"
-        path = os.path.join(a.out, name)
-        if name in done_hf or os.path.exists(path):
+        todo = [r for r in a.la if name not in done_hf[r] and not os.path.exists(os.path.join(outs[r], name))]
+        if not todo:
             continue
         part = list(range(s0, min(s0 + a.shard, len(rows))))
         part.sort(key=lambda i: rows[i]["duration"])
         toks = {i: sp.encode(rows[i]["text"]) for i in part}
-        res = {}
         batch, sec = [], 0.0
         batches = []
         for i in part:
@@ -91,66 +108,75 @@ def main():
             sec += rows[i]["duration"]
         if batch:
             batches.append(batch)
-        for bt in batches:
-            wavs = list(pool.map(lambda i: sf.read(rows[i]["audio_filepath"], dtype="float32")[0], bt))
-            L = torch.tensor([len(w) for w in wavs])
-            sig = torch.zeros(len(wavs), int(L.max()))
-            for j, w in enumerate(wavs):
-                sig[j, :len(w)] = torch.from_numpy(w)
+        res = {r: {} for r in todo}
+        nxt = loader.submit(load, batches[0]) if batches else None
+        for b, bt in enumerate(batches):
+            sig, L = nxt.result()
+            if b + 1 < len(batches):
+                nxt = loader.submit(load, batches[b + 1])
             ys = [toks[i] for i in bt]
             ylen = torch.tensor([len(y) for y in ys])
             Y = torch.zeros(len(ys), max(1, int(ylen.max())), dtype=torch.long)
             for j, y in enumerate(ys):
                 if y:
                     Y[j, :len(y)] = torch.tensor(y)
-            sig, L, Y, ylen = sig.cuda(), L.cuda(), Y.cuda(), ylen.cuda()
+            sig, L, Y, ylen = sig.cuda(non_blocking=True), L.cuda(), Y.cuda(), ylen.cuda()
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                enc, elen = t.forward(input_signal=sig, input_signal_length=L)
-                dec, _, _ = t.decoder(targets=Y, target_length=ylen)
-                f = t.joint.project_encoder(enc.transpose(1, 2))
+                feat, flen = t.preprocessor(input_signal=sig, length=L)          # once per batch
+                dec, _, _ = t.decoder(targets=Y, target_length=ylen)            # look-ahead independent
                 g = t.joint.project_prednet(dec.transpose(1, 2))
-            *_, P = rnnt_joint_node_logp(f, g, lin.weight, lin.bias, Y, elen, ylen, pos_targets=True)
-            P[..., blank] = 0.0
-            pk, ik = P.topk(a.k, dim=-1)
-            pk, ik = pk.cpu(), ik.cpu()
-            for j, i in enumerate(bt):
-                u = len(ys[j])
-                res[i] = (ik[j, :u].numpy().astype(np.int16), pk[j, :u].numpy().astype(np.float16))
-        order = sorted(res)
-        U = np.array([len(toks[i]) for i in order], dtype=np.int32)
-        off = np.concatenate([[0], np.cumsum(U)[:-1]]).astype(np.int64)
-        idx = np.concatenate([res[i][0] for i in order]) if U.sum() else np.zeros((0, a.k), np.int16)
-        p = np.concatenate([res[i][1] for i in order]) if U.sum() else np.zeros((0, a.k), np.float16)
-        tok = np.concatenate([np.array(toks[i], dtype=np.int16) for i in order]) if U.sum() else np.zeros(0, np.int16)
-        np.savez(path, row=np.array(order, dtype=np.int64), U=U, off=off, idx=idx, p=p, tok=tok)
-        pending.append(name)
-        if api is not None and len(pending) >= a.upload_every:   # one HF commit per batch of shards (per-shard
-            pending = upload(api, a, pending)                   # commits hit HF's 429 commit rate limit)
+            for r in todo:
+                t.encoder.set_default_att_context_size(ctx[r])
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    enc, elen = t.encoder(audio_signal=feat, length=flen)
+                    f = t.joint.project_encoder(enc.transpose(1, 2))
+                *_, P = rnnt_joint_node_logp(f, g, lin.weight, lin.bias, Y, elen, ylen, pos_targets=True)
+                P[..., blank] = 0.0
+                pk, ik = P.topk(a.k, dim=-1)
+                pk, ik = pk.cpu(), ik.cpu()
+                for j, i in enumerate(bt):
+                    u = len(ys[j])
+                    res[r][i] = (ik[j, :u].numpy().astype(np.int16), pk[j, :u].numpy().astype(np.float16))
+        masses = []
+        for r in todo:
+            rr = res[r]
+            order = sorted(rr)
+            U = np.array([len(toks[i]) for i in order], dtype=np.int32)
+            off = np.concatenate([[0], np.cumsum(U)[:-1]]).astype(np.int64)
+            idx = np.concatenate([rr[i][0] for i in order]) if U.sum() else np.zeros((0, a.k), np.int16)
+            p = np.concatenate([rr[i][1] for i in order]) if U.sum() else np.zeros((0, a.k), np.float16)
+            tok = np.concatenate([np.array(toks[i], dtype=np.int16) for i in order]) if U.sum() else np.zeros(0, np.int16)
+            np.savez(os.path.join(outs[r], name), row=np.array(order, dtype=np.int64), U=U, off=off, idx=idx, p=p,
+                     tok=tok)
+            masses.append(f"la{r} {float(p.astype(np.float32).sum(1).mean()) if len(p) else 0.0:.4f}")
+            pending[r].append(name)
+            if api is not None and len(pending[r]) >= a.upload_every:   # one HF commit per batch of shards
+                pending[r] = upload(api, a.hf_repo, hfd[r], outs[r], pending[r])   # (per-shard commits hit HF's 429)
         n_done += len(order)
         h_done += sum(rows[i]["duration"] for i in order) / 3600
-        mass = float(p.astype(np.float32).sum(1).mean()) if len(p) else 0.0
         el = time.time() - t0
-        print(f"DUMP_SHARD {name} rows {len(order)} tokens {int(U.sum())} | top-{a.k} mass {mass:.4f} | "
+        print(f"DUMP_SHARD {name} rows {len(order)} tokens {int(U.sum())} | top-{a.k} mass {' '.join(masses)} | "
               f"{n_done} rows {h_done:.1f} h in {el / 60:.1f} min ({h_done * 3600 / max(el, 1):.0f}x real time)",
               flush=True)
-    if api is not None:                                     # everything local not yet on HF, one commit
-        local = sorted(f for f in os.listdir(a.out) if f.startswith("shard_") and f.endswith(".npz"))
-        have = {os.path.basename(f) for f in api.list_repo_files(a.hf_repo) if f.startswith(a.hf_dir + "/")}
-        left = upload(api, a, [f for f in local if f not in have])
-        print(f"DUMP_UPLOAD local {len(local)} shards, HF missing after upload: {len(left)}", flush=True)
+    if api is not None:                                     # everything local not yet on HF, one commit per look-ahead
+        files = api.list_repo_files(a.hf_repo)
+        for r in a.la:
+            local = sorted(f for f in os.listdir(outs[r]) if f.startswith("shard_") and f.endswith(".npz"))
+            have = {os.path.basename(f) for f in files if f.startswith(hfd[r] + "/")}
+            left = upload(api, a.hf_repo, hfd[r], outs[r], [f for f in local if f not in have])
+            print(f"DUMP_UPLOAD la{r}: local {len(local)} shards, HF missing after upload: {len(left)}", flush=True)
     print("DUMP_DONE", flush=True)
 
 
-def upload(api, a, names):
+def upload(api, repo, hf_dir, out, names):
     """one commit for these shards; returns the names still not uploaded"""
     from huggingface_hub import CommitOperationAdd
     if not names:
         return []
     for k in range(8):
         try:
-            api.create_commit(a.hf_repo, operations=[CommitOperationAdd(f"{a.hf_dir}/{n}", os.path.join(a.out, n))
-                                                    for n in names],
-                              commit_message=f"kd targets {a.hf_dir}: {len(names)} shards {names[0]}..{names[-1]}")
+            api.create_commit(repo, operations=[CommitOperationAdd(f"{hf_dir}/{n}", os.path.join(out, n)) for n in names],
+                              commit_message=f"kd targets {hf_dir}: {len(names)} shards {names[0]}..{names[-1]}")
             return []
         except Exception as e:
             print(f"[dump] upload retry {k}: {e}", flush=True)
