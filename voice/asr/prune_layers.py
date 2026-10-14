@@ -106,7 +106,7 @@ def dump(path, obj):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="nvidia/nemotron-speech-streaming-en-0.6b")
+    ap.add_argument("--model", default="nvidia/nemotron-speech-streaming-en-0.6b", help="HF id or a local .nemo")
     ap.add_argument("--out", required=True)
     ap.add_argument("--worker", type=int, default=0)
     ap.add_argument("--workers", type=int, default=1)
@@ -114,6 +114,7 @@ def main():
     ap.add_argument("--sets", nargs="+", default=["ami_ihm", "notsofar", "librispeech", "earnings22"])
     ap.add_argument("--n", type=int, default=300, help="clips per val set")
     ap.add_argument("--la", type=int, default=3, help="look-ahead in 80 ms frames (3 = the app's 240 ms)")
+    ap.add_argument("--bp", type=float, default=0.0, help="RNN-T blank penalty for the greedy decode (WER)")
     ap.add_argument("--batch_sec", type=float, default=300)
     ap.add_argument("--nll_chunk", type=int, default=8, help="clips per RNN-T NLL joint")
     ap.add_argument("--val_dir", default="/home/marimo/work/asr/en3")
@@ -123,12 +124,16 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     import nemo.collections.asr as nemo_asr
-    m = nemo_asr.models.ASRModel.from_pretrained(a.model, map_location="cuda").eval()
+    m = (nemo_asr.models.ASRModel.restore_from(a.model, map_location="cuda") if a.model.endswith(".nemo")
+         else nemo_asr.models.ASRModel.from_pretrained(a.model, map_location="cuda")).eval()
     from omegaconf import open_dict
     dec = m.cfg.decoding
     with open_dict(dec):              # the CUDA-graph greedy decoder hit illegal memory accesses with 4 workers + training
         dec.greedy.use_cuda_graph_decoder = False
     m.change_decoding_strategy(dec)
+    if a.bp:                          # RNN-T blank penalty for the WER (the decoding setting that ships)
+        import blank_penalty
+        blank_penalty.apply(a.bp, head="rnnt")
     set_lookahead(m.encoder, a.la)
     sets = load_sets(a)
     layers = list(m.encoder.layers)
