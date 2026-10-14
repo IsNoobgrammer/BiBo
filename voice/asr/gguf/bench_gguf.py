@@ -39,9 +39,10 @@ def la_nemo(src, r, out):
     return want
 
 
-def nemo_stream_wer(path, clips):
-    """NeMo cache-aware streaming (the engine's algorithm) on the GPU: pooled WER and the hypotheses."""
+def nemo_stream_wer(path, clips, bps):
+    """NeMo cache-aware streaming (the engine's algorithm) on the GPU, per RNN-T blank penalty: {bp: (WER, D, I)}."""
     import torch
+    import blank_penalty
     import nemo.collections.asr as nemo_asr
     from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
     from omegaconf import open_dict
@@ -52,8 +53,11 @@ def nemo_stream_wer(path, clips):
         dec.greedy.use_cuda_graph_decoder = False
     m.change_decoding_strategy(dec)
     m.encoder.setup_streaming_params()
-    s = d = i = n = 0
-    for wav, ref in clips:
+    res = {}
+    for bp in bps:
+      blank_penalty.apply(bp, head="rnnt")
+      s = d = i = n = 0
+      for wav, ref in clips:
         buf = CacheAwareStreamingAudioBuffer(model=m, online_normalization=False)
         buf.append_audio(wav, stream_id=-1)
         cc, ct, cl = m.encoder.get_initial_cache_state(batch_size=1)
@@ -69,9 +73,11 @@ def nemo_stream_wer(path, clips):
         hyp = texts[0].text if hasattr(texts[0], "text") else texts[0]
         x = edits(ref, normalize_v2(hyp))
         s, d, i, n = s + x[0], d + x[1], i + x[2], n + len(ref)
+      res[bp] = (100 * (s + d + i) / n, 100 * d / n, 100 * i / n)
+    blank_penalty.apply(0.0, head="rnnt")
     del m
     torch.cuda.empty_cache()
-    return 100 * (s + d + i) / n, 100 * d / n, 100 * i / n
+    return res
 
 
 def main():
@@ -79,7 +85,10 @@ def main():
     ap.add_argument("--nemo", required=True)
     ap.add_argument("--name", required=True)
     ap.add_argument("--las", type=int, nargs="+", default=[6])
-    ap.add_argument("--quants", nargs="+", default=["f32", "q8_0", "q6_k", "q5_k", "q4_k"])
+    ap.add_argument("--quants", nargs="+", default=["f32", "q8_0", "q6_k", "q5_k", "q4_k"], help="at --main_la")
+    ap.add_argument("--main_la", type=int, default=3, help="look-ahead that gets every --quants (the app's 240 ms)")
+    ap.add_argument("--quants_other", nargs="+", default=["q8_0", "q4_k"], help="at the other look-aheads")
+    ap.add_argument("--bps", type=float, nargs="+", default=[0.0, 0.5, 1.0, 1.5], help="NeMo reference blank penalties")
     ap.add_argument("--cli", required=True, help="parakeet-cli binary")
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--out", required=True)
@@ -95,12 +104,14 @@ def main():
         tag = f"{a.name}_la{r}"
         src = os.path.join(a.out, tag + ".nemo")
         ctx = la_nemo(a.nemo, r, src)
-        w, dl, ins = nemo_stream_wer(src, clips)
-        print(f"GG {tag} nemo-stream ctx {ctx} | WER {w:.2f} (D {dl:.2f} I {ins:.2f})", flush=True)
+        res = nemo_stream_wer(src, clips, a.bps)
+        best = min(res, key=lambda b: res[b][0])
+        print(f"GG {tag} nemo-stream ctx {ctx} | " + " ".join(f"bp{b:g} {res[b][0]:.2f}" for b in a.bps)
+              + f" | best bp {best:g}: {res[best][0]:.2f} (D {res[best][1]:.2f} I {res[best][2]:.2f})", flush=True)
         f32 = os.path.join(a.out, tag + "_f32.gguf")
         subprocess.run([sys.executable, os.path.join(HERE, "convert_parakeet_to_gguf.py"), "--model", src,
                         "--dtype", "f32", "--output", f32], check=True, capture_output=True)
-        for q in a.quants:
+        for q in (a.quants if r == a.main_la else a.quants_other):
             g = os.path.join(a.out, f"{tag}_{q}.gguf")
             if q == "f16":
                 subprocess.run([sys.executable, os.path.join(HERE, "convert_parakeet_to_gguf.py"), "--model", src,
