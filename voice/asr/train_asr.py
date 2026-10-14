@@ -953,6 +953,10 @@ def main():
                     help="bitwise same-seed runs (with --fused_ctc): torch deterministic algorithms, cuDNN deterministic")
     ap.add_argument("--project", default="bibo-asr")
     a = ap.parse_args()
+    if a.ctc_dropout:                       # CTC head FFN/GLU dropout (the head had none); every run type
+        import ctc_heads
+        ctc_heads.FFNReadout.p = a.ctc_dropout
+        print(f"[run] CTC head dropout {a.ctc_dropout}", flush=True)
     for h in ("rnnt", "ctc"):            # --teacher: per-head weights default to --kd_weight / --hard_weight
         if getattr(a, f"kd_{h}") is None:
             setattr(a, f"kd_{h}", a.kd_weight)
@@ -1105,10 +1109,6 @@ def main():
         import selfcond_head
         if a.teacher:                    # the CTC head learns from the TEACHER's per-frame lattice targets
             assert a.fused_joint and a.fused_attn, "--teacher needs --fused_joint and --fused_attn"
-            if a.ctc_dropout:                       # CTC head FFN/GLU dropout (the head had none)
-                import ctc_heads
-                ctc_heads.FFNReadout.p = a.ctc_dropout
-                print(f"[run] CTC head dropout {a.ctc_dropout}", flush=True)
             selfcond_head.enable(m, a.ctc_head, distill=a.kd_ctc, hard=a.hard_ctc, mode=a.kd_ctc_mode)
         else:
             selfcond_head.enable(m, a.ctc_head)
