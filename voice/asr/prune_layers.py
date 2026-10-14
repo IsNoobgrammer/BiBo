@@ -73,17 +73,20 @@ def score(m, sets, a):
                 s, d, i, n = s + x[0], d + x[1], i + x[2], n + len(r)
             if name == "meeting":                                     # T x U joint of a 16-min clip: no NLL
                 continue
-            ys = [m.tokenizer.text_to_ids(ref) or [0] for _, ref in b]
-            yl = torch.tensor([len(y) for y in ys]).cuda()
-            Y = torch.zeros(len(b), int(yl.max()), dtype=torch.long).cuda()
-            for j, y in enumerate(ys):
-                Y[j, : len(y)] = torch.tensor(y)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                g, _, _ = m.decoder(targets=Y, target_length=yl)
-                z = m.joint.joint(e[:, : int(el.max())].to(torch.bfloat16), g.transpose(1, 2))   # rnnt_loss: T == max len
-            loss = torchaudio.functional.rnnt_loss(z.float(), Y.int(), el.int(), yl.int(),
-                                                   blank=z.shape[-1] - 1, reduction="sum")
-            nll, ntok = nll + float(loss), ntok + float(yl.sum())
+            for c in range(0, len(b), a.nll_chunk):                  # (B, T, U, V) fp32 joint: small chunks
+                ys = [m.tokenizer.text_to_ids(ref) or [0] for _, ref in b[c: c + a.nll_chunk]]
+                yl = torch.tensor([len(y) for y in ys]).cuda()
+                Y = torch.zeros(len(ys), int(yl.max()), dtype=torch.long).cuda()
+                for j, y in enumerate(ys):
+                    Y[j, : len(y)] = torch.tensor(y)
+                ec, lc = e[c: c + a.nll_chunk], el[c: c + a.nll_chunk]
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    g, _, _ = m.decoder(targets=Y, target_length=yl)
+                    z = m.joint.joint(ec[:, : int(lc.max())].to(torch.bfloat16), g.transpose(1, 2))  # T == max len
+                loss = torchaudio.functional.rnnt_loss(z.float(), Y.int(), lc.int(), yl.int(),
+                                                       blank=z.shape[-1] - 1, reduction="sum")
+                nll, ntok = nll + float(loss), ntok + float(yl.sum())
+                del z
         out[name] = {"wer": 100 * (s + d + i) / n, "S": 100 * s / n, "D": 100 * d / n, "I": 100 * i / n,
                      "nll": nll / ntok if ntok else float("nan")}
     out["mean"] = float(np.mean([v["wer"] for v in out.values()]))
@@ -112,6 +115,7 @@ def main():
     ap.add_argument("--n", type=int, default=300, help="clips per val set")
     ap.add_argument("--la", type=int, default=3, help="look-ahead in 80 ms frames (3 = the app's 240 ms)")
     ap.add_argument("--batch_sec", type=float, default=300)
+    ap.add_argument("--nll_chunk", type=int, default=8, help="clips per RNN-T NLL joint")
     ap.add_argument("--val_dir", default="/home/marimo/work/asr/en3")
     ap.add_argument("--meeting", default="/home/marimo/work/asr/eval_meeting")
     ap.add_argument("--wandb", default="ablations-tinycompany-ai/nemotron-prune", help="entity/project; '' = no W&B")
@@ -120,6 +124,11 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     import nemo.collections.asr as nemo_asr
     m = nemo_asr.models.ASRModel.from_pretrained(a.model, map_location="cuda").eval()
+    from omegaconf import open_dict
+    dec = m.cfg.decoding
+    with open_dict(dec):              # the CUDA-graph greedy decoder hit illegal memory accesses with 4 workers + training
+        dec.greedy.use_cuda_graph_decoder = False
+    m.change_decoding_strategy(dec)
     set_lookahead(m.encoder, a.la)
     sets = load_sets(a)
     layers = list(m.encoder.layers)
