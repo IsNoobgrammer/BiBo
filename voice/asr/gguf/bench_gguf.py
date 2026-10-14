@@ -85,7 +85,7 @@ def main():
     ap.add_argument("--nemo", required=True)
     ap.add_argument("--name", required=True)
     ap.add_argument("--las", type=int, nargs="+", default=[6])
-    ap.add_argument("--quants", nargs="+", default=["f32", "q8_0", "q6_k", "q5_k", "q4_k"], help="at --main_la")
+    ap.add_argument("--quants", nargs="+", default=["f32", "q8_0", "q4_k"], help="at --main_la")
     ap.add_argument("--main_la", type=int, default=3, help="look-ahead that gets every --quants (the app's 240 ms)")
     ap.add_argument("--quants_other", nargs="+", default=["q8_0", "q4_k"], help="at the other look-aheads")
     ap.add_argument("--bps", type=float, nargs="+", default=[0.0, 0.5, 1.0, 1.5], help="NeMo reference blank penalties")
@@ -120,24 +120,28 @@ def main():
                 subprocess.run([a.cli, "quantize", f32, g, q], check=True, capture_output=True)
             else:
                 g = f32
-            s = dd = ii = n = 0
-            wall = 0.0
-            for (wav, ref), (wn, _) in zip(clips, MEET):
-                t0 = time.time()
-                p = subprocess.run([a.cli, "transcribe", "--model", g, "--input", os.path.join(a.meeting, wn),
-                                    "--stream", "--threads", str(a.threads)], capture_output=True, text=True)
-                wall += time.time() - t0
-                fin = re.findall(r"^\[stream:final\] (.*)$", p.stdout, re.M)
-                if p.returncode or not fin:
-                    print(f"GG {tag} {q} FAILED rc {p.returncode}: {p.stderr[-300:]}", flush=True)
-                    break
-                x = edits(ref, normalize_v2(fin[-1]))
-                s, dd, ii, n = s + x[0], dd + x[1], ii + x[2], n + len(ref)
-            else:
-                mb = os.path.getsize(g) / 1e6
-                print(f"GG {tag} {q:5s} | WER {100 * (s + dd + ii) / n:5.2f} (D {100 * dd / n:5.2f} I {100 * ii / n:4.2f}) | "
-                      f"RTF {wall / secs:.3f} ({a.threads} threads, {secs / 60:.1f} min audio) | {mb:.0f} MB", flush=True)
-                up.append(g)
+            ebps = [best] + ([0.0] if (q == "f32" and best != 0.0) else [])   # the app's penalty; bp 0 = parity
+            for ebp in ebps:
+                env = dict(os.environ, PARAKEET_BLANK_PENALTY=str(ebp))   # the engine's RNN-T blank penalty
+                s = dd = ii = n = 0
+                wall = 0.0
+                for (wav, ref), (wn, _) in zip(clips, MEET):
+                    t0 = time.time()
+                    p = subprocess.run([a.cli, "transcribe", "--model", g, "--input", os.path.join(a.meeting, wn),
+                                        "--stream", "--threads", str(a.threads)], capture_output=True, text=True, env=env)
+                    wall += time.time() - t0
+                    fin = re.findall(r"^\[stream:final\] (.*)$", p.stdout, re.M)
+                    if p.returncode or not fin:
+                        print(f"GG {tag} {q} FAILED rc {p.returncode}: {p.stderr[-300:]}", flush=True)
+                        break
+                    x = edits(ref, normalize_v2(fin[-1]))
+                    s, dd, ii, n = s + x[0], dd + x[1], ii + x[2], n + len(ref)
+                else:
+                    mb = os.path.getsize(g) / 1e6
+                    print(f"GG {tag} {q:5s} bp {ebp:g} | WER {100 * (s + dd + ii) / n:5.2f} (D {100 * dd / n:5.2f} "
+                          f"I {100 * ii / n:4.2f}) | RTF {wall / secs:.3f} ({a.threads} threads, {secs / 60:.1f} min audio) "
+                          f"| {mb:.0f} MB", flush=True)
+            up.append(g)
     if a.hf_dir:
         from huggingface_hub import HfApi, CommitOperationAdd
         HfApi().create_commit("fhai50032/bibo-asr-ckpt",
