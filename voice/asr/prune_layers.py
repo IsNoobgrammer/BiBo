@@ -80,7 +80,7 @@ def score(m, sets, a):
                 Y[j, : len(y)] = torch.tensor(y)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 g, _, _ = m.decoder(targets=Y, target_length=yl)
-                z = m.joint.joint(e.to(torch.bfloat16), g.transpose(1, 2))
+                z = m.joint.joint(e[:, : int(el.max())].to(torch.bfloat16), g.transpose(1, 2))   # rnnt_loss: T == max len
             loss = torchaudio.functional.rnnt_loss(z.float(), Y.int(), el.int(), yl.int(),
                                                    blank=z.shape[-1] - 1, reduction="sum")
             nll, ntok = nll + float(loss), ntok + float(yl.sum())
