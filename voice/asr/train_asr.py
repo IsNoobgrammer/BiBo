@@ -939,7 +939,7 @@ def main():
                     "teacher's blank / deletion bias")
     ap.add_argument("--teacher_la", type=int, default=None, help="--teacher: FIXED teacher look-ahead in 80 ms frames "
                     "(-1 = full context); default: the student's sampled look-ahead of each batch")
-    ap.add_argument("--kd_targets", default=None, help="per-token KD from DUMPED teacher targets (teacher_dump.py "
+    ap.add_argument("--kd_targets", nargs="+", default=None, help="per-token KD from DUMPED teacher targets (teacher_dump.py "
                     "shards: a local dir or hf:<repo>:<dir>) instead of a teacher forward every step; RNN-T head, "
                     "--kd_rnnt / --hard_rnnt weights; needs --loader fast")
     ap.add_argument("--kd_cache", action="store_true", help="--teacher, per-token mode, fixed --teacher_la: keep "

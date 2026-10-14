@@ -134,12 +134,28 @@ def load_store(path, n_rows):
 def enable_store(model, path, kd_weight=0.7, hard_weight=1.0, mask=True, manifest=None):
     """per-token KD on the RNN-T head from DUMPED teacher targets (teacher_dump.py): no teacher forward in the step.
     The fast loader's batches carry their manifest row ids (5th element); an outermost on_before_batch_transfer
-    takes them off (NeMo's step sees the usual 4) and the joint builds the dense (B, U, V) targets from the store."""
+    takes them off (NeMo's step sees the usual 4) and the joint builds the dense (B, U, V) targets from the store.
+    path: one store, or several 'LA=store' (one teacher_dump per teacher look-ahead): each batch then reads the
+    store of the look-ahead the student sampled for it (a matched teacher, as with a live --teacher)."""
     import numpy as np
     n_rows = sum(1 for _ in open(manifest, encoding="utf-8"))
-    start, U, idx, p, tok, nf = load_store(path, n_rows)
-    missing = int((start < 0).sum())
-    assert missing == 0, f"teacher store {path}: {missing} of {n_rows} manifest rows have no targets"
+    paths = [path] if isinstance(path, str) else list(path)
+    named = {int(x.split("=", 1)[0]): x.split("=", 1)[1] for x in paths if "=" in x.split(":", 1)[0]}
+    assert len(named) in (0, len(paths)), f"--kd_targets: all 'LA=store' or one plain store, got {paths}"
+    stores = {}                                      # look-ahead (None = one store for every batch) -> (idx, p)
+    start = U = tok = None
+    nf = 0
+    for la, sp in (named.items() if named else [(None, paths[0])]):
+        st_, U_, idx_, p_, tok_, nf_ = load_store(sp, n_rows)
+        missing = int((st_ < 0).sum())
+        assert missing == 0, f"teacher store {sp}: {missing} of {n_rows} manifest rows have no targets"
+        if start is None:
+            start, U, tok = st_, U_, tok_
+        else:                                        # same manifest + tokenizer: identical token layout
+            assert np.array_equal(U_, U) and np.array_equal(st_, start), f"store {sp}: token layout differs"
+        stores[la] = (idx_, p_)
+        nf += nf_
+    idx = next(iter(stores.values()))[0]
     V1 = model.joint.joint_net[-1].out_features
     dead = dead_pieces(model.tokenizer, manifest) if mask else []
     reset = None
@@ -147,7 +163,7 @@ def enable_store(model, path, kd_weight=0.7, hard_weight=1.0, mask=True, manifes
         reset, nlin = mask_outputs(model, dead)
         print(f"[teacher_kd] student: {len(dead)} pieces masked (bias -1e4, no grad) in {nlin} readouts", flush=True)
     dead_t = torch.tensor(dead, dtype=torch.long, device="cuda") if dead else None
-    state = {"ids": None, "checked": 0}
+    state = {"ids": None, "checked": 0, "by_la": {}}
     before = model.on_before_batch_transfer
 
     def on_before_batch_transfer(batch, dataloader_idx):
@@ -167,6 +183,10 @@ def enable_store(model, path, kd_weight=0.7, hard_weight=1.0, mask=True, manifes
             kd = getattr(model.joint, "_kd_value", None)
             if kd is not None:
                 model.log("core/loss_kd_rnnt", kd, on_step=True, on_epoch=False)
+            n = sum(state["by_la"].values())
+            if n in (10, 200, 2000):                 # the matched stores are actually being used, per look-ahead
+                print(f"[teacher_kd] store batches per student look-ahead after {n}: {dict(sorted(state['by_la'].items()))}",
+                      flush=True)
             return out
         finally:
             model.joint._kd_value = None
@@ -187,10 +207,18 @@ def enable_store(model, path, kd_weight=0.7, hard_weight=1.0, mask=True, manifes
             state["checked"] += 1
             if state["checked"] == 5:
                 print("[teacher_kd] store join check: 5 batches, every row's stored tokens == its labels", flush=True)
+        if None in stores:
+            idx, p = stores[None]
+        else:                                        # the look-ahead the student sampled for this batch
+            ctx = getattr(model.encoder, "_fused_ctx", None)
+            assert ctx is not None, "per-look-ahead stores need --fused_attn on the student (its sampled look-ahead)"
+            r = ctx[0][1]
+            assert r in stores, f"student look-ahead {r} has no store (have {sorted(stores)})"
+            idx, p = stores[r]
+            state["by_la"][r] = state["by_la"].get(r, 0) + 1
         pos = np.concatenate([np.arange(n) for n in u]) if u.sum() else np.zeros(0, np.int64)
         brow = np.repeat(np.arange(B), u)
         src = np.repeat(start[ids], u) + pos
-        K = idx.shape[1]
         ii = torch.from_numpy(idx[src].astype(np.int64)).cuda(non_blocking=True)
         pp = torch.from_numpy(p[src].astype(np.float32)).cuda(non_blocking=True)
         dense = torch.zeros(B * Um, V1, device="cuda")
@@ -209,7 +237,7 @@ def enable_store(model, path, kd_weight=0.7, hard_weight=1.0, mask=True, manifes
     model.joint._kd_w = float(kd_weight)
     model.joint._hard_w = float(hard_weight)
     model.joint._kd_mode = "pos"
-    print(f"[teacher_kd] per-token KD from the dumped store {path}: {nf} shards, {len(tok)} tokens, {n_rows} rows, "
+    print(f"[teacher_kd] per-token KD from the dumped store(s) {paths}: {nf} shards, {len(tok)} tokens, {n_rows} rows, "
           f"top-{idx.shape[1]}; RNN-T loss = {hard_weight} x text + {kd_weight} x KD; no teacher model", flush=True)
 
 
