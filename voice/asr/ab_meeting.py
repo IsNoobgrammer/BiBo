@@ -20,6 +20,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blank_penalty  # noqa: E402
+import ctc_heads  # noqa: E402
 import selfcond_head  # noqa: E402
 from ctc_heads import MEETING, encode, set_lookahead  # noqa: E402
 from score import edits, normalize, normalize_v2, wer  # noqa: E402
@@ -29,10 +30,13 @@ def load(path, head, ckpt=None):
     import nemo.collections.asr as nemo_asr
     m = nemo_asr.models.ASRModel.restore_from(path, map_location="cuda", strict=head == "none")
     if head != "none":                                  # "none": a stock-CTC run (run5), loaded as saved
-        selfcond_head.enable(m, head)
         with tarfile.open(path) as t:
             sd = torch.load(t.extractfile(next(n for n in t.getnames() if n.endswith("model_weights.ckpt"))),
                             map_location="cuda", weights_only=False)
+        post = [k for k in sd if k.startswith("ctc_decoder.head.") and ".post." in k]   # train_asr --ctc_head_norm
+        ctc_heads.FFNReadout.post_norm = (None if not post else "layer" if any(k.endswith(".post.bias") for k in post)
+                                          else "rms")
+        selfcond_head.enable(m, head)
         m.load_state_dict(sd, strict=True)
     if ckpt:                                            # score another checkpoint of the same run (e.g. an earlier epoch)
         cks = ckpt if isinstance(ckpt, (list, tuple)) else [ckpt]
