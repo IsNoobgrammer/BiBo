@@ -180,7 +180,7 @@ def build(model, lr, muon_lr=None, wd=1e-3, muon_wd=None, momentum=0.95, variant
     return Combined([muon, adamw])
 
 
-def warmup_cosine(opt, warmup, max_steps, min_lr):
+def warmup_cosine(opt, warmup, max_steps, min_lr, hold=None):
     """NeMo CosineAnnealing's shape per param group: linear warm-up, cosine to min_lr (absolute, as NeMo)."""
     import math
     import torch
@@ -190,6 +190,8 @@ def warmup_cosine(opt, warmup, max_steps, min_lr):
         floor = min(min_lr / base, 1.0)
 
         def lam(t):
+            if hold is not None:                     # debug: the lr stays at its value at step `hold`
+                t = min(t, hold)
             if t < warmup:
                 return (t + 1) / warmup
             x = min(1.0, (t - warmup) / max(1, max_steps - warmup))
