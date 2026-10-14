@@ -135,12 +135,13 @@ def enable_store(model, path, kd_weight=0.7, hard_weight=1.0, mask=True, manifes
     """per-token KD on the RNN-T head from DUMPED teacher targets (teacher_dump.py): no teacher forward in the step.
     The fast loader's batches carry their manifest row ids (5th element); an outermost on_before_batch_transfer
     takes them off (NeMo's step sees the usual 4) and the joint builds the dense (B, U, V) targets from the store.
-    path: one store, or several 'LA=store' (one teacher_dump per teacher look-ahead): each batch then reads the
+    path: one store, or several 'LA=store' / 'full=store' (one teacher_dump look-ahead each): each batch then reads the
     store of the look-ahead the student sampled for it (a matched teacher, as with a live --teacher)."""
     import numpy as np
     n_rows = sum(1 for _ in open(manifest, encoding="utf-8"))
     paths = [path] if isinstance(path, str) else list(path)
-    named = {int(x.split("=", 1)[0]): x.split("=", 1)[1] for x in paths if "=" in x.split(":", 1)[0]}
+    named = {(-1 if x.split("=", 1)[0] == "full" else int(x.split("=", 1)[0])): x.split("=", 1)[1]   # LA or full=
+             for x in paths if "=" in x.split(":", 1)[0]}
     assert len(named) in (0, len(paths)), f"--kd_targets: all 'LA=store' or one plain store, got {paths}"
     stores = {}                                      # look-ahead (None = one store for every batch) -> (idx, p)
     start = U = tok = None
