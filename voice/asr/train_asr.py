@@ -886,6 +886,7 @@ def main():
                     help="per-epoch fraction of utterances augmented on the fly (aug_online.py), last value repeats, "
                          "e.g. 0 0.5 0.5 0.5 0.2")
     ap.add_argument("--grad_diag", type=int, default=0, help="log per-module grad norms + look-ahead every N steps")
+    ap.add_argument("--log_every", type=int, default=50, help="Lightning log_every_n_steps (debug probes: 5)")
     ap.add_argument("--clip", type=float, default=1.0, help="global grad-norm clip (debug: late-training spikes)")
     ap.add_argument("--hold_lr_step", type=int, default=None, help="freeze the schedule's lr at this step (debug probes)")
     ap.add_argument("--stop_step", type=int, default=None, help="stop at this global step (schedule unchanged)")
@@ -1171,7 +1172,7 @@ def main():
     trainer = pl.Trainer(
         devices=1, accelerator="gpu", precision="32-true" if a.bf16_master or a.parity_fp32 else "bf16-mixed", max_steps=max_steps, max_epochs=-1,
         val_check_interval=eval_steps, check_val_every_n_epoch=None if eval_steps else 1,
-        num_sanity_val_steps=0, gradient_clip_val=None if a.bf16_master else a.clip, log_every_n_steps=50,
+        num_sanity_val_steps=0, gradient_clip_val=None if a.bf16_master else a.clip, log_every_n_steps=a.log_every,
         use_distributed_sampler=False, logger=logger, enable_checkpointing=True, benchmark=False,
         callbacks=[AudioMeter(), RngState(), EpochShuffle(a.aug_schedule, m), TQDMProgressBar(refresh_rate=50), ValAggregate(a.val), LearningRateMonitor("step"),
                    ModelCheckpoint(dirpath=ckpt_dir, monitor=MON, mode="min", save_top_k=2,
