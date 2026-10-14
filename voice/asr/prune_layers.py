@@ -104,6 +104,61 @@ def dump(path, obj):
     os.replace(path + ".tmp", path)
 
 
+def beam_search(a, L, teacher, run_eval, sets, fixed, per, wb):
+    """Beam search over the set of kept layers: each stage expands every beam member by dropping each of its layers,
+    scores the unique sets (cached by set, k_<bitmask>.json, so a set reached two ways is scored once; --import_dir
+    seeds the cache with a greedy run's results), keeps the --beam best by
+    obj = w * meeting WER + (1 - w) * mean WER of the other sets (w = --w_meeting)."""
+    others = [s for s in sets if s != "meeting"]
+
+    def obj(r):
+        return a.w_meeting * r["meeting"]["wer"] + (1 - a.w_meeting) * float(np.mean([r[s]["wer"] for s in others]))
+
+    def key(keep):
+        return os.path.join(a.out, "k_" + "".join("1" if j in keep else "0" for j in range(L)) + ".json")
+
+    if a.worker == 0 and a.import_dir:                    # seed the cache (same model / look-ahead / bp / sets / n)
+        import glob
+        n = 0
+        for f in glob.glob(os.path.join(a.import_dir, "*.json")):
+            r = json.load(open(f))
+            if "keep" in r and not os.path.exists(key(r["keep"])):
+                dump(key(r["keep"]), r)
+                n += 1
+        print(f"[beam] imported {n} scored layer sets from {a.import_dir}", flush=True)
+    t0 = obj(teacher)
+    beam = [tuple(range(L))]
+    log = os.path.join(a.out, "beam.log")
+    if a.worker == 0:
+        with open(log, "a") as f:
+            f.write(f"BEAM kept {L} rank 0 | obj {t0:.2f} | dropped [] | " + " ".join(f"{s} {teacher[s]['wer']:.2f}" for s in sets) + "\n")
+    for k in range(L - 1, a.stop - 1, -1):
+        cands = sorted({tuple(x for x in b if x != j) for b in beam for j in b})
+        for idx, c in enumerate(cands):
+            if idx % a.workers == a.worker:
+                run_eval(list(c), key(c))
+        res = dict(zip(cands, wait_for([key(c) for c in cands])))
+        ranked = sorted(cands, key=lambda c: (obj(res[c]), c))
+        beam = ranked[: a.beam]
+        if a.worker == 0:
+            lines = []
+            for i, c in enumerate(beam):
+                r = res[c]
+                lines.append(f"BEAM kept {k} ({(fixed + k * per) / 1e6:.0f}M) rank {i} | obj {obj(r):.2f} (vs full {obj(r) - t0:+.2f}) | "
+                             f"dropped {sorted(set(range(L)) - set(c))} | " + " ".join(f"{s} {r[s]['wer']:.2f}" for s in sets)
+                             + f" | {len(cands)} candidates")
+            print("\n".join(lines), flush=True)
+            with open(log, "a") as f:
+                f.write("\n".join(lines) + "\n")
+            if wb is not None:
+                r = res[beam[0]]
+                wb.log({"layers_kept": k, "params_M": (fixed + k * per) / 1e6, "beam/obj": obj(r), "beam/d_full_obj": obj(r) - t0,
+                        **{f"beam/wer/{s}": r[s]["wer"] for s in sets}})
+    if wb is not None:
+        wb.finish()
+    print(f"PRUNE_DONE worker {a.worker}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="nvidia/nemotron-speech-streaming-en-0.6b", help="HF id or a local .nemo")
@@ -121,6 +176,9 @@ def main():
     ap.add_argument("--meeting", default="/home/marimo/work/asr/eval_meeting")
     ap.add_argument("--wandb", default="ablations-tinycompany-ai/nemotron-prune", help="entity/project; '' = no W&B")
     ap.add_argument("--run", default="greedy-depth-la240")
+    ap.add_argument("--beam", type=int, default=0, help="beam width (0 = greedy, ranked by the mean of all sets)")
+    ap.add_argument("--w_meeting", type=float, default=0.8, help="beam objective weight of the meeting WER")
+    ap.add_argument("--import_dir", default=None, help="seed the beam cache with another run's scored sets (same settings)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     import nemo.collections.asr as nemo_asr
@@ -187,6 +245,9 @@ def main():
                                                                 for c in cands])
             wb.log(row)
 
+    if a.beam:
+        beam_search(a, len(layers), teacher, run_eval, sets, fixed, per, wb)
+        return
     if a.worker == 0:
         log(len(keep), -1, teacher, [])
     while len(keep) > a.stop:
