@@ -82,7 +82,9 @@ class FFNReadout(nn.Module):
     """Transformer-style readout, param-matched pair:
       ffn4: h + down(act(up(LN h))), d -> 4d -> d           (2 * 4 d^2 params)
       glu : h + down(act(gate(LN h)) * up(LN h)), hidden 8d/3 rounded to 8  (3 * 8/3 d^2 params)
-    then Linear d -> vocab. act = SiLU or radial normsilu (on the gate for glu, as in BiBo's experts)."""
+    then Linear d -> vocab. act = SiLU or radial normsilu (on the gate for glu, as in BiBo's experts).
+    p: dropout on the hidden activation before `down` (train_asr --ctc_dropout; 0 = none, the default)."""
+    p = 0.0
 
     def __init__(self, d, c, kind, radial=False, residual=True):
         super().__init__()
@@ -105,6 +107,8 @@ class FFNReadout(nn.Module):
             x = self.act(g) * u
         else:
             x = self.act(x)
+        if self.p > 0 and self.training:
+            x = F.dropout(x, self.p, True)
         return (h if self.residual else 0) + self.down(x)
 
     def forward(self, h):

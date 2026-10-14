@@ -886,6 +886,7 @@ def main():
                     help="per-epoch fraction of utterances augmented on the fly (aug_online.py), last value repeats, "
                          "e.g. 0 0.5 0.5 0.5 0.2")
     ap.add_argument("--grad_diag", type=int, default=0, help="log per-module grad norms + look-ahead every N steps")
+    ap.add_argument("--ctc_dropout", type=float, default=0.0, help="dropout inside the CTC head's FFN/GLU readouts (0 = none)")
     ap.add_argument("--log_every", type=int, default=50, help="Lightning log_every_n_steps (debug probes: 5)")
     ap.add_argument("--clip", type=float, default=1.0, help="global grad-norm clip (debug: late-training spikes)")
     ap.add_argument("--hold_lr_step", type=int, default=None, help="freeze the schedule's lr at this step (debug probes)")
@@ -1104,6 +1105,10 @@ def main():
         import selfcond_head
         if a.teacher:                    # the CTC head learns from the TEACHER's per-frame lattice targets
             assert a.fused_joint and a.fused_attn, "--teacher needs --fused_joint and --fused_attn"
+            if a.ctc_dropout:                       # CTC head FFN/GLU dropout (the head had none)
+                import ctc_heads
+                ctc_heads.FFNReadout.p = a.ctc_dropout
+                print(f"[run] CTC head dropout {a.ctc_dropout}", flush=True)
             selfcond_head.enable(m, a.ctc_head, distill=a.kd_ctc, hard=a.hard_ctc, mode=a.kd_ctc_mode)
         else:
             selfcond_head.enable(m, a.ctc_head)
