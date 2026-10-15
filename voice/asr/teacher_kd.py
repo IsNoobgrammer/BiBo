@@ -81,8 +81,9 @@ def mask_outputs(model, ids):
     """student: the dead pieces' output biases held at -1e4 (logit ~ -inf in training, validation, export) in every
     vocabulary readout (RNN-T joint + each CTC pass); their weight / bias gradients are zeroed"""
     V1 = model.joint.joint_net[-1].out_features
-    lins = [model.joint.joint_net[-1]] + [m for m in model.ctc_decoder.modules()
-                                          if isinstance(m, torch.nn.Linear) and m.out_features == V1]
+    ctc = getattr(model, "ctc_decoder", None)         # None: an RNN-T-only student (pruned Nemotron)
+    lins = [model.joint.joint_net[-1]] + ([m for m in ctc.modules()
+                                           if isinstance(m, torch.nn.Linear) and m.out_features == V1] if ctc else [])
     idx = {}                                          # per device: built while the model is still on the CPU
 
     def on(dev):
