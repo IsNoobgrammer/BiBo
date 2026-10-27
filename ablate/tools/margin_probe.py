@@ -47,19 +47,7 @@ def main():
     ap.add_argument("--seqs", type=int, default=64)
     a = ap.parse_args()
     hold = None
-    # the board routes through the fused megakernel (BiBoMoERouter.router_logits is never called): spy on its
-    # inputs before load_from_hub applies the patch, which imports the name at patch time
-    import kernels.sm120.megakernel.moe.block as MB
     rl = []
-    _mk = MB.megakernel_block
-
-    def spy(x, w, *args, **kw):
-        with torch.no_grad():
-            xf = x.float()
-            hn = (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + kw.get("eps", 1e-6)) * w["nw"].float())
-            rl.append((hn @ w["rw"].float()).flatten()[::7])
-        return _mk(x, w, *args, **kw)
-    MB.megakernel_block = spy
     for sub in a.subs.split(","):
         model, cfg = load_from_hub(a.repo, sub)
         model.eval()
@@ -67,7 +55,24 @@ def main():
             hold = _val.build_holdout(cfg.dataset, 1024, a.seqs, DEV)
         rl.clear()
         hooks = []
-        for mod in model.modules():
+        # every routing path (eager router, megakernel) enters through layer._ffn_forward: recompute the router
+        # logits there from the layer's own norm + gate weights, in fp32
+        for layer in model.model.layers:
+            gate = getattr(getattr(layer, "mlp", None), "gate", None)
+            if gate is None or not hasattr(gate, "gate_proj"):
+                continue
+            fwd = layer._ffn_forward
+
+            def ffn(hs, _f=fwd, _l=layer, _g=gate):
+                with torch.no_grad():
+                    x = hs.float()
+                    ln = _l.post_attention_layernorm
+                    hn = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + ln.variance_epsilon) * ln.weight.float()
+                    rl.append((hn @ _g.gate_proj.weight.float().t()).flatten()[::7])
+                return _f(hs)
+            layer._ffn_forward = ffn
+            hooks.append(layer)
+        for mod in []:
             if type(mod).__name__ == "BiBoMoERouter":
                 orig = mod.router_logits
 
@@ -108,7 +113,7 @@ def main():
             r = torch.cat(rl)
             q = torch.quantile(r[torch.randperm(r.numel(), device=r.device)[:1_000_000]],
                                torch.tensor([0.5, 0.99, 0.999], device=r.device))
-            print(f"router logits ({len(hooks)} eager routers + megakernel): max {r.max():.2f}  p50 {q[0]:.2f}  p99 {q[1]:.2f}  "
+            print(f"router logits ({len(hooks)} MoE layers): max {r.max():.2f}  p50 {q[0]:.2f}  p99 {q[1]:.2f}  "
                   f"p99.9 {q[2]:.2f}  >10: {(r > 10).float().mean():.4%}  >16.6 (sigmoid grad = 0): "
                   f"{(r > 16.6).float().mean():.4%}")
         del model
