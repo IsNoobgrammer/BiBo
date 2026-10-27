@@ -55,22 +55,20 @@ def main():
             hold = _val.build_holdout(cfg.dataset, 1024, a.seqs, DEV)
         rl.clear()
         hooks = []
-        # every routing path (eager router, megakernel) enters through layer._ffn_forward: recompute the router
-        # logits there from the layer's own norm + gate weights, in fp32
+        # the megakernel replays every router forward hook with the FFN's PRE-norm input (patches.patch_megakernel);
+        # the eager router gets the normed input. Recompute the logits from the layer's own norm + gate, in fp32.
         for layer in model.model.layers:
             gate = getattr(getattr(layer, "mlp", None), "gate", None)
             if gate is None or not hasattr(gate, "gate_proj"):
                 continue
-            fwd = layer._ffn_forward
 
-            def ffn(hs, _f=fwd, _l=layer, _g=gate):
+            def hook(mod, inp, out, _l=layer):
                 with torch.no_grad():
-                    x = hs.float()
+                    x = inp[0].float()
                     ln = _l.post_attention_layernorm
                     hn = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + ln.variance_epsilon) * ln.weight.float()
-                    rl.append((hn @ _g.gate_proj.weight.float().t()).flatten()[::7])
-                return _f(hs)
-            layer._ffn_forward = ffn
+                    rl.append((hn @ mod.gate_proj.weight.float().t()).flatten()[::7])
+            gate.register_forward_hook(hook)
             hooks.append(layer)
         for mod in []:
             if type(mod).__name__ == "BiBoMoERouter":
